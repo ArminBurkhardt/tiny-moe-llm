@@ -1,5 +1,6 @@
 from modules.data.test_vectorized_dataset import test_get_similar_batch, test_dataset_basic_functionality
 from modules.data.dataloader import test_fileloader, test_dataloader
+from modules.data.dataset import test_dataset
 import torch
 import logging
 
@@ -20,5 +21,8 @@ if __name__ == "__main__":
     
     logging.info("Testing data loader...")
     test_dataloader()
+    
+    logging.info("Testing Dataset class...")
+    test_dataset()
     
     logging.info("All tests passed!")

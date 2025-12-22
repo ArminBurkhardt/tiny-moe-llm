@@ -30,4 +30,4 @@ class Encoder(nn.Module):
         x = self.norm(x)
         return x
 
-## TODO replace with Gemma3 https://huggingface.co/google/gemma-3n-E2B-it 
+## TODO replace with Gemma3 https://huggingface.co/google/gemma-3-1b-it

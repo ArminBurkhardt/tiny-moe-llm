@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-from utils import BASE_DIR
+from utils import BASE_DIR, DIR, logger
 
 __DATASETS = [
     "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu",
@@ -10,7 +10,7 @@ __DATASETS = [
 
 
 
-class _FileLoader:
+class FileLoader:
     def __init__(self, root: str):
         self.root = root
         self.subdirs = sorted(os.listdir(root))
@@ -54,7 +54,7 @@ class _FileLoader:
 class DataLoader:
     def __init__(self, data_root: str, drop_last: bool = False, batch_size: int = 32, minimum_score: float = 0.0, target_column: str = None):
         self.data_root = data_root
-        self.file_loader = _FileLoader(data_root)
+        self.file_loader = FileLoader(data_root)
         self.current_data = None
         self.current_idx = 0
         self.drop_last = drop_last
@@ -71,6 +71,17 @@ class DataLoader:
             self.current_idx = 0
         except StopIteration:
             self.current_data = None
+            
+    def get_next_file(self) -> pd.DataFrame | None:
+        try:
+            data = next(self.file_loader)
+            if self.minimum_score > 0.0:
+                data = data[data["score"] >= self.minimum_score]
+            if self.target_column is not None:
+                data = data[[self.target_column]]
+            return data
+        except StopIteration:
+            return None
     
     def get_next_batch(self, batch_size: int) -> pd.DataFrame:
         if self.current_data is None or self.current_idx >= len(self.current_data):
@@ -102,21 +113,21 @@ class DataLoader:
 
 
 def test_fileloader():
-    data_root = os.path.join(BASE_DIR, "data", "datasets", "ultrafineweb_en_v1_4")
-    loader = _FileLoader(data_root)
+    data_root = DIR.UFW_V1_4_DIR
+    loader = FileLoader(data_root)
     for i, data in enumerate(loader):
-        print(f"Loaded file {i} with {len(data)} records.")
-        print(data.head())
+        logger.info(f"Loaded file {i} with {len(data)} records.")
+        logger.info(data.head())
     
         
 def test_dataloader():
-    data_root = os.path.join(BASE_DIR, "data", "datasets", "ultrafineweb_en_v1_4")
+    data_root = DIR.UFW_V1_4_DIR
     dataloader = DataLoader(data_root, drop_last=True, batch_size=2048, minimum_score=0.5, target_column="content")
     for i, batch in enumerate(dataloader):
-        print(f"Batch {i} with {len(batch)} records.")
+        logger.info(f"Batch {i} with {len(batch)} records.")
     
     
-    print(batch.head())
+    logger.info(batch.head())
 
 
 
