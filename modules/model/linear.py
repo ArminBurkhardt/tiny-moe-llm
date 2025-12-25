@@ -120,3 +120,29 @@ class SolvableLinear(nn.Module):
 
 
 
+
+
+
+def test_solvable_linear():
+    layer = SolvableLinear(3, 3)
+    x = torch.randn(100, 3)
+    true_weight = torch.tensor([[2.0, -1.0, 0.5],
+                                [0.0, 1.5, -0.5],
+                                [-1.0, 0.0, 1.0]])
+    true_bias = torch.tensor([0.5, -1.0, 2.0])
+    y = x @ true_weight.T + true_bias
+
+    layer.solve_from_batch(x, y, l2=1e-4)
+
+    y_pred = layer(x)
+    assert torch.allclose(y_pred, y, atol=1e-3), "Forward pass does not match expected output"
+
+    x_recovered = layer.inverse(y)
+    assert torch.allclose(x_recovered, x, atol=1e-3), "Inverse pass does not recover input"
+
+    print("SolvableLinear tests passed.")
+
+
+
+
+

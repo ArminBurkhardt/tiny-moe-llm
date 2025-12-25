@@ -115,3 +115,22 @@ class MatrixInvertabilityLoss(nn.Module):
 
 # https://docs.pytorch.org/docs/stable/generated/torch.linalg.pinv.html#torch.linalg.pinv 
 
+
+
+
+def test_matrix_invertability_loss():
+    batch_size = 10
+    matrix_size = 5
+
+    # Create a batch of random square matrices
+    matrices = torch.randn(batch_size, matrix_size, matrix_size)
+
+    # Instantiate the loss function
+    loss_fn = MatrixInvertabilityLoss(epsilon=1e-6, method="non_square_pinverse")
+
+    # Compute the loss
+    loss = loss_fn(matrices)
+
+    print(f"Invertibility Loss: {loss.item()}")
+
+

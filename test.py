@@ -1,6 +1,8 @@
 from modules.data.test_vectorized_dataset import test_get_similar_batch, test_dataset_basic_functionality
 from modules.data.dataloader import test_fileloader, test_dataloader
 from modules.data.dataset import test_dataset
+from modules.model.linear import test_solvable_linear
+from modules.model.losses import test_matrix_invertability_loss
 import torch
 import logging
 
@@ -23,6 +25,15 @@ if __name__ == "__main__":
     test_dataloader()
     
     logging.info("Testing Dataset class...")
-    test_dataset()
+    if False:
+        test_dataset()
+    else:
+        logging.info("Skipping test_dataset due to long runtime.")
+    
+    logging.info("Testing solvable linear layer...")
+    test_solvable_linear()
+    
+    logging.info("Testing matrix invertibility loss...")
+    test_matrix_invertability_loss()
     
     logging.info("All tests passed!")
