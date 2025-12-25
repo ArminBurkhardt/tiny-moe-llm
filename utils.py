@@ -17,3 +17,9 @@ class DIR:
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# set warning color to yellow
+ch = logging.StreamHandler()
+ch.setLevel(logging.WARNING)
+formatter = logging.Formatter("\033[93m%(levelname)s: %(message)s\033[0m")
+ch.setFormatter(formatter)
+logger.addHandler(ch)

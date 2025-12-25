@@ -1,5 +1,6 @@
 import torch 
 from torch import nn
+from modules.model.linear import SolvableLinear
 
 
 class Decoder(nn.Module):
@@ -7,7 +8,7 @@ class Decoder(nn.Module):
         super(Decoder, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.linear = nn.Linear(hidden_size, output_size, bias=False)
+        self.linear = SolvableLinear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=-1)
 
     def forward(self, hidden_states):
@@ -17,7 +18,6 @@ class Decoder(nn.Module):
 
     def inverse(self, outputs):
         # Inverse operation to map outputs back to hidden states
-        # This is a placeholder implementation and may not be accurate
-        pseudo_hidden = torch.matmul(outputs, torch.pinverse(self.linear.weight))
+        pseudo_hidden = self.linear.approx_linear_inverse(outputs)
         return pseudo_hidden
 
