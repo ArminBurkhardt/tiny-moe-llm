@@ -1,8 +1,57 @@
 import torch
 from torch import nn
 
+class InvertibleLinear(nn.Module):
+    def __init__(self, input_size: int, output_size: int, bias: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.linear = nn.Linear(input_size, output_size, bias=bias)
+        self._cached_inv = None  # lazily computed inverse when square and full-rank
 
-class SolvableLinear(nn.Module):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:        
+        return self.linear(x)
+    
+
+    @property
+    def is_square(self) -> bool:
+        return self.input_size == self.output_size
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Compute x from y when the solved weight matrix is invertible and square."""
+        if not self.is_square:
+            raise ValueError("Inverse is only defined for square layers (input_size == output_size)")
+
+        weight = self.linear.weight
+        bias = self.linear.bias
+
+        if self._cached_inv is None:
+            try:
+                self._cached_inv = torch.linalg.inv(weight)
+            except torch.linalg.LinAlgError as exc:
+                raise ValueError("Weight matrix is not invertible; cannot compute inverse") from exc
+
+        # y = x @ W^T + b  =>  x = (y - b) @ (W^T)^{-1} = (y - b) @ W^{-T}
+        with torch.no_grad():
+            x = (y - bias) @ self._cached_inv.T
+        return x
+
+
+    def approx_linear_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Compute approximate x from y using the pseudo-inverse of the weight matrix."""
+        weight = self.linear.weight
+        bias = self.linear.bias
+
+        weight_pinv = torch.linalg.pinv(weight)
+
+        # y = x @ W^T + b  =>  x ≈ (y - b) @ (W^T)^{+} = (y - b) @ W^{+T}
+        with torch.no_grad():
+            x_approx = (y - bias) @ weight_pinv.T
+        return x_approx
+ 
+
+class SolvableLinear(InvertibleLinear):
     """Linear layer that can be solved from a batch via (regularized) least squares.
 
     Notes:
@@ -13,11 +62,7 @@ class SolvableLinear(nn.Module):
     """
 
     def __init__(self, input_size: int, output_size: int):
-        super().__init__()
-        self.input_size = input_size
-        self.output_size = output_size
-        self.linear = nn.Linear(input_size, output_size)
-        self._cached_inv = None  # lazily computed inverse when square and full-rank
+        super().__init__(input_size, output_size, bias=True)
         self.grad_enabled = False
         
         
@@ -30,10 +75,6 @@ class SolvableLinear(nn.Module):
     def disable_grad(self):
         """Disable gradient tracking for this layer's parameters."""
         self.enable_grad(False)
-
-    @property
-    def is_square(self) -> bool:
-        return self.input_size == self.output_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.grad_enabled:
@@ -81,40 +122,6 @@ class SolvableLinear(nn.Module):
             self._cached_inv = None  # reset cached inverse
 
         return weight, bias
-
-    def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        """Compute x from y when the solved weight matrix is invertible and square."""
-        if not self.is_square:
-            raise ValueError("Inverse is only defined for square layers (input_size == output_size)")
-
-        weight = self.linear.weight
-        bias = self.linear.bias
-
-        if self._cached_inv is None:
-            try:
-                self._cached_inv = torch.linalg.inv(weight)
-            except torch.linalg.LinAlgError as exc:
-                raise ValueError("Weight matrix is not invertible; cannot compute inverse") from exc
-
-        # y = x @ W^T + b  =>  x = (y - b) @ (W^T)^{-1} = (y - b) @ W^{-T}
-        with torch.no_grad():
-            x = (y - bias) @ self._cached_inv.T
-        return x
-
-
-
-
-    def approx_linear_inverse(self, y: torch.Tensor) -> torch.Tensor:
-        """Compute approximate x from y using the pseudo-inverse of the weight matrix."""
-        weight = self.linear.weight
-        bias = self.linear.bias
-
-        weight_pinv = torch.linalg.pinv(weight)
-
-        # y = x @ W^T + b  =>  x ≈ (y - b) @ (W^T)^{+} = (y - b) @ W^{+T}
-        with torch.no_grad():
-            x_approx = (y - bias) @ weight_pinv.T
-        return x_approx
 
 
 
