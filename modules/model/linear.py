@@ -6,6 +6,7 @@ class InvertibleLinear(nn.Module):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
+        self.bias = bias
         self.linear = nn.Linear(input_size, output_size, bias=bias)
         self._cached_inv = None  # lazily computed inverse when square and full-rank
 
@@ -24,7 +25,7 @@ class InvertibleLinear(nn.Module):
             raise ValueError("Inverse is only defined for square layers (input_size == output_size)")
 
         weight = self.linear.weight
-        bias = self.linear.bias
+        bias = self.linear.bias if self.bias else 0.0
 
         if self._cached_inv is None:
             try:
@@ -41,7 +42,7 @@ class InvertibleLinear(nn.Module):
     def approx_linear_inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Compute approximate x from y using the pseudo-inverse of the weight matrix."""
         weight = self.linear.weight
-        bias = self.linear.bias
+        bias = self.linear.bias if self.bias else 0.0
 
         weight_pinv = torch.linalg.pinv(weight)
 
