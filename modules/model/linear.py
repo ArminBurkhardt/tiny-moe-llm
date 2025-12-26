@@ -1,20 +1,22 @@
 import torch
 from torch import nn
+from utils import logger, FP64
 
 class InvertibleLinear(nn.Module):
-    def __init__(self, input_size: int, output_size: int, bias: bool = True):
+    def __init__(self, input_size: int, output_size: int, bias: bool = True, dtype=FP64):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.bias = bias
-        self.linear = nn.Linear(input_size, output_size, bias=bias)
+        self.linear = nn.Linear(input_size, output_size, bias=bias).to(dtype)
         self._cached_inv = None  # lazily computed inverse when square and full-rank
 
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != self.linear.weight.dtype:
+            x = x.to(self.linear.weight.dtype)
         return self.linear(x)
     
-
     @property
     def is_square(self) -> bool:
         return self.input_size == self.output_size
@@ -62,8 +64,8 @@ class SolvableLinear(InvertibleLinear):
           solution (normal equations with L2 regularization) on the provided batch.
     """
 
-    def __init__(self, input_size: int, output_size: int):
-        super().__init__(input_size, output_size, bias=True)
+    def __init__(self, input_size: int, output_size: int, dtype=FP64):
+        super().__init__(input_size, output_size, bias=True, dtype=dtype)
         self.grad_enabled = False
         
         
@@ -78,6 +80,8 @@ class SolvableLinear(InvertibleLinear):
         self.enable_grad(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype != self.linear.weight.dtype:
+            x = x.to(self.linear.weight.dtype)
         if self.grad_enabled:
             return self.linear(x)
         else:
@@ -98,6 +102,11 @@ class SolvableLinear(InvertibleLinear):
             raise ValueError("Batch sizes of x and y must match")
         if x.shape[1] != self.input_size or y.shape[1] != self.output_size:
             raise ValueError("Input/output dimensions do not match layer configuration")
+        
+        if x.dtype != self.linear.weight.dtype:
+            x = x.to(self.linear.weight.dtype)
+        if y.dtype != self.linear.weight.dtype:
+            y = y.to(self.linear.weight.dtype)
 
         device = x.device
         dtype = x.dtype
@@ -132,12 +141,12 @@ class SolvableLinear(InvertibleLinear):
 
 
 def test_solvable_linear():
-    layer = SolvableLinear(3, 3)
-    x = torch.randn(100, 3)
+    layer = SolvableLinear(3, 3, dtype=FP64)
+    x = torch.randn(100, 3, dtype=FP64)
     true_weight = torch.tensor([[2.0, -1.0, 0.5],
                                 [0.0, 1.5, -0.5],
-                                [-1.0, 0.0, 1.0]])
-    true_bias = torch.tensor([0.5, -1.0, 2.0])
+                                [-1.0, 0.0, 1.0]], dtype=FP64)
+    true_bias = torch.tensor([0.5, -1.0, 2.0], dtype=FP64)
     y = x @ true_weight.T + true_bias
 
     layer.solve_from_batch(x, y, l2=1e-4)

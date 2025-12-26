@@ -1,5 +1,6 @@
 import os
 import logging
+import torch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,3 +24,19 @@ ch.setLevel(logging.WARNING)
 formatter = logging.Formatter("\033[93m%(levelname)s: %(message)s\033[0m")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
+
+
+
+
+FP64 = torch.float64
+FP32 = torch.float32
+
+
+
+
+
+
+
+
+
+
