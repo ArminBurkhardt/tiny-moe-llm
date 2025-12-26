@@ -1,8 +1,8 @@
 import torch
 from torch import nn
-from utils import logger, FP64
+from utils import logger, FP64, InvertibleModule
 
-class InvertibleLinear(nn.Module):
+class InvertibleLinear(nn.Module, InvertibleModule):
     def __init__(self, input_size: int, output_size: int, bias: bool = True, dtype=FP64):
         super().__init__()
         self.input_size = input_size
@@ -52,7 +52,15 @@ class InvertibleLinear(nn.Module):
         with torch.no_grad():
             x_approx = (y - bias) @ weight_pinv.T
         return x_approx
- 
+
+
+    def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Automatically choose between exact and approximate inverse based on layer shape."""
+        if self.is_square:
+            return self.inverse(y)
+        else:
+            return self.approx_linear_inverse(y)
+
 
 class SolvableLinear(InvertibleLinear):
     """Linear layer that can be solved from a batch via (regularized) least squares.

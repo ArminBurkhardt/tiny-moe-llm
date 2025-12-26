@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from typing import Callable
-from utils import logger
+from utils import logger, InvertibleModule
 
 class ParameterizedSigmoid:    
     @staticmethod
@@ -39,7 +39,7 @@ class ParameterizedSigmoid:
                             (a - y))
         return nonlinear_function
 
-class InvertibleActivation(nn.Module):
+class InvertibleActivation(nn.Module, InvertibleModule):
     """An invertible activation function using parameterized sigmoid."""
 
     def __init__(self, a: float = 1.0, b: float = 1.0):
@@ -58,8 +58,45 @@ class InvertibleActivation(nn.Module):
         if y.dtype not in [torch.float64]:
             logger.warning("InvertibleActivation received a low precision input. Inverse will likely produce an unexpected result. Please use float64 for accurate inversion.")
         return self.inverse_func(y)
+    
+    def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        return self.inverse(y)
 
 
+class InvertibleLeakyReLUActivation(nn.Module, InvertibleModule):
+    def __init__(self, negative_slope: float = 0.01):
+        super(InvertibleLeakyReLUActivation, self).__init__()
+        self.negative_slope = negative_slope
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.where(x >= 0, x, self.negative_slope * x)
+    
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        return torch.where(y >= 0, y, y / self.negative_slope)
+    
+    def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        return self.inverse(y)
+
+
+class ShiftActivation(nn.Module, InvertibleModule):
+    def __init__(self, shift: float, activation: nn.Module = None):
+        super(ShiftActivation, self).__init__()
+        self.shift = shift
+        self.activation = activation
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.activation is not None:
+            x = self.activation(x)
+        return x + self.shift
+    
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        y = y - self.shift
+        if self.activation is not None:
+            y = self.activation.inverse(y)
+        return y
+    
+    def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        return self.inverse(y)
 
 
 def test_invertible_activation():

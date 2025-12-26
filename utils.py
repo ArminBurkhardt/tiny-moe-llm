@@ -1,6 +1,8 @@
 import os
 import logging
 import torch
+from torch import nn
+from abc import ABC, abstractmethod
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -35,8 +37,16 @@ FP32 = torch.float32
 
 
 
+class InvertibleModule(ABC):
+    """Base class for invertible modules."""
 
+    @abstractmethod
+    def inverse(self, y: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("Inverse method not implemented.")
 
-
+    @abstractmethod
+    def auto_inverse(self, y: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Automatically choose between exact and approximate inverse based on module properties."""
+        raise NotImplementedError("Auto-inverse method not implemented.")
 
 

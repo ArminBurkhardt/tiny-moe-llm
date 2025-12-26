@@ -2,10 +2,10 @@ import torch
 from torch import nn
 from modules.model.linear import InvertibleLinear
 from modules.model.activations import InvertibleActivation
-from utils import logger, FP64
+from utils import logger, FP64, InvertibleModule
 
 
-class InvertibleLinearAttention(nn.Module):
+class InvertibleLinearAttention(nn.Module, InvertibleModule):
     def __init__(self, input_size, output_size, activation: nn.Module = nn.Softmax(dim=-1), dtype=FP64):
         super(InvertibleLinearAttention, self).__init__()
         self.input_size = input_size
@@ -102,6 +102,8 @@ class InvertibleLinearAttention(nn.Module):
              
         return x
 
+    def auto_inverse(self, output: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+        return self.inverse(output, other)
 
 
 def test_invertible_linear_attention():
