@@ -5,9 +5,9 @@ from modules.model.activations import InvertibleActivation
 from utils import logger, FP64
 
 
-class InvertableLinearAttention(nn.Module):
+class InvertibleLinearAttention(nn.Module):
     def __init__(self, input_size, output_size, activation: nn.Module = nn.Softmax(dim=-1), dtype=FP64):
-        super(InvertableLinearAttention, self).__init__()
+        super(InvertibleLinearAttention, self).__init__()
         self.input_size = input_size
         self.output_size = output_size
         
@@ -104,13 +104,13 @@ class InvertableLinearAttention(nn.Module):
 
 
 
-def test_invertable_linear_attention():
+def test_invertible_linear_attention():
     batch_size = 2
     seq_len = 8
     input_size = 8
     output_size = 8
 
-    attention = InvertableLinearAttention(input_size, output_size, activation=InvertibleActivation(), dtype=FP64)
+    attention = InvertibleLinearAttention(input_size, output_size, activation=InvertibleActivation(), dtype=FP64)
 
     torch.manual_seed(0)
 

@@ -125,4 +125,6 @@ class Gemma3Encoder(nn.Module):
 
 
 
-## Gemma3: https://huggingface.co/google/gemma-3-1b-it
+# Gemma3-1b-it: https://huggingface.co/google/gemma-3-1b-it
+# Gemma3-270m-it https://huggingface.co/google/gemma-3-270m-it 
+# T5 Gemma 2 270m - 270m: https://huggingface.co/google/t5gemma-2-270m-270m 

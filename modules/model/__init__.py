@@ -4,7 +4,7 @@ from modules.model.encoder import Gemma3Encoder
 from modules.model.decoder import Decoder
 from modules.model.router import LatentRouter
 from modules.model.linear import SolvableLinear, InvertibleLinear
-from modules.model.invertable_modules import InvertableLinearAttention
+from modules.model.invertible_modules import InvertibleLinearAttention
 from modules.model.losses import MatrixInvertabilityLoss
 
 
@@ -18,7 +18,7 @@ __all__ = [
     "SolvableLinear",
     "MatrixInvertabilityLoss",
     "InvertibleLinear",
-    "InvertableLinearAttention",
+    "InvertibleLinearAttention",
     "InvertibleActivation",
 ]
 
