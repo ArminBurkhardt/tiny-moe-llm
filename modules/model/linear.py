@@ -104,6 +104,11 @@ class SolvableLinear(InvertibleLinear):
             y: Tensor of shape (batch, output_size)
             l2: Small L2 regularization term for stability
         """
+        # NOTE:
+        # Underlying equation: y = x @ W^T + b = [x, 1] @ [W^T; b]
+        # We can solve for W and b using normal equations with Tikhonov regularization
+        # => theta = (X^T X + l2*I)^(-1) X^T y
+        # where theta = [W^T; b] and X = [x, 1]
         if x.dim() != 2 or y.dim() != 2:
             raise ValueError("x and y must be 2D: (batch, feature)")
         if x.shape[0] != y.shape[0]:
@@ -142,7 +147,13 @@ class SolvableLinear(InvertibleLinear):
         return weight, bias
 
 
-
+    def auto_solve(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-4):
+        """Automatically solve for weights and bias from batch."""
+        if x.dim() > 2:
+            x = x.reshape(-1, self.input_size)
+            y = y.reshape(-1, self.output_size)
+        return self.solve_from_batch(x, y, l2=l2)
+        
 
 
 

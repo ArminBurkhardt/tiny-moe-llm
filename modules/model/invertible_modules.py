@@ -53,8 +53,8 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         
         # 1. Reconstruct Key and Value from the known context 'other'
         # We need these to isolate the Query.
-        K = self.k(other) # [Batch, Seq_S, Dim]
-        V = self.v(other) # [Batch, Seq_S, Dim]
+        K = self.k(other) # [Batch, Seq_S, Dim], K = other @ W_k + b_k
+        V = self.v(other) # [Batch, Seq_S, Dim], V = other @ W_v + b_v
 
         seq_len = other.size(-2)
         if seq_len != self.output_size:
@@ -73,12 +73,12 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         
         # Try to use solve if square for better precision
         if self.is_square and seq_len == self.output_size:
-             # W @ V = Output => V.T @ W.T = Output.T => W.T = solve(V.T, Output.T)
-             try:
-                 attn_weights = torch.linalg.solve(V.transpose(-2, -1), output.transpose(-2, -1)).transpose(-2, -1)
-             except torch.linalg.LinAlgError:
-                 V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
-                 attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
+            # W @ V = Output => V.T @ W.T = Output.T => W.T = solve(V.T, Output.T)
+            try:
+               attn_weights = torch.linalg.solve(V.transpose(-2, -1), output.transpose(-2, -1)).transpose(-2, -1)
+            except torch.linalg.LinAlgError:
+               V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
+               attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
         else:
             V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
             attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
@@ -101,12 +101,12 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         K_T = K.transpose(-2, -1) # [Batch, Dim, Seq_S]
         
         if self.is_square and seq_len == self.output_size:
-             # Q @ K.T = scaled_scores => K @ Q.T = scaled_scores.T => Q.T = solve(K, scaled_scores.T)
-             try:
-                 Q = torch.linalg.solve(K, scaled_scores.transpose(-2, -1)).transpose(-2, -1)
-             except torch.linalg.LinAlgError:
-                 K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
-                 Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
+            # Q @ K.T = scaled_scores => K @ Q.T = scaled_scores.T => Q.T = solve(K, scaled_scores.T)
+            try:
+                Q = torch.linalg.solve(K, scaled_scores.transpose(-2, -1)).transpose(-2, -1)
+            except torch.linalg.LinAlgError:
+                K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
+                Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
         else:
             K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
             Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
