@@ -5,6 +5,7 @@ from modules.model.activations import test_invertible_activation
 from modules.model.invertible_modules import test_invertible_linear_attention
 from modules.model.linear import test_solvable_linear
 from modules.model.losses import test_matrix_invertability_loss
+from modules.model.decoder import test_decoder
 import torch
 import logging
 
@@ -43,5 +44,8 @@ if __name__ == "__main__":
     
     logging.info("Testing invertible linear attention...")
     test_invertible_linear_attention()
+    
+    logging.info("Testing decoder...")
+    test_decoder()
     
     logging.info("All tests passed!")

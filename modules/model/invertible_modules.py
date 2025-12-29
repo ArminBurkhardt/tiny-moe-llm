@@ -1,7 +1,7 @@
 import torch 
 from torch import nn
 from modules.model.linear import InvertibleLinear
-from modules.model.activations import InvertibleActivation
+from modules.model.activations import InvertibleActivation, ShiftActivation
 from utils import logger, FP64, InvertibleModule
 
 
@@ -70,8 +70,18 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         # We need to compute W = Output @ pinv(V)
         # Note: We use pinverse (Pseudo-Inverse) because V might not be square.
         # If V is tall (Seq > Dim), information is lost and recovery is approximate.
-        V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
-        attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
+        
+        # Try to use solve if square for better precision
+        if self.is_square and seq_len == self.output_size:
+             # W @ V = Output => V.T @ W.T = Output.T => W.T = solve(V.T, Output.T)
+             try:
+                 attn_weights = torch.linalg.solve(V.transpose(-2, -1), output.transpose(-2, -1)).transpose(-2, -1)
+             except torch.linalg.LinAlgError:
+                 V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
+                 attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
+        else:
+            V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
+            attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
         
         # 3. Inverse Activation
         # Equation: W = Activation(Scores) -> Scores = Activation_Inv(W)
@@ -89,9 +99,17 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         scaled_scores = attn_scores * scale
         
         K_T = K.transpose(-2, -1) # [Batch, Dim, Seq_S]
-        K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
         
-        Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
+        if self.is_square and seq_len == self.output_size:
+             # Q @ K.T = scaled_scores => K @ Q.T = scaled_scores.T => Q.T = solve(K, scaled_scores.T)
+             try:
+                 Q = torch.linalg.solve(K, scaled_scores.transpose(-2, -1)).transpose(-2, -1)
+             except torch.linalg.LinAlgError:
+                 K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
+                 Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
+        else:
+            K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
+            Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
         
         # 5. Recover x from Q
         # Equation: Q = x @ W_q + bias
@@ -111,8 +129,10 @@ def test_invertible_linear_attention():
     seq_len = 8
     input_size = 8
     output_size = 8
+    
+    shifted_activation = ShiftActivation(shift=0.1, activation=InvertibleActivation(a=0.9, b=0.1))
 
-    attention = InvertibleLinearAttention(input_size, output_size, activation=InvertibleActivation(), dtype=FP64)
+    attention = InvertibleLinearAttention(input_size, output_size, activation=shifted_activation, dtype=FP64)
 
     torch.manual_seed(0)
 

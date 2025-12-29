@@ -34,7 +34,7 @@ class ParameterizedSigmoid:
         """
         assert b > 0, "Parameter 'b' must be positive."
         def nonlinear_function(y: torch.Tensor) -> torch.Tensor:
-            assert torch.all((y < a) & (y > -b)), "Input y must be in the range (-b, a)."
+            assert torch.all((y < a) & (y > -b)), f"Input y must be in the range (-{b}, {a}). Found y with min {y.min().item()} and max {y.max().item()}."
             return torch.log((1 + y/b) / 
                             (a - y))
         return nonlinear_function
@@ -92,7 +92,7 @@ class ShiftActivation(nn.Module, InvertibleModule):
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         y = y - self.shift
         if self.activation is not None:
-            y = self.activation.inverse(y)
+            y = self.activation.auto_inverse(y)
         return y
     
     def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
