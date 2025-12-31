@@ -6,6 +6,7 @@ from modules.model.invertible_modules import test_invertible_linear_attention
 from modules.model.linear import test_solvable_linear
 from modules.model.losses import test_matrix_invertability_loss
 from modules.model.decoder import test_decoder
+from modules.model.test_moe import test_moe
 import torch
 import logging
 
@@ -47,5 +48,8 @@ if __name__ == "__main__":
     
     logging.info("Testing decoder...")
     test_decoder()
+    
+    logging.info("Testing Mixture of Experts...")
+    test_moe()
     
     logging.info("All tests passed!")
