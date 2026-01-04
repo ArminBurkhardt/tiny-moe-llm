@@ -11,11 +11,18 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 class DIR:
     BASE_DIR = BASE_DIR
     GEMMA_EMBEDDING_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained", "embeddinggemma-300m")
-    GEMMA_3_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained", "gemma-3-1b-it")
+    GEMMA_3_1B_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained", "gemma-3-1b-it")
+    GEMMA_3_270M_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained", "gemma-3-270m-it")
+    GEMMA_2_T5_270M_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained", "t5-gemma-2-270m-270m")
+    
+    GEMMA_3_DIR = GEMMA_3_1B_DIR  # Alias 
 
     DATA_DIR = os.path.join(BASE_DIR, "data")
 
     UFW_V1_4_DIR = os.path.join(DATA_DIR, "datasets", "ultrafineweb_en_v1_4")
+
+
+PATH = DIR
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)

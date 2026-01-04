@@ -6,7 +6,7 @@ from modules.model.router import LatentRouter
 from modules.model.linear import SolvableLinear, InvertibleLinear
 from modules.model.invertible_modules import InvertibleLinearAttention
 from modules.model.losses import MatrixInvertabilityLoss
-
+from modules.model.moe import MixtureOfExperts
 
 __all__ = [
     "ParameterizedSigmoid",
@@ -20,5 +20,6 @@ __all__ = [
     "InvertibleLinear",
     "InvertibleLinearAttention",
     "InvertibleActivation",
+    "MixtureOfExperts",
 ]
 
