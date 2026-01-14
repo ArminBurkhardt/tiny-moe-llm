@@ -17,8 +17,8 @@ class DummyExpert(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-    def solve_for_batch(self, x, target):
-        # Dummy implementation of solve_for_batch
+    def solve_from_batch(self, x, target):
+        # Dummy implementation of solve_from_batch
         # In a real scenario, this would solve for weights.
         # Here we just set weights to map x to target roughly, or just do nothing/mock it.
         # For testing purposes, let's just modify a flag or attribute to verify it was called.
@@ -31,8 +31,11 @@ class MockRouter(nn.Module):
         self.input_size = input_size
         self.output_index = num_experts # Output is the last one
         self.added_experts = 0
+        self.hidden_size = 32 # Dummy hidden size
+        self.head = nn.Linear(self.hidden_size, num_experts + 1)
+        self.backbone = lambda x: torch.zeros(x.size(0), self.hidden_size) # Dummy backbone
 
-    def forward(self, x, is_final=None):
+    def forward(self, x, is_final=None, output_skew=0.0):
         batch_size = x.size(0)
         # Return uniform probabilities for simplicity, or specific ones if needed
         # Total options = current experts + OUTPUT
@@ -43,6 +46,8 @@ class MockRouter(nn.Module):
     def add_experts(self, n):
         self.num_experts += n
         self.output_index = self.num_experts
+        # Resize head dummy
+        self.head = nn.Linear(self.hidden_size, self.num_experts + 1)
 
 class TestMixtureOfExperts(unittest.TestCase):
     def setUp(self):
@@ -70,6 +75,8 @@ class TestMixtureOfExperts(unittest.TestCase):
         self.assertEqual(len(self.moe.experts), 0)
         self.assertEqual(self.moe.steps_per_expert, self.steps_per_expert)
         self.assertEqual(self.moe.current_step, 0)
+        # Check usage_counts initialization
+        self.assertEqual(len(self.moe.usage_counts), 0)
 
     def test_training_cycle(self):
         self.moe.train()
@@ -97,6 +104,9 @@ class TestMixtureOfExperts(unittest.TestCase):
         # Check if expert was added
         self.assertEqual(len(self.moe.experts), 1)
         self.assertTrue(self.moe.experts[0].solved) # Check if solve_for_batch was called
+        # Check usage counts resized
+        self.assertEqual(len(self.moe.usage_counts), 1)
+        
         self.assertEqual(self.router.num_experts, 1)
         
         # Check return values
@@ -130,6 +140,9 @@ class TestMixtureOfExperts(unittest.TestCase):
         # Since MockRouter returns 0.5 for expert 0.
         expected_output = 0.5 * self.moe.experts[0](x)
         self.assertTrue(torch.allclose(output, expected_output))
+        
+        # Validate usage counts updated (should be > 0 since we ran forward)
+        self.assertTrue(self.moe.usage_counts[0] > 0)
 
     def test_inference(self):
         self.moe.eval()
@@ -140,38 +153,39 @@ class TestMixtureOfExperts(unittest.TestCase):
         self.moe.experts.append(new_expert)
         self.router.add_experts(1)
         
+        # Manually update usage counts to match experts, otherwise forward might complain or resize
+        self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1)])
+        
         # Reset step
         self.moe.reset_step()
         
-        # Inference step < steps_per_expert
-        # Should mask OUTPUT expert
+        # Inference should NOT mask OUTPUT expert regardless of step
         # MockRouter returns [0.5, 0.5] (expert 0, OUTPUT)
-        # Masking OUTPUT -> [0.5, 0.0] -> normalize -> [1.0, 0.0]
-        # Output = 1.0 * expert[0](x) + 0.0 * x
-        output = self.moe(x)
-        expected_output = new_expert(x)
-        self.assertTrue(torch.allclose(output, expected_output))
-        
-        # Advance steps
-        for _ in range(self.steps_per_expert - 1):
-            self.moe(x)
-            
-        # Inference step >= steps_per_expert (if logic allows, but code says cycle_pos logic is mostly for training?)
-        # Wait, let's check the code for inference logic.
-        # Inference:
-        # if self.current_step < self.steps_per_expert:
-        #    Mask OUTPUT
-        # else:
-        #    Don't mask OUTPUT
-        
-        # Now current_step == steps_per_expert
-        output = self.moe(x)
-        
-        # Should NOT mask OUTPUT
-        # Probs [0.5, 0.5]
         # Output = 0.5 * expert[0](x) + 0.5 * x
+        output, probs = self.moe(x)
         expected_output = 0.5 * new_expert(x) + 0.5 * x
         self.assertTrue(torch.allclose(output, expected_output))
+        
+    def test_pruning_moe(self):
+        # Setup experts
+        self.moe.experts.append(DummyExpert(self.input_size))
+        self.moe.experts.append(DummyExpert(self.input_size))
+        self.moe.usage_counts = torch.tensor([10.0, 1.0])
+        self.router.num_experts = 2
+        
+        # MockRouter has head
+        self.router.head = nn.Linear(32, 3) # 2 experts + output
+        
+        # Prune least used (index 1)
+        self.moe.prune_least_used()
+        
+        self.assertEqual(len(self.moe.experts), 1)
+        self.assertEqual(len(self.moe.usage_counts), 1)
+        self.assertEqual(self.moe.usage_counts[0], 10.0) # The one kept
+        self.assertEqual(self.router.num_experts, 1)
+        # Check router head resized: 1 expert + 1 output = 2
+        self.assertEqual(self.router.head.out_features, 2)
+
 
 def test_moe():
     suite = unittest.TestLoader().loadTestsFromTestCase(TestMixtureOfExperts)

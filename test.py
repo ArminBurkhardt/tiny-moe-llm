@@ -52,4 +52,12 @@ if __name__ == "__main__":
     logging.info("Testing Mixture of Experts...")
     test_moe()
     
+    if True:
+        logging.info("Testing Final Transformer...")
+        from modules.model.test_final_transformer import TestFinalTransformer
+        test_suite = TestFinalTransformer()
+        test_suite.setUp()
+        test_suite.test_all()
+        test_suite.tearDown()
+    
     logging.info("All tests passed!")

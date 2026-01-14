@@ -68,17 +68,21 @@ class LatentRouter(nn.Module):
         self.head = new_head
         self.num_experts = new_num
 
-    def forward(self, z: torch.Tensor, is_final: bool | None = None) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, is_final: bool | None = None, output_skew: float = 0.0) -> torch.Tensor:
         """Return probabilities over experts including the OUTPUT expert.
 
         Args:
             z: Latent tensor of shape [..., input_size].
             is_final: Training-time flag. Required during training to control whether
                       the OUTPUT expert is allowed. Ignored during eval/inference.
+            output_skew: Scalar added to the OUTPUT expert logit before softmax.
         """
 
         h = self.backbone(z)
         logits = self.head(h)
+
+        # Apply skew to the OUTPUT expert logit
+        logits[..., self.output_index] += output_skew
 
         if self.training:
             if is_final is None:

@@ -143,7 +143,7 @@ def test_invertible_linear_attention():
     recovered_x = attention.inverse(output, other)
 
     diff = torch.abs(x - recovered_x)
-    logger.info("Original x: %s", x)
-    logger.info("Recovered x: %s", recovered_x)
+    #logger.info("Original x: %s", x)
+    #logger.info("Recovered x: %s", recovered_x)
     logger.info("Difference (mean/ max): %s / %s", diff.mean().item(), diff.max().item())
     assert torch.allclose(x, recovered_x, atol=1e-6), "Recovered x diverges; check invertibility constraints"

@@ -63,17 +63,21 @@ def test_decoder():
 
     decoder = Decoder(hidden_size, output_size)
     
+    errors = []
+    
     torch.manual_seed(0)
     
-    x = torch.randn(batch_size, seq_len, hidden_size, dtype=FP64)
-    context = torch.randn(batch_size, seq_len, hidden_size, dtype=FP64)
+    for i in range(64):        
+        x = torch.randn(batch_size, seq_len, hidden_size, dtype=FP64)
+        context = torch.randn(batch_size, seq_len, hidden_size, dtype=FP64)
 
-    output = decoder(x, context)
-    reconstructed_x = decoder.inverse(output, context)
+        output = decoder(x, context)
+        reconstructed_x = decoder.inverse(output, context)
 
-    assert torch.allclose(x, reconstructed_x, atol=1e-4), "Decoder inversion failed!"
+        assert torch.allclose(x, reconstructed_x, atol=1e-4), "Decoder inversion failed!"
+        errors.append(torch.abs(x - reconstructed_x).max().item())
     
-    logger.info("Decoder test passed successfully, with inversion error of %s", torch.abs(x - reconstructed_x).max().item())
+    logger.info("Decoder test passed successfully, with inversion error of %s", max(errors))
 
 
 
