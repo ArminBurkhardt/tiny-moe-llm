@@ -8,7 +8,7 @@ This file records findings checked against current source files.
 
 ## Source-verified inconsistencies (task list)
 
-- [ ] **Unify expert solving method name**
+- [x] **Unify expert solving method name**
   - `modules/model/expert.py` defines `ExpertModule.solve_for_batch(...)`.
   - `modules/model/moe.py` calls `new_expert.solve_from_batch(...)` during expert addition.
   - Action: choose one method name (`solve_from_batch` or `solve_for_batch`) and align implementation + call sites.

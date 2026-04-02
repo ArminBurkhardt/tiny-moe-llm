@@ -17,7 +17,7 @@ class ExpertModule(nn.Module):
         x = self.activation(x)
         return x
 
-    def solve_for_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
         """
         Solves for the linear layer weights such that the expert output approximates y.
         y = activation(linear(x)) => linear(x) = activation_inv(y)

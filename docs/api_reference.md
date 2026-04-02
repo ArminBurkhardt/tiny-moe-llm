@@ -87,7 +87,7 @@ This document describes the currently usable classes, methods, and functions in 
 ### Experts/MoE (`modules/model/expert.py`, `modules/model/moe.py`)
 - `class ExpertModule(nn.Module)`
   - `forward(x)`
-  - `solve_for_batch(x, y, l2=1e-5)`
+  - `solve_from_batch(x, y, l2=1e-5)`
 - `class MixtureOfExperts(nn.Module)`
   - `prune_least_used()`
   - `forward(x, target=None, output_skew=0.0)`
