@@ -4,25 +4,19 @@ This file records findings checked against current source files.
 
 ## Explicit TODO/FIXME markers
 
-- Searched the repository for `TODO`, `FIXME`, `BUG`, `XXX`, and `HACK` markers.
-- No explicit markers were found.
+- None as of now
 
-## Source-verified inconsistencies
+## Source-verified inconsistencies (task list)
 
-1. **Method name mismatch in expert solving path**
-   - `modules/model/expert.py` defines `ExpertModule.solve_for_batch(...)`
-   - `modules/model/moe.py` calls `new_expert.solve_from_batch(...)`
-   - If `ExpertModule` is used as the expert template, this mismatch can raise `AttributeError` during the "add expert" training phase.
+- [ ] **Unify expert solving method name**
+  - `modules/model/expert.py` defines `ExpertModule.solve_for_batch(...)`.
+  - `modules/model/moe.py` calls `new_expert.solve_from_batch(...)` during expert addition.
+  - Action: choose one method name (`solve_from_batch` or `solve_for_batch`) and align implementation + call sites.
 
-2. **Unreachable lines in MoE inference return path**
-   - In `modules/model/moe.py`, after `return output, probs` in inference branch, there are additional lines (`self.current_step += 1` and `return output`) that are unreachable.
+- [ ] **Remove unreachable inference code in MoE**
+  - In `modules/model/moe.py`, lines after `return output, probs` in the inference branch are unreachable (`self.current_step += 1` and `return output`).
+  - Action: delete unreachable lines to avoid ambiguous behavior.
 
-3. **Test expectation mismatch with current code path**
-   - `modules/model/test_final_transformer.py` expects `model.moe.current_step` not to change in inference.
-   - The current unreachable `self.current_step += 1` line in inference supports that observed behavior, but the line itself is dead code and should be cleaned for clarity.
-
-## Recommended follow-up
-
-- Align expert API naming (`solve_for_batch` vs `solve_from_batch`) across expert implementations.
-- Remove unreachable code in `modules/model/moe.py` for maintainability.
-- Keep tests aligned with intended inference-step semantics.
+- [ ] **Lock intended inference-step behavior with tests**
+  - `modules/model/test_final_transformer.py` currently expects `model.moe.current_step == 0` after inference.
+  - Action: keep or change this expectation intentionally, then align code and test to the same semantics.
