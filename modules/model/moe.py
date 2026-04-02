@@ -175,8 +175,6 @@ class MixtureOfExperts(nn.Module):
             output += probs[..., self.router.output_index].unsqueeze(-1) * x
             
             return output, probs
-            self.current_step += 1
-            return output
 
     def reset_step(self):
         self.current_step = 0

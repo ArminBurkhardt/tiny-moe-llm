@@ -13,7 +13,7 @@ This file records findings checked against current source files.
   - `modules/model/moe.py` calls `new_expert.solve_from_batch(...)` during expert addition.
   - Action: choose one method name (`solve_from_batch` or `solve_for_batch`) and align implementation + call sites.
 
-- [ ] **Remove unreachable inference code in MoE**
+- [x] **Remove unreachable inference code in MoE**
   - In `modules/model/moe.py`, lines after `return output, probs` in the inference branch are unreachable (`self.current_step += 1` and `return output`).
   - Action: delete unreachable lines to avoid ambiguous behavior.
 
