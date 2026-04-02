@@ -57,6 +57,7 @@ class FinalTransformer(nn.Module):
         self.prune_step_interval = prune_step_interval
         self.max_recurrence = max_recurrence
         self.global_step = 0
+        self.skew_factor = 0.5  # Adjustable hyperparameter for inference skewing (OUTPUT prob increase per expert call)
 
     def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None):
         """
@@ -164,7 +165,7 @@ class FinalTransformer(nn.Module):
             while loop_count < self.max_recurrence:
                 # Skew function: "takes the number of expert calls and adds them to the probability of the OUTPUT expert"
                 # "adds them" -> Linear additive skew.
-                skew = float(loop_count) * 0.5 # Adjustable hyperparameter
+                skew = float(loop_count) * self.skew_factor  # Adjustable hyperparameter
                 
                 output, probs = self.moe(curr_z, output_skew=skew)
                 
