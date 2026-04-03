@@ -159,6 +159,11 @@ This document describes the currently usable classes, methods, and functions in 
   - `_extract_texts_and_embeddings(batch)`
   - `_maybe_to_device(device)`
 
+### Chat Template (`modules/data/chat_template.py`)
+- `class Chat`
+  - `__init__(self, tokenizer)`
+  - `format_chat(messages)`
+
 ---
 
 ## `modules/util`
