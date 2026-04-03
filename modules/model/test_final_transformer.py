@@ -29,11 +29,8 @@ class TestFinalTransformer(unittest.TestCase):
         # Setup mock encoder instance
         self.mock_encoder = MagicMock()
         self.mock_encoder_cls.return_value = self.mock_encoder
-        # When encoder(input_ids) is called, it returns a mock object with last_hidden_state
-        self.mock_encoder_output = MagicMock()
-        # last_hidden_state shape: [Batch, Seq, Hidden]
-        self.mock_encoder_output.last_hidden_state = torch.randn(2, 5, self.latent_dim)
-        self.mock_encoder.return_value = self.mock_encoder_output
+        # Gemma3Encoder.forward returns a plain tensor of shape [Batch, Seq, Hidden]
+        self.mock_encoder.return_value = torch.randn(2, 5, self.latent_dim)
         self.mock_encoder.parameters.return_value = [torch.tensor(1.0, requires_grad=True)]
 
         # Setup mock decoder instance
@@ -83,7 +80,7 @@ class TestFinalTransformer(unittest.TestCase):
         target_vectors = torch.randn(batch_size, seq_len, self.output_dim)
         
         # Reset mock encoder output for consistent shape
-        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.latent_dim)
+        self.mock_encoder.return_value = torch.randn(batch_size, seq_len, self.latent_dim)
         
         # Verify initial state
         initial_experts_count = len(model.moe.experts) # 2
@@ -133,7 +130,7 @@ class TestFinalTransformer(unittest.TestCase):
         seq_len = 5
         input_ids = torch.randint(0, 100, (batch_size, seq_len))
         target_vectors = torch.randn(batch_size, seq_len, self.output_dim)
-        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.latent_dim)
+        self.mock_encoder.return_value = torch.randn(batch_size, seq_len, self.latent_dim)
         
         output, loss = model(input_ids, target_vectors)
         
@@ -156,7 +153,7 @@ class TestFinalTransformer(unittest.TestCase):
         batch_size = 2
         seq_len = 5
         input_ids = torch.randint(0, 100, (batch_size, seq_len))
-        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.latent_dim)
+        self.mock_encoder.return_value = torch.randn(batch_size, seq_len, self.latent_dim)
         
         output = model(input_ids)
         self.assertEqual(output.shape, (batch_size, seq_len, self.output_dim))
@@ -181,7 +178,7 @@ class TestFinalTransformer(unittest.TestCase):
         
         input_ids = torch.randint(0, 100, (2, 5))
         target_vectors = torch.randn(2, 5, self.output_dim)
-        self.mock_encoder_output.last_hidden_state = torch.randn(2, 5, self.latent_dim)
+        self.mock_encoder.return_value = torch.randn(2, 5, self.latent_dim)
         
         # Mock usage counts: Expert 1 is least used
         model.moe.usage_counts = torch.tensor([10.0, 1.0, 50.0, 5.0, 10.0])
@@ -219,7 +216,7 @@ class TestFinalTransformer(unittest.TestCase):
         
         input_ids = torch.randint(0, 100, (1, 5))
         target_vectors = torch.randn(1, 5, self.output_dim)
-        self.mock_encoder_output.last_hidden_state = torch.randn(1, 5, self.latent_dim)
+        self.mock_encoder.return_value = torch.randn(1, 5, self.latent_dim)
         
         initial_usage = model.moe.usage_counts.clone() # Should be zeros
         

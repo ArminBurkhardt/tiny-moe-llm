@@ -66,9 +66,8 @@ class FinalTransformer(nn.Module):
             target_vectors: [Batch, Seq, OutputDim] - Required for training (solving experts)
         """
         # Encoder
-        # Context is used for the decoder and potentially as initial latent?
-        # Gemma3Encoder returns hidden states.
-        context = self.encoder(input_ids).last_hidden_state
+        # Gemma3Encoder.forward returns a plain tensor of shape [B, S, hidden_size].
+        context = self.encoder(input_ids)
         
         # Initial latent z. 
         # Using context as z? Or separate? 

@@ -130,6 +130,15 @@ class MixtureOfExperts(nn.Module):
                 
                 new_expert.solve_from_batch(x_flat, target_flat)
                 
+                # Enable gradients so the expert trains as a regular layer from this
+                # point on.  ``consolidate`` (ExpertModule) converts SolvableLinear to a
+                # plain nn.Linear and enables grad; ``enable_grad`` (SolvableLinear) just
+                # flips the flag.
+                if hasattr(new_expert, 'consolidate'):
+                    new_expert.consolidate(disable_grad=False, dtype=torch.float32)
+                elif hasattr(new_expert, 'enable_grad'):
+                    new_expert.enable_grad(True)
+                
                 self.experts.append(new_expert)
                 self.usage_counts = torch.cat([self.usage_counts, torch.zeros(1, device=self.usage_counts.device)])
 

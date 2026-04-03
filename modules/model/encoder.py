@@ -94,14 +94,14 @@ class Gemma3Encoder(nn.Module):
         )
         self.model.eval()
 
-    @torch.inference_mode()
-    def forward(
+    def _encode(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         return_all_hidden_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Core encoding logic shared between training and inference forward passes."""
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -117,6 +117,38 @@ class Gemma3Encoder(nn.Module):
             return selected, hidden_states
 
         return selected
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        return_all_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Return the hidden state at ``target_layer`` for the given input tokens.
+
+        During training the encoder runs with full gradient tracking so that
+        back-propagation can fine-tune its weights.  During evaluation the
+        computation runs under :func:`torch.inference_mode` for efficiency.
+
+        Args:
+            input_ids: Integer token tensor of shape ``[batch, seq_len]``.
+            attention_mask: Optional boolean/float mask of shape
+                ``[batch, seq_len]``.
+            position_ids: Optional position indices of shape
+                ``[batch, seq_len]``.
+            return_all_hidden_states: If ``True``, also return the full tuple
+                of per-layer hidden states alongside the selected one.
+
+        Returns:
+            The hidden-state tensor at ``target_layer`` with shape
+            ``[batch, seq_len, hidden_size]``, or a ``(selected, all_states)``
+            tuple when ``return_all_hidden_states`` is ``True``.
+        """
+        if self.training:
+            return self._encode(input_ids, attention_mask, position_ids, return_all_hidden_states)
+        with torch.inference_mode():
+            return self._encode(input_ids, attention_mask, position_ids, return_all_hidden_states)
 
 
     @property

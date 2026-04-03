@@ -1,7 +1,7 @@
 ## TODOs
 
-- [] Pretraining script using Ultrafineweb v1.4
-- [] SFT script using KIMI-K2.5-550000x and reasoning dataset
+- [x] Pretraining script using Ultrafineweb v1.4
+- [x] SFT script using KIMI-K2.5-550000x and reasoning dataset
     > SFT should feature finetuning all parameters.
     > Use `Chat` template for formatting the data.
 - [] Generate multiple reasoning paths per question using Gemma4 
