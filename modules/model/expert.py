@@ -11,6 +11,7 @@ class ExpertModule(nn.Module):
         super().__init__()
         self.linear = SolvableLinear(input_size, output_size)
         self.activation = InvertibleActivation()
+        self.completed = False
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear(x)
@@ -28,8 +29,62 @@ class ExpertModule(nn.Module):
         
         # Solve the linear layer
         self.linear.solve_from_batch(x, y_pre_act, l2=l2)
+        self.completed = True
+        
+    def consolidate(self, force: bool = False, disable_grad: bool = True, dtype=torch.float32):
+        """Consolidate completed expert by converting to a **non-invertable** module. Frees up memory and allows for more efficient inference. 
+        
+        If `force` is `True`, consolidates even if not completed."""
+        
+        # TODO: use in training to convert fp64 -> fp32 after solving, to save memory and speed up inference. can still have grad enabled
+        
+        if self.completed or force:
+            # Create a new linear layer with the same weights but no gradient tracking
+            new_linear = nn.Linear(self.linear.input_size, self.linear.output_size, bias=self.linear.bias is not None)
+            with torch.no_grad():
+                new_linear.weight.copy_(self.linear.linear.weight.to(dtype))
+                if self.linear.bias is not None:
+                    new_linear.bias.copy_(self.linear.linear.bias.to(dtype))
+            
+            self.linear = new_linear
+            
+            self.enable_grad(enabled=not disable_grad)
+            
+    def enable_grad(self, enabled = False):
+        """Enable gradient tracking for this expert's parameters."""
+        if hasattr(self.linear, 'disable_grad'):
+            self.linear.enable_grad(enabled)
+        else:
+            for param in self.linear.parameters():
+                param.requires_grad = enabled
+                
+    def disable_grad(self):
+        """Disable gradient tracking for this expert's parameters."""
+        self.enable_grad(False)
 
-
-
+class ExpertModuleWithSkip(ExpertModule):
+    """An expert module with a skip connection from input to output."""
+    
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__(input_size, output_size)
+        # Ensure the linear layer maps input to output size for the skip connection
+        assert input_size == output_size, "Input and output sizes must match for skip connection."
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_linear = self.linear(x)
+        x_activated = self.activation(x_linear)
+        return x + x_activated  # Skip connection adds input to activated output
+    
+    
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
+        """
+        Solves for the linear layer weights such that the expert output approximates y.
+        y = x + activation(linear(x)) => activation(linear(x)) = y - x => linear(x) = activation_inv(y - x)
+        """
+        with torch.no_grad():
+            y_pre_act = self.activation.inverse(y - x)
+        
+        self.linear.solve_from_batch(x, y_pre_act, l2=l2)
+        self.completed = True
 
 
