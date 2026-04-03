@@ -23,7 +23,8 @@ class DIR:
     
     KIMI_DIR = os.path.join(DATA_DIR, "datasets", "parquet", "KIMI-K2.5-550000x")
     
-    REASNONING_DIR = os.path.join(DATA_DIR, "datasets", "parquet", "reasoning")
+    REASONING_DIR = os.path.join(DATA_DIR, "datasets", "parquet", "reasoning")
+    REASNONING_DIR = REASONING_DIR  # backward-compatibility alias (legacy typo)
 
 
 PATH = DIR
@@ -60,4 +61,21 @@ class InvertibleModule(ABC):
         """Automatically choose between exact and approximate inverse based on module properties."""
         raise NotImplementedError("Auto-inverse method not implemented.")
 
+
+def router_loss_scalar(router_loss) -> float:
+    """Return the router auxiliary loss as a plain Python float.
+
+    ``MixtureOfExperts.forward`` can return either a :class:`torch.Tensor` or
+    a plain ``int``/``float`` (e.g. ``0`` when there is nothing to optimise).
+    This helper normalises both cases for logging and accumulation.
+
+    Args:
+        router_loss: A scalar :class:`torch.Tensor` or a numeric value.
+
+    Returns:
+        The loss as a Python ``float``.
+    """
+    if isinstance(router_loss, torch.Tensor):
+        return router_loss.item()
+    return float(router_loss)
 

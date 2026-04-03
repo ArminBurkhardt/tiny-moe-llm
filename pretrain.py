@@ -63,7 +63,7 @@ from transformers import AutoTokenizer
 from modules.model.expert import ExpertModule
 from modules.model.transformer import FinalTransformer
 from modules.data.dataloader import DataLoader as FileDataLoader
-from utils import DIR
+from utils import DIR, router_loss_scalar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -394,7 +394,7 @@ def train(args: argparse.Namespace) -> None:
         step += 1
 
         running_task_loss += task_loss.item()
-        running_router_loss += router_loss.item() if isinstance(router_loss, torch.Tensor) else router_loss
+        running_router_loss += router_loss_scalar(router_loss)
 
         # ---------------------------------------------------- logging
         if step % args.log_steps == 0:

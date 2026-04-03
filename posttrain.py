@@ -76,7 +76,7 @@ from modules.data.chat_template import Chat
 from modules.data.dataloader import FileLoader
 from modules.model.transformer import FinalTransformer
 from modules.model.expert import ExpertModule
-from utils import DIR
+from utils import DIR, router_loss_scalar
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reasoning_dir",
-        default=DIR.REASNONING_DIR,
+        default=DIR.REASONING_DIR,
         help="Root directory of the reasoning-dataset parquet shards "
              "(contains opus-4.6/ and sonnet-4.6/ sub-directories).",
     )
@@ -269,10 +269,7 @@ def _iter_conversations(data_dirs: List[str]) -> Generator[List[dict], None, Non
         return
 
     # Round-robin across active loaders using itertools.cycle.
-    active: List[tuple] = [(loader, None) for loader in loaders]   # (loader, current_df_iter)
-    all_iters = []
-    for loader in loaders:
-        all_iters.append(_df_record_iter(loader))
+    all_iters = [_df_record_iter(loader) for loader in loaders]
 
     for record_iter in itertools.cycle(all_iters):
         try:
@@ -603,7 +600,7 @@ def train(args: argparse.Namespace) -> None:
 
         step += 1
         running_task_loss += task_loss.item()
-        running_router_loss += router_loss.item() if isinstance(router_loss, torch.Tensor) else router_loss
+        running_router_loss += router_loss_scalar(router_loss)
 
         # --------------------------------------------------- logging
         if step % args.log_steps == 0:
