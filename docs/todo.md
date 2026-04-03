@@ -5,4 +5,5 @@
     > SFT should feature finetuning all parameters.
     > Use `Chat` template for formatting the data.
 - [] Generate multiple reasoning paths per question using Gemma4 
-- [] Skip connections between experts
+- [x] Add Normalization and Dropout layers to the model architecture
+- [x] Skip connections between experts
