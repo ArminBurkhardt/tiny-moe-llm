@@ -23,18 +23,8 @@ def inspect_file(data_root: str):
                     print(f"File: {file_path}, Records: {len(df)}, Columns: {df.columns.tolist()}")
                     print(df.head(10))
 
-
-
-
-
-
-
-
-
-
-
 if __name__ == "__main__":
-    data_roots = [DIR.UFW_V1_4_DIR, DIR.KIMI_DIR]
+    data_roots = [DIR.UFW_V1_4_DIR, DIR.KIMI_DIR, DIR.REASNONING_DIR]
     for data_root in data_roots:
         print(f"Inspecting files in {data_root}...")
         inspect_file(data_root)
