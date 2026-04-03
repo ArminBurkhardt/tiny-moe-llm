@@ -63,7 +63,6 @@ Usage
 
 import argparse
 import ast
-import itertools
 import logging
 import os
 from typing import Generator, List, Optional
@@ -246,8 +245,10 @@ def _iter_conversations(data_dirs: List[str]) -> Generator[List[dict], None, Non
     """Yield individual conversation ``messages`` lists from a set of roots.
 
     Each root is walked by :class:`~modules.data.dataloader.FileLoader`.
-    Multiple roots are interleaved record-by-record in a round-robin fashion
-    so that no single dataset dominates early training.
+    Multiple roots are interleaved record-by-record in a true round-robin
+    fashion so that no single dataset dominates early training.  Exhausted
+    sources are silently dropped; the generator terminates once all sources
+    are exhausted.
 
     Args:
         data_dirs: List of parquet root directories.  Each directory must
@@ -258,6 +259,8 @@ def _iter_conversations(data_dirs: List[str]) -> Generator[List[dict], None, Non
         A single conversation as a list of ``{"role": …, "content": …}``
         dicts.
     """
+    from collections import deque
+
     loaders = []
     for root in data_dirs:
         if os.path.isdir(root):
@@ -268,16 +271,21 @@ def _iter_conversations(data_dirs: List[str]) -> Generator[List[dict], None, Non
     if not loaders:
         return
 
-    # Round-robin across active loaders using itertools.cycle.
-    all_iters = [_df_record_iter(loader) for loader in loaders]
+    # A deque of active iterators.  Each step we pop from the left, try to
+    # advance it, and (if not exhausted) push it back to the right.  This
+    # gives true round-robin with correct exhaustion handling: an iterator
+    # that raises StopIteration is simply not re-queued.
+    active: deque = deque(_df_record_iter(loader) for loader in loaders)
 
-    for record_iter in itertools.cycle(all_iters):
+    while active:
+        record_iter = active.popleft()
         try:
             messages = next(record_iter)
+            active.append(record_iter)   # re-queue for next round
             if messages is not None:
                 yield messages
         except StopIteration:
-            break
+            pass  # source exhausted — drop it from the rotation
 
 
 def _df_record_iter(loader: FileLoader) -> Generator[Optional[List[dict]], None, None]:
