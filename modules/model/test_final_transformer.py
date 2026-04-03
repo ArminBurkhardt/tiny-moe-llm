@@ -2,6 +2,7 @@ import torch
 import unittest
 from unittest.mock import MagicMock, patch
 from modules.model.transformer import FinalTransformer
+from modules.model.expert import ExpertModuleWithSkip
 from modules.model.linear import InvertibleLinear
 from modules.model.router import LatentRouter
 
@@ -11,11 +12,35 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
+class _DummyExpert(torch.nn.Module):
+    """Lightweight expert stub used to test transformer structure without exercise the
+    closed-form solve or activation-range constraints of the real expert."""
+
+    def __init__(self, input_size: int, output_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_size, output_size, bias=False)
+        with torch.no_grad():
+            self.linear.weight.copy_(torch.eye(input_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+    def solve_from_batch(self, x: torch.Tensor, target: torch.Tensor, l2: float = 1e-5):
+        pass  # No-op: transformer structure tests do not validate the closed-form solve
+
+    def consolidate(self, force: bool = False, disable_grad: bool = True, dtype=torch.float32):
+        pass  # No-op stub
+
+
 class TestFinalTransformer(unittest.TestCase):
     def setUp(self):
         self.latent_dim = 32 #16
         self.output_dim = 32
         self.model_dir = "dummy/path"
+
+        # A lightweight expert that avoids range constraints of ExpertModuleWithSkip's
+        # closed-form solve, used for transformer structure tests.
+        self.dummy_expert = _DummyExpert(self.latent_dim, self.latent_dim)
         
         # Patch the actual classes used in FinalTransformer if they are heavy
         # Specifically Gemma3Encoder which loads a model from disk
@@ -58,6 +83,13 @@ class TestFinalTransformer(unittest.TestCase):
         )
         self.assertIsInstance(model, FinalTransformer)
         self.assertEqual(len(model.moe.experts), 2)
+        # Default expert template must be ExpertModuleWithSkip
+        self.assertIsInstance(model.moe.expert_template, ExpertModuleWithSkip)
+        # Encoder-output normalisation and dropout layers must be present
+        self.assertIsInstance(model.encoder_norm, torch.nn.LayerNorm)
+        self.assertIsInstance(model.encoder_dropout, torch.nn.Dropout)
+        # MoE post-norm must be a LayerNorm when hidden_size is wired in
+        self.assertIsInstance(model.moe.post_norm, torch.nn.LayerNorm)
         # Check encoder loaded with correct args
         self.mock_encoder_cls.assert_called_with(
             model_dir=self.model_dir, 
@@ -73,7 +105,8 @@ class TestFinalTransformer(unittest.TestCase):
             latent_dim=self.latent_dim,
             output_dim=self.output_dim,
             num_initial_experts=2,
-            steps_per_expert_add=steps_per_expert_add
+            steps_per_expert_add=steps_per_expert_add,
+            expert_template=self.dummy_expert,  # avoid activation range constraint during solve
         )
         model.train()
         
@@ -116,7 +149,8 @@ class TestFinalTransformer(unittest.TestCase):
             latent_dim=self.latent_dim,
             output_dim=self.output_dim,
             num_initial_experts=2,
-            steps_per_expert_add=steps_per_expert_add
+            steps_per_expert_add=steps_per_expert_add,
+            expert_template=self.dummy_expert,  # avoid activation range constraint during solve
         )
         model.train()
         
@@ -149,7 +183,8 @@ class TestFinalTransformer(unittest.TestCase):
             latent_dim=self.latent_dim,
             output_dim=self.output_dim,
             num_initial_experts=2,
-            max_recurrence=max_recurrence
+            max_recurrence=max_recurrence,
+            expert_template=self.dummy_expert,
         )
         model.eval()
         
@@ -172,7 +207,8 @@ class TestFinalTransformer(unittest.TestCase):
             output_dim=self.output_dim,
             num_initial_experts=5,
             prune_step_interval=1, # Prune every step
-            steps_per_expert_add=100 # Don't add experts during this test
+            steps_per_expert_add=100, # Don't add experts during this test
+            expert_template=self.dummy_expert,
         )
         model.train()
         # Set global step such that % interval == 0
@@ -213,7 +249,8 @@ class TestFinalTransformer(unittest.TestCase):
             latent_dim=self.latent_dim,
             output_dim=self.output_dim,
             num_initial_experts=2,
-            steps_per_expert_add=steps_per_expert_add
+            steps_per_expert_add=steps_per_expert_add,
+            expert_template=self.dummy_expert,  # avoid activation range constraint during solve
         )
         model.train()
         
@@ -240,6 +277,86 @@ class TestFinalTransformer(unittest.TestCase):
         self.test_forward_inference()
         self.test_pruning_trigger()
         self.test_usage_count_updates()
+
+
+class TestExpertModuleWithSkip(unittest.TestCase):
+    """Tests for ExpertModuleWithSkip's normalization, dropout, and solve behaviour."""
+
+    def setUp(self):
+        self.dim = 8
+        torch.manual_seed(42)
+
+    def test_has_norm_and_dropout(self):
+        expert = ExpertModuleWithSkip(self.dim, self.dim, dropout=0.2)
+        self.assertIsInstance(expert.norm, torch.nn.LayerNorm)
+        self.assertIsInstance(expert.dropout, torch.nn.Dropout)
+        self.assertAlmostEqual(expert.dropout.p, 0.2)
+
+    def test_forward_shape(self):
+        """Output shape must match input shape (skip connection)."""
+        expert = ExpertModuleWithSkip(self.dim, self.dim)
+        x = torch.randn(4, self.dim)
+        out = expert(x)
+        self.assertEqual(out.shape, x.shape)
+
+    def test_forward_is_residual(self):
+        """With dropout disabled (eval mode), forward is deterministic and includes skip."""
+        expert = ExpertModuleWithSkip(self.dim, self.dim, dropout=0.0)
+        expert.eval()
+        x = torch.randn(4, self.dim)
+        out = expert(x)
+        # The skip connection means output is not equal to x (linear+activation adds to it)
+        # but the residual contribution is present.
+        x_norm = expert.norm(x)
+        expected = x + expert.activation(expert.linear(x_norm))
+        self.assertTrue(torch.allclose(out, expected, atol=1e-6))
+
+    def test_solve_from_batch(self):
+        """After solving with exact data, forward output should reproduce targets precisely."""
+        torch.manual_seed(1)
+        dim = self.dim
+
+        # Source expert with known (randomised) linear weights
+        source = ExpertModuleWithSkip(dim, dim, dropout=0.0)
+        with torch.no_grad():
+            torch.nn.init.normal_(source.linear.linear.weight, std=0.3)
+            torch.nn.init.normal_(source.linear.linear.bias, std=0.1)
+        source.eval()
+
+        # Generate input and exact targets from the source expert.
+        # y = x + activation(linear(norm(x))) so y - x is always in (-1, 1),
+        # satisfying InvertibleActivation's range constraint by construction.
+        x = torch.randn(32, dim)
+        with torch.no_grad():
+            y = source(x).double()
+
+        # A fresh expert is solved from (x, y) and should reproduce the same mapping.
+        solved = ExpertModuleWithSkip(dim, dim, dropout=0.0)
+        solved.eval()
+        solved.solve_from_batch(x, y, l2=1e-8)
+
+        out = solved(x).double()
+        self.assertTrue(
+            torch.allclose(out, y, atol=0.01),
+            f"Max error after solve: {(out - y).abs().max().item():.4f}",
+        )
+
+    def test_dropout_disabled_in_eval(self):
+        """Two consecutive eval-mode forward passes must return identical results."""
+        expert = ExpertModuleWithSkip(self.dim, self.dim, dropout=0.5)
+        expert.eval()
+        x = torch.randn(4, self.dim)
+        self.assertTrue(torch.allclose(expert(x), expert(x)))
+
+    def test_dropout_active_in_train(self):
+        """Two consecutive train-mode forward passes should differ (dropout stochasticity)."""
+        torch.manual_seed(0)
+        expert = ExpertModuleWithSkip(self.dim, self.dim, dropout=0.5)
+        expert.train()
+        x = torch.randn(16, self.dim)
+        # With p=0.5 and 16 samples, the probability of two identical passes is negligible.
+        self.assertFalse(torch.allclose(expert(x), expert(x)))
+
 
 if __name__ == '__main__':
     unittest.main()

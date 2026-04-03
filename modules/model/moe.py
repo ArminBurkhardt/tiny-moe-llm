@@ -19,7 +19,7 @@ import copy
 #       using the expert's invertible nature (.solve_for_batch). This avoids backprop through the expert and speeds up training.
 
 class MixtureOfExperts(nn.Module):
-    def __init__(self, router: LatentRouter, experts: nn.ModuleList = None, dtype=FP64, expert: nn.Module = None, steps_per_expert: int = 100):
+    def __init__(self, router: LatentRouter, experts: nn.ModuleList = None, dtype=FP64, expert: nn.Module = None, steps_per_expert: int = 100, hidden_size: int | None = None):
         super().__init__()
         self.router = router
         self.experts = experts if experts is not None else nn.ModuleList()
@@ -28,6 +28,10 @@ class MixtureOfExperts(nn.Module):
         self.steps_per_expert = steps_per_expert
         self.current_step = 0
         self.usage_counts = torch.zeros(0)  # Will be resized when experts are added
+        # Post-norm applied after the weighted combination of expert outputs.
+        # Uses LayerNorm when hidden_size is provided; otherwise falls back to Identity
+        # so that the MoE can be used without knowing the feature dimension upfront.
+        self.post_norm = nn.LayerNorm(hidden_size) if hidden_size is not None else nn.Identity()
 
     def prune_least_used(self):
         """Removes the expert with the lowest usage count."""
@@ -105,7 +109,10 @@ class MixtureOfExperts(nn.Module):
                 output = torch.zeros_like(x)
                 for i, expert in enumerate(self.experts):
                     output += probs[..., i].unsqueeze(-1) * expert(x)
-                
+
+                # Normalise the combined expert output
+                output = self.post_norm(output)
+
                 self.current_step += 1
                 return output
                 
@@ -170,10 +177,13 @@ class MixtureOfExperts(nn.Module):
             output = torch.zeros_like(x)
             for i, expert in enumerate(self.experts):
                 output += probs[..., i].unsqueeze(-1) * expert(x)
-            
+
             # Add OUTPUT contribution (identity)
             output += probs[..., self.router.output_index].unsqueeze(-1) * x
-            
+
+            # Normalise the combined output
+            output = self.post_norm(output)
+
             return output, probs
 
     def reset_step(self):
