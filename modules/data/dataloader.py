@@ -113,21 +113,22 @@ class DataLoader:
 
 
 def test_fileloader():
-    data_root = DIR.UFW_V1_4_DIR
-    loader = FileLoader(data_root)
-    for i, data in enumerate(loader):
-        logger.info(f"Loaded file {i} with {len(data)} records.")
-        logger.info(data.head())
+    data_roots = [DIR.UFW_V1_4_DIR]
+    for data_root in data_roots:
+        loader = FileLoader(data_root)
+        for i, data in enumerate(loader):
+            logger.info(f"Loaded file {i} with {len(data)} records.")
+            logger.info(data.head())
     
         
 def test_dataloader():
-    data_root = DIR.UFW_V1_4_DIR
-    dataloader = DataLoader(data_root, drop_last=True, batch_size=2048, minimum_score=0.5, target_column="content")
-    for i, batch in enumerate(dataloader):
-        logger.info(f"Batch {i} with {len(batch)} records.")
-    
-    
-    logger.info(batch.head())
+    data_roots = [DIR.UFW_V1_4_DIR]
+    for data_root in data_roots:
+        dataloader = DataLoader(data_root, drop_last=True, batch_size=2048, minimum_score=0.5, target_column="content")
+        for i, batch in enumerate(dataloader):
+            logger.info(f"Batch {i} with {len(batch)} records.")
+        
+        logger.info(batch.head())
 
 
 
