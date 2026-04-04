@@ -7,3 +7,4 @@
 - [] Generate multiple reasoning paths per question using Gemma4 
 - [x] Add Normalization and Dropout layers to the model architecture
 - [x] Skip connections between experts
+- [] Add attention expert
