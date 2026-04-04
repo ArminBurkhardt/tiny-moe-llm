@@ -28,8 +28,8 @@ Input token IDs  [B, S]
 │                                                                   │
 │  ┌─────────────────────────────────────────────────────────────┐  │
 │  │  LatentRouter                                               │  │
-│  │    LayerNorm(D) → Linear(D,H) → GELU → Dropout             │  │
-│  │    → Linear(H,H) → GELU → Dropout → LinearAttention(H)     │  │
+│  │    LayerNorm(D) → Linear(D,H) → GELU → Dropout              │  │
+│  │    → Linear(H,H) → GELU → Dropout → LinearAttention(H)      │  │
 │  │    → Linear head  →  softmax(logits + output_skew)          │  │
 │  │  Output: probability distribution over experts + OUTPUT     │  │
 │  └─────────────────────────────────────────────────────────────┘  │
@@ -46,7 +46,7 @@ Input token IDs  [B, S]
 │       Weighted sum over all active experts (training: old only;   │
 │       inference: old + OUTPUT identity)                           │
 │                │                                                  │
-│       LayerNorm(D)   ← post-MoE normalisation (MixtureOfExperts) │
+│       LayerNorm(D)   ← post-MoE normalisation (MixtureOfExperts)  │
 └───────────────────────────────────────────────────────────────────┘
         │
         ▼  (final z after recurrent loop)
@@ -56,9 +56,9 @@ Input token IDs  [B, S]
 │    → InvertibleLeakyReLUActivation                                │
 │    → InvertibleLinear(D, D)                                       │
 │    → InvertibleActivation                                         │
-│    → InvertibleLinearAttention(D, D)  (cross-attention: z × ctx) │
+│    → InvertibleLinearAttention(D, D)  (cross-attention: z × ctx)  │
 │    → InvertibleActivation                                         │
-│    → InvertibleLinear(D, O)           (final projection)         │
+│    → InvertibleLinear(D, O)           (final projection)          │
 └───────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -221,6 +221,3 @@ z → Decoder(z, context) → output  [B, S, O]
 return output
 ```
 
-> **Note on dropout during inference:** `nn.Dropout` is automatically disabled
-> when the model is in `eval()` mode (via `model.eval()`), so no explicit skipping
-> is required.
