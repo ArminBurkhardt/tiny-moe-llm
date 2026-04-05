@@ -59,16 +59,25 @@ class FinalTransformer(nn.Module):
         self.global_step = 0
         self.skew_factor = 0.5  # Adjustable hyperparameter for inference skewing (OUTPUT prob increase per expert call)
 
-    def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None):
-        """
+    def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None, attention_mask: torch.Tensor | None = None):
+        """Run a forward pass in pretraining mode or inference mode.
+
         Args:
-            input_ids: [Batch, Seq]
-            target_vectors: [Batch, Seq, VocabSize] - Required for training (solving experts)
+            input_ids: Token indices of shape ``[Batch, Seq]``.
+            target_vectors: Supervision signal in vocabulary space of shape
+                ``[Batch, Seq, VocabSize]``.  Required during training so that the
+                target latent ``z_target`` can be computed for solving new experts.
+            attention_mask: Optional boolean attention mask of shape
+                ``[Batch, Seq]`` passed through to the encoder.
+
+        Returns:
+            Training: ``(logits, router_loss)`` where ``logits`` is
+            ``[Batch, Seq, VocabSize]`` and ``router_loss`` is a scalar tensor.
+
+            Inference: ``logits`` of shape ``[Batch, Seq, VocabSize]``.
         """
         # Encoder
-        # Context is used for the decoder and potentially as initial latent?
-        # Gemma3Encoder returns hidden states.
-        context = self.encoder(input_ids).last_hidden_state
+        context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
         
         # Initial latent z. 
         # Using context as z? Or separate? 
@@ -182,6 +191,56 @@ class FinalTransformer(nn.Module):
             
             final_output = self.decoder(curr_z, context)
             return final_output
+
+
+    def sft_forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass for supervised fine-tuning (SFT).
+
+        Unlike the pretraining :meth:`forward`, this path does **not** manage the
+        expert lifecycle (no expert addition, no solving, no pruning).  It simply
+        routes the latent through the existing experts using the inference-style
+        soft-routing, which lets every expert and the router participate in the
+        gradient computation.
+
+        All parameters (encoder, experts, router, decoder) receive gradients, so
+        calling ``optimizer.step()`` after ``loss.backward()`` updates the whole
+        model.
+
+        Args:
+            input_ids: Token indices of shape ``[Batch, Seq]``.
+            attention_mask: Optional boolean attention mask of shape
+                ``[Batch, Seq]`` passed through to the encoder.
+
+        Returns:
+            Logits tensor of shape ``[Batch, Seq, VocabSize]``.
+        """
+        # Encoder (gradients enabled by default; training flag controls dropout)
+        context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
+
+        z = context.clone()
+
+        # Soft-route through all experts (including OUTPUT) without lifecycle events.
+        # We temporarily override the router's training flag so the forward method
+        # applies no expert masking (the masking guard checks `self.training`).
+        # This does NOT affect dropout in the backbone because we only touch the
+        # router's own flag, not its children.
+        _router_training = self.moe.router.training
+        self.moe.router.training = False
+        probs = self.moe.router(z, output_skew=0.0)
+        self.moe.router.training = _router_training
+
+        routed = torch.zeros_like(z)
+        for i, expert in enumerate(self.moe.experts):
+            routed = routed + probs[..., i].unsqueeze(-1) * expert(z)
+        # OUTPUT expert is the identity transform
+        routed = routed + probs[..., self.moe.router.output_index].unsqueeze(-1) * z
+
+        logits = self.decoder(routed, context)
+        return logits
 
 
 
