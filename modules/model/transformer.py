@@ -10,7 +10,7 @@ class FinalTransformer(nn.Module):
         self, 
         model_dir: str, 
         latent_dim: int, 
-        output_dim: int,
+        vocab_size: int,
         num_initial_experts: int = 4,
         steps_per_expert_add: int = 2, # "First two expert calls..." implying 2 normal calls
         prune_step_interval: int = 1000,
@@ -30,7 +30,7 @@ class FinalTransformer(nn.Module):
             param.requires_grad = True
             
         # Decoder: Invertible
-        self.decoder = Decoder(hidden_size=latent_dim, output_size=output_dim)
+        self.decoder = Decoder(hidden_size=latent_dim, output_size=vocab_size)
         # Decoder trained normally
         
         # Experts Core
@@ -63,7 +63,7 @@ class FinalTransformer(nn.Module):
         """
         Args:
             input_ids: [Batch, Seq]
-            target_vectors: [Batch, Seq, OutputDim] - Required for training (solving experts)
+            target_vectors: [Batch, Seq, VocabSize] - Required for training (solving experts)
         """
         # Encoder
         # Context is used for the decoder and potentially as initial latent?
