@@ -18,7 +18,8 @@ For implementation details and current project status, see the documentation in 
 Borrows heavily from [Gemma3]
 
 Datasets:
-- [Ultra-FineWeb](https://huggingface.co/datasets/openbmb/Ultra-FineWeb/tree/main/data/ultrafineweb_en_v1_4/CC-MAIN-2020-40)
+- [Ultra-FineWeb](https://huggingface.co/datasets/openbmb/Ultra-FineWeb/tree/main/data/ultrafineweb_en_v1_4)
+- [FineWeb-HQ](https://huggingface.co/datasets/epfml/FineWeb-HQ)
 
 
 Reasoning Datasets:

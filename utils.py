@@ -19,7 +19,7 @@ class DIR:
 
     DATA_DIR = os.path.join(BASE_DIR, "data")
 
-    UFW_V1_4_DIR = os.path.join(DATA_DIR, "datasets", "parquet", "ultrafineweb_en_v1_4")
+    UFW_V1_4_DIR = os.path.join(DATA_DIR, "datasets", "parquet", "fineweb")
     
     KIMI_DIR = os.path.join(DATA_DIR, "datasets", "parquet", "KIMI-K2.5-550000x")
     
