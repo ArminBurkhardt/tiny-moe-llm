@@ -7,4 +7,8 @@
 - [] Generate multiple reasoning paths per question using Gemma4 
 - [x] Add Normalization and Dropout layers to the model architecture
 - [x] Skip connections between experts
-- [] Add attention expert
+- [] Add attention experts
+- [] Expert top k routing
+- [] possible consolidation of dataset files into chunks (eg. 3 files loaded)
+    > should allow for better grouping by similarity
+ 
