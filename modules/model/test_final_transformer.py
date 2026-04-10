@@ -53,7 +53,7 @@ class TestFinalTransformer(unittest.TestCase):
         model = FinalTransformer(
             model_dir=self.model_dir,
             latent_dim=self.latent_dim,
-            output_dim=self.output_dim,
+            vocab_size=self.output_dim,
             num_initial_experts=2
         )
         self.assertIsInstance(model, FinalTransformer)
@@ -71,7 +71,7 @@ class TestFinalTransformer(unittest.TestCase):
         model = FinalTransformer(
             model_dir=self.model_dir,
             latent_dim=self.latent_dim,
-            output_dim=self.output_dim,
+            vocab_size=self.output_dim,
             num_initial_experts=2,
             steps_per_expert_add=steps_per_expert_add
         )
@@ -114,7 +114,7 @@ class TestFinalTransformer(unittest.TestCase):
         model = FinalTransformer(
             model_dir=self.model_dir,
             latent_dim=self.latent_dim,
-            output_dim=self.output_dim,
+            vocab_size=self.output_dim,
             num_initial_experts=2,
             steps_per_expert_add=steps_per_expert_add
         )
@@ -147,7 +147,7 @@ class TestFinalTransformer(unittest.TestCase):
         model = FinalTransformer(
             model_dir=self.model_dir,
             latent_dim=self.latent_dim,
-            output_dim=self.output_dim,
+            vocab_size=self.output_dim,
             num_initial_experts=2,
             max_recurrence=max_recurrence
         )
@@ -169,7 +169,7 @@ class TestFinalTransformer(unittest.TestCase):
         model = FinalTransformer(
             model_dir=self.model_dir,
             latent_dim=self.latent_dim,
-            output_dim=self.output_dim,
+            vocab_size=self.output_dim,
             num_initial_experts=5,
             prune_step_interval=1, # Prune every step
             steps_per_expert_add=100 # Don't add experts during this test
@@ -211,7 +211,7 @@ class TestFinalTransformer(unittest.TestCase):
         model = FinalTransformer(
             model_dir=self.model_dir,
             latent_dim=self.latent_dim,
-            output_dim=self.output_dim,
+            vocab_size=self.output_dim,
             num_initial_experts=2,
             steps_per_expert_add=steps_per_expert_add
         )

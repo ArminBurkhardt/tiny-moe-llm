@@ -59,16 +59,25 @@ class FinalTransformer(nn.Module):
         self.global_step = 0
         self.skew_factor = 0.5  # Adjustable hyperparameter for inference skewing (OUTPUT prob increase per expert call)
 
-    def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None):
-        """
+    def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None, attention_mask: torch.Tensor | None = None):
+        """Run a forward pass in pretraining mode or inference mode.
+
         Args:
-            input_ids: [Batch, Seq]
-            target_vectors: [Batch, Seq, VocabSize] - Required for training (solving experts)
+            input_ids: Token indices of shape ``[Batch, Seq]``.
+            target_vectors: Supervision signal in vocabulary space of shape
+                ``[Batch, Seq, VocabSize]``.  Required during training so that the
+                target latent ``z_target`` can be computed for solving new experts.
+            attention_mask: Optional boolean attention mask of shape
+                ``[Batch, Seq]`` passed through to the encoder.
+
+        Returns:
+            Training: ``(logits, router_loss)`` where ``logits`` is
+            ``[Batch, Seq, VocabSize]`` and ``router_loss`` is a scalar tensor.
+
+            Inference: ``logits`` of shape ``[Batch, Seq, VocabSize]``.
         """
         # Encoder
-        # Context is used for the decoder and potentially as initial latent?
-        # Gemma3Encoder returns hidden states.
-        context = self.encoder(input_ids).last_hidden_state
+        context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
         
         # Initial latent z. 
         # Using context as z? Or separate? 
@@ -182,6 +191,74 @@ class FinalTransformer(nn.Module):
             
             final_output = self.decoder(curr_z, context)
             return final_output
+
+
+    def sft_forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward pass for supervised fine-tuning (SFT).
+
+        Replicates the recurrent routing loop from the inference branch of
+        :meth:`forward` while keeping gradients enabled for all parameters
+        (encoder, router, experts, decoder).  No expert-addition, solving, or
+        pruning takes place; the MoE lifecycle is intentionally bypassed.
+
+        The recurrence logic is identical to inference:
+
+        1. At each iteration the latent is routed through all experts (including
+           the OUTPUT expert) with a skew that grows linearly with ``loop_count``
+           to nudge the router towards the OUTPUT expert over time.
+        2. The loop exits early when the mean OUTPUT-expert probability exceeds
+           ``0.5``, otherwise it runs for at most ``max_recurrence`` steps.
+
+        The MoE module's ``training`` flag (and the router's) is temporarily set
+        to ``False`` inside the loop so that the inference path of
+        :class:`~modules.model.moe.MixtureOfExperts` is used (no expert masking).
+        Setting the flag directly—rather than calling ``.eval()``—ensures that
+        dropout in the encoder and decoder backbones remains active.
+
+        Args:
+            input_ids: Token indices of shape ``[Batch, Seq]``.
+            attention_mask: Optional boolean attention mask of shape
+                ``[Batch, Seq]`` passed through to the encoder.
+
+        Returns:
+            Logits tensor of shape ``[Batch, Seq, VocabSize]``.
+        """
+        # Encoder (gradients enabled; training flag controls dropout)
+        context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
+
+        z = context.clone()
+
+        # Temporarily override the MoE and router training flags so that the
+        # inference-path routing (no masking) is used while gradients still flow.
+        _moe_training = self.moe.training
+        _router_training = self.moe.router.training
+        self.moe.training = False
+        self.moe.router.training = False
+
+        curr_z = z
+        loop_count = 0
+
+        while loop_count < self.max_recurrence:
+            skew = float(loop_count) * self.skew_factor
+            output, probs = self.moe(curr_z, output_skew=skew)
+
+            curr_z = output
+            loop_count += 1
+
+            output_prob = probs[..., self.moe.router.output_index].mean()
+            if output_prob > 0.5:
+                break
+
+        # Restore training flags before the decoder forward pass
+        self.moe.training = _moe_training
+        self.moe.router.training = _router_training
+
+        logits = self.decoder(curr_z, context)
+        return logits
 
 
 

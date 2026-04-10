@@ -1,6 +1,23 @@
 import torch
 from torch import nn
 from transformers import AutoConfig, AutoModel
+from dataclasses import dataclass
+
+
+@dataclass
+class EncoderOutput:
+    """Output container for :class:`Gemma3Encoder`.
+
+    Attributes:
+        last_hidden_state: Hidden states from the selected transformer layer,
+            shape ``[batch, seq_len, hidden_size]``.
+        hidden_states: All intermediate hidden states (including the embedding
+            layer at index 0) when ``return_all_hidden_states=True`` was passed
+            to :meth:`Gemma3Encoder.forward`.  ``None`` otherwise.
+    """
+
+    last_hidden_state: torch.Tensor
+    hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
 # LLM Encoder Module
@@ -94,14 +111,30 @@ class Gemma3Encoder(nn.Module):
         )
         self.model.eval()
 
-    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         return_all_hidden_states: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    ) -> EncoderOutput:
+        """Extract hidden states from Gemma 3.
+
+        The method honours the current ``training`` flag so that calling
+        ``model.train()`` on the parent :class:`FinalTransformer` correctly
+        enables dropout and gradient computation for fine-tuning.
+
+        Args:
+            input_ids: Token indices of shape ``[batch, seq_len]``.
+            attention_mask: Optional boolean mask of shape ``[batch, seq_len]``.
+            position_ids: Optional position indices of shape ``[batch, seq_len]``.
+            return_all_hidden_states: When ``True``, include the full tuple of
+                per-layer hidden states in the returned :class:`EncoderOutput`.
+
+        Returns:
+            :class:`EncoderOutput` with ``last_hidden_state`` of shape
+            ``[batch, seq_len, hidden_size]``, and optionally ``hidden_states``.
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -114,9 +147,9 @@ class Gemma3Encoder(nn.Module):
         selected = hidden_states[self.target_layer]
 
         if return_all_hidden_states:
-            return selected, hidden_states
+            return EncoderOutput(last_hidden_state=selected, hidden_states=hidden_states)
 
-        return selected
+        return EncoderOutput(last_hidden_state=selected)
 
 
     @property
