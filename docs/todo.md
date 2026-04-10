@@ -8,7 +8,11 @@
 - [x] Add Normalization and Dropout layers to the model architecture
 - [x] Skip connections between experts
 - [] Add attention experts
+    - [] Related: Switch to Gemma4 for Per Layer Embeddings (also providing more contextual information)
 - [] Expert top k routing
 - [] possible consolidation of dataset files into chunks (eg. 3 files loaded)
     > should allow for better grouping by similarity
+- [] Update Pre- and Posttraining scripts to accomadate changes in dataset architecture
+- [] Add benchmarking script for evaluation
+- [] Multi Token Prediction
  

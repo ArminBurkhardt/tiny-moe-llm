@@ -15,11 +15,13 @@ For implementation details and current project status, see the documentation in 
 
 
 ## Credit
-Borrows heavily from [Gemma3]
+Borrows heavily from [Gemma3](https://huggingface.co/google/gemma-3-27b-it)
+
+Training guidance and datasets:
+- [Nemotron-3-Super](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8)
 
 Datasets:
 - [Ultra-FineWeb](https://huggingface.co/datasets/openbmb/Ultra-FineWeb/tree/main/data/ultrafineweb_en_v1_4)
-- [FineWeb-HQ](https://huggingface.co/datasets/epfml/FineWeb-HQ)
 
 
 Reasoning Datasets:
