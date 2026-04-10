@@ -3,6 +3,7 @@
 ### General
 - [ ] Add benchmarking script for evaluation
 - [ ] Maybe try NVFP4 during Pretraining
+- [ ] Try [LiquidAI ColBERT](https://huggingface.co/LiquidAI/LFM2-ColBERT-350M) instead of Gemma Embeddings
 
 ### Data
 - [ ] Generate multiple reasoning paths per question using Gemma4
