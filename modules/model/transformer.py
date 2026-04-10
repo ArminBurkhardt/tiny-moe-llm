@@ -1,6 +1,7 @@
 import torch 
 from torch import nn
 from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts
+from modules.model.expert import ExpertModuleWithSkip
 from modules.model.router import LatentRouter
 from modules.model.linear import InvertibleLinear, SolvableLinear
 from utils import FP64
@@ -15,7 +16,8 @@ class FinalTransformer(nn.Module):
         steps_per_expert_add: int = 2, # "First two expert calls..." implying 2 normal calls
         prune_step_interval: int = 1000,
         max_recurrence: int = 10,
-        expert_template: nn.Module = None
+        expert_template: nn.Module = None,
+        dropout: float = 0.1,
     ):
         super().__init__()
         
@@ -28,17 +30,21 @@ class FinalTransformer(nn.Module):
         # Encoder is only finetuned.
         for param in self.encoder.parameters():
             param.requires_grad = True
+
+        # Normalise and regularise the encoder output before it enters the MoE loop.
+        # LayerNorm stabilises the latent distribution across the batch; dropout prevents
+        # over-reliance on any single encoder feature.
+        self.encoder_norm = nn.LayerNorm(latent_dim)
+        self.encoder_dropout = nn.Dropout(dropout)
             
         # Decoder: Invertible
         self.decoder = Decoder(hidden_size=latent_dim, output_size=vocab_size)
         # Decoder trained normally
         
         # Experts Core
-        # "solvable experts". We need an expert template.
+        # ExpertModuleWithSkip is the chosen expert for the final model.
         if expert_template is None:
-            # Simple Invertible Linear as expert? or MLP?
-            # "Solvable" implies InvertibleLinear usually in this context
-            expert_template = SolvableLinear(latent_dim, latent_dim)
+            expert_template = ExpertModuleWithSkip(latent_dim, latent_dim, dropout=dropout)
             
         router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts, hidden_size=latent_dim)
         
@@ -46,7 +52,8 @@ class FinalTransformer(nn.Module):
             router=router, 
             expert=expert_template,
             steps_per_expert=steps_per_expert_add,
-            dtype=torch.float32
+            dtype=torch.float32,
+            hidden_size=latent_dim,
         )
         # Pre-populate experts using deepcopy to ensure they are distinct instances
         import copy
@@ -79,6 +86,10 @@ class FinalTransformer(nn.Module):
         # Encoder
         context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
         
+        # Normalise and regularise encoder output before feeding into the MoE loop.
+        context = self.encoder_norm(context)
+        context = self.encoder_dropout(context)
+
         # Initial latent z. 
         # Using context as z? Or separate? 
         # Usually MoE transforms z -> z'.

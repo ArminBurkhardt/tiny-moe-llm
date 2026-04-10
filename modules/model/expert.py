@@ -63,28 +63,45 @@ class ExpertModule(nn.Module):
         self.enable_grad(False)
 
 class ExpertModuleWithSkip(ExpertModule):
-    """An expert module with a skip connection from input to output."""
-    
-    def __init__(self, input_size: int, output_size: int):
+    """An expert module with a skip connection, pre-LayerNorm, and dropout.
+
+    The forward pass applies pre-normalization before the linear transformation,
+    then adds dropout to the activated output before the residual addition:
+
+        output = x + dropout(activation(linear(norm(x))))
+
+    This follows the pre-norm residual style used in modern transformer architectures
+    and improves training stability.
+    """
+
+    def __init__(self, input_size: int, output_size: int, dropout: float = 0.1):
         super().__init__(input_size, output_size)
         # Ensure the linear layer maps input to output size for the skip connection
         assert input_size == output_size, "Input and output sizes must match for skip connection."
-    
+        # Pre-norm stabilises the distribution entering the linear layer
+        self.norm = nn.LayerNorm(input_size)
+        # Dropout regularises the expert's contribution before it is added back
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_linear = self.linear(x)
+        x_norm = self.norm(x)
+        x_linear = self.linear(x_norm)
         x_activated = self.activation(x_linear)
-        return x + x_activated  # Skip connection adds input to activated output
-    
-    
+        return x + self.dropout(x_activated)  # Skip connection adds input to regularised output
+
     def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
-        """
-        Solves for the linear layer weights such that the expert output approximates y.
-        y = x + activation(linear(x)) => activation(linear(x)) = y - x => linear(x) = activation_inv(y - x)
+        """Solves for the linear layer weights such that the expert output approximates y.
+
+        Accounts for the pre-norm layer:
+          y = x + activation(linear(norm(x)))
+          => linear(norm(x)) = activation_inv(y - x)
+        Dropout is excluded from the closed-form solve (equivalent to p=0 during solving).
         """
         with torch.no_grad():
+            x_norm = self.norm(x)
             y_pre_act = self.activation.inverse(y - x)
-        
-        self.linear.solve_from_batch(x, y_pre_act, l2=l2)
+
+        self.linear.solve_from_batch(x_norm, y_pre_act, l2=l2)
         self.completed = True
 
 
