@@ -75,7 +75,7 @@ class PretrainConfig:
     max_recurrence: int = 10
     max_experts: int = 16
 
-    # ---- Optimiser ----
+    # ---- Optimizer ----
     lr: float = 1e-4
     router_lr: float = 1e-3
     router_loss_weight: float = 0.1

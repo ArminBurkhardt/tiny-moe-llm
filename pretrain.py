@@ -517,8 +517,8 @@ def main() -> None:
 
     # ----- Latent dimension -----
     if args.latent_dim is None:
-        encoder_cfg = AutoConfig.from_pretrained(args.model_dir)
-        latent_dim = encoder_cfg.hidden_size
+        encoder_config = AutoConfig.from_pretrained(args.model_dir)
+        latent_dim = encoder_config.hidden_size
         logger.info("Inferred latent_dim=%d from encoder config.", latent_dim)
     else:
         latent_dim = args.latent_dim

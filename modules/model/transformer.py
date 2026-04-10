@@ -246,13 +246,12 @@ class FinalTransformer(nn.Module):
             skew = float(loop_count) * self.skew_factor
             output, probs = self.moe(curr_z, output_skew=skew)
 
-            output_prob = probs[..., self.moe.router.output_index].mean()
-            if output_prob > 0.5:
-                curr_z = output
-                break
-
             curr_z = output
             loop_count += 1
+
+            output_prob = probs[..., self.moe.router.output_index].mean()
+            if output_prob > 0.5:
+                break
 
         # Restore training flags before the decoder forward pass
         self.moe.training = _moe_training
