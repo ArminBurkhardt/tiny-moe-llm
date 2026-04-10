@@ -200,15 +200,24 @@ class FinalTransformer(nn.Module):
     ) -> torch.Tensor:
         """Forward pass for supervised fine-tuning (SFT).
 
-        Unlike the pretraining :meth:`forward`, this path does **not** manage the
-        expert lifecycle (no expert addition, no solving, no pruning).  It simply
-        routes the latent through the existing experts using the inference-style
-        soft-routing, which lets every expert and the router participate in the
-        gradient computation.
+        Replicates the recurrent routing loop from the inference branch of
+        :meth:`forward` while keeping gradients enabled for all parameters
+        (encoder, router, experts, decoder).  No expert-addition, solving, or
+        pruning takes place; the MoE lifecycle is intentionally bypassed.
 
-        All parameters (encoder, experts, router, decoder) receive gradients, so
-        calling ``optimizer.step()`` after ``loss.backward()`` updates the whole
-        model.
+        The recurrence logic is identical to inference:
+
+        1. At each iteration the latent is routed through all experts (including
+           the OUTPUT expert) with a skew that grows linearly with ``loop_count``
+           to nudge the router towards the OUTPUT expert over time.
+        2. The loop exits early when the mean OUTPUT-expert probability exceeds
+           ``0.5``, otherwise it runs for at most ``max_recurrence`` steps.
+
+        The MoE module's ``training`` flag (and the router's) is temporarily set
+        to ``False`` inside the loop so that the inference path of
+        :class:`~modules.model.moe.MixtureOfExperts` is used (no expert masking).
+        Setting the flag directly—rather than calling ``.eval()``—ensures that
+        dropout in the encoder and decoder backbones remains active.
 
         Args:
             input_ids: Token indices of shape ``[Batch, Seq]``.
@@ -218,28 +227,38 @@ class FinalTransformer(nn.Module):
         Returns:
             Logits tensor of shape ``[Batch, Seq, VocabSize]``.
         """
-        # Encoder (gradients enabled by default; training flag controls dropout)
+        # Encoder (gradients enabled; training flag controls dropout)
         context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
 
         z = context.clone()
 
-        # Soft-route through all experts (including OUTPUT) without lifecycle events.
-        # We temporarily override the router's training flag so the forward method
-        # applies no expert masking (the masking guard checks `self.training`).
-        # This does NOT affect dropout in the backbone because we only touch the
-        # router's own flag, not its children.
+        # Temporarily override the MoE and router training flags so that the
+        # inference-path routing (no masking) is used while gradients still flow.
+        _moe_training = self.moe.training
         _router_training = self.moe.router.training
+        self.moe.training = False
         self.moe.router.training = False
-        probs = self.moe.router(z, output_skew=0.0)
+
+        curr_z = z
+        loop_count = 0
+
+        while loop_count < self.max_recurrence:
+            skew = float(loop_count) * self.skew_factor
+            output, probs = self.moe(curr_z, output_skew=skew)
+
+            output_prob = probs[..., self.moe.router.output_index].mean()
+            if output_prob > 0.5:
+                curr_z = output
+                break
+
+            curr_z = output
+            loop_count += 1
+
+        # Restore training flags before the decoder forward pass
+        self.moe.training = _moe_training
         self.moe.router.training = _router_training
 
-        routed = torch.zeros_like(z)
-        for i, expert in enumerate(self.moe.experts):
-            routed = routed + probs[..., i].unsqueeze(-1) * expert(z)
-        # OUTPUT expert is the identity transform
-        routed = routed + probs[..., self.moe.router.output_index].unsqueeze(-1) * z
-
-        logits = self.decoder(routed, context)
+        logits = self.decoder(curr_z, context)
         return logits
 
 

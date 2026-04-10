@@ -20,7 +20,8 @@ The MoE module follows a fixed curriculum cycle of length
    is trained to select the special OUTPUT (identity) expert.
 
 When the number of live experts reaches ``max_experts``, the least-used expert
-is pruned (``moe.prune_least_used()``) before the new one is registered.
+is pruned (``moe.prune_least_used()``).  The optimiser is rebuilt at that point
+to release all references to the removed expert's parameters.
 
 Optimiser groups
 ----------------
@@ -29,6 +30,12 @@ Optimiser groups
 * Newly added experts are appended to the optimiser as a fresh param group
   right after their grad is enabled, so they receive gradient updates from the
   very next step.
+
+Default hyperparameters
+-----------------------
+All model and training defaults live in :mod:`training_config` (:class:`~training_config.PretrainConfig`).
+CLI flags override individual values; the merged config is saved in every
+checkpoint for full reproducibility.
 
 Usage
 -----
@@ -41,6 +48,7 @@ Usage
 """
 
 import argparse
+import importlib
 import logging
 import os
 
@@ -49,8 +57,8 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoTokenizer
 
 from modules.data.dataset import Dataset
-from modules.model.expert import ExpertModule
 from modules.model.transformer import FinalTransformer
+from training_config import EXPERT_TEMPLATES, PretrainConfig
 from utils import DIR, logger
 
 
@@ -59,6 +67,8 @@ from utils import DIR, logger
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    _cfg = PretrainConfig()  # source of default values
+
     parser = argparse.ArgumentParser(
         description="Pretrain tiny-moe-llm on UltraFineWeb (next-token prediction).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -88,9 +98,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--expert_template",
+        default=_cfg.expert_template,
+        choices=list(EXPERT_TEMPLATES),
+        help="Expert class to use for the MoE.  Must be registered in training_config.EXPERT_TEMPLATES.",
+    )
+    parser.add_argument(
         "--max_experts",
         type=int,
-        default=16,
+        default=_cfg.max_experts,
         help=(
             "Maximum number of live experts.  When this limit is reached the "
             "least-used expert is pruned before a new one is added."
@@ -99,19 +115,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_initial_experts",
         type=int,
-        default=2,
+        default=_cfg.num_initial_experts,
         help="Number of experts to pre-populate at model initialisation.",
     )
     parser.add_argument(
         "--steps_per_expert",
         type=int,
-        default=100,
+        default=_cfg.steps_per_expert,
         help="Normal-routing steps per MoE cycle before a new expert is added.",
     )
     parser.add_argument(
         "--prune_step_interval",
         type=int,
-        default=500,
+        default=_cfg.prune_step_interval,
         help=(
             "FinalTransformer global-step interval at which the least-used expert "
             "is additionally pruned (independent of the max_experts cap)."
@@ -120,51 +136,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_recurrence",
         type=int,
-        default=10,
+        default=_cfg.max_recurrence,
         help="Maximum number of recurrent MoE iterations during inference.",
     )
-    parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate.")
+    parser.add_argument("--lr", type=float, default=_cfg.lr, help="Base learning rate.")
     parser.add_argument(
         "--router_lr",
         type=float,
-        default=1e-3,
+        default=_cfg.router_lr,
         help="Learning rate for router parameters (often benefits from a higher value).",
     )
     parser.add_argument(
         "--router_loss_weight",
         type=float,
-        default=0.1,
+        default=_cfg.router_loss_weight,
         help="Coefficient for the router auxiliary loss.",
     )
     parser.add_argument(
-        "--weight_decay", type=float, default=0.01, help="AdamW weight-decay."
+        "--weight_decay", type=float, default=_cfg.weight_decay, help="AdamW weight-decay."
     )
     parser.add_argument(
         "--grad_clip",
         type=float,
-        default=1.0,
+        default=_cfg.grad_clip,
         help="Gradient-norm clipping threshold (0 disables clipping).",
     )
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=_cfg.batch_size)
     parser.add_argument(
-        "--max_length", type=int, default=512, help="Maximum token sequence length."
+        "--max_length", type=int, default=_cfg.max_length, help="Maximum token sequence length."
     )
     parser.add_argument(
-        "--min_score",
-        type=float,
-        default=0.5,
-        help="Minimum UltraFineWeb quality score to include a sample.",
+        "--num_steps", type=int, default=_cfg.num_steps, help="Total training steps."
     )
     parser.add_argument(
-        "--num_steps", type=int, default=10_000, help="Total training steps."
-    )
-    parser.add_argument(
-        "--log_interval", type=int, default=10, help="Log metrics every N steps."
+        "--log_interval", type=int, default=_cfg.log_interval, help="Log metrics every N steps."
     )
     parser.add_argument(
         "--save_interval",
         type=int,
-        default=1_000,
+        default=_cfg.save_interval,
         help="Save a checkpoint every N steps.",
     )
     parser.add_argument(
@@ -183,19 +193,25 @@ def parse_args() -> argparse.Namespace:
 def build_model(args: argparse.Namespace, vocab_size: int, latent_dim: int) -> FinalTransformer:
     """Construct a :class:`FinalTransformer` for pretraining.
 
-    The expert template is an :class:`ExpertModule` (invertible linear +
-    parameterised sigmoid activation), which supports the closed-form
-    ``solve_from_batch`` required by the MoE expert-addition cycle.
+    The expert template class is resolved via the :data:`~training_config.EXPERT_TEMPLATES`
+    registry using ``args.expert_template``.  The template must implement
+    ``solve_from_batch`` so the MoE expert-addition cycle can solve its
+    parameters analytically.
 
     Args:
-        args: Parsed command-line arguments.
+        args: Parsed command-line arguments (expert_template and model-architecture
+            flags are read here).
         vocab_size: Vocabulary size (from the tokeniser).
         latent_dim: Latent space dimension (typically the encoder hidden size).
 
     Returns:
         An untrained :class:`FinalTransformer` in training mode.
     """
-    expert_template = ExpertModule(latent_dim, latent_dim)
+    # Resolve the expert class from the registry
+    fqn = EXPERT_TEMPLATES[args.expert_template]
+    module_name, class_name = fqn.rsplit(".", 1)
+    expert_cls = getattr(importlib.import_module(module_name), class_name)
+    expert_template = expert_cls(latent_dim, latent_dim)
 
     model = FinalTransformer(
         model_dir=args.model_dir,
@@ -217,12 +233,17 @@ def build_model(args: argparse.Namespace, vocab_size: int, latent_dim: int) -> F
 def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.optim.AdamW:
     """Build an :class:`~torch.optim.AdamW` with separate param groups.
 
-    * Encoder, decoder, and initial expert parameters use ``args.lr``.
+    * Encoder, decoder, and expert parameters use ``args.lr``.
     * Router parameters use ``args.router_lr``.
 
+    This function is also used to rebuild the optimiser after expert pruning, so
+    that all references to the removed expert's parameters are released.
+
     Args:
-        model: Initialised :class:`FinalTransformer`.
-        args: Parsed command-line arguments.
+        model: :class:`FinalTransformer` instance whose current parameters define
+            the optimiser groups.
+        args: Parsed command-line arguments (provides learning rates and
+            weight-decay).
 
     Returns:
         Configured :class:`~torch.optim.AdamW` optimiser.
@@ -242,7 +263,7 @@ def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.
             {"params": encoder_params, "lr": args.lr, "name": "encoder"},
             {"params": decoder_params, "lr": args.lr, "name": "decoder"},
             {"params": router_params, "lr": args.router_lr, "name": "router"},
-            {"params": expert_params, "lr": args.lr, "name": "initial_experts"},
+            {"params": expert_params, "lr": args.lr, "name": "experts"},
         ],
         weight_decay=args.weight_decay,
     )
@@ -251,16 +272,17 @@ def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.
 def _enable_expert_grad(expert: torch.nn.Module) -> None:
     """Consolidate a solved expert and enable gradient-based updates.
 
-    Calls :meth:`ExpertModule.consolidate` (which converts the internal
-    ``SolvableLinear`` to a standard ``nn.Linear`` at ``float32`` precision and
-    enables ``requires_grad``) when available, otherwise falls back to enabling
-    ``requires_grad`` on all parameters directly.
+    Calls :meth:`~modules.model.expert.ExpertModule.consolidate` when available
+    (converts the internal ``SolvableLinear`` to a standard ``nn.Linear`` at
+    ``float32`` precision and enables ``requires_grad``), otherwise falls back
+    to enabling ``requires_grad`` on all parameters directly.
 
     Args:
         expert: Newly solved expert module.
     """
-    if isinstance(expert, ExpertModule):
-        # consolidate: fp64 → fp32, replaces SolvableLinear with nn.Linear, enables grad
+    if hasattr(expert, "consolidate"):
+        # ExpertModule.consolidate: fp64 → fp32, replaces SolvableLinear with
+        # nn.Linear, enables grad
         expert.consolidate(force=True, disable_grad=False, dtype=torch.float32)
     else:
         for param in expert.parameters():
@@ -293,7 +315,7 @@ def train_step(
     args: argparse.Namespace,
     vocab_size: int,
     device: str,
-) -> dict:
+) -> tuple[dict, torch.optim.Optimizer | None]:
     """Execute a single pretraining step.
 
     The batch is expected to contain ``input_ids`` (with padding), optional
@@ -302,8 +324,13 @@ def train_step(
     model predicts the *next* token at each position.
 
     After the MoE forward pass, any newly added expert is enabled for gradient
-    updates and registered with the optimiser.  If the live-expert count exceeds
-    ``args.max_experts``, the least-used expert is pruned.
+    updates and registered with the optimiser via
+    :func:`_add_expert_to_optimizer`.
+
+    If the live-expert count exceeds ``args.max_experts``, the least-used expert
+    is pruned and the optimiser is **rebuilt** via :func:`build_optimizer`.
+    This releases all references to the removed expert's parameters and prevents
+    a memory leak from stale parameter tensors retained in optimiser state.
 
     Args:
         model: :class:`FinalTransformer` in training mode.
@@ -314,8 +341,10 @@ def train_step(
         device: Target device string (e.g. ``"cuda"`` or ``"cpu"``).
 
     Returns:
-        Dict with scalar metrics: ``lm_loss``, ``router_loss``, ``total_loss``,
-        ``num_experts``.
+        A ``(metrics, new_optimizer)`` pair.  ``metrics`` is a dict with scalar
+        keys ``lm_loss``, ``router_loss``, ``total_loss``, and ``num_experts``.
+        ``new_optimizer`` is a freshly built :class:`~torch.optim.AdamW` when
+        pruning occurred, or ``None`` when no pruning took place.
     """
     # Shift sequences: input = all but last token, target = all but first token
     input_ids = batch["input_ids"][:, :-1].to(device)
@@ -349,7 +378,8 @@ def train_step(
         attention_mask=attention_mask,
     )
 
-    # Enable gradient updates on any experts that were just added
+    # Enable gradient updates on any experts that were just added and register
+    # their parameters with the current optimiser
     n_experts_after = len(model.moe.experts)
     for idx in range(n_experts_before, n_experts_after):
         new_expert = model.moe.experts[idx]
@@ -357,11 +387,16 @@ def train_step(
         _add_expert_to_optimizer(optimizer, new_expert, args.lr)
         logger.info("Expert %d added and enabled for gradient updates.", idx)
 
-    # Prune if the live-expert count exceeds the configured cap
+    # Prune if the live-expert count exceeds the configured cap, then rebuild
+    # the optimiser so that stale references to the pruned expert's parameters
+    # are released (avoids an effective memory leak in the optimiser state).
+    new_optimizer: torch.optim.Optimizer | None = None
     if n_experts_after > args.max_experts:
         model.moe.prune_least_used()
+        new_optimizer = build_optimizer(model, args)
         logger.info(
-            "Pruned least-used expert (max_experts=%d).  Live experts: %d",
+            "Pruned least-used expert (max_experts=%d).  Live experts: %d.  "
+            "Optimiser rebuilt.",
             args.max_experts,
             len(model.moe.experts),
         )
@@ -377,19 +412,23 @@ def train_step(
     router_loss_value = router_loss if isinstance(router_loss, torch.Tensor) else torch.tensor(router_loss, device=device)
     total_loss = lm_loss + args.router_loss_weight * router_loss_value
 
-    # Backward pass and optimiser step
+    # Backward pass and optimiser step (use the active optimiser before any
+    # rebuild; the rebuilt optimiser takes effect from the next step)
     optimizer.zero_grad()
     total_loss.backward()
     if args.grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
     optimizer.step()
 
-    return {
-        "lm_loss": lm_loss.item(),
-        "router_loss": router_loss_value.item(),
-        "total_loss": total_loss.item(),
-        "num_experts": len(model.moe.experts),
-    }
+    return (
+        {
+            "lm_loss": lm_loss.item(),
+            "router_loss": router_loss_value.item(),
+            "total_loss": total_loss.item(),
+            "num_experts": len(model.moe.experts),
+        },
+        new_optimizer,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,15 +441,23 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     step: int,
     args: argparse.Namespace,
+    config: dict,
 ) -> None:
     """Save model + optimiser state to *path*.
+
+    The serialised payload includes a copy of the merged training configuration
+    (CLI args merged on top of :class:`~training_config.PretrainConfig` defaults)
+    so that every checkpoint is fully self-contained and the run can be
+    reproduced exactly.
 
     Args:
         path: Destination file path (e.g. ``ckpts/trained/pretrain/ckpt_step1000.pt``).
         model: :class:`FinalTransformer` instance.
         optimizer: Active optimiser.
         step: Current global training step.
-        args: Parsed command-line arguments (saved for reproducibility).
+        args: Parsed command-line arguments (saved for reference).
+        config: Serialised :class:`~training_config.PretrainConfig` dict (saved
+            as the canonical hyperparameter record for reproducibility).
     """
     torch.save(
         {
@@ -418,6 +465,7 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
+            "config": config,
         },
         path,
     )
@@ -437,6 +485,30 @@ def main() -> None:
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # ----- Build a serialisable config dict from CLI args -----
+    # PretrainConfig supplies typed defaults; CLI flags override individual
+    # values.  The resulting dict is embedded in every checkpoint.
+    training_cfg = PretrainConfig(
+        expert_template=args.expert_template,
+        num_initial_experts=args.num_initial_experts,
+        steps_per_expert=args.steps_per_expert,
+        prune_step_interval=args.prune_step_interval,
+        max_recurrence=args.max_recurrence,
+        max_experts=args.max_experts,
+        lr=args.lr,
+        router_lr=args.router_lr,
+        router_loss_weight=args.router_loss_weight,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        num_steps=args.num_steps,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+    )
+    config_dict = training_cfg.as_dict()
+    logger.info("Training config: %s", config_dict)
+
     # ----- Tokeniser -----
     logger.info("Loading tokeniser from %s", args.model_dir)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
@@ -445,8 +517,8 @@ def main() -> None:
 
     # ----- Latent dimension -----
     if args.latent_dim is None:
-        config = AutoConfig.from_pretrained(args.model_dir)
-        latent_dim = config.hidden_size
+        encoder_cfg = AutoConfig.from_pretrained(args.model_dir)
+        latent_dim = encoder_cfg.hidden_size
         logger.info("Inferred latent_dim=%d from encoder config.", latent_dim)
     else:
         latent_dim = args.latent_dim
@@ -506,7 +578,10 @@ def main() -> None:
             data_iter = iter(dataset)
             batch = next(data_iter)
 
-        metrics = train_step(model, batch, optimizer, args, vocab_size, device)
+        metrics, new_optimizer = train_step(model, batch, optimizer, args, vocab_size, device)
+        # Replace the optimiser when pruning caused a rebuild
+        if new_optimizer is not None:
+            optimizer = new_optimizer
         global_step += 1
 
         if global_step % args.log_interval == 0:
@@ -522,11 +597,11 @@ def main() -> None:
 
         if global_step % args.save_interval == 0:
             ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
-            save_checkpoint(ckpt_path, model, optimizer, global_step, args)
+            save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
 
     # ----- Final checkpoint -----
     final_path = os.path.join(args.output_dir, "final.pt")
-    save_checkpoint(final_path, model, optimizer, global_step, args)
+    save_checkpoint(final_path, model, optimizer, global_step, args, config_dict)
     logger.info("Pretraining complete.  Final model → %s", final_path)
 
 
