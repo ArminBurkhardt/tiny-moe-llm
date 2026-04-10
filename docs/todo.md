@@ -2,6 +2,7 @@
 
 ### General
 - [ ] Add benchmarking script for evaluation
+- [ ] Maybe try NVFP4 during Pretraining
 
 ### Data
 - [ ] Generate multiple reasoning paths per question using Gemma4
