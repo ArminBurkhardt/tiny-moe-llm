@@ -15,13 +15,19 @@ For implementation details and current project status, see the documentation in 
 
 
 ## Credit
-Borrows heavily from [Gemma3](https://huggingface.co/google/gemma-3-27b-it)
+Borrows heavily from [Gemma3](https://huggingface.co/google/gemma-3-27b-it) and [Gemma4](https://huggingface.co/google/gemma-4-31b-it)
 
 Training guidance and datasets:
 - [Nemotron-3-Super](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8)
 
+Papers and research:
+- [LoopLM](https://arxiv.org/abs/2510.25741) 
+- [Nemotron-3-Super](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Super-Technical-Report.pdf)
+- [Multi-token Prediction](https://arxiv.org/pdf/2404.19737)
+
 Datasets:
 - [Ultra-FineWeb](https://huggingface.co/datasets/openbmb/Ultra-FineWeb/tree/main/data/ultrafineweb_en_v1_4)
+- [Wikipedia](https://huggingface.co/datasets/wikimedia/wikipedia)
 
 
 Reasoning Datasets:
