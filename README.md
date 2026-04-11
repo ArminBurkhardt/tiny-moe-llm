@@ -17,7 +17,7 @@ For implementation details and current project status, see the documentation in 
 ## Credit
 Borrows heavily from [Gemma3](https://huggingface.co/google/gemma-3-27b-it) and [Gemma4](https://huggingface.co/google/gemma-4-31b-it)
 
-Training guidance and datasets:
+Training guidance and not datasets because they reject individuals who are not affiliated with an institution:
 - [Nemotron-3-Super](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8)
 
 Papers and research:
