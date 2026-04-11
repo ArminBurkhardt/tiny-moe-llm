@@ -63,6 +63,8 @@ class PretrainConfig:
         num_steps: Total number of pretraining gradient steps.
         log_interval: Print metrics every N steps.
         save_interval: Write a checkpoint every N steps.
+        mtp_steps: Number of future-token offsets in the MTP objective.
+        mtp_lambda: Geometric weight multiplier for farther MTP offsets.
     """
 
     # ---- Expert architecture ----
@@ -88,6 +90,8 @@ class PretrainConfig:
     num_steps: int = 10_000
     log_interval: int = 10
     save_interval: int = 1_000
+    mtp_steps: int = 1
+    mtp_lambda: float = 1.0
 
     def as_dict(self) -> dict:
         """Return a plain-dict representation suitable for JSON / pickle serialisation."""

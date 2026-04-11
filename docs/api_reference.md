@@ -115,6 +115,9 @@ This document describes the currently usable classes, methods, and functions in 
   - `pinverse_method(matrices)`
   - `non_square_pinverse_method(matrices)`
 
+### Multi-token prediction (`modules/model/mtp.py`)
+- `compute_mtp_loss(logits, labels, mtp_steps=1, mtp_lambda=1.0, ignore_index=-100)`
+
 ### Integrated model (`modules/model/transformer.py`)
 - `class FinalTransformer(nn.Module)`
   - `forward(input_ids, target_vectors=None)`

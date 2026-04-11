@@ -11,6 +11,8 @@ The repository is structured for fast iteration on architecture ideas, including
 
 For implementation details and current project status, see the documentation in `/docs`.
 
+Pretraining (`pretrain.py`) and supervised fine-tuning (`posttrain.py`) support configurable multi-token prediction (MTP) via `--mtp_steps` and `--mtp_lambda`.
+
 
 
 

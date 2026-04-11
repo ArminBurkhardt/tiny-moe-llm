@@ -50,12 +50,12 @@ from typing import Iterator
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from torch.utils.data import IterableDataset
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase
 
 from modules.data.chat_template import Chat
 from modules.data.dataloader import FileLoader
+from modules.model.mtp import compute_mtp_loss
 from modules.model.transformer import FinalTransformer
 from utils import DIR, logger
 
@@ -126,6 +126,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1_000,
         help="Save a checkpoint every N steps.",
+    )
+    parser.add_argument(
+        "--mtp_steps",
+        type=int,
+        default=1,
+        help="Number of future-token offsets used for the MTP objective.",
+    )
+    parser.add_argument(
+        "--mtp_lambda",
+        type=float,
+        default=1.0,
+        help="Geometric weighting factor for farther MTP offsets.",
     )
     return parser.parse_args()
 
@@ -351,8 +363,8 @@ def sft_step(
 
     Uses :meth:`FinalTransformer.sft_forward` for a gradient-enabled forward
     pass that routes through existing experts without triggering the expert
-    lifecycle.  Cross-entropy loss is computed only on assistant tokens (where
-    ``labels != -100``).
+    lifecycle. Multi-token prediction (MTP) loss is computed only on assistant
+    tokens (where ``labels != -100``).
 
     Args:
         model: :class:`FinalTransformer` in training mode.
@@ -374,10 +386,12 @@ def sft_step(
     # SFT forward: encoder → MoE (routing only) → decoder
     logits = model.sft_forward(input_ids, attention_mask=attention_mask)
 
-    # Cross-entropy loss (assistant tokens only; padding / user tokens masked)
-    loss = F.cross_entropy(
-        logits.reshape(-1, vocab_size),
-        labels.reshape(-1),
+    # Multi-token prediction loss (assistant tokens only)
+    loss = compute_mtp_loss(
+        logits=logits,
+        labels=labels,
+        mtp_steps=args.mtp_steps,
+        mtp_lambda=args.mtp_lambda,
         ignore_index=-100,
     )
 

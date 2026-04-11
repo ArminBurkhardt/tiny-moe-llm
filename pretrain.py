@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pretrain.py — Pretraining script for tiny-moe-llm on UltraFineWeb.
 
-Training objective: next-token prediction (causal LM) via cross-entropy loss.
+Training objective: multi-token prediction (MTP) with configurable horizon.
 
 Expert lifecycle during pretraining
 ------------------------------------
@@ -58,6 +58,7 @@ import torch.nn.functional as F
 from transformers import AutoConfig, AutoTokenizer
 
 from modules.data.dataset import Dataset
+from modules.model.mtp import compute_mtp_loss
 from modules.model.transformer import FinalTransformer
 from training_config import EXPERT_TEMPLATES, PretrainConfig
 from utils import DIR, logger
@@ -71,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     _cfg = PretrainConfig()  # source of default values
 
     parser = argparse.ArgumentParser(
-        description="Pretrain tiny-moe-llm on UltraFineWeb (next-token prediction).",
+        description="Pretrain tiny-moe-llm on UltraFineWeb (multi-token prediction).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -177,6 +178,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=_cfg.save_interval,
         help="Save a checkpoint every N steps.",
+    )
+    parser.add_argument(
+        "--mtp_steps",
+        type=int,
+        default=_cfg.mtp_steps,
+        help="Number of future-token offsets used for the MTP objective.",
+    )
+    parser.add_argument(
+        "--mtp_lambda",
+        type=float,
+        default=_cfg.mtp_lambda,
+        help="Geometric weighting factor for farther MTP offsets.",
     )
     parser.add_argument(
         "--resume",
@@ -402,10 +415,12 @@ def train_step(
             len(model.moe.experts),
         )
 
-    # Language-modelling loss (cross-entropy, ignoring padding)
-    lm_loss = F.cross_entropy(
-        logits.reshape(-1, vocab_size),
-        labels.reshape(-1),
+    # Multi-token prediction language-model loss
+    lm_loss = compute_mtp_loss(
+        logits=logits,
+        labels=labels,
+        mtp_steps=args.mtp_steps,
+        mtp_lambda=args.mtp_lambda,
         ignore_index=-100,
     )
 
@@ -506,6 +521,8 @@ def main() -> None:
         num_steps=args.num_steps,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
+        mtp_steps=args.mtp_steps,
+        mtp_lambda=args.mtp_lambda,
     )
     config_dict = training_cfg.as_dict()
     logger.info("Training config: %s", config_dict)
