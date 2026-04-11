@@ -43,6 +43,7 @@ To add an extra data source append a tuple ``(root_dir, "messages")`` to the
 """
 
 import argparse
+import json
 import logging
 import os
 from typing import Iterator
@@ -82,25 +83,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--kimi_dir",
-        default=DIR.KIMI_DIR,
-        help="Root directory for the KIMI-K2.5 parquet shards.",
-    )
-    parser.add_argument(
-        "--reasoning_dir",
-        default=DIR.REASNONING_DIR,
-        help="Root directory for reasoning dataset parquet shards.",
-    )
-    parser.add_argument(
-        "--extra_data",
-        nargs="*",
-        default=[],
-        metavar="PATH",
-        help=(
-            "Zero or more additional dataset root directories.  Each directory "
-            "must contain parquet files with a ``messages`` column (same schema "
-            "as KIMI / reasoning datasets).  Useful for synthetic data sources."
-        ),
+        "--data_config",
+        default="data_config.json",
+        help="Path to JSON file specifying datasets mapping.",
     )
     parser.add_argument(
         "--output_dir",
@@ -341,29 +326,12 @@ def build_model(
 # ---------------------------------------------------------------------------
 
 def build_datasets(args: argparse.Namespace) -> list[tuple[str, str]]:
-    """Assemble the list of ``(root_dir, messages_column)`` SFT sources.
-
-    Built-in sources
-    ~~~~~~~~~~~~~~~~
-    * KIMI-K2.5-550000x  (``args.kimi_dir``)
-    * Reasoning datasets  (``args.reasoning_dir``)
-
-    Extra sources
-    ~~~~~~~~~~~~~
-    Any paths passed via ``--extra_data`` are appended here.  Each directory
-    must contain parquet files with a ``messages`` column.
-
-    Returns:
-        List of ``(root_dir, column_name)`` tuples consumed by
-        :class:`SFTDataset`.
-    """
-    sources: list[tuple[str, str]] = [
-        (args.kimi_dir, "messages"),
-        (args.reasoning_dir, "messages"),
-    ]
-    for extra_dir in args.extra_data:
-        sources.append((extra_dir, "messages"))
-        logger.info("Extra SFT data source registered: %s", extra_dir)
+    with open(args.data_config, "r") as f:
+        data_config = json.load(f)
+    
+    sources = [(item["root"], item["column"]) for item in data_config.get("sft", [])]
+    if not sources:
+        logger.warning(f"No SFT sources found in {args.data_config}")
     return sources
 
 

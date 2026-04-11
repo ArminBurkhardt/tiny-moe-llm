@@ -49,6 +49,7 @@ Usage
 
 import argparse
 import importlib
+import json
 import logging
 import os
 
@@ -79,9 +80,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to the Gemma 3 checkpoint used as encoder.",
     )
     parser.add_argument(
-        "--data_root",
-        default=DIR.UFW_V1_4_DIR,
-        help="Root directory of UltraFineWeb parquet shards.",
+        "--data_config",
+        default="data_config.json",
+        help="Path to JSON file mapping pretrain datasets to paths and columns",
     )
     parser.add_argument(
         "--output_dir",
@@ -548,12 +549,16 @@ def main() -> None:
         optimizer.load_state_dict(optimizer_state)
 
     # ----- Dataset -----
-    logger.info("Building UltraFineWeb dataset from %s", args.data_root)
+    logger.info("Building pretrain dataset from %s", args.data_config)
+    with open(args.data_config, "r") as f:
+        data_config = json.load(f)
+    
+    pretrain_sources = [(item["root"], item["column"]) for item in data_config.get("pretrain", [])]
+
     dataset = Dataset(
-        data_root=args.data_root,
+        sources=pretrain_sources,
         batch_size=args.batch_size,
         similarity_delta=0.7,
-        text_column="content",
         max_loaded_embeddings=100_000,
         device=device if torch.cuda.is_available() else None,
         tokenizer=tokenizer,

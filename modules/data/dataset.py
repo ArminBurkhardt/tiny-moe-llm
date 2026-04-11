@@ -22,10 +22,11 @@ class Dataset(IterableDataset):
         self,
         data_root: Optional[str] = None,
         *,
+        sources: Optional[list[tuple[str, str]]] = None,
         texts: Optional[list[str]] = None,
         batch_size: int = 64,
         similarity_delta: float = 0.7,
-        text_column: str = "content",
+        text_column: Optional[str] = None,
         max_loaded_embeddings: int = 1_000_000,
         device: Optional[str] = None,
         embedding_dim: int = 256,
@@ -38,11 +39,12 @@ class Dataset(IterableDataset):
     ) -> None:
         """
         Args:
-            data_root: Root folder containing parquet shards (walked by FileLoader).
+            data_root: Root folder containing parquet shards (walked by FileLoader). Legacy, prefer sources.
+            sources: List of (root_dir, text_column) tuples.
             texts: Optional in-memory texts. If provided, FileLoader is skipped.
             batch_size: Number of samples to return per batch.
             similarity_delta: Cosine similarity threshold passed to VectorizedDataset.get_similar_batch.
-            text_column: Column name to read from parquet files.
+            text_column: Column name to read from parquet files. Legacy, prefer sources.
             max_loaded_embeddings: Upper bound of embeddings kept in memory for similarity search.
             device: Optional device for the embedding model (e.g. "cuda").
             embedding_dim: Embedding dimension for _EmbeddingGemmaModel.
@@ -54,15 +56,14 @@ class Dataset(IterableDataset):
             return_texts: If True, include raw texts for debugging/logging.
         """
 
-        if texts is None and data_root is None:
-            raise ValueError("Either texts or data_root must be provided.")
+        if texts is None and data_root is None and sources is None:
+            raise ValueError("Either texts, data_root, or sources must be provided.")
 
         if tokenizer is None:
             raise ValueError("tokenizer must be provided to build LLM batches.")
 
         self.batch_size = batch_size
         self.similarity_delta = similarity_delta
-        self.text_column = text_column
         self.max_loaded_embeddings = max_loaded_embeddings
         self.return_embeddings = return_embeddings
         self.return_texts = return_texts
@@ -71,19 +72,46 @@ class Dataset(IterableDataset):
         self.padding = padding
         self.show_progress_bar = False
 
+        if sources is not None:
+            self.sources = sources
+        elif data_root is not None and text_column is not None:
+            self.sources = [(data_root, text_column)]
+        elif data_root is not None:
+            self.sources = [(data_root, "content")]
+        else:
+            self.sources = []
+
         self.model = embedding_model or _EmbeddingGemmaModel(device=device, embedding_dim=embedding_dim)
         # Light convenience: if device not given but cuda is available, move model if supported.
         if (torch.cuda.is_available()) and (device is None):
             self._maybe_to_device("cuda")
-        self.file_loader = FileLoader(data_root) if data_root else None
 
         # State for the active vectorized dataset built from the current parquet shard or provided texts.
         self.current_vector_ds: Optional[VectorizedDataset] = None
         self.current_batches_left: int = 0
+        
+        self.texts_mode = texts is not None
+        self.source_iter = self._shard_iterator() if not self.texts_mode else None
 
         # If texts are given eagerly build the vectorized dataset so __iter__ works immediately.
         if texts is not None:
             self._load_vectorized_dataset(texts)
+
+    def _shard_iterator(self) -> Iterator[list[str]]:
+        import os
+        for root_dir, text_column in self.sources:
+            if not os.path.exists(root_dir):
+                logger.warning(f"Data root not found, skipping: {root_dir}")
+                continue
+            
+            file_loader = FileLoader(root_dir)
+            for df in file_loader:
+                if text_column not in df.columns:
+                    continue
+                
+                texts = df[text_column].dropna().astype(str).tolist()
+                if len(texts) > 0:
+                    yield texts
 
     def __iter__(self) -> Iterator[dict]:
         return self._batch_iterator()
@@ -137,22 +165,15 @@ class Dataset(IterableDataset):
     def _advance_to_next_file(self) -> bool:
         """Load the next parquet shard and build its VectorizedDataset."""
         # If we were instantiated with in-memory texts, do not advance further.
-        if self.file_loader is None:
+        if self.texts_mode:
             return False
 
-        for df in self.file_loader:
-            if self.text_column not in df.columns:
-                # Skip shards that do not contain the target column.
-                continue
-
-            texts = df[self.text_column].dropna().astype(str).tolist()
-            if len(texts) == 0:
-                continue
-
+        try:
+            texts = next(self.source_iter)
             self._load_vectorized_dataset(texts)
             return True
-
-        return False
+        except StopIteration:
+            return False
 
     def _load_vectorized_dataset(self, texts: list[str]) -> None:
         # Respect max_loaded_embeddings by truncating the shard if necessary.
