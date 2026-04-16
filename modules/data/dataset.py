@@ -1,6 +1,6 @@
 """Streaming dataset that yields tokenized LLM batches of similar texts.
 
-This wraps ``FileLoader`` (parquet reader) and ``VectorizedDataset`` (embedding +
+This wraps ``FileLoader`` (parquet reader) and ``VectorDataset`` (embedding +
  similarity search) so each returned batch contains texts that are mutually
  similar above a cosine threshold. Each yielded item is already tokenized for a
  causal LLM: ``input_ids``, ``attention_mask``, and ``labels`` where padding is
@@ -13,7 +13,7 @@ from torch.utils.data import IterableDataset
 from transformers import PreTrainedTokenizerBase
 
 from modules.data.dataloader import FileLoader
-from modules.data.vectorized_dataset import VectorizedDataset, _EmbeddingGemmaModel
+from modules.data.vector_dataset import VectorDataset, _EmbeddingGemmaModel
 from utils import BASE_DIR, logger, DIR
 
 
@@ -43,7 +43,7 @@ class Dataset(IterableDataset):
             sources: List of (root_dir, text_column) tuples.
             texts: Optional in-memory texts. If provided, FileLoader is skipped.
             batch_size: Number of samples to return per batch.
-            similarity_delta: Cosine similarity threshold passed to VectorizedDataset.get_similar_batch.
+            similarity_delta: Cosine similarity threshold passed to VectorDataset.get_similar_batch.
             text_column: Column name to read from parquet files. Legacy, prefer sources.
             max_loaded_embeddings: Upper bound of embeddings kept in memory for similarity search.
             device: Optional device for the embedding model (e.g. "cuda").
@@ -87,7 +87,7 @@ class Dataset(IterableDataset):
             self._maybe_to_device("cuda")
 
         # State for the active vectorized dataset built from the current parquet shard or provided texts.
-        self.current_vector_ds: Optional[VectorizedDataset] = None
+        self.current_vector_ds: Optional[VectorDataset] = None
         self.current_batches_left: int = 0
         
         self.texts_mode = texts is not None
@@ -163,7 +163,7 @@ class Dataset(IterableDataset):
             yield result
 
     def _advance_to_next_file(self) -> bool:
-        """Load the next parquet shard and build its VectorizedDataset."""
+        """Load the next parquet shard and build its VectorDataset."""
         # If we were instantiated with in-memory texts, do not advance further.
         if self.texts_mode:
             return False
@@ -180,7 +180,7 @@ class Dataset(IterableDataset):
         if len(texts) > self.max_loaded_embeddings:
             texts = texts[: self.max_loaded_embeddings]
 
-        vector_ds = VectorizedDataset(texts, self.model, max_loaded_embeddings=self.max_loaded_embeddings)
+        vector_ds = VectorDataset(texts, self.model, max_loaded_embeddings=self.max_loaded_embeddings)
         vector_ds.compute_embeddings(show_progress_bar=self.show_progress_bar)
 
         self.current_vector_ds = vector_ds

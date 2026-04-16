@@ -137,11 +137,11 @@ This document describes the currently usable classes, methods, and functions in 
   - `__iter__()`
   - `__next__()`
 
-### Embedding dataset (`modules/data/vectorized_dataset.py`)
+### Embedding dataset (`modules/data/vector_dataset.py`)
 - `class _EmbeddingGemmaModel`
   - `encode(texts, convert_to_tensor=True, batch_size=64, show_progress_bar=False, precision='float32', normalize_embeddings=True)`
   - `similarity_speedy(text0, others)`
-- `class VectorizedDataset`
+- `class VectorDataset`
   - `from_texts(texts, model)`
   - `save(path)`
   - `load(path, model)`

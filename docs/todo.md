@@ -15,6 +15,8 @@
 - [x] Skip connections between experts
 - [ ] Add attention experts
     - [ ] Related: Switch to Gemma4 for Per Layer Embeddings (also providing more contextual information)
+    - [ ] Add embedding layer input to all experts
+    - [ ] Add consistent reasoning trace during post training (via MoE vector input)
 - [ ] Expert top k routing
 - [ ] Multi Token Prediction
 - [ ] Move MoE to latent space with a skip connection
@@ -26,4 +28,5 @@
     > 
     > Use `Chat` template for formatting the data.
 - [ ] Update Pre- and Posttraining scripts to accomadate changes in dataset architecture
+- [ ] Logging to files
 

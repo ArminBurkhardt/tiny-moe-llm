@@ -1,4 +1,4 @@
-from modules.data.test_vectorized_dataset import test_get_similar_batch, test_dataset_basic_functionality
+from modules.data.test_vector_dataset import test_get_similar_batch, test_dataset_basic_functionality, test_get_similar_batch_colBERT
 from modules.data.dataloader import test_fileloader, test_dataloader
 from modules.data.dataset import test_dataset
 from modules.model.activations import test_invertible_activation
@@ -16,11 +16,14 @@ logging.info(f"Torch version: {torch.__version__}")
 logging.info(f"Torch CUDA available: {torch.cuda.is_available()}")
 
 if __name__ == "__main__":
-    logging.info("Testing dataset functionalities...")
+    logging.info("Testing dataset functionalities (Gemma)...")
     test_dataset_basic_functionality()
     
-    logging.info("Testing similarity batch retrieval...")
+    logging.info("Testing similarity batch retrieval (Gemma)...")
     test_get_similar_batch()
+    
+    logging.info("Testing similarity batch retrieval (ColBERT)...")
+    # test_get_similar_batch_colBERT()
     
     logging.info("Testing file loader...")
     test_fileloader()
