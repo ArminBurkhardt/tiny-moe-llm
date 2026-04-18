@@ -228,7 +228,7 @@ This document summarizes the current public/usable APIs with concise usage notes
   - `__len__()`
   - `get_similar_batch(batch_size, text_only=False, delta=0.5, return_embeddings=False)`
     - returns texts or list of dicts (`id`, `text`, optional `embedding`)
-- `VectorDataset = LFM2ColBERTVectorDataset` (current alias used by imports)
+- `VectorDataset = GemmaVectorDataset` (current alias used by imports)
 
 ### Tokenized iterable dataset (`modules/data/dataset.py`)
 - `class Dataset(torch.utils.data.IterableDataset)`

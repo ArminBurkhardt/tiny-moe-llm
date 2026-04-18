@@ -307,7 +307,7 @@ class LFM2ColBERTVectorDataset:
                         for doc_id, text in batch_items]
 
 
-VectorDataset = LFM2ColBERTVectorDataset
+VectorDataset = GemmaVectorDataset
 """
 Wrapper to provide a consistent interface for different embedding models.
 """
