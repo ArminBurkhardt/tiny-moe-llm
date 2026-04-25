@@ -1,9 +1,8 @@
 import torch 
 from torch import nn
-from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts
-from modules.model.expert import ExpertModuleWithSkip
-from modules.model.router import LatentRouter
-from modules.model.linear import InvertibleLinear, SolvableLinear
+from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts, \
+    ExpertModuleWithSkip, LatentRouter, InvertibleLinear, SolvableLinear, \
+    GroupedQueryAttention, RoPE, ExpertModuleWithSkipAndEmbedding
 from utils import FP64
 
 class FinalTransformer(nn.Module):
@@ -26,6 +25,8 @@ class FinalTransformer(nn.Module):
         # Since we don't know the exact layer, we'll default to a mid-layer or expose it.
         # Assuming layer 12 is "best" for example, or letting user specify.
         self.encoder = Gemma3Encoder(model_dir=model_dir, target_layer=12, torch_dtype=torch.float32)
+        # TODO: use Gemma4Encoder with correct downloaded model
+        #       NOTE: Gemma4 already uses RoPE and GQA, so no further changes needed.
         
         # Encoder is only finetuned.
         for param in self.encoder.parameters():
@@ -42,9 +43,14 @@ class FinalTransformer(nn.Module):
         # Decoder trained normally
         
         # Experts Core
-        # ExpertModuleWithSkip is the chosen expert for the final model.
+        # ExpertModuleWithSkipAndEmbedding is the chosen expert for the final model.
         if expert_template is None:
-            expert_template = ExpertModuleWithSkip(latent_dim, latent_dim, dropout=dropout)
+            expert_template = ExpertModuleWithSkipAndEmbedding(
+                input_size=latent_dim, 
+                output_size=latent_dim, 
+                dropout=dropout, 
+                num_embeddings=vocab_size
+            ) 
             
         router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts, hidden_size=latent_dim)
         
@@ -136,7 +142,7 @@ class FinalTransformer(nn.Module):
                     # We need to provide the TARGET for this solving.
                     # The target is z_target.
                     # So we call MoE with target.
-                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target)
+                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target, input_ids=input_ids)
                     
                     # Compute router loss: Force router to pick new expert
                     # CrossEntropy(probs, target_idx)
@@ -150,7 +156,7 @@ class FinalTransformer(nn.Module):
                 elif cycle_pos == self.moe.steps_per_expert + 1:
                     # Output Expert Mode
                     # "Route to OUTPUT expert only"
-                    curr_z, probs, target_idx = self.moe(curr_z)
+                    curr_z, probs, target_idx = self.moe(curr_z, input_ids=input_ids)
                     
                     # Router loss to force Output
                     loss = nn.CrossEntropyLoss()(probs.reshape(-1, probs.size(-1)), 
@@ -161,7 +167,7 @@ class FinalTransformer(nn.Module):
                 else:
                     # Normal routing (Old Experts)
                     # "Recurrent call"
-                    curr_z = self.moe(curr_z)
+                    curr_z = self.moe(curr_z, input_ids=input_ids)
                     
                     loop_count += 1
                     
@@ -187,7 +193,7 @@ class FinalTransformer(nn.Module):
                 # "adds them" -> Linear additive skew.
                 skew = float(loop_count) * self.skew_factor  # Adjustable hyperparameter
                 
-                output, probs = self.moe(curr_z, output_skew=skew)
+                output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
                 
                 # Using argmax for "Decision" on per-sample basis
                 # For simplicity, we check if average Output probability is dominant
