@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from utils import logger, FP64, InvertibleModule
+from utils import logger, FP64, InvertibleModule, SolvableModule
 
 class InvertibleLinear(nn.Module, InvertibleModule):
     def __init__(self, input_size: int, output_size: int, bias: bool = True, dtype=FP64):
@@ -62,7 +62,7 @@ class InvertibleLinear(nn.Module, InvertibleModule):
             return self.approx_linear_inverse(y)
 
 
-class SolvableLinear(InvertibleLinear):
+class SolvableLinear(InvertibleLinear, SolvableModule):
     """Linear layer that can be solved from a batch via (regularized) least squares.
 
     Notes:

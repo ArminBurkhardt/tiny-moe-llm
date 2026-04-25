@@ -80,7 +80,8 @@ class MixtureOfExperts(nn.Module):
             self.router.head = new_head
             self.router.num_experts -= 1
 
-    def forward(self, x: torch.Tensor, target: torch.Tensor = None, output_skew: float = 0.0):
+    def forward(self, x: torch.Tensor, target: torch.Tensor = None, output_skew: float = 0.0, *args, **kwargs):
+        # args and kwargs are passed to the experts
         cycle_len = self.steps_per_expert + 2
         cycle_pos = self.current_step % cycle_len
         
@@ -108,7 +109,7 @@ class MixtureOfExperts(nn.Module):
 
                 output = torch.zeros_like(x)
                 for i, expert in enumerate(self.experts):
-                    output += probs[..., i].unsqueeze(-1) * expert(x)
+                    output += probs[..., i].unsqueeze(-1) * expert(x, *args, **kwargs)
 
                 # Normalise the combined expert output
                 output = self.post_norm(output)
@@ -135,7 +136,7 @@ class MixtureOfExperts(nn.Module):
                 x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
                 target_flat = target.reshape(-1, target.shape[-1]) if target is not None and target.ndim > 2 else target
                 
-                new_expert.solve_from_batch(x_flat, target_flat)
+                new_expert.solve_from_batch(x_flat, target_flat, *args, **kwargs)
                 
                 self.experts.append(new_expert)
                 self.usage_counts = torch.cat([self.usage_counts, torch.zeros(1, device=self.usage_counts.device)])

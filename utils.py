@@ -61,3 +61,10 @@ class InvertibleModule(ABC):
         raise NotImplementedError("Auto-inverse method not implemented.")
 
 
+
+class SolvableModule(ABC):
+    """Base class for modules that can be solved from a batch."""
+
+    @abstractmethod
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError("Solve method not implemented.")
