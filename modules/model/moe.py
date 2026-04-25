@@ -19,24 +19,32 @@ import copy
 #       using the expert's invertible nature (.solve_for_batch). This avoids backprop through the expert and speeds up training.
 
 class MixtureOfExperts(nn.Module):
-    def __init__(self, router: LatentRouter, experts: nn.ModuleList = None, dtype=FP64, expert: nn.Module = None, steps_per_expert: int = 100, hidden_size: int | None = None):
+    def __init__(self, router: LatentRouter, experts: nn.ModuleList = None, special_experts: nn.ModuleList = None, dtype=FP64, expert: nn.Module = None, steps_per_expert: int = 100, hidden_size: int | None = None):
         super().__init__()
         self.router = router
-        self.experts = experts if experts is not None else nn.ModuleList()
+        
+        self.experts = nn.ModuleList()
+        if special_experts is not None:
+            self.experts.extend(special_experts)
+        self.num_special_experts = len(self.experts)
+        
+        if experts is not None:
+            self.experts.extend(experts)
+            
         self.expert_template = expert
         self.dtype = dtype
         self.steps_per_expert = steps_per_expert
         self.current_step = 0
-        self.usage_counts = torch.zeros(0)  # Will be resized when experts are added
+        self.usage_counts = torch.zeros(len(self.experts))
         # Post-norm applied after the weighted combination of expert outputs.
         # Uses LayerNorm when hidden_size is provided; otherwise falls back to Identity
         # so that the MoE can be used without knowing the feature dimension upfront.
         self.post_norm = nn.LayerNorm(hidden_size) if hidden_size is not None else nn.Identity()
 
     def prune_least_used(self):
-        """Removes the expert with the lowest usage count."""
-        if len(self.experts) == 0:
-            return
+        """Removes the expert with the lowest usage count, excluding special experts."""
+        if len(self.experts) <= self.num_special_experts:
+            return  # Only special experts left, nothing to prune
         
         # Find least used expert
         # usage_counts should match len(experts)
@@ -47,7 +55,10 @@ class MixtureOfExperts(nn.Module):
             min_len = min(len(old_counts), len(self.experts))
             self.usage_counts[:min_len] = old_counts[:min_len]
 
-        min_idx = torch.argmin(self.usage_counts).item()
+        # Only consider prunable experts
+        prunable_counts = self.usage_counts[self.num_special_experts:]
+        min_idx_relative = torch.argmin(prunable_counts).item()
+        min_idx = min_idx_relative + self.num_special_experts
         
         # Remove from experts
         del self.experts[min_idx]
@@ -80,7 +91,8 @@ class MixtureOfExperts(nn.Module):
             self.router.head = new_head
             self.router.num_experts -= 1
 
-    def forward(self, x: torch.Tensor, target: torch.Tensor = None, output_skew: float = 0.0):
+    def forward(self, x: torch.Tensor, target: torch.Tensor = None, output_skew: float = 0.0, *args, **kwargs):
+        # args and kwargs are passed to the experts
         cycle_len = self.steps_per_expert + 2
         cycle_pos = self.current_step % cycle_len
         
@@ -108,7 +120,7 @@ class MixtureOfExperts(nn.Module):
 
                 output = torch.zeros_like(x)
                 for i, expert in enumerate(self.experts):
-                    output += probs[..., i].unsqueeze(-1) * expert(x)
+                    output += probs[..., i].unsqueeze(-1) * expert(x, *args, **kwargs)
 
                 # Normalise the combined expert output
                 output = self.post_norm(output)
@@ -135,7 +147,7 @@ class MixtureOfExperts(nn.Module):
                 x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
                 target_flat = target.reshape(-1, target.shape[-1]) if target is not None and target.ndim > 2 else target
                 
-                new_expert.solve_from_batch(x_flat, target_flat)
+                new_expert.solve_from_batch(x_flat, target_flat, *args, **kwargs)
                 
                 self.experts.append(new_expert)
                 self.usage_counts = torch.cat([self.usage_counts, torch.zeros(1, device=self.usage_counts.device)])

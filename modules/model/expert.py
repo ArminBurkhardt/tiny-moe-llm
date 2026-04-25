@@ -1,10 +1,12 @@
 import torch
 from torch import nn
 from modules.model.linear import SolvableLinear
+from utils import SolvableModule
 from modules.model.activations import InvertibleActivation
+from modules.model.embeddings import PerLayerEmbedding
 
 
-class ExpertModule(nn.Module):
+class ExpertModule(nn.Module, SolvableModule):
     """An expert module consisting of an invertible linear layer followed by a parameterized sigmoid activation."""
     
     def __init__(self, input_size: int, output_size: int):
@@ -103,5 +105,69 @@ class ExpertModuleWithSkip(ExpertModule):
 
         self.linear.solve_from_batch(x_norm, y_pre_act, l2=l2)
         self.completed = True
+
+
+class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip):
+    def __init__(self, input_size: int, output_size: int, dropout: float = 0.1, num_embeddings: int = None):
+        super().__init__(input_size, output_size, dropout)
+        self.embedding = PerLayerEmbedding(num_embeddings=num_embeddings, embedding_dim=input_size)
+        
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape ``[Batch, Seq, InputSize]``.
+            input_ids: Token indices of shape ``[Batch, Seq]``.
+        """
+        embed = self.embedding(input_ids)
+        x_norm = self.norm(x + embed)
+        x_linear = self.linear(x_norm)
+        x_activated = self.activation(x_linear)
+        return x + self.dropout(x_activated)
+
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, input_ids: torch.Tensor, l2: float = 1e-5):
+        """Solves for the linear layer weights such that the expert output approximates y.
+
+        Accounts for the pre-norm layer:
+          y = x + activation(linear(norm(x)))
+          => linear(norm(x)) = activation_inv(y - x)
+        Dropout is excluded from the closed-form solve (equivalent to p=0 during solving).
+        """
+        with torch.no_grad():
+            embed = self.embedding(input_ids)
+            x_norm = self.norm(x + embed)
+            y_pre_act = self.activation.inverse(y - x)
+
+        self.linear.solve_from_batch(x_norm, y_pre_act, l2=l2)
+        self.completed = True
+
+
+
+class SelfAttentionExpert(nn.Module):
+    def __init__(self, input_size: int, output_size: int, dropout: float = 0.1, num_heads: int = 8):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(input_size)
+        self.attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads, dropout=dropout)
+    
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x_norm = self.norm(x)
+        attn_output, _ = self.attn(x_norm, x_norm, x_norm)
+        return x + self.dropout(attn_output)
+    
+class CrossAttentionExpert(nn.Module):
+    def __init__(self, input_size: int, output_size: int, dropout: float = 0.1, num_heads: int = 8):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(input_size)
+        self.attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads, dropout=dropout)
+    
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        x_norm = self.norm(x)
+        attn_output, _ = self.attn(x_norm, context, context)
+        return x + self.dropout(attn_output)
 
 

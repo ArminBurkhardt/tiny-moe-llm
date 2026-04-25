@@ -1,9 +1,10 @@
 import torch 
 from torch import nn
-from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts
-from modules.model.expert import ExpertModuleWithSkip
-from modules.model.router import LatentRouter
-from modules.model.linear import InvertibleLinear, SolvableLinear
+from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts, \
+    ExpertModuleWithSkip, LatentRouter, InvertibleLinear, SolvableLinear, \
+    GroupedQueryAttention, RoPE, ExpertModuleWithSkipAndEmbedding
+from modules.model.expert import SelfAttentionExpert
+from modules.model.information_retrieval import InformationRetrievalModule
 from utils import FP64
 
 class FinalTransformer(nn.Module):
@@ -13,6 +14,8 @@ class FinalTransformer(nn.Module):
         latent_dim: int, 
         vocab_size: int,
         num_initial_experts: int = 4,
+        num_attention_experts: int = 1,
+        ir_num_entries: int = 256,
         steps_per_expert_add: int = 2, # "First two expert calls..." implying 2 normal calls
         prune_step_interval: int = 1000,
         max_recurrence: int = 10,
@@ -26,6 +29,8 @@ class FinalTransformer(nn.Module):
         # Since we don't know the exact layer, we'll default to a mid-layer or expose it.
         # Assuming layer 12 is "best" for example, or letting user specify.
         self.encoder = Gemma3Encoder(model_dir=model_dir, target_layer=12, torch_dtype=torch.float32)
+        # TODO: use Gemma4Encoder with correct downloaded model
+        #       NOTE: Gemma4 already uses RoPE and GQA, so no further changes needed.
         
         # Encoder is only finetuned.
         for param in self.encoder.parameters():
@@ -42,15 +47,30 @@ class FinalTransformer(nn.Module):
         # Decoder trained normally
         
         # Experts Core
-        # ExpertModuleWithSkip is the chosen expert for the final model.
+        # ExpertModuleWithSkipAndEmbedding is the chosen expert for the final model.
         if expert_template is None:
-            expert_template = ExpertModuleWithSkip(latent_dim, latent_dim, dropout=dropout)
+            expert_template = ExpertModuleWithSkipAndEmbedding(
+                input_size=latent_dim, 
+                output_size=latent_dim, 
+                dropout=dropout, 
+                num_embeddings=vocab_size
+            ) 
+        
+        special_experts_list = []
+        for _ in range(num_attention_experts):
+            special_experts_list.append(SelfAttentionExpert(latent_dim, latent_dim, dropout=dropout))
+        
+        special_experts_list.append(InformationRetrievalModule(num_entries=ir_num_entries, latent_dim=latent_dim, output_dim=latent_dim, residual=True))
+        
+        special_experts = nn.ModuleList(special_experts_list)
+        num_special_experts = len(special_experts)
             
-        router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts, hidden_size=latent_dim)
+        router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts + num_special_experts, hidden_size=latent_dim)
         
         self.moe = MixtureOfExperts(
             router=router, 
             expert=expert_template,
+            special_experts=special_experts,
             steps_per_expert=steps_per_expert_add,
             dtype=torch.float32,
             hidden_size=latent_dim,
@@ -59,7 +79,7 @@ class FinalTransformer(nn.Module):
         import copy
         for _ in range(num_initial_experts):
             self.moe.experts.append(copy.deepcopy(expert_template))
-            self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1)])
+            self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1, device=self.moe.usage_counts.device)])
 
         self.prune_step_interval = prune_step_interval
         self.max_recurrence = max_recurrence
@@ -136,7 +156,7 @@ class FinalTransformer(nn.Module):
                     # We need to provide the TARGET for this solving.
                     # The target is z_target.
                     # So we call MoE with target.
-                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target)
+                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target, input_ids=input_ids)
                     
                     # Compute router loss: Force router to pick new expert
                     # CrossEntropy(probs, target_idx)
@@ -150,7 +170,7 @@ class FinalTransformer(nn.Module):
                 elif cycle_pos == self.moe.steps_per_expert + 1:
                     # Output Expert Mode
                     # "Route to OUTPUT expert only"
-                    curr_z, probs, target_idx = self.moe(curr_z)
+                    curr_z, probs, target_idx = self.moe(curr_z, input_ids=input_ids)
                     
                     # Router loss to force Output
                     loss = nn.CrossEntropyLoss()(probs.reshape(-1, probs.size(-1)), 
@@ -161,7 +181,7 @@ class FinalTransformer(nn.Module):
                 else:
                     # Normal routing (Old Experts)
                     # "Recurrent call"
-                    curr_z = self.moe(curr_z)
+                    curr_z = self.moe(curr_z, input_ids=input_ids)
                     
                     loop_count += 1
                     
@@ -187,7 +207,7 @@ class FinalTransformer(nn.Module):
                 # "adds them" -> Linear additive skew.
                 skew = float(loop_count) * self.skew_factor  # Adjustable hyperparameter
                 
-                output, probs = self.moe(curr_z, output_skew=skew)
+                output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
                 
                 # Using argmax for "Decision" on per-sample basis
                 # For simplicity, we check if average Output probability is dominant
