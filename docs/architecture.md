@@ -90,5 +90,5 @@ Training uses `decoder.inverse(target_vectors, context)` to compute the solve ta
 ### `sft_forward(...)` (SFT path)
 
 - Uses inference-style MoE routing loop with gradients enabled.
-- Temporarily sets `self.moe.training = False` and `self.moe.router.training = False` to avoid training-time routing masks/expert lifecycle.
+- Temporarily sets `self.moe.training = False` and `self.moe.router.training = False` during the routing loop so inference-style routing is used (no training-time masks/expert lifecycle) while autograd for parameters remains enabled.
 - Returns `logits`.
