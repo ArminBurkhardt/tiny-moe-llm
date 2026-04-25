@@ -3,6 +3,8 @@ from torch import nn
 from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts, \
     ExpertModuleWithSkip, LatentRouter, InvertibleLinear, SolvableLinear, \
     GroupedQueryAttention, RoPE, ExpertModuleWithSkipAndEmbedding
+from modules.model.expert import SelfAttentionExpert
+from modules.model.information_retrieval import InformationRetrievalModule
 from utils import FP64
 
 class FinalTransformer(nn.Module):
@@ -12,6 +14,8 @@ class FinalTransformer(nn.Module):
         latent_dim: int, 
         vocab_size: int,
         num_initial_experts: int = 4,
+        num_attention_experts: int = 1,
+        ir_num_entries: int = 256,
         steps_per_expert_add: int = 2, # "First two expert calls..." implying 2 normal calls
         prune_step_interval: int = 1000,
         max_recurrence: int = 10,
@@ -51,12 +55,22 @@ class FinalTransformer(nn.Module):
                 dropout=dropout, 
                 num_embeddings=vocab_size
             ) 
+        
+        special_experts_list = []
+        for _ in range(num_attention_experts):
+            special_experts_list.append(SelfAttentionExpert(latent_dim, latent_dim, dropout=dropout))
+        
+        special_experts_list.append(InformationRetrievalModule(num_entries=ir_num_entries, latent_dim=latent_dim, output_dim=latent_dim, residual=True))
+        
+        special_experts = nn.ModuleList(special_experts_list)
+        num_special_experts = len(special_experts)
             
-        router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts, hidden_size=latent_dim)
+        router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts + num_special_experts, hidden_size=latent_dim)
         
         self.moe = MixtureOfExperts(
             router=router, 
             expert=expert_template,
+            special_experts=special_experts,
             steps_per_expert=steps_per_expert_add,
             dtype=torch.float32,
             hidden_size=latent_dim,
@@ -65,7 +79,7 @@ class FinalTransformer(nn.Module):
         import copy
         for _ in range(num_initial_experts):
             self.moe.experts.append(copy.deepcopy(expert_template))
-            self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1)])
+            self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1, device=self.moe.usage_counts.device)])
 
         self.prune_step_interval = prune_step_interval
         self.max_recurrence = max_recurrence

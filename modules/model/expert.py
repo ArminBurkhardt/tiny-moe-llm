@@ -151,24 +151,23 @@ class SelfAttentionExpert(nn.Module):
         self.norm = nn.LayerNorm(input_size)
         self.attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads, dropout=dropout)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         x_norm = self.norm(x)
-        x_linear = self.linear(x_norm)
-        x_activated = self.activation(x_linear)
-        return x + self.dropout(x_activated)
+        attn_output, _ = self.attn(x_norm, x_norm, x_norm)
+        return x + self.dropout(attn_output)
     
-    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
-        """Solves for the linear layer weights such that the expert output approximates y.
+class CrossAttentionExpert(nn.Module):
+    def __init__(self, input_size: int, output_size: int, dropout: float = 0.1, num_heads: int = 8):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(input_size)
+        self.attn = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads, dropout=dropout)
+    
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        x_norm = self.norm(x)
+        attn_output, _ = self.attn(x_norm, context, context)
+        return x + self.dropout(attn_output)
 
-        Accounts for the pre-norm layer:
-          y = x + activation(linear(norm(x)))
-          => linear(norm(x)) = activation_inv(y - x)
-        Dropout is excluded from the closed-form solve (equivalent to p=0 during solving).
-        """
-        with torch.no_grad():
-            x_norm = self.norm(x)
-            y_pre_act = self.activation.inverse(y - x)
-
-        self.linear.solve_from_batch(x_norm, y_pre_act, l2=l2)
-        self.completed = True
 

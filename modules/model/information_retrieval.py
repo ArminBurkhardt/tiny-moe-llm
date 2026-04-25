@@ -68,7 +68,7 @@ class InformationRetrievalModule(nn.Module):
         """Ensures all z vectors are orthogonal at start."""
         nn.init.orthogonal_(self.z_keys)
 
-    def forward(self, x: torch.Tensor, return_weights=False) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
+    def forward(self, x: torch.Tensor, return_weights=False, **kwargs) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
         """
         x: input tensor of shape (batch, seq_len, latent_dim) or (batch, latent_dim)
         return_weights: if True, also returns the retrieval weights (similarity scores)
@@ -115,26 +115,4 @@ class InformationRetrievalModule(nn.Module):
             return out, weights
         return out
 
-
-def verify_model():
-    # typical LLM latent dimensions
-    B, S, D = 4, 128, 1024 
-    num_entries = 256
-    
-    model = InformationRetrievalModule(num_entries, D, D)
-    x = torch.randn(B, S, D)
-    
-    output, weights = model(x, return_weights=True)
-    
-    print(f"Input Shape:  {x.shape}")        # [4, 128, 1024]
-    print(f"Output Shape: {output.shape}")   # [4, 128, 1024]
-    print(f"Weights Shape: {weights.shape}") # [512, 256] (B*S, num_entries)
-    
-    # Verify orthogonality at start
-    z_sim = torch.matmul(model.z_keys, model.z_keys.t())
-    # Diagonal should be 1, others should be near 0
-    print(f"Orthogonality check (mean off-diag): {torch.abs(z_sim - torch.eye(num_entries)).mean().item():.6f}")
-
-if __name__ == "__main__":
-    verify_model()
 

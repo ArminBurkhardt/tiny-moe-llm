@@ -22,10 +22,10 @@ class _DummyExpert(torch.nn.Module):
         with torch.no_grad():
             self.linear.weight.copy_(torch.eye(input_size))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.linear(x)
 
-    def solve_from_batch(self, x: torch.Tensor, target: torch.Tensor, l2: float = 1e-5):
+    def solve_from_batch(self, x: torch.Tensor, target: torch.Tensor, l2: float = 1e-5, **kwargs):
         pass  # No-op: transformer structure tests do not validate the closed-form solve
 
     def consolidate(self, force: bool = False, disable_grad: bool = True, dtype=torch.float32):
@@ -82,7 +82,7 @@ class TestFinalTransformer(unittest.TestCase):
             num_initial_experts=2
         )
         self.assertIsInstance(model, FinalTransformer)
-        self.assertEqual(len(model.moe.experts), 2)
+        self.assertEqual(len(model.moe.experts), 4)
         # Default expert template must be ExpertModuleWithSkip
         self.assertIsInstance(model.moe.expert_template, ExpertModuleWithSkip)
         # Encoder-output normalisation and dropout layers must be present
@@ -174,7 +174,7 @@ class TestFinalTransformer(unittest.TestCase):
         # Should have advanced 1 step: 3 -> 4
         self.assertEqual(model.moe.current_step, 4)
         # No experts added
-        self.assertEqual(len(model.moe.experts), 2)
+        self.assertEqual(len(model.moe.experts), 4)
 
     def test_forward_inference(self):
         max_recurrence = 5
@@ -198,7 +198,7 @@ class TestFinalTransformer(unittest.TestCase):
         
         # Inference doesn't change step or experts
         self.assertEqual(model.moe.current_step, 0)
-        self.assertEqual(len(model.moe.experts), 2)
+        self.assertEqual(len(model.moe.experts), 4)
 
     def test_pruning_trigger(self):
         model = FinalTransformer(
@@ -236,11 +236,11 @@ class TestFinalTransformer(unittest.TestCase):
         
         # Check expert 1 (index 1) was removed. So counts should match [10, 50, 5, 10] (shifted) plus any updates from the forward pass.
         # Updates are small.
-        self.assertEqual(len(model.moe.experts), 4)
+        self.assertEqual(len(model.moe.experts), 6)
         
         # Verify Router size changed
         # Router head output size is num_experts + 1
-        self.assertEqual(model.moe.router.head.out_features, 4 + 1) # 4 experts + 1 output
+        self.assertEqual(model.moe.router.head.out_features, 6 + 1) # 4 experts + 1 output
 
     def test_usage_count_updates(self):
         steps_per_expert_add = 5

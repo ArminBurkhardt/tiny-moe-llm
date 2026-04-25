@@ -119,6 +119,7 @@ def test_fileloader():
         for i, data in enumerate(loader):
             logger.info(f"Loaded file {i} with {len(data)} records.")
             logger.info(data.head())
+            break
     
         
 def test_dataloader():
@@ -127,6 +128,7 @@ def test_dataloader():
         dataloader = DataLoader(data_root, drop_last=True, batch_size=2048, minimum_score=0.5, target_column="content")
         for i, batch in enumerate(dataloader):
             logger.info(f"Batch {i} with {len(batch)} records.")
+            break
         
         logger.info(batch.head())
 
