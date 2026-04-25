@@ -161,3 +161,64 @@ class Gemma3Encoder(nn.Module):
 # Gemma3-1b-it: https://huggingface.co/google/gemma-3-1b-it
 # Gemma3-270m-it https://huggingface.co/google/gemma-3-270m-it 
 # T5 Gemma 2 270m - 270m: https://huggingface.co/google/t5gemma-2-270m-270m 
+
+
+
+# purely documentation changes, no functional changes
+# FIXME: merge to one class
+class Gemma4Encoder(Gemma3Encoder):
+    """Wrapper that exposes Gemma 4 hidden states for encoder-style use.
+
+    Parameters
+    ----------
+    model_dir:
+        Local path to the Gemma 4 checkpoint directory.
+    target_layer:
+        1-based index of the transformer layer to read from. Defaults to the
+        final layer. Hidden states include the embedding output at index 0, so
+        target_layer=1 returns the output after the first block.
+    drop_last_n_layers:
+        Alternative to target_layer; return the hidden state n layers
+        before the end. Cannot be combined with target_layer.
+    torch_dtype:
+        Optional dtype override (defaults to bfloat16 as recommended by Gemma).
+    device_map:
+        Passed to AutoModel.from_pretrained to control device placement.
+    """
+    def __init__(
+        self, 
+        model_dir: str, 
+        target_layer: int | None = None, 
+        drop_last_n_layers: int = 0, 
+        torch_dtype: torch.dtype | None = torch.bfloat16, 
+        device_map: str | dict | None = None
+    ):
+        super().__init__(model_dir, target_layer, drop_last_n_layers, torch_dtype, device_map)
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        return_all_hidden_states: bool = False,
+    ) -> EncoderOutput:
+        """Extract hidden states from Gemma 4.
+
+        The method honors the current ``training`` flag so that calling
+        ``model.train()`` on the parent :class:`FinalTransformer` correctly
+        enables dropout and gradient computation for fine-tuning.
+
+        Args:
+            input_ids: Token indices of shape ``[batch, seq_len]``.
+            attention_mask: Optional boolean mask of shape ``[batch, seq_len]``.
+            position_ids: Optional position indices of shape ``[batch, seq_len]``.
+            return_all_hidden_states: When ``True``, include the full tuple of
+                per-layer hidden states in the returned :class:`EncoderOutput`.
+
+        Returns:
+            :class:`EncoderOutput` with ``last_hidden_state`` of shape
+            ``[batch, seq_len, hidden_size]``, and optionally ``hidden_states``.
+        """
+        return super().forward(input_ids, attention_mask, position_ids, return_all_hidden_states)
+
+
