@@ -365,11 +365,13 @@ def sft_step(
     Returns:
         Dict with scalar metrics: ``loss``.
     """
-    input_ids = batch["input_ids"].to(device)
+    # Shift sequences for next-token prediction
+    input_ids = batch["input_ids"][:, :-1].to(device)
+    labels = batch["labels"][:, 1:].to(device)
+    
     attention_mask = batch.get("attention_mask")
     if attention_mask is not None:
-        attention_mask = attention_mask.to(device)
-    labels = batch["labels"].to(device)
+        attention_mask = attention_mask[:, :-1].to(device)
 
     # SFT forward: encoder → MoE (routing only) → decoder
     logits = model.sft_forward(input_ids, attention_mask=attention_mask)
@@ -481,26 +483,59 @@ def main() -> None:
     )
 
     # ----- SFT training loop -----
-    global_step = 0
-    for epoch in range(args.num_epochs):
-        logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
-        for batch in dataset:
-            metrics = sft_step(model, batch, optimizer, args, vocab_size, device)
-            global_step += 1
+    start_step = 0
+    start_epoch = 0
 
-            if global_step % args.log_interval == 0:
-                logger.info(
-                    "epoch %d | step %6d | loss=%.4f",
-                    epoch + 1,
-                    global_step,
-                    metrics["loss"],
-                )
+    if args.checkpoint:
+        logger.info("Resuming from %s", args.checkpoint)
+        ckpt = torch.load(args.checkpoint, map_location="cpu")
+        if "step" in ckpt:
+            start_step = ckpt["step"]
+        if "epoch" in ckpt:
+            start_epoch = ckpt["epoch"]
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            logger.info(f"Loaded optimizer state. Resuming from step {start_step}, epoch {start_epoch}")
 
-            if global_step % args.save_interval == 0:
-                ckpt_path = os.path.join(
-                    args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}.pt"
-                )
-                save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+    global_step = start_step
+
+    try:
+        for epoch in range(start_epoch, args.num_epochs):
+            logger.info("Epoch %d/%d", epoch + 1, args.num_epochs)
+            data_iter = iter(dataset)
+
+            # Fast-forward dataset if resuming in the middle of an epoch:
+            # (Assuming step tracking needs to be accurate, we'd skip (start_step % items_per_epoch) batches,
+            # but simpler to fast_forward via a generic means)
+            steps_already_in_epoch = 0
+            if hasattr(dataset, "fast_forward") and epoch == start_epoch and start_step > 0:
+                logger.info(f"Fast-forwarding epoch {epoch + 1} by specific batches...")
+                dataset.fast_forward(steps_already_in_epoch)
+
+            for batch in data_iter:
+                metrics = sft_step(model, batch, optimizer, args, vocab_size, device)
+                global_step += 1
+
+                if global_step % args.log_interval == 0:
+                    logger.info(
+                        "epoch %d | step %6d | loss=%.4f",
+                        epoch + 1,
+                        global_step,
+                        metrics["loss"],
+                    )
+
+                if global_step % args.save_interval == 0:
+                    ckpt_path = os.path.join(
+                        args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}.pt"
+                    )
+                    save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+
+    except KeyboardInterrupt:
+        logger.info("Training paused by user (Ctrl+C). Saving checkpoint...")
+        ckpt_path = os.path.join(args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}_paused.pt")
+        save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+        logger.info("Checkpoint saved. You can resume later using --checkpoint %s", ckpt_path)
+        return
 
     # ----- Final checkpoint -----
     final_path = os.path.join(args.output_dir, "sft_final.pt")

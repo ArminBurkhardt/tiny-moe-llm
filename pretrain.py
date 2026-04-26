@@ -573,36 +573,57 @@ def main() -> None:
         start_step,
     )
     data_iter = iter(dataset)
+    
+    # Fast-forward dataset to resume point
+    if start_step > 0:
+        logger.info(f"Fast-forwarding dataset by {start_step} steps...")
+        if hasattr(dataset, "fast_forward"):
+            dataset.fast_forward(start_step)
+        else:
+            for _ in range(start_step):
+                try:
+                    next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataset)
+
     global_step = start_step
 
-    while global_step < args.num_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            # Restart the dataset iterator when data is exhausted
-            data_iter = iter(dataset)
-            batch = next(data_iter)
+    try:
+        while global_step < args.num_steps:
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                # Restart the dataset iterator when data is exhausted
+                data_iter = iter(dataset)
+                batch = next(data_iter)
 
-        metrics, new_optimizer = train_step(model, batch, optimizer, args, vocab_size, device)
-        # Replace the optimiser when pruning caused a rebuild
-        if new_optimizer is not None:
-            optimizer = new_optimizer
-        global_step += 1
+            metrics, new_optimizer = train_step(model, batch, optimizer, args, vocab_size, device)
+            # Replace the optimiser when pruning caused a rebuild
+            if new_optimizer is not None:
+                optimizer = new_optimizer
+            global_step += 1
 
-        if global_step % args.log_interval == 0:
-            logger.info(
-                "step %6d/%d | lm=%.4f | router=%.4f | total=%.4f | experts=%d",
-                global_step,
-                args.num_steps,
-                metrics["lm_loss"],
-                metrics["router_loss"],
-                metrics["total_loss"],
-                metrics["num_experts"],
-            )
+            if global_step % args.log_interval == 0:
+                logger.info(
+                    "step %6d/%d | lm=%.4f | router=%.4f | total=%.4f | experts=%d",
+                    global_step,
+                    args.num_steps,
+                    metrics["lm_loss"],
+                    metrics["router_loss"],
+                    metrics["total_loss"],
+                    metrics["num_experts"],
+                )
 
-        if global_step % args.save_interval == 0:
-            ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
-            save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+            if global_step % args.save_interval == 0:
+                ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
+                save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+
+    except KeyboardInterrupt:
+        logger.info("Training paused by user (Ctrl+C). Saving checkpoint...")
+        ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}_paused.pt")
+        save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+        logger.info("Checkpoint saved. You can resume later using --resume %s", ckpt_path)
+        return
 
     # ----- Final checkpoint -----
     final_path = os.path.join(args.output_dir, "final.pt")
