@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-"""pretrain.py — Pretraining script for tiny-moe-llm on UltraFineWeb.
-
+"""
 Training objective: next-token prediction (causal LM) via cross-entropy loss.
 
 Expert lifecycle during pretraining

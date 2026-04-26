@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
-"""posttrain.py — Supervised fine-tuning (SFT) script for tiny-moe-llm.
-
+"""
 Datasets
 --------
-* **KIMI-K2.5-550000x** – instruction-following conversations stored in a
-  ``messages`` column containing a list of ``{"role": …, "content": …}`` dicts.
-* **Reasoning datasets** (Claude-Opus-4.6, Claude-Sonnet-4.6) – reasoning
-  conversations with the same ``messages`` schema, optionally accompanied by a
-  ``metadata`` column (ignored during training).
 
-Any additional dataset directory can be registered at the bottom of the
+Additional dataset directory can be registered at the bottom of the
 ``SFT_SOURCES`` list (see *Expandability* section below), making it trivial to
-incorporate synthetic data generated with e.g. Gemma 4.
+incorporate synthetic data.
 
 Chat template
 -------------
