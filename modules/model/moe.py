@@ -143,11 +143,10 @@ class MixtureOfExperts(nn.Module):
                 
                 new_expert = copy.deepcopy(self.expert_template)
                 
-                # Flatten batch and sequence dimensions for solving if necessary
-                x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-                target_flat = target.reshape(-1, target.shape[-1]) if target is not None and target.ndim > 2 else target
+                # DO NOT flatten here if experts handle extra structure (like input_ids)
+                # Instead, let the expert flatten it right before linear.solve_from_batch
                 
-                new_expert.solve_from_batch(x_flat, target_flat, *args, **kwargs)
+                new_expert.solve_from_batch(x, target, *args, **kwargs)
                 
                 self.experts.append(new_expert)
                 self.usage_counts = torch.cat([self.usage_counts, torch.zeros(1, device=self.usage_counts.device)])

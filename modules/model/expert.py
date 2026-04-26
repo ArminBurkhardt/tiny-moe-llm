@@ -15,12 +15,12 @@ class ExpertModule(nn.Module, SolvableModule):
         self.activation = InvertibleActivation()
         self.completed = False
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         x = self.linear(x)
         x = self.activation(x)
         return x
 
-    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5, **kwargs):
         """
         Solves for the linear layer weights such that the expert output approximates y.
         y = activation(linear(x)) => linear(x) = activation_inv(y)
@@ -30,7 +30,7 @@ class ExpertModule(nn.Module, SolvableModule):
             y_pre_act = self.activation.inverse(y)
         
         # Solve the linear layer
-        self.linear.solve_from_batch(x, y_pre_act, l2=l2)
+        self.linear.auto_solve(x, y_pre_act, l2=l2)
         self.completed = True
         
     def consolidate(self, force: bool = False, disable_grad: bool = True, dtype=torch.float32):
@@ -85,13 +85,13 @@ class ExpertModuleWithSkip(ExpertModule):
         # Dropout regularises the expert's contribution before it is added back
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         x_norm = self.norm(x)
         x_linear = self.linear(x_norm)
         x_activated = self.activation(x_linear)
         return x + self.dropout(x_activated)  # Skip connection adds input to regularised output
 
-    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5):
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, l2: float = 1e-5, **kwargs):
         """Solves for the linear layer weights such that the expert output approximates y.
 
         Accounts for the pre-norm layer:
@@ -103,7 +103,7 @@ class ExpertModuleWithSkip(ExpertModule):
             x_norm = self.norm(x)
             y_pre_act = self.activation.inverse(y - x)
 
-        self.linear.solve_from_batch(x_norm, y_pre_act, l2=l2)
+        self.linear.auto_solve(x_norm, y_pre_act, l2=l2)
         self.completed = True
 
 
@@ -112,7 +112,7 @@ class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip):
         super().__init__(input_size, output_size, dropout)
         self.embedding = PerLayerEmbedding(num_embeddings=num_embeddings, embedding_dim=input_size)
         
-    def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_ids: torch.Tensor = None, **kwargs) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape ``[Batch, Seq, InputSize]``.
@@ -124,7 +124,7 @@ class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip):
         x_activated = self.activation(x_linear)
         return x + self.dropout(x_activated)
 
-    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, input_ids: torch.Tensor, l2: float = 1e-5):
+    def solve_from_batch(self, x: torch.Tensor, y: torch.Tensor, input_ids: torch.Tensor, l2: float = 1e-5, **kwargs):
         """Solves for the linear layer weights such that the expert output approximates y.
 
         Accounts for the pre-norm layer:
@@ -137,7 +137,7 @@ class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip):
             x_norm = self.norm(x + embed)
             y_pre_act = self.activation.inverse(y - x)
 
-        self.linear.solve_from_batch(x_norm, y_pre_act, l2=l2)
+        self.linear.auto_solve(x_norm, y_pre_act, l2=l2)
         self.completed = True
 
 

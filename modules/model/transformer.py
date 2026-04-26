@@ -275,7 +275,7 @@ class FinalTransformer(nn.Module):
 
         while loop_count < self.max_recurrence:
             skew = float(loop_count) * self.skew_factor
-            output, probs = self.moe(curr_z, output_skew=skew)
+            output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
 
             curr_z = output
             loop_count += 1
