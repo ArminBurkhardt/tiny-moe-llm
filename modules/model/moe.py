@@ -91,6 +91,31 @@ class MixtureOfExperts(nn.Module):
             self.router.head = new_head
             self.router.num_experts -= 1
 
+    def get_usage_stats(self) -> dict:
+        """Returns statistics about expert usage to be logged."""
+        stats = {}
+        if len(self.usage_counts) == 0:
+            return stats
+            
+        total_usage = self.usage_counts.sum().item()
+        if total_usage == 0:
+            total_usage = 1e-9 # avoid division by zero
+
+        percentages = (self.usage_counts / total_usage) * 100.0
+
+        if self.num_special_experts > 0:
+            special_usages = percentages[:self.num_special_experts]
+            stats["special_expert_usage_avg"] = special_usages.mean().item()
+            stats["special_expert_usage_max"] = special_usages.max().item()
+
+        normal_counts = percentages[self.num_special_experts:]
+        if len(normal_counts) > 0:
+            stats["normal_expert_usage_min"] = normal_counts.min().item()
+            stats["normal_expert_usage_max"] = normal_counts.max().item()
+            stats["normal_expert_usage_avg"] = normal_counts.mean().item()
+            
+        return stats
+
     def forward(self, x: torch.Tensor, target: torch.Tensor = None, output_skew: float = 0.0, *args, **kwargs):
         # args and kwargs are passed to the experts
         cycle_len = self.steps_per_expert + 2

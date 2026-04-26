@@ -95,9 +95,10 @@ class Dataset(IterableDataset):
 
         # If texts are given eagerly build the vectorized dataset so __iter__ works immediately.
         if texts is not None:
+            self.current_dataset_name = "in_memory"
             self._load_vectorized_dataset(texts)
 
-    def _shard_iterator(self) -> Iterator[list[str]]:
+    def _shard_iterator(self) -> Iterator[tuple[list[str], str]]:
         import os
         for root_dir, text_column in self.sources:
             if not os.path.exists(root_dir):
@@ -111,7 +112,7 @@ class Dataset(IterableDataset):
                 
                 texts = df[text_column].dropna().astype(str).tolist()
                 if len(texts) > 0:
-                    yield texts
+                    yield texts, root_dir
 
     def __iter__(self) -> Iterator[dict]:
         return self._batch_iterator()
@@ -123,7 +124,7 @@ class Dataset(IterableDataset):
                 if not self._advance_to_next_file():
                     break  # Exhausted all data
 
-            batch = self.current_vector_ds.get_similar_batch(
+            batch, batch_similarity = self.current_vector_ds.get_similar_batch(
                 batch_size=self.batch_size,
                 delta=self.similarity_delta,
                 text_only=not self.return_embeddings,
@@ -153,6 +154,8 @@ class Dataset(IterableDataset):
                 "input_ids": tokenized["input_ids"],
                 "attention_mask": tokenized.get("attention_mask"),
                 "labels": labels,
+                "similarity": batch_similarity,
+                "dataset_name": getattr(self, "current_dataset_name", "unknown")
             }
 
             if self.return_embeddings and embeddings is not None:
@@ -167,9 +170,10 @@ class Dataset(IterableDataset):
         # If we were instantiated with in-memory texts, do not advance further.
         if self.texts_mode:
             return False
-
+            
         try:
-            texts = next(self.source_iter)
+            texts, dataset_name = next(self.source_iter)
+            self.current_dataset_name = dataset_name
             self._load_vectorized_dataset(texts)
             return True
         except StopIteration:

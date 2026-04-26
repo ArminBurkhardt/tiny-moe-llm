@@ -51,6 +51,7 @@ from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase
 from modules.data.chat_template import Chat
 from modules.data.dataloader import FileLoader
 from modules.model.transformer import FinalTransformer
+from modules.util.metrics_logger import MetricsLogger, check_pause_flag, clear_pause_flag
 from utils import DIR, logger
 
 
@@ -383,7 +384,11 @@ def sft_step(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
     optimizer.step()
 
-    return {"loss": loss.item()}
+    metrics = {"loss": loss.item()}
+    if hasattr(model.moe, "get_usage_stats"):
+        metrics["expert_stats"] = model.moe.get_usage_stats()
+        
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +497,9 @@ def main() -> None:
             logger.info(f"Loaded optimizer state. Resuming from step {start_step}, epoch {start_epoch}")
 
     global_step = start_step
+    
+    metrics_logger = MetricsLogger(os.path.join(args.output_dir, "sft_metrics.jsonl"))
+    control_file_path = os.path.join(args.output_dir, "control.json")
 
     try:
         for epoch in range(start_epoch, args.num_epochs):
@@ -507,6 +515,14 @@ def main() -> None:
                 dataset.fast_forward(steps_already_in_epoch)
 
             for batch in data_iter:
+                if check_pause_flag(control_file_path):
+                    logger.info("Pause signal received. Saving checkpoint and exiting...")
+                    ckpt_path = os.path.join(args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}_paused.pt")
+                    save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+                    clear_pause_flag(control_file_path)
+                    logger.info("Paused. You can resume later using --checkpoint %s", ckpt_path)
+                    return
+                
                 metrics = sft_step(model, batch, optimizer, args, vocab_size, device)
                 global_step += 1
 
@@ -517,6 +533,12 @@ def main() -> None:
                         global_step,
                         metrics["loss"],
                     )
+                    
+                    # Prepare and save metrics
+                    metrics["step"] = global_step
+                    metrics["epoch"] = epoch + 1
+                    metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
+                    metrics_logger.log(metrics)
 
                 if global_step % args.save_interval == 0:
                     ckpt_path = os.path.join(

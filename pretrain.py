@@ -57,6 +57,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from modules.data.dataset import Dataset
 from modules.model.transformer import FinalTransformer
+from modules.util.metrics_logger import MetricsLogger, wait_if_paused
 from training_config import EXPERT_TEMPLATES, PretrainConfig
 from utils import DIR, logger
 
@@ -419,13 +420,21 @@ def train_step(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
     optimizer.step()
 
+    metrics = {
+        "lm_loss": lm_loss.item(),
+        "router_loss": router_loss_value.item(),
+        "total_loss": total_loss.item(),
+        "num_experts": len(model.moe.experts),
+    }
+
+    if hasattr(model.moe, "get_usage_stats"):
+        metrics["expert_stats"] = model.moe.get_usage_stats()
+        
+    metrics["similarity"] = batch.get("similarity", 0.0)
+    metrics["dataset_name"] = batch.get("dataset_name", "unknown")
+
     return (
-        {
-            "lm_loss": lm_loss.item(),
-            "router_loss": router_loss_value.item(),
-            "total_loss": total_loss.item(),
-            "num_experts": len(model.moe.experts),
-        },
+        metrics,
         new_optimizer,
     )
 
@@ -570,6 +579,10 @@ def main() -> None:
         args.num_steps,
         start_step,
     )
+    
+    metrics_logger = MetricsLogger(os.path.join(args.output_dir, "pretrain_metrics.jsonl"))
+    control_file_path = os.path.join(args.output_dir, "control.json")
+    
     data_iter = iter(dataset)
     
     # Fast-forward dataset to resume point
@@ -588,6 +601,15 @@ def main() -> None:
 
     try:
         while global_step < args.num_steps:
+            from modules.util.metrics_logger import check_pause_flag, clear_pause_flag
+            if check_pause_flag(control_file_path):
+                logger.info("Pause signal received. Saving checkpoint and exiting...")
+                ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}_paused.pt")
+                save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+                clear_pause_flag(control_file_path)
+                logger.info("Paused. You can resume later using --resume %s", ckpt_path)
+                return
+                
             try:
                 batch = next(data_iter)
             except StopIteration:
@@ -603,14 +625,21 @@ def main() -> None:
 
             if global_step % args.log_interval == 0:
                 logger.info(
-                    "step %6d/%d | lm=%.4f | router=%.4f | total=%.4f | experts=%d",
+                    "step %6d/%d | dataset=%s | sim=%.2f | lm=%.4f | router=%.4f | total=%.4f | experts=%d",
                     global_step,
                     args.num_steps,
+                    metrics.get("dataset_name", "unknown"),
+                    metrics.get("similarity", 0.0),
                     metrics["lm_loss"],
                     metrics["router_loss"],
                     metrics["total_loss"],
                     metrics["num_experts"],
                 )
+                
+                # Prepare and save metrics
+                metrics["step"] = global_step
+                metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
+                metrics_logger.log(metrics)
 
             if global_step % args.save_interval == 0:
                 ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")

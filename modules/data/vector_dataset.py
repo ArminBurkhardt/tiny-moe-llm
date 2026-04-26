@@ -86,7 +86,7 @@ class GemmaVectorDataset:
             "embedding": self.embeddings[idx]
         }
 
-    def get_similar_batch(self, batch_size: int, delta: float, text_only: bool = False) -> list[dict | str]:
+    def get_similar_batch(self, batch_size: int, delta: float, text_only: bool = False) -> tuple[list[dict | str], float]:
         """ Get a batch of items where all items are similar to each other above a certain cosine similarity threshold.
         
         Args:
@@ -98,7 +98,7 @@ class GemmaVectorDataset:
             ValueError: If embeddings are not computed.
 
         Returns:
-            List[Dict[str, Any]]: A list of items from the dataset that are similar to each other.
+            Tuple[List[Dict[str, Any] | str], float]: A tuple containing the batch of items and the mean pairwise cosine similarity of the batch.
         """
         
         if self.embeddings is None:
@@ -129,11 +129,19 @@ class GemmaVectorDataset:
             # Sample batch_size from similar indices
             perm = torch.randperm(len(similar_indices))
             batch_indices = similar_indices[perm[:batch_size]]
+            
+        if len(batch_indices) > 0:
+            batch_embeddings = self.embeddings[batch_indices]
+            sim_matrix = torch.matmul(batch_embeddings, batch_embeddings.T)
+            mean_similarity = sim_matrix.mean().item()
+        else:
+            mean_similarity = 0.0
+            
         # Return the batch as list of dicts or texts
         if text_only:
-            return [self.texts[i.item()] for i in batch_indices]
+            return [self.texts[i.item()] for i in batch_indices], mean_similarity
         else:
-            return [self[i.item()] for i in batch_indices]
+            return [self[i.item()] for i in batch_indices], mean_similarity
 
 
 
@@ -233,7 +241,7 @@ class LFM2ColBERTVectorDataset:
     def __len__(self):
         return len(self.texts)
 
-    def get_similar_batch(self, batch_size: int, text_only: bool = False, delta: float = 0.5, return_embeddings: bool = False) -> list[dict | str]:
+    def get_similar_batch(self, batch_size: int, text_only: bool = False, delta: float = 0.5, return_embeddings: bool = False) -> tuple[list[dict | str], float]:
         """ Get a batch of items where all items are similar to each other above a certain cosine similarity threshold.
         
         Args:
@@ -246,7 +254,7 @@ class LFM2ColBERTVectorDataset:
             ValueError: If embeddings are not computed.
 
         Returns:
-            List[Dict[str, Any]]: A list of items from the dataset that are similar to each other.
+            Tuple[List[Dict[str, Any] | str], float]: A batch and the mean pairwise similarity.
         """
         # TODO: solve conflict with delta (similarity threshold) and batch_size (number of items to return). Currently, delta is ignored.
         # FIXME: remove all usages of delta, thus making mandatory to ignore delta
@@ -293,18 +301,20 @@ class LFM2ColBERTVectorDataset:
             batch_items.append((str(doc_id), self.texts.pop(str(doc_id))))
             
         if text_only:
-            return [text for _, text in batch_items]
+            batch_result = [text for _, text in batch_items]
         else:
             if return_embeddings:
                 embeddings = self.model.encode_documents([text for _, text in batch_items], batch_size=batch_size, padding=True)
-                return [{"id": doc_id, 
+                batch_result = [{"id": doc_id, 
                         "text": text, 
                         "embedding": embedding} 
                         for (doc_id, text), embedding in zip(batch_items, embeddings)]
             else:
-                return [{"id": doc_id, 
+                batch_result = [{"id": doc_id, 
                         "text": text} 
                         for doc_id, text in batch_items]
+        
+        return batch_result, 0.0
 
 
 VectorDataset = GemmaVectorDataset
