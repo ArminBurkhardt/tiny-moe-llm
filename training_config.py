@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 EXPERT_TEMPLATES: dict[str, str] = {
     "ExpertModule": "modules.model.expert.ExpertModule",
     "ExpertModuleWithSkip": "modules.model.expert.ExpertModuleWithSkip",
+    "ExpertModuleWithSkipAndEmbedding": "modules.model.expert.ExpertModuleWithSkipAndEmbedding",
 }
 
 
@@ -66,14 +67,14 @@ class PretrainConfig:
     """
 
     # ---- Expert architecture ----
-    expert_template: str = "ExpertModule"
+    expert_template: str = "ExpertModuleWithSkipAndEmbedding"
 
     # ---- Model architecture ----
-    num_initial_experts: int = 2
+    num_initial_experts: int = 8
     steps_per_expert: int = 100
     prune_step_interval: int = 500
     max_recurrence: int = 10
-    max_experts: int = 16
+    max_experts: int = 64
 
     # ---- Optimizer ----
     lr: float = 1e-4
@@ -83,8 +84,8 @@ class PretrainConfig:
     grad_clip: float = 1.0
 
     # ---- Training loop ----
-    batch_size: int = 4
-    max_length: int = 512
+    batch_size: int = 2
+    max_length: int = 4096
     num_steps: int = 10_000
     log_interval: int = 10
     save_interval: int = 1_000

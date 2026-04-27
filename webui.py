@@ -105,3 +105,6 @@ if not ex_df.empty and len(ex_df.columns) > 0:
     st.line_chart(ex_df)
 else:
     st.info("No expert usage stats available yet.")
+
+
+# streamlit run webui.py

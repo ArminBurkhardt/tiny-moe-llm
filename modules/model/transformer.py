@@ -16,19 +16,17 @@ class FinalTransformer(nn.Module):
         num_initial_experts: int = 4,
         num_attention_experts: int = 1,
         ir_num_entries: int = 256,
-        steps_per_expert_add: int = 2, # "First two expert calls..." implying 2 normal calls
+        steps_per_expert_add: int = 2,
         prune_step_interval: int = 1000,
         max_recurrence: int = 10,
         expert_template: nn.Module = None,
         dropout: float = 0.1,
+        gemma3_target_layer: int = 9,
     ):
         super().__init__()
         
         # Encoder: Gemma 3 1B
-        # "up the layer determined to be the best for latent encodings"
-        # Since we don't know the exact layer, we'll default to a mid-layer or expose it.
-        # Assuming layer 12 is "best" for example, or letting user specify.
-        self.encoder = Gemma3Encoder(model_dir=model_dir, target_layer=12, torch_dtype=torch.float32)
+        self.encoder = Gemma3Encoder(model_dir=model_dir, target_layer=gemma3_target_layer, torch_dtype=torch.float32)
         # TODO: use Gemma4Encoder with correct downloaded model
         #       NOTE: Gemma4 already uses RoPE and GQA, so no further changes needed.
         

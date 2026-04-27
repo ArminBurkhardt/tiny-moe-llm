@@ -211,7 +211,11 @@ def build_model(args: argparse.Namespace, vocab_size: int, latent_dim: int) -> F
     fqn = EXPERT_TEMPLATES[args.expert_template]
     module_name, class_name = fqn.rsplit(".", 1)
     expert_cls = getattr(importlib.import_module(module_name), class_name)
-    expert_template = expert_cls(latent_dim, latent_dim)
+    try:
+        expert_template = expert_cls(latent_dim, latent_dim)
+    except Exception as e:
+        logger.error("Failed to instantiate expert template: %s", e)
+        expert_template = expert_cls(latent_dim, latent_dim, num_embeddings=vocab_size)
 
     model = FinalTransformer(
         model_dir=args.model_dir,
@@ -565,7 +569,7 @@ def main() -> None:
     dataset = Dataset(
         sources=pretrain_sources,
         batch_size=args.batch_size,
-        similarity_delta=0.7,
+        similarity_delta=0.5,
         max_loaded_embeddings=100_000,
         device=device if torch.cuda.is_available() else None,
         tokenizer=tokenizer,
@@ -578,6 +582,12 @@ def main() -> None:
         "Starting pretraining: %d steps (resuming from step %d).",
         args.num_steps,
         start_step,
+    )
+    
+    logger.info(
+        "Total parameters: %d | Trainable parameters: %d",
+        sum(p.numel() for p in model.parameters()),
+        sum(p.numel() for p in model.parameters() if p.requires_grad),
     )
     
     metrics_logger = MetricsLogger(os.path.join(args.output_dir, "pretrain_metrics.jsonl"))
