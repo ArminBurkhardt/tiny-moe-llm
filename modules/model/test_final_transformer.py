@@ -34,13 +34,13 @@ class _DummyExpert(torch.nn.Module):
 
 class TestFinalTransformer(unittest.TestCase):
     def setUp(self):
-        self.latent_dim = 32 #16
+        self.hidden_size = 32 #16
         self.output_dim = 32
         self.model_dir = "dummy/path"
 
         # A lightweight expert that avoids range constraints of ExpertModuleWithSkip's
         # closed-form solve, used for transformer structure tests.
-        self.dummy_expert = _DummyExpert(self.latent_dim, self.latent_dim)
+        self.dummy_expert = _DummyExpert(self.hidden_size, self.hidden_size)
         
         # Patch the actual classes used in FinalTransformer if they are heavy
         # Specifically Gemma3Encoder which loads a model from disk
@@ -57,7 +57,7 @@ class TestFinalTransformer(unittest.TestCase):
         # When encoder(input_ids) is called, it returns a mock object with last_hidden_state
         self.mock_encoder_output = MagicMock()
         # last_hidden_state shape: [Batch, Seq, Hidden]
-        self.mock_encoder_output.last_hidden_state = torch.randn(2, 5, self.latent_dim)
+        self.mock_encoder_output.last_hidden_state = torch.randn(2, 5, self.hidden_size)
         self.mock_encoder.return_value = self.mock_encoder_output
         self.mock_encoder.parameters.return_value = [torch.tensor(1.0, requires_grad=True)]
 
@@ -67,7 +67,7 @@ class TestFinalTransformer(unittest.TestCase):
         # decoder(hidden, context) -> output
         self.mock_decoder.side_effect = lambda x, c: torch.randn(x.size(0), x.size(1), self.output_dim)
         # decoder.inverse(output, context) -> hidden
-        self.mock_decoder.inverse.side_effect = lambda y, c: torch.randn(y.size(0), y.size(1), self.latent_dim)
+        self.mock_decoder.inverse.side_effect = lambda y, c: torch.randn(y.size(0), y.size(1), self.hidden_size)
 
 
     def tearDown(self):
@@ -77,7 +77,7 @@ class TestFinalTransformer(unittest.TestCase):
     def test_initialization(self):
         model = FinalTransformer(
             model_dir=self.model_dir,
-            latent_dim=self.latent_dim,
+            hidden_size=self.hidden_size,
             vocab_size=self.output_dim,
             num_initial_experts=2
         )
@@ -102,7 +102,7 @@ class TestFinalTransformer(unittest.TestCase):
         steps_per_expert_add = 2
         model = FinalTransformer(
             model_dir=self.model_dir,
-            latent_dim=self.latent_dim,
+            hidden_size=self.hidden_size,
             vocab_size=self.output_dim,
             num_initial_experts=2,
             steps_per_expert_add=steps_per_expert_add,
@@ -116,7 +116,7 @@ class TestFinalTransformer(unittest.TestCase):
         target_vectors = torch.randn(batch_size, seq_len, self.output_dim)
         
         # Reset mock encoder output for consistent shape
-        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.latent_dim)
+        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.hidden_size)
         
         # Verify initial state
         initial_experts_count = len(model.moe.experts) # 2
@@ -146,7 +146,7 @@ class TestFinalTransformer(unittest.TestCase):
         steps_per_expert_add = 2
         model = FinalTransformer(
             model_dir=self.model_dir,
-            latent_dim=self.latent_dim,
+            hidden_size=self.hidden_size,
             vocab_size=self.output_dim,
             num_initial_experts=2,
             steps_per_expert_add=steps_per_expert_add,
@@ -167,7 +167,7 @@ class TestFinalTransformer(unittest.TestCase):
         seq_len = 5
         input_ids = torch.randint(0, 100, (batch_size, seq_len))
         target_vectors = torch.randn(batch_size, seq_len, self.output_dim)
-        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.latent_dim)
+        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.hidden_size)
         
         output, loss = model(input_ids, target_vectors)
         
@@ -180,7 +180,7 @@ class TestFinalTransformer(unittest.TestCase):
         max_recurrence = 5
         model = FinalTransformer(
             model_dir=self.model_dir,
-            latent_dim=self.latent_dim,
+            hidden_size=self.hidden_size,
             vocab_size=self.output_dim,
             num_initial_experts=2,
             max_recurrence=max_recurrence,
@@ -191,7 +191,7 @@ class TestFinalTransformer(unittest.TestCase):
         batch_size = 2
         seq_len = 5
         input_ids = torch.randint(0, 100, (batch_size, seq_len))
-        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.latent_dim)
+        self.mock_encoder_output.last_hidden_state = torch.randn(batch_size, seq_len, self.hidden_size)
         
         output = model(input_ids)
         self.assertEqual(output.shape, (batch_size, seq_len, self.output_dim))
@@ -203,7 +203,7 @@ class TestFinalTransformer(unittest.TestCase):
     def test_pruning_trigger(self):
         model = FinalTransformer(
             model_dir=self.model_dir,
-            latent_dim=self.latent_dim,
+            hidden_size=self.hidden_size,
             vocab_size=self.output_dim,
             num_initial_experts=5,
             prune_step_interval=1, # Prune every step
@@ -217,7 +217,7 @@ class TestFinalTransformer(unittest.TestCase):
         
         input_ids = torch.randint(0, 100, (2, 5))
         target_vectors = torch.randn(2, 5, self.output_dim)
-        self.mock_encoder_output.last_hidden_state = torch.randn(2, 5, self.latent_dim)
+        self.mock_encoder_output.last_hidden_state = torch.randn(2, 5, self.hidden_size)
         
         # Mock usage counts: Expert 1 is least used
         model.moe.usage_counts = torch.tensor([10.0, 1.0, 50.0, 5.0, 10.0])
@@ -246,7 +246,7 @@ class TestFinalTransformer(unittest.TestCase):
         steps_per_expert_add = 5
         model = FinalTransformer(
             model_dir=self.model_dir,
-            latent_dim=self.latent_dim,
+            hidden_size=self.hidden_size,
             vocab_size=self.output_dim,
             num_initial_experts=2,
             steps_per_expert_add=steps_per_expert_add,
@@ -256,7 +256,7 @@ class TestFinalTransformer(unittest.TestCase):
         
         input_ids = torch.randint(0, 100, (1, 5))
         target_vectors = torch.randn(1, 5, self.output_dim)
-        self.mock_encoder_output.last_hidden_state = torch.randn(1, 5, self.latent_dim)
+        self.mock_encoder_output.last_hidden_state = torch.randn(1, 5, self.hidden_size)
         
         initial_usage = model.moe.usage_counts.clone() # Should be zeros
         

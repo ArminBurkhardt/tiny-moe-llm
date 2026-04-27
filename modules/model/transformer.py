@@ -9,8 +9,8 @@ from utils import FP64
 class FinalTransformer(nn.Module):
     def __init__(
         self, 
-        hidden_size: int,
-        vocab_size: int,
+        hidden_size: int = 1408,
+        vocab_size: int = 262144,
         intermediate_size: int = 704,
         num_gemma_layers: int = 8,
         num_initial_experts: int = 4,
@@ -25,30 +25,33 @@ class FinalTransformer(nn.Module):
     ):
         super().__init__()
         
-        self.encoder = Gemma4Model(
-            config = {
-                "vocab_size": vocab_size,
-                "hidden_size": hidden_size,
-                "intermediate_size": intermediate_size,
-                "num_hidden_layers": num_gemma_layers,
-                "num_attention_heads": 16,
-                "num_key_value_heads": 8,
-                "head_dim": 256,
-                "max_position_embeddings": 32000,
-                "sliding_window": 512,
-                "num_experts": 32,
-                "num_active_experts": 4,
-                "num_shared_experts": 1
-            }
-        ).train()
+        if args or kwargs:
+            print(f"Warning: Unused arguments passed to FinalTransformer: {args} {kwargs}")
+        
+        config = {
+            "vocab_size": vocab_size,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "num_hidden_layers": num_gemma_layers,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 256,
+            "max_position_embeddings": 32000,
+            "sliding_window": 512,
+            "num_experts": 32,
+            "num_active_experts": 4,
+            "num_shared_experts": 1
+        }
+        
+        self.encoder = Gemma4Model(config).train()
         
         self.expert_embedding = nn.Embedding(vocab_size, hidden_size)
         self.expert_attn = Gemma4Attention(
-            hidden_size=hidden_size,
-            num_attention_heads=16,
-            num_key_value_heads=8,
-            head_dim=256,
-            dropout=dropout
+            hidden_size=config["hidden_size"],
+            num_heads=config["num_attention_heads"],
+            num_kv_heads=config["num_key_value_heads"],
+            head_dim=config["head_dim"],
+            sliding_window=config["sliding_window"],
         )
 
         self.encoder_norm = nn.LayerNorm(hidden_size)

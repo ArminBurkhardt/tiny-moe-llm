@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict, dataclass
+import importlib
 
 
 # ---------------------------------------------------------------------------
@@ -67,14 +68,18 @@ class PretrainConfig:
     """
 
     # ---- Expert architecture ----
-    expert_template: str = "ExpertModuleWithSkipAndEmbedding"
+    expert_template: str = "ExpertModuleWithSkip"
 
     # ---- Model architecture ----
-    num_initial_experts: int = 8
+    hidden_size: int = 704 # 1408
+    num_initial_experts: int = 16
     steps_per_expert: int = 100
     prune_step_interval: int = 500
     max_recurrence: int = 10
-    max_experts: int = 64
+    max_experts: int = 256
+    intermediate_size: int = 352 # 704
+    num_gemma_layers: int = 8
+    ir_num_entries: int = 65536 # 16384
 
     # ---- Optimizer ----
     lr: float = 1e-4
@@ -84,7 +89,7 @@ class PretrainConfig:
     grad_clip: float = 1.0
 
     # ---- Training loop ----
-    batch_size: int = 2
+    batch_size: int = 8
     max_length: int = 4096
     num_steps: int = 10_000
     log_interval: int = 10
@@ -97,3 +102,26 @@ class PretrainConfig:
     def copy(self) -> "PretrainConfig":
         """Return a shallow copy of this config."""
         return copy.copy(self)
+
+
+if __name__ == "__main__":
+    # build model and print param count distribution
+    from modules.model.transformer import FinalTransformer
+    config = PretrainConfig()
+    config_dict = config.as_dict()
+    expert_name = EXPERT_TEMPLATES[config.expert_template]
+    module_name, class_name = expert_name.rsplit(".", 1)
+    expert_cls = getattr(importlib.import_module(module_name), class_name)
+    config_dict["expert_template"] = expert_cls(config_dict["hidden_size"], config_dict["hidden_size"])
+    
+    config_dict["hidden_size"] = 704 # 960
+    config_dict["intermediate_size"] = 352 # 480
+    
+    model = FinalTransformer(**config_dict)
+    for name, param in model.named_parameters():
+        print(f"{name}: {param.numel():,} params")
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params:,}")
+    
+    

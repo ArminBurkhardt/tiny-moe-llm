@@ -89,9 +89,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory where checkpoints are written.",
     )
     parser.add_argument(
-        "--latent_dim",
+        "--hidden_size",
         type=int,
-        default=None,
+        default=_cfg.hidden_size,
         help=(
             "Latent space dimension.  Defaults to the encoder's hidden_size when "
             "not specified."
@@ -111,6 +111,24 @@ def parse_args() -> argparse.Namespace:
             "Maximum number of live experts.  When this limit is reached the "
             "least-used expert is pruned before a new one is added."
         ),
+    )
+    parser.add_argument(
+        "--intermediate_size",
+        type=int,
+        default=_cfg.intermediate_size,
+        help="Dimension of the intermediate (feedforward) layer in the transformer blocks.",
+    )
+    parser.add_argument(
+        "--num_gemma_layers",
+        type=int,
+        default=_cfg.num_gemma_layers,
+        help="Number of transformer layers in the underlying Gemma model.",
+    )
+    parser.add_argument(
+        "--ir_num_entries",
+        type=int,
+        default=_cfg.ir_num_entries,
+        help="Number of entries in the routing index.",
     )
     parser.add_argument(
         "--num_initial_experts",
@@ -190,7 +208,7 @@ def parse_args() -> argparse.Namespace:
 # Model construction
 # ---------------------------------------------------------------------------
 
-def build_model(args: argparse.Namespace, vocab_size: int, latent_dim: int) -> FinalTransformer:
+def build_model(args: argparse.Namespace, vocab_size: int, hidden_size: int) -> FinalTransformer:
     """Construct a :class:`FinalTransformer` for pretraining.
 
     The expert template class is resolved via the :data:`~training_config.EXPERT_TEMPLATES`
@@ -202,7 +220,7 @@ def build_model(args: argparse.Namespace, vocab_size: int, latent_dim: int) -> F
         args: Parsed command-line arguments (expert_template and model-architecture
             flags are read here).
         vocab_size: Vocabulary size (from the tokeniser).
-        latent_dim: Latent space dimension (typically the encoder hidden size).
+        hidden_size: Latent space dimension (typically the encoder hidden size).
 
     Returns:
         An untrained :class:`FinalTransformer` in training mode.
@@ -212,14 +230,14 @@ def build_model(args: argparse.Namespace, vocab_size: int, latent_dim: int) -> F
     module_name, class_name = fqn.rsplit(".", 1)
     expert_cls = getattr(importlib.import_module(module_name), class_name)
     try:
-        expert_template = expert_cls(latent_dim, latent_dim)
+        expert_template = expert_cls(hidden_size, hidden_size)
     except Exception as e:
         logger.error("Failed to instantiate expert template: %s", e)
-        expert_template = expert_cls(latent_dim, latent_dim, num_embeddings=vocab_size)
+        expert_template = expert_cls(hidden_size, hidden_size, num_embeddings=vocab_size)
 
     model = FinalTransformer(
         model_dir=args.model_dir,
-        latent_dim=latent_dim,
+        hidden_size=hidden_size,
         vocab_size=vocab_size,
         num_initial_experts=args.num_initial_experts,
         steps_per_expert_add=args.steps_per_expert,
@@ -526,18 +544,12 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     vocab_size = len(tokenizer)
     logger.info("Vocabulary size: %d", vocab_size)
-
-    # ----- Latent dimension -----
-    if args.latent_dim is None:
-        encoder_config = AutoConfig.from_pretrained(args.model_dir)
-        latent_dim = encoder_config.hidden_size
-        logger.info("Inferred latent_dim=%d from encoder config.", latent_dim)
-    else:
-        latent_dim = args.latent_dim
+    
+    hidden_size = args.hidden_size
 
     # ----- Model -----
-    logger.info("Building FinalTransformer (latent_dim=%d, vocab_size=%d)…", latent_dim, vocab_size)
-    model = build_model(args, vocab_size, latent_dim)
+    logger.info("Building FinalTransformer (hidden_size=%d, vocab_size=%d)…", hidden_size, vocab_size)
+    model = build_model(args, vocab_size, hidden_size)
 
     # Resume from checkpoint before moving to device to keep memory predictable
     start_step = 0
@@ -551,8 +563,6 @@ def main() -> None:
 
     model.to(device)
     model.train()
-    # Put the underlying Gemma model in train mode so dropout is active
-    model.encoder.model.train()
 
     # ----- Optimiser -----
     optimizer = build_optimizer(model, args)
@@ -655,7 +665,8 @@ def main() -> None:
                 ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
                 save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as e:
+        raise e
         logger.info("Training paused by user (Ctrl+C). Saving checkpoint...")
         ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}_paused.pt")
         save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)

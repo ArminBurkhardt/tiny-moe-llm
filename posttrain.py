@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory where SFT checkpoints are saved.",
     )
     parser.add_argument(
-        "--latent_dim",
+        "--hidden_size",
         type=int,
         default=None,
         help="Latent dimension.  Inferred from the encoder config when not given.",
@@ -284,7 +284,7 @@ class SFTDataset(IterableDataset):
 # ---------------------------------------------------------------------------
 
 def build_model(
-    args: argparse.Namespace, vocab_size: int, latent_dim: int
+    args: argparse.Namespace, vocab_size: int, hidden_size: int
 ) -> FinalTransformer:
     """Build a :class:`FinalTransformer` for SFT.
 
@@ -295,17 +295,17 @@ def build_model(
     Args:
         args: Parsed command-line arguments.
         vocab_size: Vocabulary size from the tokeniser.
-        latent_dim: Latent space dimension.
+        hidden_size: Latent space dimension.
 
     Returns:
         :class:`FinalTransformer` ready for SFT.
     """
     from modules.model.expert import ExpertModule
 
-    expert_template = ExpertModule(latent_dim, latent_dim)
+    expert_template = ExpertModule(hidden_size, hidden_size)
     model = FinalTransformer(
         model_dir=args.model_dir,
-        latent_dim=latent_dim,
+        hidden_size=hidden_size,
         vocab_size=vocab_size,
         num_initial_experts=2,
         # Large value so the MoE cycle never triggers expert-addition during SFT
@@ -446,16 +446,16 @@ def main() -> None:
     logger.info("Vocabulary size: %d", vocab_size)
 
     # ----- Latent dimension -----
-    if args.latent_dim is None:
+    if args.hidden_size is None:
         config = AutoConfig.from_pretrained(args.model_dir)
-        latent_dim = config.hidden_size
-        logger.info("Inferred latent_dim=%d from encoder config.", latent_dim)
+        hidden_size = config.hidden_size
+        logger.info("Inferred hidden_size=%d from encoder config.", hidden_size)
     else:
-        latent_dim = args.latent_dim
+        hidden_size = args.hidden_size
 
     # ----- Model -----
     logger.info("Building FinalTransformer for SFT…")
-    model = build_model(args, vocab_size, latent_dim)
+    model = build_model(args, vocab_size, hidden_size)
 
     if args.checkpoint:
         logger.info("Loading pretrained weights from %s", args.checkpoint)

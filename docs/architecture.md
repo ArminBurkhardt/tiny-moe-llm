@@ -65,7 +65,7 @@ Input token IDs  [B, S]
 Output logits / embeddings  [B, S, O]
 ```
 
-**Notation:**  `B` = batch, `S` = sequence length, `D` = `latent_dim`,
+**Notation:**  `B` = batch, `S` = sequence length, `D` = `hidden_size`,
 `H` = router hidden size, `O` = `output_dim`, `p` = dropout probability.
 
 ---
