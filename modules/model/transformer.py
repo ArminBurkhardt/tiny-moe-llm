@@ -1,18 +1,18 @@
 import torch 
 from torch import nn
-from modules.model import Gemma3Encoder, Decoder, MixtureOfExperts, \
+from modules.model import Gemma4Model, Gemma4Attention, Decoder, MixtureOfExperts, \
     ExpertModuleWithSkip, LatentRouter, InvertibleLinear, SolvableLinear, \
-    GroupedQueryAttention, RoPE, ExpertModuleWithSkipAndEmbedding
-from modules.model.expert import SelfAttentionExpert
+    GroupedQueryAttention, RoPE, SelfAttentionExpert
 from modules.model.information_retrieval import InformationRetrievalModule
 from utils import FP64
 
 class FinalTransformer(nn.Module):
     def __init__(
         self, 
-        model_dir: str, 
-        latent_dim: int, 
+        hidden_size: int,
         vocab_size: int,
+        intermediate_size: int = 704,
+        num_gemma_layers: int = 8,
         num_initial_experts: int = 4,
         num_attention_experts: int = 1,
         ir_num_entries: int = 256,
@@ -21,49 +21,65 @@ class FinalTransformer(nn.Module):
         max_recurrence: int = 10,
         expert_template: nn.Module = None,
         dropout: float = 0.1,
-        gemma3_target_layer: int = 9,
+        *args, **kwargs,
     ):
         super().__init__()
         
-        # Encoder: Gemma 3 1B
-        self.encoder = Gemma3Encoder(model_dir=model_dir, target_layer=gemma3_target_layer, torch_dtype=torch.float32)
-        # TODO: use Gemma4Encoder with correct downloaded model
-        #       NOTE: Gemma4 already uses RoPE and GQA, so no further changes needed.
+        self.encoder = Gemma4Model(
+            config = {
+                "vocab_size": vocab_size,
+                "hidden_size": hidden_size,
+                "intermediate_size": intermediate_size,
+                "num_hidden_layers": num_gemma_layers,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 256,
+                "max_position_embeddings": 32000,
+                "sliding_window": 512,
+                "num_experts": 32,
+                "num_active_experts": 4,
+                "num_shared_experts": 1
+            }
+        ).train()
         
-        # Encoder is only finetuned.
-        for param in self.encoder.parameters():
-            param.requires_grad = True
+        self.expert_embedding = nn.Embedding(vocab_size, hidden_size)
+        self.expert_attn = Gemma4Attention(
+            hidden_size=hidden_size,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=256,
+            dropout=dropout
+        )
 
-        # Normalise and regularise the encoder output before it enters the MoE loop.
-        # LayerNorm stabilises the latent distribution across the batch; dropout prevents
-        # over-reliance on any single encoder feature.
-        self.encoder_norm = nn.LayerNorm(latent_dim)
+        self.encoder_norm = nn.LayerNorm(hidden_size)
         self.encoder_dropout = nn.Dropout(dropout)
-            
-        # Decoder: Invertible
-        self.decoder = Decoder(hidden_size=latent_dim, output_size=vocab_size)
-        # Decoder trained normally
         
-        # Experts Core
-        # ExpertModuleWithSkipAndEmbedding is the chosen expert for the final model.
         if expert_template is None:
-            expert_template = ExpertModuleWithSkipAndEmbedding(
-                input_size=latent_dim, 
-                output_size=latent_dim, 
-                dropout=dropout, 
-                num_embeddings=vocab_size
+            expert_template = ExpertModuleWithSkip(
+                input_size=hidden_size*2, 
+                output_size=hidden_size, 
+                dropout=dropout,
             ) 
         
         special_experts_list = []
         for _ in range(num_attention_experts):
-            special_experts_list.append(SelfAttentionExpert(latent_dim, latent_dim, dropout=dropout))
+            special_experts_list.append(SelfAttentionExpert(hidden_size, hidden_size, dropout=dropout))
         
-        special_experts_list.append(InformationRetrievalModule(num_entries=ir_num_entries, latent_dim=latent_dim, output_dim=latent_dim, residual=True))
+        special_experts_list.append(InformationRetrievalModule(
+            num_entries=ir_num_entries, 
+            latent_dim=hidden_size, 
+            output_dim=hidden_size, 
+            residual=True
+        ))
         
         special_experts = nn.ModuleList(special_experts_list)
         num_special_experts = len(special_experts)
             
-        router = LatentRouter(input_size=latent_dim, num_experts=num_initial_experts + num_special_experts, hidden_size=latent_dim)
+        router = LatentRouter(
+            input_size=hidden_size*2, 
+            num_experts=num_initial_experts + num_special_experts, 
+            hidden_size=hidden_size
+        )
         
         self.moe = MixtureOfExperts(
             router=router, 
@@ -71,13 +87,19 @@ class FinalTransformer(nn.Module):
             special_experts=special_experts,
             steps_per_expert=steps_per_expert_add,
             dtype=torch.float32,
-            hidden_size=latent_dim,
+            hidden_size=hidden_size,
         )
-        # Pre-populate experts using deepcopy to ensure they are distinct instances
+        
+        # pre populate experts using deepcopy to ensure they are distinct instances
         import copy
         for _ in range(num_initial_experts):
-            self.moe.experts.append(copy.deepcopy(expert_template))
+            new_expert = copy.deepcopy(expert_template)
+            new_expert.reset()
+            self.moe.experts.append(new_expert)
             self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1, device=self.moe.usage_counts.device)])
+
+        # invertible decoder
+        self.decoder = Decoder(hidden_size=hidden_size, output_size=vocab_size)
 
         self.prune_step_interval = prune_step_interval
         self.max_recurrence = max_recurrence
@@ -101,17 +123,14 @@ class FinalTransformer(nn.Module):
 
             Inference: ``logits`` of shape ``[Batch, Seq, VocabSize]``.
         """
-        # Encoder
-        context = self.encoder(input_ids, attention_mask=attention_mask).last_hidden_state
+        context = self.encoder(input_ids, attention_mask=attention_mask, return_hidden_states=True).last_hidden_state
         
-        # Normalise and regularise encoder output before feeding into the MoE loop.
         context = self.encoder_norm(context)
         context = self.encoder_dropout(context)
 
-        # Initial latent z. 
-        # Using context as z? Or separate? 
-        # Usually MoE transforms z -> z'.
         z = context.clone()
+        embeds = self.expert_embedding(input_ids)
+        embeds = self.expert_attn(hidden_states=embeds, attention_mask=attention_mask)
         
         if self.training:
             assert target_vectors is not None, "Target vectors required for training"
@@ -134,7 +153,6 @@ class FinalTransformer(nn.Module):
             # If we want to align "First two expert calls" with recurrent steps 0 and 1,
             # and "Final call" with step 2 (Add Expert), we need to ensure MoE sees that.
             
-            outputs = []
             router_loss = 0
             
             # Recurrent Loop Logic matching User Curriculum
@@ -142,6 +160,8 @@ class FinalTransformer(nn.Module):
             curr_z = z
             
             while True:
+                # add embeddings to the latent for routing
+                curr_z = torch.cat([curr_z, embeds], dim=-1)
                 # Check what MoE will do
                 cycle_len = self.moe.steps_per_expert + 2
                 cycle_pos = self.moe.current_step % cycle_len
@@ -154,7 +174,7 @@ class FinalTransformer(nn.Module):
                     # We need to provide the TARGET for this solving.
                     # The target is z_target.
                     # So we call MoE with target.
-                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target, input_ids=input_ids)
+                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target)
                     
                     # Compute router loss: Force router to pick new expert
                     # CrossEntropy(probs, target_idx)
@@ -204,6 +224,9 @@ class FinalTransformer(nn.Module):
                 # Skew function: "takes the number of expert calls and adds them to the probability of the OUTPUT expert"
                 # "adds them" -> Linear additive skew.
                 skew = float(loop_count) * self.skew_factor  # Adjustable hyperparameter
+                
+                # add embeddings to the latent for routing
+                curr_z = torch.cat([curr_z, embeds], dim=-1)
                 
                 output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
                 
@@ -270,8 +293,14 @@ class FinalTransformer(nn.Module):
 
         curr_z = z
         loop_count = 0
+        
+        embeds = self.expert_embedding(input_ids)
+        embeds = self.expert_attn(hidden_states=embeds, attention_mask=attention_mask)
 
         while loop_count < self.max_recurrence:
+            # add embeddings to the latent for routing
+            curr_z = torch.cat([curr_z, embeds], dim=-1)
+                
             skew = float(loop_count) * self.skew_factor
             output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
 

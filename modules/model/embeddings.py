@@ -20,6 +20,13 @@ class PerLayerEmbedding(nn.Module):
         embed = self.rope(embed)
         embed = self.attn(embed)
         return embed
+    
+    def reset(self):
+        """Reset the embedding parameters."""
+        self.embedding.reset_parameters()
+        self.attn.q.reset_parameters()
+        self.attn.k.reset_parameters()
+        self.attn.v.reset_parameters()
 
 
 class RoPE(nn.Module):

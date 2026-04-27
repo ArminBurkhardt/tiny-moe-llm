@@ -60,6 +60,11 @@ class InvertibleLinear(nn.Module, InvertibleModule):
             return self.inverse(y)
         else:
             return self.approx_linear_inverse(y)
+        
+    def reset(self):
+        """Reset layer weights and cached inverse."""
+        self.linear.reset_parameters()
+        self._cached_inv = None
 
 
 class SolvableLinear(InvertibleLinear, SolvableModule):

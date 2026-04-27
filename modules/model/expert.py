@@ -63,6 +63,11 @@ class ExpertModule(nn.Module, SolvableModule):
     def disable_grad(self):
         """Disable gradient tracking for this expert's parameters."""
         self.enable_grad(False)
+        
+    def reset(self):
+        """Reset all parameters"""
+        self.linear.reset()
+        self.completed = False
 
 class ExpertModuleWithSkip(ExpertModule):
     """An expert module with a skip connection, pre-LayerNorm, and dropout.
@@ -105,6 +110,11 @@ class ExpertModuleWithSkip(ExpertModule):
 
         self.linear.auto_solve(x_norm, y_pre_act, l2=l2)
         self.completed = True
+        
+    def reset(self):
+        """Reset all parameters, including the LayerNorm."""
+        super().reset()
+        self.norm.reset_parameters()
 
 
 class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip):
@@ -139,6 +149,11 @@ class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip):
 
         self.linear.auto_solve(x_norm, y_pre_act, l2=l2)
         self.completed = True
+        
+    def reset(self):
+        """Reset all parameters, including the LayerNorm and embedding."""
+        super().reset()
+        self.embedding.reset()
 
 
 
