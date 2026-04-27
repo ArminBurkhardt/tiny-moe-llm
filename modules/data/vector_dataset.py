@@ -150,10 +150,17 @@ class GemmaVectorDataset:
 ################
 
 
+try: 
+    from pylate import indexes, models, retrieve
+except ImportError:
+    indexes = None
+    models = None
+    retrieve = None
 
 class _EmbeddingLFM2ColBERTModel:
     def __init__(self, device: str = None, index_folder: str = "pylate-index"):
-        from pylate import indexes, models, retrieve
+        if models is None or indexes is None or retrieve is None:
+            raise ImportError("pylate library is required for _EmbeddingLFM2ColBERTModel. Please install it with `pip install pylate`.")
         self.model = models.ColBERT(
             model_name_or_path = BASE_DIR + "/ckpts/pretrained/LFM2-ColBERT-350M",
         )
@@ -172,7 +179,6 @@ class _EmbeddingLFM2ColBERTModel:
         return self.model.encode(queries, batch_size=batch_size, is_query=True, show_progress_bar=show_progress_bar, convert_to_tensor=True, padding=padding)
 
     def build_index(self, document_ids: list[str], documents_embeddings):
-        from pylate import indexes, retrieve
         self.index = indexes.PLAID(
             index_folder=self.index_folder,
             index_name="index",
@@ -185,7 +191,6 @@ class _EmbeddingLFM2ColBERTModel:
         self.retriever = retrieve.ColBERT(index=self.index)
         
     def load_index(self):
-        from pylate import indexes, retrieve
         self.index = indexes.PLAID(
             index_folder=self.index_folder,
             index_name="index",
