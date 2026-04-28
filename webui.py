@@ -68,8 +68,9 @@ df = pd.DataFrame(records)
 latest = df.iloc[-1]
 
 st.header("Overview")
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col_tok, col2, col3, col4, col5 = st.columns(6)
 col1.metric("Progress (Step)", f"{latest.get('step', -1)}")
+col_tok.metric("Total Tokens", f"{latest.get('total_tokens', 0) / 1e6:.2f}M")
 col2.metric("Total Loss", f"{latest.get('total_loss', 0.0):.4f}")
 col3.metric("LM Loss", f"{latest.get('lm_loss', 0.0):.4f}")
 col4.metric("Dataset", f"{latest.get('dataset_name', 'Unknown')}")

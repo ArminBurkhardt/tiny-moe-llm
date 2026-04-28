@@ -473,6 +473,7 @@ def save_checkpoint(
     model: FinalTransformer,
     optimizer: torch.optim.Optimizer,
     step: int,
+    tokens: int,
     args: argparse.Namespace,
     config: dict,
 ) -> None:
@@ -495,6 +496,7 @@ def save_checkpoint(
     torch.save(
         {
             "step": step,
+            "tokens": tokens,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
@@ -557,12 +559,14 @@ def main() -> None:
 
     # Resume from checkpoint before moving to device to keep memory predictable
     start_step = 0
+    start_tokens = 0
     optimizer_state = None
     if args.resume:
         logger.info("Resuming from %s", args.resume)
         ckpt = torch.load(args.resume, map_location="cpu")
         model.load_state_dict(ckpt["model_state_dict"])
         start_step = ckpt.get("step", 0)
+        start_tokens = ckpt.get("tokens", 0)
         optimizer_state = ckpt.get("optimizer_state_dict")
 
     model.to(device)
@@ -623,6 +627,7 @@ def main() -> None:
                     data_iter = iter(dataset)
 
     global_step = start_step
+    total_tokens = start_tokens
 
     try:
         while global_step < args.num_steps:
@@ -630,7 +635,7 @@ def main() -> None:
             if check_pause_flag(control_file_path):
                 logger.info("Pause signal received. Saving checkpoint and exiting...")
                 ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}_paused.pt")
-                save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+                save_checkpoint(ckpt_path, model, optimizer, global_step, total_tokens, args, config_dict)
                 clear_pause_flag(control_file_path)
                 logger.info("Paused. You can resume later using --resume %s", ckpt_path)
                 return
@@ -642,6 +647,11 @@ def main() -> None:
                 data_iter = iter(dataset)
                 batch = next(data_iter)
 
+            # Count non-padding tokens
+            labels = batch.get("labels", batch["input_ids"])
+            tokens_in_batch = (labels != -100).sum().item()
+            total_tokens += tokens_in_batch
+
             metrics, new_optimizer = train_step(model, batch, optimizer, args, vocab_size, device)
             # Replace the optimiser when pruning caused a rebuild
             if new_optimizer is not None:
@@ -650,7 +660,7 @@ def main() -> None:
 
             if global_step % args.log_interval == 0:
                 logger.info(
-                    "step %6d/%d | dataset=%s | sim=%.2f | lm=%.4f | router=%.4f | total=%.4f | experts=%d",
+                    "step %6d/%d | dataset=%s | sim=%.2f | lm=%.4f | router=%.4f | total=%.4f | experts=%d | tokens=%.2fM",
                     global_step,
                     args.num_steps,
                     metrics.get("dataset_name", "unknown"),
@@ -659,27 +669,29 @@ def main() -> None:
                     metrics["router_loss"],
                     metrics["total_loss"],
                     metrics["num_experts"],
+                    total_tokens / 1e6,
                 )
                 
                 # Prepare and save metrics
                 metrics["step"] = global_step
+                metrics["total_tokens"] = total_tokens
                 metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
                 metrics_logger.log(metrics)
 
             if global_step % args.save_interval == 0:
                 ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
-                save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+                save_checkpoint(ckpt_path, model, optimizer, global_step, total_tokens, args, config_dict)
 
     except KeyboardInterrupt:
         logger.info("Training paused by user (Ctrl+C). Saving checkpoint...")
         ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}_paused.pt")
-        save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
+        save_checkpoint(ckpt_path, model, optimizer, global_step, total_tokens, args, config_dict)
         logger.info("Checkpoint saved. You can resume later using --resume %s", ckpt_path)
         return
 
     # ----- Final checkpoint -----
     final_path = os.path.join(args.output_dir, "final.pt")
-    save_checkpoint(final_path, model, optimizer, global_step, args, config_dict)
+    save_checkpoint(final_path, model, optimizer, global_step, total_tokens, args, config_dict)
     logger.info("Pretraining complete.  Final model → %s", final_path)
 
 

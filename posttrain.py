@@ -400,6 +400,7 @@ def save_checkpoint(
     model: FinalTransformer,
     optimizer: torch.optim.Optimizer,
     step: int,
+    tokens: int,
     epoch: int,
     args: argparse.Namespace,
 ) -> None:
@@ -410,12 +411,14 @@ def save_checkpoint(
         model: :class:`FinalTransformer` instance.
         optimizer: Active optimiser.
         step: Current global training step.
+        tokens: Total tokens processed so far.
         epoch: Current epoch index.
         args: Parsed command-line arguments.
     """
     torch.save(
         {
             "step": step,
+            "tokens": tokens,
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -484,6 +487,7 @@ def main() -> None:
     # ----- SFT training loop -----
     start_step = 0
     start_epoch = 0
+    start_tokens = 0
 
     if args.checkpoint:
         logger.info("Resuming from %s", args.checkpoint)
@@ -492,11 +496,14 @@ def main() -> None:
             start_step = ckpt["step"]
         if "epoch" in ckpt:
             start_epoch = ckpt["epoch"]
+        if "tokens" in ckpt:
+            start_tokens = ckpt["tokens"]
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             logger.info(f"Loaded optimizer state. Resuming from step {start_step}, epoch {start_epoch}")
 
     global_step = start_step
+    total_tokens = start_tokens
     
     metrics_logger = MetricsLogger(os.path.join(args.output_dir, "sft_metrics.jsonl"))
     control_file_path = os.path.join(args.output_dir, "control.json")
@@ -518,24 +525,31 @@ def main() -> None:
                 if check_pause_flag(control_file_path):
                     logger.info("Pause signal received. Saving checkpoint and exiting...")
                     ckpt_path = os.path.join(args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}_paused.pt")
-                    save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+                    save_checkpoint(ckpt_path, model, optimizer, global_step, total_tokens, epoch, args)
                     clear_pause_flag(control_file_path)
                     logger.info("Paused. You can resume later using --checkpoint %s", ckpt_path)
                     return
                 
+                # Count non-padding tokens
+                labels = batch.get("labels", batch["input_ids"])
+                tokens_in_batch = (labels != -100).sum().item()
+                total_tokens += tokens_in_batch
+
                 metrics = sft_step(model, batch, optimizer, args, vocab_size, device)
                 global_step += 1
 
                 if global_step % args.log_interval == 0:
                     logger.info(
-                        "epoch %d | step %6d | loss=%.4f",
+                        "epoch %d | step %6d | loss=%.4f | tokens=%.2fM",
                         epoch + 1,
                         global_step,
                         metrics["loss"],
+                        total_tokens / 1e6,
                     )
                     
                     # Prepare and save metrics
                     metrics["step"] = global_step
+                    metrics["total_tokens"] = total_tokens
                     metrics["epoch"] = epoch + 1
                     metrics["learning_rate"] = optimizer.param_groups[0]["lr"]
                     metrics_logger.log(metrics)
@@ -544,18 +558,18 @@ def main() -> None:
                     ckpt_path = os.path.join(
                         args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}.pt"
                     )
-                    save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+                    save_checkpoint(ckpt_path, model, optimizer, global_step, total_tokens, epoch, args)
 
     except KeyboardInterrupt:
         logger.info("Training paused by user (Ctrl+C). Saving checkpoint...")
         ckpt_path = os.path.join(args.output_dir, f"sft_epoch{epoch + 1}_step{global_step}_paused.pt")
-        save_checkpoint(ckpt_path, model, optimizer, global_step, epoch, args)
+        save_checkpoint(ckpt_path, model, optimizer, global_step, total_tokens, epoch, args)
         logger.info("Checkpoint saved. You can resume later using --checkpoint %s", ckpt_path)
         return
 
     # ----- Final checkpoint -----
     final_path = os.path.join(args.output_dir, "sft_final.pt")
-    save_checkpoint(final_path, model, optimizer, global_step, args.num_epochs - 1, args)
+    save_checkpoint(final_path, model, optimizer, global_step, total_tokens, args.num_epochs - 1, args)
     logger.info("SFT complete.  Final model → %s", final_path)
 
 
