@@ -196,6 +196,12 @@ def parse_args() -> argparse.Namespace:
         help="Save a checkpoint every N steps.",
     )
     parser.add_argument(
+        "--optimizer8bit",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg.optimizer8bit,
+        help="Use 8-bit AdamW optimizer from bitsandbytes.",
+    )
+    parser.add_argument(
         "--vectorize", action=argparse.BooleanOptionalAction, default=_cfg.vectorize, help="Whether to text vectorize."
     )
     parser.add_argument(
@@ -255,8 +261,8 @@ def build_model(args: argparse.Namespace, vocab_size: int, hidden_size: int) -> 
 # Optimiser helpers
 # ---------------------------------------------------------------------------
 
-def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.optim.AdamW:
-    """Build an :class:`~torch.optim.AdamW` with separate param groups.
+def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.optim.Optimizer:
+    """Build an :class:`~torch.optim.AdamW` (or 8-bit AdamW) with separate param groups.
 
     * Encoder, decoder, and expert parameters use ``args.lr``.
     * Router parameters use ``args.router_lr``.
@@ -271,7 +277,7 @@ def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.
             weight-decay).
 
     Returns:
-        Configured :class:`~torch.optim.AdamW` optimiser.
+        Configured optimiser.
     """
     encoder_params = list(model.encoder.parameters())
     decoder_params = list(model.decoder.parameters())
@@ -283,14 +289,25 @@ def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.
         if p.requires_grad
     ]
 
-    return torch.optim.AdamW(
+    optim_kwargs = {"weight_decay": args.weight_decay}
+    if getattr(args, "optimizer8bit", False):
+        try:
+            import bitsandbytes as bnb
+            optim_cls = bnb.optim.AdamW8bit
+        except ImportError:
+            logger.warning("bitsandbytes not installed, falling back to torch.optim.AdamW")
+            optim_cls = torch.optim.AdamW
+    else:
+        optim_cls = torch.optim.AdamW
+
+    return optim_cls(
         [
             {"params": encoder_params, "lr": args.lr, "name": "encoder"},
             {"params": decoder_params, "lr": args.lr, "name": "decoder"},
             {"params": router_params, "lr": args.router_lr, "name": "router"},
             {"params": expert_params, "lr": args.lr, "name": "experts"},
         ],
-        weight_decay=args.weight_decay,
+        **optim_kwargs
     )
 
 

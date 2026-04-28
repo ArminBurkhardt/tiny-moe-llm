@@ -82,6 +82,7 @@ class PretrainConfig:
     ir_num_entries: int = 65536 # 16384
 
     # ---- Optimizer ----
+    optimizer8bit: bool = False
     lr: float = 1e-4
     router_lr: float = 1e-3
     router_loss_weight: float = 0.1

@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate.")
     parser.add_argument(
+        "--optimizer8bit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use 8-bit AdamW optimizer from bitsandbytes.",
+    )
+    parser.add_argument(
         "--weight_decay", type=float, default=0.01, help="AdamW weight-decay."
     )
     parser.add_argument(
@@ -471,9 +477,18 @@ def main() -> None:
     model.encoder.model.train()
 
     # ----- Optimiser (all parameters fine-tuned) -----
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
+    optim_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if getattr(args, "optimizer8bit", False):
+        try:
+            import bitsandbytes as bnb
+            optim_cls = bnb.optim.AdamW8bit
+        except ImportError:
+            logger.warning("bitsandbytes not installed, falling back to torch.optim.AdamW")
+            optim_cls = torch.optim.AdamW
+    else:
+        optim_cls = torch.optim.AdamW
+    
+    optimizer = optim_cls(model.parameters(), **optim_kwargs)
 
     # ----- Dataset sources -----
     sources = build_datasets(args)
