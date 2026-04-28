@@ -36,6 +36,7 @@ class Dataset(IterableDataset):
         padding: str = "max_length",
         return_embeddings: bool = False,
         return_texts: bool = False,
+        vectorize: bool = True,
     ) -> None:
         """
         Args:
@@ -67,6 +68,7 @@ class Dataset(IterableDataset):
         self.max_loaded_embeddings = max_loaded_embeddings
         self.return_embeddings = return_embeddings
         self.return_texts = return_texts
+        self.vectorize = vectorize
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = padding
@@ -81,10 +83,13 @@ class Dataset(IterableDataset):
         else:
             self.sources = []
 
-        self.model = embedding_model or _EmbeddingGemmaModel(device=device, embedding_dim=embedding_dim)
-        # Light convenience: if device not given but cuda is available, move model if supported.
-        if (torch.cuda.is_available()) and (device is None):
-            self._maybe_to_device("cuda")
+        if self.vectorize:
+            self.model = embedding_model or _EmbeddingGemmaModel(device=device, embedding_dim=embedding_dim)
+            # Light convenience: if device not given but cuda is available, move model if supported.
+            if (torch.cuda.is_available()) and (device is None):
+                self._maybe_to_device("cuda")
+        else:
+            self.model = None
 
         # State for the active vectorized dataset built from the current parquet shard or provided texts.
         self.current_vector_ds: Optional[VectorDataset] = None
@@ -120,15 +125,22 @@ class Dataset(IterableDataset):
     def _batch_iterator(self) -> Iterator[dict]:
         while True:
             # Ensure we have a vectorized dataset with remaining batches.
-            if self.current_vector_ds is None or self.current_batches_left == 0:
+            if (self.vectorize and self.current_vector_ds is None) or \
+               (not self.vectorize and getattr(self, "current_texts", None) is None) or \
+               self.current_batches_left == 0:
                 if not self._advance_to_next_file():
                     break  # Exhausted all data
 
-            batch, batch_similarity = self.current_vector_ds.get_similar_batch(
-                batch_size=self.batch_size,
-                delta=self.similarity_delta,
-                text_only=not self.return_embeddings,
-            )
+            if self.vectorize:
+                batch, batch_similarity = self.current_vector_ds.get_similar_batch(
+                    batch_size=self.batch_size,
+                    delta=self.similarity_delta,
+                    text_only=not self.return_embeddings,
+                )
+            else:
+                batch = self.current_texts[self.current_texts_idx : self.current_texts_idx + self.batch_size]
+                self.current_texts_idx += self.batch_size
+                batch_similarity = 0.0
 
             # A small guard for very small shards: skip empty batches.
             if len(batch) == 0:
@@ -184,10 +196,15 @@ class Dataset(IterableDataset):
         if len(texts) > self.max_loaded_embeddings:
             texts = texts[: self.max_loaded_embeddings]
 
-        vector_ds = VectorDataset(texts, self.model, max_loaded_embeddings=self.max_loaded_embeddings)
-        vector_ds.compute_embeddings(show_progress_bar=self.show_progress_bar)
+        if self.vectorize:
+            vector_ds = VectorDataset(texts, self.model, max_loaded_embeddings=self.max_loaded_embeddings)
+            vector_ds.compute_embeddings(show_progress_bar=self.show_progress_bar)
+            self.current_vector_ds = vector_ds
+        else:
+            self.current_vector_ds = None
+            self.current_texts = texts
+            self.current_texts_idx = 0
 
-        self.current_vector_ds = vector_ds
         # Estimate how many batches we can serve from this shard; at least one.
         self.current_batches_left = max(len(texts) // self.batch_size, 1)
 

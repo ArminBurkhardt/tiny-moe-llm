@@ -196,6 +196,9 @@ def parse_args() -> argparse.Namespace:
         help="Save a checkpoint every N steps.",
     )
     parser.add_argument(
+        "--vectorize", action=argparse.BooleanOptionalAction, default=_cfg.vectorize, help="Whether to text vectorize."
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -535,6 +538,7 @@ def main() -> None:
         num_steps=args.num_steps,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
+        vectorize=args.vectorize,
     )
     config_dict = training_cfg.as_dict()
     logger.info("Training config: %s", config_dict)
@@ -585,6 +589,7 @@ def main() -> None:
         tokenizer=tokenizer,
         max_length=args.max_length,
         padding="max_length",
+        vectorize=args.vectorize,
     )
 
     # ----- Training loop -----
@@ -665,8 +670,7 @@ def main() -> None:
                 ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}.pt")
                 save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)
 
-    except KeyboardInterrupt as e:
-        raise e
+    except KeyboardInterrupt:
         logger.info("Training paused by user (Ctrl+C). Saving checkpoint...")
         ckpt_path = os.path.join(args.output_dir, f"ckpt_step{global_step}_paused.pt")
         save_checkpoint(ckpt_path, model, optimizer, global_step, args, config_dict)

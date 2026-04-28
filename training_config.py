@@ -94,6 +94,7 @@ class PretrainConfig:
     num_steps: int = 10_000
     log_interval: int = 10
     save_interval: int = 1_000
+    vectorize: bool = False
 
     def as_dict(self) -> dict:
         """Return a plain-dict representation suitable for JSON / pickle serialisation."""

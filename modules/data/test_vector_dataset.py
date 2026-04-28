@@ -32,7 +32,7 @@ def test_get_similar_batch():
     batch_size = 3
     delta = 0.7  # Cosine similarity threshold
 
-    batch = dataset.get_similar_batch(batch_size=batch_size, delta=delta)
+    batch, _ = dataset.get_similar_batch(batch_size=batch_size, delta=delta)
 
     # Verify the batch
     assert len(batch) <= batch_size, f"Batch size should be <= {batch_size}, got {len(batch)}"
