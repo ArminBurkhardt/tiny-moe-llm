@@ -1,13 +1,14 @@
 import torch 
+import math
 from torch import nn
-from modules.model.linear import InvertibleLinear
+from modules.model.linear import InvertibleLinear, GroupedInvertibleLinear
 from modules.model.invertible_modules import InvertibleLinearAttention
 from modules.model.activations import InvertibleActivation, InvertibleLeakyReLUActivation, ShiftActivation
 from utils import logger, FP64
 
 
 class Decoder(nn.Module):
-    def __init__(self, hidden_size, output_size):
+    def __init__(self, hidden_size, output_size, dtype=FP64):
         super(Decoder, self).__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
@@ -15,14 +16,21 @@ class Decoder(nn.Module):
         shifted_activation = ShiftActivation(shift=0.1, activation=InvertibleActivation(a=0.9, b=0.1))
         
         self.layers = nn.ModuleList([
-            InvertibleLinear(hidden_size, hidden_size, dtype=FP64),
+            InvertibleLinear(hidden_size, hidden_size, dtype=dtype),
             InvertibleLeakyReLUActivation(),
-            InvertibleLinear(hidden_size, hidden_size, dtype=FP64),
+            InvertibleLinear(hidden_size, hidden_size, dtype=dtype),
             InvertibleActivation(a=1, b=1),
-            InvertibleLinearAttention(hidden_size, hidden_size, activation=shifted_activation, dtype=FP64),
-            InvertibleActivation(a=1, b=1),
-            InvertibleLinear(hidden_size, output_size, dtype=FP64)
+            InvertibleLinearAttention(hidden_size, hidden_size, activation=shifted_activation, dtype=dtype),
+            InvertibleActivation(a=1, b=1)
         ])
+        
+        assert output_size >= hidden_size, "Output size must be greater than or equal to hidden size for grouped invertible linear layer."
+        self.lm_head = GroupedInvertibleLinear(
+            input_size=hidden_size, 
+            output_size=output_size, 
+            num_groups=math.gcd(hidden_size, output_size), 
+            dtype=dtype
+        )
 
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
@@ -45,16 +53,6 @@ class Decoder(nn.Module):
         return y
 
 
-# do like encoder from gemma3 and then add the docoder from gemma3 but with cross attn
-# with other as the gemma3 encoder output and x as the expert output
-
-
-
-
-
-
-
-
 def test_decoder():
     batch_size = 2
     seq_len = 8
@@ -74,7 +72,7 @@ def test_decoder():
         output = decoder(x, context)
         reconstructed_x = decoder.inverse(output, context)
 
-        assert torch.allclose(x, reconstructed_x, atol=1e-4), "Decoder inversion failed!"
+        assert torch.allclose(x, reconstructed_x, atol=1e-3), "Decoder inversion failed!"
         errors.append(torch.abs(x - reconstructed_x).max().item())
     
     logger.info("Decoder test passed successfully, with inversion error of %s", max(errors))

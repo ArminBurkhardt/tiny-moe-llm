@@ -3,7 +3,7 @@ from modules.data.dataloader import test_fileloader, test_dataloader
 from modules.data.dataset import test_dataset
 from modules.model.activations import test_invertible_activation
 from modules.model.invertible_modules import test_invertible_linear_attention
-from modules.model.linear import test_solvable_linear
+from modules.model.linear import test_grouped_solvable_linear, test_solvable_linear
 from modules.model.losses import test_matrix_invertability_loss
 from modules.model.decoder import test_decoder
 from modules.model.test_moe import test_moe
@@ -42,6 +42,9 @@ if __name__ == "__main__":
     
     logging.info("Testing solvable linear layer...")
     test_solvable_linear()
+    
+    logging.info("Testing grouped solvable linear layer...")
+    test_grouped_solvable_linear()
     
     logging.info("Testing matrix invertibility loss...")
     test_matrix_invertability_loss()

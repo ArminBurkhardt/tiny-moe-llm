@@ -43,6 +43,8 @@ logger.addHandler(ch)
 
 FP64 = torch.float64
 FP32 = torch.float32
+FP16 = torch.float16
+BF16 = torch.bfloat16
 
 
 

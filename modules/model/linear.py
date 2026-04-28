@@ -160,9 +160,82 @@ class SolvableLinear(InvertibleLinear, SolvableModule):
         return self.solve_from_batch(x, y, l2=l2)
         
 
+class GroupedSolvableLinear(SolvableLinear):
+    """Extension of SolvableLinear that supports grouped linear transformations.
 
+    This layer applies separate linear transformations to disjoint groups of input features.
+    The solve_from_batch method is adapted to solve each group independently.
+    """
 
+    def __init__(self, input_size: int, output_size: int, num_groups: int, dtype=FP64):
+        if input_size % num_groups != 0 or output_size % num_groups != 0:
+            raise ValueError(f"input_size ({input_size}) and output_size ({output_size}) must be divisible by num_groups ({num_groups})")
+        super().__init__(1, 1, dtype=dtype) # dummy, its deleted below
+        self.num_groups = num_groups
+        self.group_input_size = input_size // num_groups
+        self.group_output_size = output_size // num_groups
+        
+        self.linears = nn.ModuleList([
+            SolvableLinear(self.group_input_size, self.group_output_size, dtype=dtype)
+            for _ in range(num_groups)
+        ])
+        
+        # overwrite parent class
+        del self.linear
+        self.input_size = input_size
+        self.output_size = output_size
+        
+    def forward(self, x):
+        outputs = []
+        for i, linear in enumerate(self.linears):
+            start = i * self.group_input_size
+            end = (i + 1) * self.group_input_size
+            outputs.append(linear(x[:, start:end]))
+        return torch.cat(outputs, dim=1)
+    
+    def enable_grad(self, enabled = True):
+        for linear in self.linears:
+            linear.enable_grad(enabled)
+        self.grad_enabled = enabled
+    
+    def disable_grad(self):
+        self.enable_grad(False)
 
+    def solve_from_batch(self, x, y, l2=1e-4):
+        for i, linear in enumerate(self.linears):
+            start_in = i * self.group_input_size
+            end_in = (i + 1) * self.group_input_size
+            start_out = i * self.group_output_size
+            end_out = (i + 1) * self.group_output_size
+            linear.solve_from_batch(x[:, start_in:end_in], y[:, start_out:end_out], l2=l2)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        outputs = []
+        for i, linear in enumerate(self.linears):
+            start_out = i * self.group_output_size
+            end_out = (i + 1) * self.group_output_size
+            outputs.append(linear.inverse(y[:, start_out:end_out]))
+        return torch.cat(outputs, dim=1)
+
+    def approx_linear_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        outputs = []
+        for i, linear in enumerate(self.linears):
+            start_out = i * self.group_output_size
+            end_out = (i + 1) * self.group_output_size
+            outputs.append(linear.approx_linear_inverse(y[:, start_out:end_out]))
+        return torch.cat(outputs, dim=1)
+
+    def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        if self.is_square:
+            return self.inverse(y)
+        else:
+            return self.approx_linear_inverse(y)
+
+    def auto_solve(self, x, y, l2=1e-4):
+        return self.solve_from_batch(x, y, l2=l2)
+    
+
+GroupedInvertibleLinear = GroupedSolvableLinear
 
 def test_solvable_linear():
     layer = SolvableLinear(3, 3, dtype=FP64)
@@ -184,6 +257,28 @@ def test_solvable_linear():
     print("SolvableLinear tests passed.")
 
 
+def test_grouped_solvable_linear():
+    layer = GroupedSolvableLinear(4, 4, num_groups=2, dtype=FP64)
+    x = torch.randn(100, 4, dtype=FP64)
+    true_weight_1 = torch.tensor([[1.0, -0.5],
+                                  [0.0, 1.0]], dtype=FP64)
+    true_bias_1 = torch.tensor([0.5, -1.0], dtype=FP64)
+    true_weight_2 = torch.tensor([[2.0, 0.0],
+                                  [-1.0, 1.5]], dtype=FP64)
+    true_bias_2 = torch.tensor([-0.5, 2.0], dtype=FP64)
 
+    y_group_1 = x[:, :2] @ true_weight_1.T + true_bias_1
+    y_group_2 = x[:, 2:] @ true_weight_2.T + true_bias_2
+    y = torch.cat([y_group_1, y_group_2], dim=1)
+
+    layer.solve_from_batch(x, y, l2=1e-4)
+
+    y_pred = layer(x)
+    assert torch.allclose(y_pred, y, atol=1e-3), "Forward pass does not match expected output"
+    
+    x_recovered = layer.auto_inverse(y)
+    assert torch.allclose(x_recovered, x, atol=1e-3), "Auto-inverse does not recover input"
+
+    print("GroupedSolvableLinear tests passed.")
 
 

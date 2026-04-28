@@ -72,13 +72,13 @@ class PretrainConfig:
 
     # ---- Model architecture ----
     hidden_size: int = 704 # 1408
-    num_initial_experts: int = 16
+    num_initial_experts: int = 128
     steps_per_expert: int = 100
     prune_step_interval: int = 500
     max_recurrence: int = 10
-    max_experts: int = 256
+    max_experts: int = 512
     intermediate_size: int = 352 # 704
-    num_gemma_layers: int = 8
+    num_gemma_layers: int = 10
     ir_num_entries: int = 65536 # 16384
 
     # ---- Optimizer ----
@@ -90,10 +90,10 @@ class PretrainConfig:
 
     # ---- Training loop ----
     batch_size: int = 8
-    max_length: int = 4096
-    num_steps: int = 10_000
+    max_length: int = 8192 # 4096
+    num_steps: int = 50_000
     log_interval: int = 10
-    save_interval: int = 1_000
+    save_interval: int = 5_000
     vectorize: bool = False
 
     def as_dict(self) -> dict:
