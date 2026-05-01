@@ -108,7 +108,7 @@ z       = context.clone()
 - Inference: skew factor linearly increases the OUTPUT logit with each recurrent
   step, biasing early termination.
 
-### 4. ExpertModuleWithSkip (chosen expert for the final model)
+### 4. ExpertModuleWithSkip family
 ```
 output = x + Dropout(p)(InvertibleActivation(SolvableLinear(LayerNorm(D)(x))))
 ```
@@ -138,6 +138,15 @@ Step-by-step:
 linear-layer input that matches the forward pass.  Dropout is excluded from the
 solve (it is a closed-form regression, not a stochastic optimisation step).
 
+**Current implementation notes:**
+- `FinalTransformer` defaults to `ExpertModuleWithSkipAndEmbedding`, which adds
+  token-conditioned `PerLayerEmbedding(input_ids)` before the pre-norm path:
+  `x + Dropout(activation(linear(norm(x + embed))))`.
+- The MoE expert set can contain both normal experts and special experts
+  (`SelfAttentionExpert` plus one `InformationRetrievalModule` by default).
+- In pretraining, `pretrain.py` may override the expert template via
+  `training_config.EXPERT_TEMPLATES`.
+
 ### 5. MixtureOfExperts — post-norm
 ```
 output = sum_i( prob_i * expert_i(z) )
@@ -164,6 +173,16 @@ output = LayerNorm(D)(output)           ← post-MoE normalisation
 - The cross-attention in `InvertibleLinearAttention` uses `context` as keys/
   values and `z` as queries, grounding each output token in the encoder's
   representation.
+- The attention activation is wrapped as
+  `ShiftActivation(shift=0.1, activation=InvertibleActivation(a=0.9, b=0.1))`
+  in the current decoder implementation.
+
+### 7. SFT forward path
+- `FinalTransformer.sft_forward(...)` uses inference-style MoE routing while
+  keeping gradients enabled.
+- During the routing loop, it temporarily sets
+  `self.moe.training = False` and `self.moe.router.training = False` so that
+  training-time expert-masking/lifecycle logic is bypassed.
 
 ---
 
@@ -220,4 +239,3 @@ input_ids → Encoder → LayerNorm → Dropout(disabled) → z
 z → Decoder(z, context) → output  [B, S, O]
 return output
 ```
-

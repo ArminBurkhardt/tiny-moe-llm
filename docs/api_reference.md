@@ -1,41 +1,44 @@
 # API Reference
 
-This document summarizes the current public/usable APIs with concise usage notes and tensor shape guidance.
+This document summarizes the current public/usable APIs and key script entry points.
 
 ## `utils.py`
 
 ### Constants and paths
-- `DIR`
-  - Path constants used across training/data scripts:
-    - `BASE_DIR`
-    - `GEMMA_EMBEDDING_DIR`
-    - `GEMMA_3_1B_DIR`
-    - `GEMMA_3_270M_DIR`
-    - `GEMMA_2_T5_270M_DIR`
-    - `GEMMA_3_DIR` (alias of `GEMMA_3_1B_DIR`)
-    - `DATA_DIR`
-    - `UFW_V1_4_DIR`
-    - `KIMI_DIR`
-    - `REASNONING_DIR`
+- `BASE_DIR`
+- `class DIR`
+  - `BASE_DIR`
+  - `GEMMA_EMBEDDING_DIR`
+  - `GEMMA_3_1B_DIR`
+  - `GEMMA_3_270M_DIR`
+  - `GEMMA_2_T5_270M_DIR`
+  - `GEMMA_3_DIR` (alias of `GEMMA_3_1B_DIR`)
+  - `DATA_DIR`
+  - `UFW_V1_4_DIR`
+  - `KIMI_DIR`
+  - `REASNONING_DIR`
 - `PATH = DIR`
-- `FP64`, `FP32`: dtype aliases (`torch.float64`, `torch.float32`)
+- `FP64`, `FP32`
+- `logger`
 
-### Base interface
+### Interfaces
 - `class InvertibleModule`
-  - `inverse(y: torch.Tensor, **kwargs) -> torch.Tensor`
-  - `auto_inverse(y: torch.Tensor, **kwargs) -> torch.Tensor`
-  - Meaning: contract for modules that support explicit inverse (or best-effort inverse).
+  - `inverse(y, **kwargs) -> Tensor`
+  - `auto_inverse(y, **kwargs) -> Tensor`
+- `class SolvableModule`
+  - `solve_from_batch(x, y, **kwargs) -> Tensor`
 
 ---
 
-## `modules/model`
+## `modules/model` (`modules/model/__init__.py`)
 
-### Exported API (`modules/model/__init__.py`)
+### Exported API
 - `ParameterizedSigmoid`
 - `InvertibleActivation`
 - `LinearAttention`
 - `MLP`
 - `Gemma3Encoder`
+- `Gemma4Encoder`
 - `Decoder`
 - `LatentRouter`
 - `SolvableLinear`
@@ -43,149 +46,135 @@ This document summarizes the current public/usable APIs with concise usage notes
 - `InvertibleLinearAttention`
 - `MatrixInvertabilityLoss`
 - `MixtureOfExperts`
+- `PerLayerEmbedding`
+- `RoPE`
+- `RotaryPositionEmbeddingsForAttention`
+- `ExpertModuleWithSkip`
+- `ExpertModuleWithSkipAndEmbedding`
+- `GroupedQueryAttention`
 
 ### Activations (`modules/model/activations.py`)
 - `class ParameterizedSigmoid`
-  - `f(a, b) -> Callable[[Tensor], Tensor]`
-  - `f_inv(a, b) -> Callable[[Tensor], Tensor]`
-  - Element-wise, shape-preserving transform; `f_inv` expects values in `(-b, a)`.
+  - `f(a, b)`, `f_inv(a, b)`
 - `class InvertibleActivation(nn.Module, InvertibleModule)`
-  - `forward(x)` / `inverse(y)` / `auto_inverse(y)`
-  - Input/output: same shape `[..., D]`.
+  - `forward(x)`, `inverse(y)`, `auto_inverse(y)`
 - `class InvertibleLeakyReLUActivation(nn.Module, InvertibleModule)`
-  - `forward(x)` / `inverse(y)` / `auto_inverse(y)`
-  - Input/output: same shape `[..., D]`.
+  - `forward(x)`, `inverse(y)`, `auto_inverse(y)`
 - `class ShiftActivation(nn.Module, InvertibleModule)`
-  - `forward(x)` / `inverse(y)` / `auto_inverse(y)`
-  - Adds/removes constant shift; shape-preserving `[..., D]`.
+  - `forward(x)`, `inverse(y)`, `auto_inverse(y)`
 
-### Core modules (`modules/model/modules.py`)
-- `class LinearAttention(nn.Module)`
-  - `forward(x, other=None)`
-  - Expected shapes:
-    - `x`: `[B, T_q, D_in]`
-    - `other` (optional): `[B, T_kv, D_in]` (defaults to `x`)
-    - output: `[B, T_q, D_out]`
-  - Meaning: single-head linear projections (`q/k/v`) + softmax attention over sequence axis.
-- `class MLP(nn.Module)`
-  - `forward(x)`
-  - Shape: `[..., input_size] -> [..., output_size]`.
+### Attention blocks
+- `modules/model/modules.py`
+  - `class LinearAttention`
+    - `forward(x, other=None) -> [..., T_q, D_out]`
+  - `class MLP`
+    - `forward(x) -> [..., output_size]`
+  - `class MultiHeadAttention`
+    - `forward(hidden_states, other=None, attention_mask=None) -> [B, T, H]`
+- `modules/model/attention.py`
+  - `class GroupedQueryAttention`
+    - `repeat_kv(hidden_states, n_rep)`
+    - `forward(hidden_states, attention_mask=None, use_causal_mask=True)`
+
+### Embeddings / position encoding (`modules/model/embeddings.py`)
+- `class PerLayerEmbedding`
+  - `forward(input_ids)` -> `[B, S, D]`
+- `class RoPE`
+  - `forward(x)` -> rotated `[B, S, D]`
+- `class RotaryPositionEmbeddingsForAttention`
+  - `forward(x, seq_len=None)` -> `(cos, sin)` caches
+- helpers:
+  - `rotate_half(x)`
+  - `apply_rotary_pos_emb(q, k, cos, sin)`
 
 ### Linear/invertible layers (`modules/model/linear.py`)
 - `class InvertibleLinear(nn.Module, InvertibleModule)`
   - `forward(x)`
-  - `inverse(y)` (exact inverse; square + full-rank only)
+  - `inverse(y)` (square/full-rank only)
   - `approx_linear_inverse(y)` (pseudo-inverse)
-  - `auto_inverse(y)` (exact if square else pseudo-inverse)
+  - `auto_inverse(y)`
   - `is_square`
-  - Shapes:
-    - `forward`: `[..., input_size] -> [..., output_size]`
-    - inverse variants: `[..., output_size] -> [..., input_size]`
-- `class SolvableLinear(InvertibleLinear)`
+- `class SolvableLinear(InvertibleLinear, SolvableModule)`
   - `enable_grad(enabled=True)` / `disable_grad()`
-  - `forward(x)`
   - `solve_from_batch(x, y, l2=1e-4)`
   - `auto_solve(x, y, l2=1e-4)`
-  - Solve contract:
-    - `x`: `[N, input_size]`
-    - `y`: `[N, output_size]`
-    - returns `(weight, bias)` with shapes `[output_size, input_size]`, `[output_size]`.
 
 ### Router (`modules/model/router.py`)
-- `class LatentRouter(nn.Module)`
-  - `output_index`: index of special OUTPUT expert (`== num_experts`)
-  - `add_experts(k)`: extends expert logits while preserving OUTPUT head row
-  - `forward(z, is_final=None, output_skew=0.0)`
-    - `z`: latent `[..., input_size]`
-    - output: probabilities `[..., num_experts + 1]` (last index is OUTPUT expert)
-  - Training behavior:
-    - requires `is_final`
-    - `is_final=False`: OUTPUT masked out
-    - `is_final=True`: only OUTPUT allowed
-  - Eval behavior: all experts (including OUTPUT) are eligible.
+- `class LatentRouter`
+  - `output_index`
+  - `add_experts(k)`
+  - `forward(z, is_final=None, output_skew=0.0)` -> probabilities over `[num_experts + 1]`
 - `Router = LatentRouter` compatibility alias
 
-### Experts/MoE (`modules/model/expert.py`, `modules/model/moe.py`)
-- `class ExpertModule(nn.Module)`
-  - `forward(x)`: `[..., input_size] -> [..., output_size]`
-  - `solve_from_batch(x, y, l2=1e-5)`:
-    - expects 2D solve inputs (`[N, input_size]`, `[N, output_size]`)
-    - inverts activation then solves linear weights
-  - `consolidate(force=False, disable_grad=True, dtype=torch.float32)`: replaces solvable linear with plain `nn.Linear`
+### Experts and MoE (`modules/model/expert.py`, `modules/model/moe.py`)
+- `class ExpertModule`
+  - `forward(x)`
+  - `solve_from_batch(x, y, l2=1e-5)`
+  - `consolidate(force=False, disable_grad=True, dtype=torch.float32)`
   - `enable_grad(enabled=False)` / `disable_grad()`
 - `class ExpertModuleWithSkip(ExpertModule)`
-  - Pre-norm + dropout + residual expert: `x + dropout(activation(linear(norm(x))))`
-  - Requires `input_size == output_size`
-- `class MixtureOfExperts(nn.Module)`
-  - `prune_least_used()`: removes least-used expert and corresponding router head row
-  - `forward(x, target=None, output_skew=0.0)`
-    - Common input: `x` latent `[B, T, D]` (or `[B, D]`)
-    - Training returns depend on curriculum phase (`steps_per_expert + 2` cycle):
-      - normal phase: returns `output` (`[... , D]`)
-      - add-expert phase: returns `(output, probs, target_idx)`
-      - output-only phase: returns `(output, probs, target_idx)`
-    - Inference (`eval`) returns `(output, probs)` where:
-      - `output`: `[..., D]`
-      - `probs`: `[..., num_experts + 1]`
-  - `reset_step()`: resets internal curriculum step counter.
+  - residual pre-norm expert:
+    - `x + dropout(activation(linear(norm(x))))`
+  - `solve_from_batch` with pre-norm and residual target transform
+- `class ExpertModuleWithSkipAndEmbedding(ExpertModuleWithSkip)`
+  - token-conditioned expert:
+    - `forward(x, input_ids)`
+    - `solve_from_batch(x, y, input_ids, l2=1e-5)`
+- `class SelfAttentionExpert`
+  - `forward(x, **kwargs)`
+- `class CrossAttentionExpert`
+  - `forward(x, context)`
+- `class MixtureOfExperts`
+  - constructor supports:
+    - `router`, optional `experts`, optional `special_experts`, optional `expert_template`
+    - `steps_per_expert`, `hidden_size` (for post-norm)
+  - `forward(x, target=None, output_skew=0.0, *args, **kwargs)`
+    - training: normal routing / add-expert / output-only phases
+    - eval: weighted combination including OUTPUT identity contribution
+  - `prune_least_used()`
+  - `reset_step()`
+
+### Information retrieval expert (`modules/model/information_retrieval.py`)
+- `class InformationRetrievalLayer`
+  - `forward(query)`
+- `class InformationRetrievalModule`
+  - `reset_keys()`
+  - `forward(x, return_weights=False, **kwargs)`
 
 ### Encoder/decoder (`modules/model/encoder.py`, `modules/model/decoder.py`)
 - `@dataclass EncoderOutput`
-  - `last_hidden_state`: `[B, T, H]`
-  - `hidden_states`: optional tuple of per-layer tensors (`len = num_layers + 1` including embeddings)
-- `class Gemma3Encoder(nn.Module)`
+  - `last_hidden_state`
+  - `hidden_states`
+- `class Gemma3Encoder`
   - `forward(input_ids, attention_mask=None, position_ids=None, return_all_hidden_states=False) -> EncoderOutput`
-  - Inputs:
-    - `input_ids`: `[B, T]`
-    - `attention_mask` (optional): `[B, T]`
-    - `position_ids` (optional): `[B, T]`
-  - Output:
-    - `EncoderOutput.last_hidden_state`: `[B, T, hidden_size]`
-    - `hidden_states` populated only when requested
-  - `hidden_size` property: model hidden width from HF config.
-- `class Decoder(nn.Module)`
+  - `hidden_size` property
+- `class Gemma4Encoder(Gemma3Encoder)`
+  - same forward contract as Gemma3 wrapper
+- `class Decoder`
   - `forward(x, context)`
-    - `x`: latent `[B, T, hidden_size]`
-    - `context`: encoder context `[B, T_ctx, hidden_size]` (typically same `T`)
-    - output: `[B, T, output_size]`
   - `inverse(output, context)`
-    - `output`: `[B, T, output_size]`
-    - returns approximate/exact latent `[B, T, hidden_size]` depending on invertibility conditions.
 
 ### Invertible attention (`modules/model/invertible_modules.py`)
 - `class InvertibleLinearAttention(nn.Module, InvertibleModule)`
   - `forward(x, other=None)`
-    - `x`: `[B, T_q, D_in]`
-    - `other`: `[B, T_kv, D_in]` (defaults to `x`)
-    - output: `[B, T_q, D_out]`
-  - `inverse(output, other)` / `auto_inverse(output, other)`
-    - requires known `other`
-    - inverse quality depends on activation invertibility and linear algebra conditions
-  - `is_square`: `input_size == output_size`
+  - `inverse(output, other)`
+  - `auto_inverse(output, other)`
+  - `is_square`
 
 ### Losses (`modules/model/losses.py`)
-- `class MatrixInvertabilityLoss(nn.Module)`
+- `class MatrixInvertabilityLoss`
   - `forward(matrices)`
-    - determinant/pinverse methods expect square `[..., N, N]`
-    - `non_square_pinverse_method` supports `[..., M, N]`
-    - returns scalar mean loss
   - `determinant_method(matrices)`
   - `pinverse_method(matrices)`
   - `non_square_pinverse_method(matrices)`
 
 ### Integrated model (`modules/model/transformer.py`)
-- `class FinalTransformer(nn.Module)`
+- `class FinalTransformer`
   - `forward(input_ids, target_vectors=None, attention_mask=None)`
-    - Inputs:
-      - `input_ids`: `[B, T]`
-      - `target_vectors` (training only): `[B, T, vocab_size]`
-      - `attention_mask` (optional): `[B, T]`
-    - Outputs:
-      - training mode: `(logits, router_loss)` where `logits` is `[B, T, vocab_size]`
-      - eval mode: `logits` `[B, T, vocab_size]`
+    - train mode: returns `(logits, router_loss)`
+    - eval mode: returns `logits`
   - `sft_forward(input_ids, attention_mask=None)`
-    - SFT path that uses inference-style routing loop while keeping gradients enabled
-    - output: logits `[B, T, vocab_size]`.
+    - inference-style routing loop with gradients enabled
 
 ---
 
@@ -193,74 +182,93 @@ This document summarizes the current public/usable APIs with concise usage notes
 
 ### File/batch loading (`modules/data/dataloader.py`)
 - `class FileLoader`
-  - `__iter__()` / `__next__()`
-  - `reset()`
-  - `_get_next_file()`
-  - `load_file(parquet_file_path)`
-  - Usage: iterates parquet files under `root/subdir/file.parquet` and yields `pd.DataFrame`.
+  - `__iter__()`, `__next__()`, `reset()`, `_get_next_file()`, `load_file(path)`
 - `class DataLoader`
   - `load_next_file()`
   - `get_next_file()`
   - `get_next_batch(batch_size)`
-  - `__iter__()` / `__next__()`
-  - Usage: sequential dataframe batching with optional score filter and single-column projection.
+  - `__iter__()`, `__next__()`
 
 ### Embedding/vector datasets (`modules/data/vector_dataset.py`)
 - `class _EmbeddingGemmaModel`
-  - `encode(texts, convert_to_tensor=True, batch_size=64, show_progress_bar=False, precision='float32', normalize_embeddings=True)`
-    - input: `list[str]`
-    - output: embedding tensor `[N, embedding_dim]`
+  - `encode(...)`
   - `similarity_speedy(text0, others)`
-    - computes dot-similarity against many vectors.
 - `class GemmaVectorDataset`
   - `from_texts(texts, model)`
-  - `save(path)` / `load(path, model)`
+  - `save(path)`, `load(path, model)`
   - `compute_embeddings(batch_size=64, show_progress_bar=True)`
-  - `__len__()` / `__getitem__(idx)`
+  - `__len__()`, `__getitem__(idx)`
   - `get_similar_batch(batch_size, delta, text_only=False)`
-    - returns either `list[str]` or `list[{"text", "embedding"}]`
 - `class _EmbeddingLFM2ColBERTModel`
-  - `encode_documents(...)`, `encode_queries(...)`, `build_index(...)`, `load_index()`, `retrieve(...)`
+  - `encode_documents(...)`, `encode_queries(...)`
+  - `build_index(document_ids, document_embeddings)`, `load_index()`
+  - `retrieve(queries_embeddings, k=10)`
 - `class LFM2ColBERTVectorDataset`
-  - `from_texts(texts, model)`
-  - `save(path)` / `load(path, model)`
-  - `compute_embeddings(batch_size=32, show_progress_bar=True)`
+  - `from_texts(...)`
+  - `save(path)`, `load(path, model)`
+  - `compute_embeddings(...)`
   - `__len__()`
   - `get_similar_batch(batch_size, text_only=False, delta=0.5, return_embeddings=False)`
-    - returns texts or list of dicts (`id`, `text`, optional `embedding`)
-- `VectorDataset = GemmaVectorDataset` (current alias used by imports)
+- `VectorDataset = GemmaVectorDataset`
 
-### Tokenized iterable dataset (`modules/data/dataset.py`)
+### Iterable tokenized dataset (`modules/data/dataset.py`)
 - `class Dataset(torch.utils.data.IterableDataset)`
-  - `__iter__()` / `_batch_iterator()`
+  - `__iter__()`, `_batch_iterator()`
   - `_advance_to_next_file()`
   - `_load_vectorized_dataset(texts)`
   - `_extract_texts_and_embeddings(batch)`
   - `_maybe_to_device(device)`
-  - Yields dict batches with:
+  - yields dicts with:
     - `input_ids`: `[B, T]`
-    - `attention_mask`: `[B, T]` (if tokenizer returns it)
-    - `labels`: `[B, T]` with pad positions masked to `-100`
-    - optional `embeddings`: `[B, E]`
-    - optional `texts`: `list[str]`.
+    - `attention_mask`: `[B, T]` (optional)
+    - `labels`: `[B, T]` (`-100` on masked tokens)
+    - optional `embeddings`, optional `texts`
 
-### Chat Template (`modules/data/chat_template.py`)
+### Chat template helper (`modules/data/chat_template.py`)
 - `class Chat`
-  - `__init__(tokenizer)`
   - `format_chat(messages)`
-  - Input: `messages: list[{"role": str, "content": str}]`
-  - Output: single prompt string formatted via tokenizer chat template.
 
 ---
 
 ## `modules/util`
 
-### Linear probe experiment (`modules/util/linear_classifier.py`)
+### Linear probe utility (`modules/util/linear_classifier.py`)
 - `generate_synthetic_reasoning_data(num_samples=None)`
-  - returns `(train_texts, train_labels, test_texts, test_labels)`
 - `extract_hidden_states(model, tokenizer, texts, device)`
-  - returns per-layer features list; each layer entry is `[N, H]` after pooling strategy
 - `run_linear_probe(model_name, dataset_size=200)`
-  - utility experiment: trains logistic regression probes over layers.
 
-These are experimental helpers and not required by the core pretraining/SFT pipeline.
+---
+
+## Top-level training/config scripts
+
+### `training_config.py`
+- `EXPERT_TEMPLATES`
+- `@dataclass PretrainConfig`
+  - `as_dict()`
+  - `copy()`
+
+### `pretrain.py`
+- CLI / setup:
+  - `parse_args()`
+  - `build_model(args, vocab_size, latent_dim)`
+  - `build_optimizer(model, args)`
+- lifecycle helpers:
+  - `_enable_expert_grad(expert)`
+  - `_add_expert_to_optimizer(optimizer, expert, lr)`
+- training:
+  - `train_step(model, batch, optimizer, args, vocab_size, device)`
+  - `save_checkpoint(path, model, optimizer, step, args, config)`
+  - `main()`
+
+### `posttrain.py`
+- CLI / setup:
+  - `parse_args()`
+  - `build_model(args, vocab_size, latent_dim)`
+  - `build_datasets(args)`
+- dataset:
+  - `class SFTDataset`
+    - `__iter__()`, `_batch_iterator()`, `_sample_iterator()`, `_tokenize_conversation(messages)`
+- training:
+  - `sft_step(model, batch, optimizer, args, vocab_size, device)`
+  - `save_checkpoint(path, model, optimizer, step, epoch, args)`
+  - `main()`
