@@ -19,7 +19,7 @@ import copy
 #       using the expert's invertible nature (.solve_for_batch). This avoids backprop through the expert and speeds up training.
 
 class MixtureOfExperts(nn.Module):
-    def __init__(self, router: LatentRouter, experts: nn.ModuleList = None, special_experts: nn.ModuleList = None, dtype=FP64, expert: nn.Module = None, steps_per_expert: int = 100, hidden_size: int | None = None):
+    def __init__(self, router: LatentRouter, experts: nn.ModuleList = None, special_experts: nn.ModuleList = None, dtype=FP64, expert: nn.Module = None, steps_per_expert: int = 100, solve_experts: bool = True, hidden_size: int | None = None):
         super().__init__()
         self.router = router
         
@@ -34,6 +34,7 @@ class MixtureOfExperts(nn.Module):
         self.expert_template = expert
         self.dtype = dtype
         self.steps_per_expert = steps_per_expert
+        self.solve_experts = solve_experts
         self.current_step = 0
         self.usage_counts = torch.zeros(len(self.experts))
         # Post-norm applied after the weighted combination of expert outputs.
@@ -116,22 +117,26 @@ class MixtureOfExperts(nn.Module):
             
         return stats
 
-    def forward(self, x: torch.Tensor, target: torch.Tensor = None, output_skew: float = 0.0, *args, **kwargs):
+    def forward(self, x: torch.Tensor, router_input: torch.Tensor = None, target: torch.Tensor = None, output_skew: float = 0.0, *args, **kwargs):
         # args and kwargs are passed to the experts
+        if router_input is None:
+            router_input = x
         cycle_len = self.steps_per_expert + 2
         cycle_pos = self.current_step % cycle_len
         
-        # Ensure usage counts size
+        # Ensure usage counts size and device
         if len(self.usage_counts) != len(self.experts):
              self.usage_counts = torch.cat([
                  self.usage_counts.to(x.device), 
                  torch.zeros(len(self.experts) - len(self.usage_counts), device=x.device)
              ])
+        elif self.usage_counts.device != x.device:
+             self.usage_counts = self.usage_counts.to(x.device)
         
         if self.training:
             if cycle_pos < self.steps_per_expert:
                 # Normal routing to old experts
-                probs = self.router(x, is_final=False, output_skew=output_skew)
+                probs = self.router(router_input, is_final=False, output_skew=output_skew)
                 
                 # Update usage counts (soft approximation or hard choice?)
                 # User said "least used expert". Summing probs is a good proxy.
@@ -171,7 +176,12 @@ class MixtureOfExperts(nn.Module):
                 # DO NOT flatten here if experts handle extra structure (like input_ids)
                 # Instead, let the expert flatten it right before linear.solve_from_batch
                 
-                new_expert.solve_from_batch(x, target, *args, **kwargs)
+                if self.solve_experts:
+                    new_expert.solve_from_batch(x, target, *args, **kwargs)
+                else:
+                    # just initialize it so attributes expected by _enable_expert_grad exist
+                    if hasattr(new_expert, 'reset'):
+                        new_expert.reset()
                 
                 self.experts.append(new_expert)
                 self.usage_counts = torch.cat([self.usage_counts, torch.zeros(1, device=self.usage_counts.device)])
@@ -183,7 +193,7 @@ class MixtureOfExperts(nn.Module):
                 
                 # Get probs for loss computation
                 # We want router to predict the new expert (index: len(experts)-1)
-                probs = self.router(x, is_final=False, output_skew=output_skew)
+                probs = self.router(router_input, is_final=False, output_skew=output_skew)
                 target_idx = len(self.experts) - 1
                 
                 self.current_step += 1
@@ -191,7 +201,7 @@ class MixtureOfExperts(nn.Module):
                 
             elif cycle_pos == self.steps_per_expert + 1:
                 # Route to OUTPUT expert only
-                probs = self.router(x, is_final=True, output_skew=output_skew)
+                probs = self.router(router_input, is_final=True, output_skew=output_skew)
                 
                 # Assuming OUTPUT expert is identity
                 output = x
@@ -203,7 +213,7 @@ class MixtureOfExperts(nn.Module):
         
         else:
             # Inference
-            probs = self.router(x, is_final=None, output_skew=output_skew)
+            probs = self.router(router_input, is_final=None, output_skew=output_skew)
             
             # In inference we don't care about cycle_pos masking usually, 
             # unless we want to simulate the "training only on old experts" phase?
@@ -212,7 +222,7 @@ class MixtureOfExperts(nn.Module):
             
             output = torch.zeros_like(x)
             for i, expert in enumerate(self.experts):
-                output += probs[..., i].unsqueeze(-1) * expert(x)
+                output += probs[..., i].unsqueeze(-1) * expert(x, *args, **kwargs)
 
             # Add OUTPUT contribution (identity)
             output += probs[..., self.router.output_index].unsqueeze(-1) * x

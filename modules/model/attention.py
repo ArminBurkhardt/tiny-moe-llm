@@ -59,17 +59,31 @@ class GroupedQueryAttention(nn.Module):
         value_states = self.repeat_kv(value_states, self.num_groups)
 
         # 5. Scaled Dot-Product Attention
+        attn_mask = None
+        is_causal_arg = False
+
+        if attention_mask is not None:
+            # combine causal mask with padding mask
+            causal_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden_states.device).tril()
+            padding_mask = attention_mask.to(dtype=torch.bool).view(batch_size, 1, 1, seq_len)
+            if use_causal_mask:
+                attn_mask = causal_mask.view(1, 1, seq_len, seq_len) & padding_mask
+            else:
+                attn_mask = padding_mask
+        else:
+            is_causal_arg = use_causal_mask
+
         attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
-            is_causal=use_causal_mask if attention_mask is None else False
+            attn_mask=attn_mask,
+            is_causal=is_causal_arg
         )
 
-        # 6. Reshape back to [batch_size, seq_len, hidden_size]
+        # 6. Reshape back to [batch_size, seq_len, num_heads * head_dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
 
         # 7. Final output projection
         output = self.o_proj(attn_output)

@@ -20,7 +20,9 @@ class FinalTransformer(nn.Module):
         prune_step_interval: int = 1000,
         max_recurrence: int = 10,
         expert_template: nn.Module = None,
+        solve_experts: bool = True,
         dropout: float = 0.1,
+        dtype: torch.dtype = FP64,
         *args, **kwargs,
     ):
         super().__init__()
@@ -89,6 +91,7 @@ class FinalTransformer(nn.Module):
             expert=expert_template,
             special_experts=special_experts,
             steps_per_expert=steps_per_expert_add,
+            solve_experts=solve_experts,
             dtype=torch.float32,
             hidden_size=hidden_size,
         )
@@ -102,21 +105,24 @@ class FinalTransformer(nn.Module):
             self.moe.usage_counts = torch.cat([self.moe.usage_counts, torch.zeros(1, device=self.moe.usage_counts.device)])
 
         # invertible decoder
-        self.decoder = Decoder(hidden_size=hidden_size, output_size=vocab_size)
+        self.decoder = Decoder(hidden_size=hidden_size, output_size=vocab_size, dtype=dtype)
 
         self.prune_step_interval = prune_step_interval
         self.max_recurrence = max_recurrence
         self.global_step = 0
         self.skew_factor = 0.5  # Adjustable hyperparameter for inference skewing (OUTPUT prob increase per expert call)
+        self.dtype = dtype
 
-    def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None, attention_mask: torch.Tensor | None = None):
+    def forward(self, input_ids: torch.Tensor, target_vectors: torch.Tensor = None, target_labels: torch.Tensor = None, vocab_size: int = None, attention_mask: torch.Tensor | None = None):
         """Run a forward pass in pretraining mode or inference mode.
 
         Args:
             input_ids: Token indices of shape ``[Batch, Seq]``.
             target_vectors: Supervision signal in vocabulary space of shape
-                ``[Batch, Seq, VocabSize]``.  Required during training so that the
-                target latent ``z_target`` can be computed for solving new experts.
+                ``[Batch, Seq, VocabSize]``.  (Maintained for reverse compatibility)
+            target_labels: Supervision signal in integer tokens of shape
+                ``[Batch, Seq]``. Preferred over target_vectors to save memory.
+            vocab_size: Integer size of the vocabulary. Required if target_labels is used.
             attention_mask: Optional boolean attention mask of shape
                 ``[Batch, Seq]`` passed through to the encoder.
 
@@ -126,7 +132,8 @@ class FinalTransformer(nn.Module):
 
             Inference: ``logits`` of shape ``[Batch, Seq, VocabSize]``.
         """
-        context = self.encoder(input_ids, attention_mask=attention_mask, return_hidden_states=True).last_hidden_state
+        encoder_out = self.encoder(input_ids, attention_mask=attention_mask, return_hidden_states=True)
+        context = encoder_out[1].last_hidden_state
         
         context = self.encoder_norm(context)
         context = self.encoder_dropout(context)
@@ -136,7 +143,7 @@ class FinalTransformer(nn.Module):
         embeds = self.expert_attn(hidden_states=embeds, attention_mask=attention_mask)
         
         if self.training:
-            assert target_vectors is not None, "Target vectors required for training"
+            assert target_vectors is not None or target_labels is not None, "Target vectors or target labels required for training"
             
             # Pruning Logic
             if self.global_step > 0 and self.global_step % self.prune_step_interval == 0:
@@ -146,10 +153,25 @@ class FinalTransformer(nn.Module):
             
             # Compute Target Z for the new expert solving
             # z_target = Decoder^(-1)(y_target, context)
-            # We want the final output to match target_vectors.
-            # So the input to the decoder (which is the output of MoE loop) should be z_target.
             with torch.no_grad():
-                z_target = self.decoder.inverse(target_vectors.to(FP64), context.to(FP64))
+                if target_vectors is not None:
+                    z_target = self.decoder.inverse(target_vectors.to(self.dtype), context.to(self.dtype))
+                else:
+                    assert vocab_size is not None, "vocab_size must be provided if target_labels is used"
+                    B, T = target_labels.shape
+                    z_target = torch.empty((B, T, self.decoder.hidden_size), device=context.device, dtype=self.dtype)
+                    chunk_size = 128
+                    for i in range(0, T, chunk_size):
+                        end = min(T, i + chunk_size)
+                        label_chunk = target_labels[:, i:end]
+                        valid_chunk = label_chunk != -100
+                        vec_chunk = torch.zeros(B, end - i, vocab_size, device=context.device, dtype=self.dtype)
+                        if valid_chunk.any():
+                            clamped = label_chunk.clone()
+                            clamped[~valid_chunk] = 0
+                            one_hot = torch.nn.functional.one_hot(clamped, num_classes=vocab_size).to(self.dtype)
+                            vec_chunk[valid_chunk] = one_hot[valid_chunk]
+                        z_target[:, i:end] = self.decoder.inverse(vec_chunk, context[:, i:end].to(self.dtype))
             
             # MoE Handling
             # The MoE module handles the "Cycle" internally based on its own `current_step`.
@@ -164,7 +186,7 @@ class FinalTransformer(nn.Module):
             
             while True:
                 # add embeddings to the latent for routing
-                curr_z = torch.cat([curr_z, embeds], dim=-1)
+                router_input = torch.cat([curr_z, embeds], dim=-1)
                 # Check what MoE will do
                 cycle_len = self.moe.steps_per_expert + 2
                 cycle_pos = self.moe.current_step % cycle_len
@@ -177,12 +199,12 @@ class FinalTransformer(nn.Module):
                     # We need to provide the TARGET for this solving.
                     # The target is z_target.
                     # So we call MoE with target.
-                    curr_z, probs, target_idx = self.moe(curr_z, target=z_target)
+                    curr_z, probs, target_idx = self.moe(curr_z, router_input=router_input, target=z_target)
                     
                     # Compute router loss: Force router to pick new expert
                     # CrossEntropy(probs, target_idx)
                     loss = nn.CrossEntropyLoss()(probs.reshape(-1, probs.size(-1)), 
-                                                torch.full(probs.shape[:-1], target_idx, device=probs.device, dtype=torch.long).reshape(-1))
+                                                torch.full(probs.shape[:-1], target_idx, device=probs.device, dtype=self.dtype).reshape(-1))
                     router_loss += loss
                     
                     # After adding expert, the output of MoE is the output of the new expert.
@@ -191,18 +213,18 @@ class FinalTransformer(nn.Module):
                 elif cycle_pos == self.moe.steps_per_expert + 1:
                     # Output Expert Mode
                     # "Route to OUTPUT expert only"
-                    curr_z, probs, target_idx = self.moe(curr_z, input_ids=input_ids)
+                    curr_z, probs, target_idx = self.moe(curr_z, router_input=router_input, input_ids=input_ids)
                     
                     # Router loss to force Output
                     loss = nn.CrossEntropyLoss()(probs.reshape(-1, probs.size(-1)), 
-                                                torch.full(probs.shape[:-1], target_idx, device=probs.device, dtype=torch.long).reshape(-1))
+                                                torch.full(probs.shape[:-1], target_idx, device=probs.device, dtype=self.dtype).reshape(-1))
                     router_loss += loss
                     break
                     
                 else:
                     # Normal routing (Old Experts)
                     # "Recurrent call"
-                    curr_z = self.moe(curr_z, input_ids=input_ids)
+                    curr_z = self.moe(curr_z, router_input=router_input, input_ids=input_ids)
                     
                     loop_count += 1
                     
@@ -229,9 +251,9 @@ class FinalTransformer(nn.Module):
                 skew = float(loop_count) * self.skew_factor  # Adjustable hyperparameter
                 
                 # add embeddings to the latent for routing
-                curr_z = torch.cat([curr_z, embeds], dim=-1)
+                router_input = torch.cat([curr_z, embeds], dim=-1)
                 
-                output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
+                output, probs = self.moe(curr_z, output_skew=skew, router_input=router_input, input_ids=input_ids)
                 
                 # Using argmax for "Decision" on per-sample basis
                 # For simplicity, we check if average Output probability is dominant
@@ -302,10 +324,10 @@ class FinalTransformer(nn.Module):
 
         while loop_count < self.max_recurrence:
             # add embeddings to the latent for routing
-            curr_z = torch.cat([curr_z, embeds], dim=-1)
+            router_input = torch.cat([curr_z, embeds], dim=-1)
                 
             skew = float(loop_count) * self.skew_factor
-            output, probs = self.moe(curr_z, output_skew=skew, input_ids=input_ids)
+            output, probs = self.moe(curr_z, output_skew=skew, router_input=router_input, input_ids=input_ids)
 
             curr_z = output
             loop_count += 1

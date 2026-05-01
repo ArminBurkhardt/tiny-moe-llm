@@ -104,6 +104,12 @@ def parse_args() -> argparse.Namespace:
         help="Expert class to use for the MoE.  Must be registered in training_config.EXPERT_TEMPLATES.",
     )
     parser.add_argument(
+        "--solve_experts",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg.solve_experts,
+        help="Whether to solve for the newly added expert analytically.",
+    )
+    parser.add_argument(
         "--max_experts",
         type=int,
         default=_cfg.max_experts,
@@ -253,6 +259,7 @@ def build_model(args: argparse.Namespace, vocab_size: int, hidden_size: int) -> 
         prune_step_interval=args.prune_step_interval,
         max_recurrence=args.max_recurrence,
         expert_template=expert_template,
+        solve_experts=getattr(args, "solve_experts", True),
     )
     return model
 
@@ -294,6 +301,7 @@ def build_optimizer(model: FinalTransformer, args: argparse.Namespace) -> torch.
         try:
             import bitsandbytes as bnb
             optim_cls = bnb.optim.AdamW8bit
+            logger.info("Using 8-bit AdamW optimizer from bitsandbytes.")
         except ImportError:
             logger.warning("bitsandbytes not installed, falling back to torch.optim.AdamW")
             optim_cls = torch.optim.AdamW
@@ -357,6 +365,7 @@ def train_step(
     args: argparse.Namespace,
     vocab_size: int,
     device: str,
+    dtype: torch.dtype = torch.float32,
 ) -> tuple[dict, torch.optim.Optimizer | None]:
     """Execute a single pretraining step.
 
@@ -397,26 +406,17 @@ def train_step(
         attention_mask = attention_mask[:, :-1].to(device)
 
     # Build one-hot target vectors in vocabulary space [B, T, V].
-    # Padding positions (label == -100) receive a zero vector so they do not
-    # influence the expert-solving objective.
-    valid_mask = labels != -100
-    target_vectors = torch.zeros(
-        labels.shape[0], labels.shape[1], vocab_size,
-        device=device, dtype=torch.float32,
-    )
-    if valid_mask.any():
-        clamped = labels.clone()
-        clamped[~valid_mask] = 0  # avoid out-of-range index
-        one_hot = F.one_hot(clamped, num_classes=vocab_size).float()
-        target_vectors[valid_mask] = one_hot[valid_mask]
-
+    # Instantiating the full tensor takes too much memory, so we pass labels directly
+    # and compute it in chunks inside the forward pass.
+    
     # Track expert count before the forward pass to detect additions
     n_experts_before = len(model.moe.experts)
 
     # Forward pass (MoE cycle handles expert-addition internally)
     logits, router_loss = model(
         input_ids,
-        target_vectors=target_vectors,
+        target_labels=labels,
+        vocab_size=vocab_size,
         attention_mask=attention_mask,
     )
 
@@ -451,7 +451,7 @@ def train_step(
     )
 
     # Combine LM loss with the router auxiliary loss
-    router_loss_value = router_loss if isinstance(router_loss, torch.Tensor) else torch.tensor(router_loss, device=device)
+    router_loss_value = router_loss if isinstance(router_loss, torch.Tensor) else torch.tensor(router_loss, device=device, dtype=dtype)
     total_loss = lm_loss + args.router_loss_weight * router_loss_value
 
     # Backward pass and optimiser step (use the active optimiser before any
@@ -542,6 +542,7 @@ def main() -> None:
     # values.  The resulting dict is embedded in every checkpoint.
     training_cfg = PretrainConfig(
         expert_template=args.expert_template,
+        solve_experts=getattr(args, "solve_experts", True),
         num_initial_experts=args.num_initial_experts,
         steps_per_expert=args.steps_per_expert,
         prune_step_interval=args.prune_step_interval,
@@ -560,6 +561,7 @@ def main() -> None:
         vectorize=args.vectorize,
     )
     config_dict = training_cfg.as_dict()
+    dtype = config_dict["dtype"]
     logger.info("Training config: %s", config_dict)
 
     # ----- Tokeniser -----
@@ -572,7 +574,7 @@ def main() -> None:
 
     # ----- Model -----
     logger.info("Building FinalTransformer (hidden_size=%d, vocab_size=%d)…", hidden_size, vocab_size)
-    model = build_model(args, vocab_size, hidden_size)
+    model = build_model(args, vocab_size, hidden_size).to(dtype)
 
     # Resume from checkpoint before moving to device to keep memory predictable
     start_step = 0

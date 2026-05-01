@@ -22,19 +22,21 @@ class ParameterizedSigmoid:
 
 
     @staticmethod
-    def f_inv(a: float, b: float) -> Callable[[torch.Tensor], torch.Tensor]:
+    def f_inv(a: float, b: float,  assertion: bool = True) -> Callable[[torch.Tensor], torch.Tensor]:
         """Creates the inverse to the parameterized nonlinear function.
 
         Args:
             a (float): x -> inf, f(x) -> a
             b (float): x -> -inf, f(x) -> -b
+            assertion (bool): Whether to assert that input y is in the valid range (-b, a) for the inverse function. Defaults to True.
 
         Returns:
             Callable[[float], float]: A function that computes f^{-1}(y).
         """
         assert b > 0, "Parameter 'b' must be positive."
-        def nonlinear_function(y: torch.Tensor) -> torch.Tensor:
-            assert torch.all((y < a) & (y > -b)), f"Input y must be in the range (-{b}, {a}). Found y with min {y.min().item()} and max {y.max().item()}."
+        def nonlinear_function(y: torch.Tensor,) -> torch.Tensor:
+            if assertion:
+                assert torch.all((y < a) & (y > -b)), f"Input y must be in the range (-{b}, {a}). Found y with min {y.min().item()} and max {y.max().item()}."
             return torch.log((1 + y/b) / 
                             (a - y))
         return nonlinear_function
@@ -42,21 +44,31 @@ class ParameterizedSigmoid:
 class InvertibleActivation(nn.Module, InvertibleModule):
     """An invertible activation function using parameterized sigmoid."""
 
-    def __init__(self, a: float = 1.0, b: float = 1.0):
+    def __init__(self, a: float = 1.0, b: float = 1.0, suppress: bool = False):
+        """
+        Args:
+            a (float, optional): Parameter `a`. Defaults to 1.0.
+            b (float, optional): Parameter `b`. Defaults to 1.0.
+            suppress (bool, optional): Whether to suppress warnings. Defaults to False.
+        """
         super(InvertibleActivation, self).__init__()
         self.a = a
         self.b = b
         self.forward_func = ParameterizedSigmoid.f(a, b)
-        self.inverse_func = ParameterizedSigmoid.f_inv(a, b)
+        self.inverse_func = ParameterizedSigmoid.f_inv(a, b, assertion=not suppress)
+        self.warned = False
+        self.suppress = suppress
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype not in [torch.float64]:
+        if x.dtype not in [torch.float64] and not self.warned:
             logger.warning("InvertibleActivation received a low precision input. FP32 may lead to extreme numerical inaccuracies downstream.")
+            self.warned = True
         return self.forward_func(x)
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        if y.dtype not in [torch.float64]:
+        if y.dtype not in [torch.float64] and not self.warned:
             logger.warning("InvertibleActivation received a low precision input. Inverse will likely produce an unexpected result. Please use float64 for accurate inversion.")
+            self.warned = True
         return self.inverse_func(y)
     
     def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:

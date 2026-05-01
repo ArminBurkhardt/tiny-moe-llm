@@ -19,6 +19,7 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
             logger.warning("Provided activation does not have an inverse method. Unable to invert attention weights.")
         
         self.activation = activation
+        self._warned = False
         
     def forward(self, x: torch.Tensor, other: torch.Tensor = None) -> torch.Tensor:
         if other is None:
@@ -57,13 +58,14 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         V = self.v(other) # [Batch, Seq_S, Dim], V = other @ W_v + b_v
 
         seq_len = other.size(-2)
-        if seq_len != self.output_size:
+        if (seq_len != self.output_size) and not self._warned:
             logger.warning(
                 "InvertableLinearAttention: seq_len (%d) != output_size (%d); "
                 "inverse will be a least-squares projection, not an exact recovery.",
                 seq_len,
                 self.output_size,
             )
+            self._warned = True
         
         # 2. Solve for Attention Weights (W)
         # Equation: Output = W @ V
@@ -71,16 +73,18 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         # Note: We use pinverse (Pseudo-Inverse) because V might not be square.
         # If V is tall (Seq > Dim), information is lost and recovery is approximate.
         
+        calc_dtype = torch.float64 if V.dtype == torch.float64 else torch.float32
+
         # Try to use solve if square for better precision
         if self.is_square and seq_len == self.output_size:
             # W @ V = Output => V.T @ W.T = Output.T => W.T = solve(V.T, Output.T)
             try:
-               attn_weights = torch.linalg.solve(V.transpose(-2, -1), output.transpose(-2, -1)).transpose(-2, -1)
+               attn_weights = torch.linalg.solve(V.transpose(-2, -1).to(calc_dtype), output.transpose(-2, -1).to(calc_dtype)).transpose(-2, -1).to(V.dtype)
             except torch.linalg.LinAlgError:
-               V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
+               V_pinv = torch.linalg.pinv(V.to(calc_dtype)).to(V.dtype) # [Batch, Dim, Seq_S]
                attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
         else:
-            V_pinv = torch.linalg.pinv(V) # [Batch, Dim, Seq_S]
+            V_pinv = torch.linalg.pinv(V.to(calc_dtype)).to(V.dtype) # [Batch, Dim, Seq_S]
             attn_weights = torch.matmul(output, V_pinv) # [Batch, Seq_N, Seq_S]
         
         # 3. Inverse Activation
@@ -103,12 +107,12 @@ class InvertibleLinearAttention(nn.Module, InvertibleModule):
         if self.is_square and seq_len == self.output_size:
             # Q @ K.T = scaled_scores => K @ Q.T = scaled_scores.T => Q.T = solve(K, scaled_scores.T)
             try:
-                Q = torch.linalg.solve(K, scaled_scores.transpose(-2, -1)).transpose(-2, -1)
+                Q = torch.linalg.solve(K.to(calc_dtype), scaled_scores.transpose(-2, -1).to(calc_dtype)).transpose(-2, -1).to(K.dtype)
             except torch.linalg.LinAlgError:
-                K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
+                K_T_pinv = torch.linalg.pinv(K_T.to(calc_dtype)).to(K.dtype) # [Batch, Seq_S, Dim]
                 Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
         else:
-            K_T_pinv = torch.linalg.pinv(K_T) # [Batch, Seq_S, Dim]
+            K_T_pinv = torch.linalg.pinv(K_T.to(calc_dtype)).to(K.dtype) # [Batch, Seq_S, Dim]
             Q = torch.matmul(scaled_scores, K_T_pinv) # [Batch, Seq_N, Dim]
         
         # 5. Recover x from Q

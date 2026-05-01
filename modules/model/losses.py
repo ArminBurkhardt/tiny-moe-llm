@@ -51,7 +51,10 @@ class MatrixInvertabilityLoss(nn.Module):
         matrices_stable = matrices + self.epsilon * eye
 
         # Compute log-determinant
-        sign, logabsdet = torch.linalg.slogdet(matrices_stable)
+        calc_dtype = torch.float64 if matrices_stable.dtype == torch.float64 else torch.float32
+        sign, logabsdet = torch.linalg.slogdet(matrices_stable.to(calc_dtype))
+        sign = sign.to(matrices_stable.dtype)
+        logabsdet = logabsdet.to(matrices_stable.dtype)
 
         # We want to maximize log-determinant, so minimize negative log-determinant
         loss = -logabsdet
@@ -70,7 +73,8 @@ class MatrixInvertabilityLoss(nn.Module):
             Scalar tensor representing the average invertibility loss.
         """
         # Compute pseudo-inverse
-        pinv_matrices = torch.linalg.pinv(matrices)
+        calc_dtype = torch.float64 if matrices.dtype == torch.float64 else torch.float32
+        pinv_matrices = torch.linalg.pinv(matrices.to(calc_dtype)).to(matrices.dtype)
 
         # Compute product of matrix and its pseudo-inverse
         identity_approx = torch.matmul(matrices, pinv_matrices)
@@ -94,7 +98,8 @@ class MatrixInvertabilityLoss(nn.Module):
             Scalar tensor representing the average invertibility loss.
         """
         # Compute pseudo-inverse
-        pinv_matrices = torch.linalg.pinv(matrices)
+        calc_dtype = torch.float64 if matrices.dtype == torch.float64 else torch.float32
+        pinv_matrices = torch.linalg.pinv(matrices.to(calc_dtype)).to(matrices.dtype)
 
         # Compute product of matrix and its pseudo-inverse
         identity_approx = torch.matmul(matrices, pinv_matrices)

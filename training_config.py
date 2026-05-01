@@ -13,6 +13,9 @@ import copy
 from dataclasses import asdict, dataclass
 import importlib
 
+import torch
+from utils import FP64, FP32, FP16, BF16
+
 
 # ---------------------------------------------------------------------------
 # Expert template registry
@@ -69,10 +72,11 @@ class PretrainConfig:
 
     # ---- Expert architecture ----
     expert_template: str = "ExpertModuleWithSkip"
+    solve_experts: bool = False
 
     # ---- Model architecture ----
     hidden_size: int = 704 # 1408
-    num_initial_experts: int = 128
+    num_initial_experts: int = 64
     steps_per_expert: int = 100
     prune_step_interval: int = 500
     max_recurrence: int = 10
@@ -82,7 +86,7 @@ class PretrainConfig:
     ir_num_entries: int = 65536 # 16384
 
     # ---- Optimizer ----
-    optimizer8bit: bool = False
+    optimizer8bit: bool = True
     lr: float = 1e-4
     router_lr: float = 1e-3
     router_loss_weight: float = 0.1
@@ -90,12 +94,13 @@ class PretrainConfig:
     grad_clip: float = 1.0
 
     # ---- Training loop ----
-    batch_size: int = 8
-    max_length: int = 8192 # 4096
+    batch_size: int = 2
+    max_length: int = 4096 # 8192 # 4096
     num_steps: int = 50_000
     log_interval: int = 10
     save_interval: int = 5_000
     vectorize: bool = False
+    dtype: torch.dtype = BF16
 
     def as_dict(self) -> dict:
         """Return a plain-dict representation suitable for JSON / pickle serialisation."""

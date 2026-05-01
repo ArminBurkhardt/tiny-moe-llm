@@ -7,15 +7,15 @@
 
 ### Data
 - [ ] Generate multiple reasoning paths per question using Gemma4
-- [ ] possible consolidation of dataset files into chunks (eg. 3 files loaded)
+- [x] *Deprecated: possible consolidation of dataset files into chunks (eg. 3 files loaded)*
     > should allow for better grouping by similarity
 
 ### Architectural changes
 - [x] Add Normalization and Dropout layers to the model architecture
 - [x] Skip connections between experts
-- [ ] Add attention experts
-    - [ ] Related: Switch to Gemma4 for Per Layer Embeddings (also providing more contextual information)
-    - [ ] Add embedding layer input to all experts
+- [x] Add attention experts
+    - [x] Related: Switch to Gemma4 for Per Layer Embeddings (also providing more contextual information)
+    - [x] Add embedding layer input to all experts
     - [ ] Add consistent reasoning trace during post training (via MoE vector input)
 - [ ] Expert top k routing
 - [ ] Multi Token Prediction
@@ -27,6 +27,6 @@
     > SFT should feature finetuning all parameters.
     > 
     > Use `Chat` template for formatting the data.
-- [ ] Update Pre- and Posttraining scripts to accomadate changes in dataset architecture
-- [ ] Logging to files
+- [x] Update Pre- and Posttraining scripts to accomadate changes in dataset architecture
+- [x] Logging to files
 

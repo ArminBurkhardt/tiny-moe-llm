@@ -31,12 +31,15 @@ class InvertibleLinear(nn.Module, InvertibleModule):
 
         if self._cached_inv is None:
             try:
-                self._cached_inv = torch.linalg.inv(weight)
+                calc_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
+                self._cached_inv = torch.linalg.inv(weight.to(calc_dtype)).to(weight.dtype)
             except torch.linalg.LinAlgError as exc:
                 raise ValueError("Weight matrix is not invertible; cannot compute inverse") from exc
 
         # y = x @ W^T + b  =>  x = (y - b) @ (W^T)^{-1} = (y - b) @ W^{-T}
         with torch.no_grad():
+            if y.dtype != self.linear.weight.dtype:
+                y = y.to(self.linear.weight.dtype)
             x = (y - bias) @ self._cached_inv.T
         return x
 
@@ -46,10 +49,14 @@ class InvertibleLinear(nn.Module, InvertibleModule):
         weight = self.linear.weight
         bias = self.linear.bias if self.bias else 0.0
 
-        weight_pinv = torch.linalg.pinv(weight)
+        # pinv expects float32 or float64
+        calc_dtype = torch.float64 if weight.dtype == torch.float64 else torch.float32
+        weight_pinv = torch.linalg.pinv(weight.to(calc_dtype)).to(weight.dtype)
 
         # y = x @ W^T + b  =>  x ≈ (y - b) @ (W^T)^{+} = (y - b) @ W^{+T}
         with torch.no_grad():
+            if y.dtype != weight.dtype:
+                y = y.to(weight.dtype)
             x_approx = (y - bias) @ weight_pinv.T
         return x_approx
 
@@ -137,9 +144,10 @@ class SolvableLinear(InvertibleLinear, SolvableModule):
         rhs = design.T @ y
 
         try:
-            theta = torch.linalg.solve(gram + reg, rhs)  # (input_size+1, output_size)
+            calc_dtype = torch.float64 if gram.dtype == torch.float64 else torch.float32
+            theta = torch.linalg.solve((gram + reg).to(calc_dtype), rhs.to(calc_dtype)).to(gram.dtype)  # (input_size+1, output_size)
         except torch.linalg.LinAlgError:
-            theta = torch.linalg.pinv(gram + reg) @ rhs
+            theta = (torch.linalg.pinv((gram + reg).to(calc_dtype)) @ rhs.to(calc_dtype)).to(gram.dtype)
 
         weight = theta[:-1].T  # (output_size, input_size)
         bias = theta[-1]       # (output_size,)
@@ -190,8 +198,8 @@ class GroupedSolvableLinear(SolvableLinear):
         for i, linear in enumerate(self.linears):
             start = i * self.group_input_size
             end = (i + 1) * self.group_input_size
-            outputs.append(linear(x[:, start:end]))
-        return torch.cat(outputs, dim=1)
+            outputs.append(linear(x[..., start:end]))
+        return torch.cat(outputs, dim=-1)
     
     def enable_grad(self, enabled = True):
         for linear in self.linears:
@@ -207,23 +215,23 @@ class GroupedSolvableLinear(SolvableLinear):
             end_in = (i + 1) * self.group_input_size
             start_out = i * self.group_output_size
             end_out = (i + 1) * self.group_output_size
-            linear.solve_from_batch(x[:, start_in:end_in], y[:, start_out:end_out], l2=l2)
+            linear.solve_from_batch(x[..., start_in:end_in], y[..., start_out:end_out], l2=l2)
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         outputs = []
         for i, linear in enumerate(self.linears):
             start_out = i * self.group_output_size
             end_out = (i + 1) * self.group_output_size
-            outputs.append(linear.inverse(y[:, start_out:end_out]))
-        return torch.cat(outputs, dim=1)
+            outputs.append(linear.inverse(y[..., start_out:end_out]))
+        return torch.cat(outputs, dim=-1)
 
     def approx_linear_inverse(self, y: torch.Tensor) -> torch.Tensor:
         outputs = []
         for i, linear in enumerate(self.linears):
             start_out = i * self.group_output_size
             end_out = (i + 1) * self.group_output_size
-            outputs.append(linear.approx_linear_inverse(y[:, start_out:end_out]))
-        return torch.cat(outputs, dim=1)
+            outputs.append(linear.approx_linear_inverse(y[..., start_out:end_out]))
+        return torch.cat(outputs, dim=-1)
 
     def auto_inverse(self, y: torch.Tensor) -> torch.Tensor:
         if self.is_square:

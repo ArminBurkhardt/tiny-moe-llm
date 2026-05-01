@@ -144,33 +144,38 @@ class Gemma4Attention(nn.Module):
 
         # Setup sliding window if applicable
         attn_mask = None
+        is_causal_arg = False
+
         if attention_mask is not None:
-            attn_mask = attention_mask
+            # attention_mask is usually (batch, seq_len) where 1/True is keep, 0/False is ignore.
+            # SDPA expects True = KEEP. We need to combine causal (and optionally sliding window) with padding mask.
+            causal_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden_states.device).tril()
+            padding_mask = attention_mask.to(dtype=torch.bool).view(batch_size, 1, 1, seq_len)
+            attn_mask = causal_mask.view(1, 1, seq_len, seq_len) & padding_mask
+
+            if use_sliding_window and self.sliding_window is not None:
+                window_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden_states.device)
+                window_mask = torch.tril(window_mask)
+                window_mask = torch.triu(window_mask, diagonal=-self.sliding_window)
+                attn_mask = attn_mask & window_mask.view(1, 1, seq_len, seq_len)
         elif use_sliding_window and self.sliding_window is not None:
             # Create causal sliding window mask
             attn_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=hidden_states.device)
             attn_mask = torch.tril(attn_mask)
             attn_mask = torch.triu(attn_mask, diagonal=-self.sliding_window)
-            # F.scaled_dot_product_attention expects boolean mask or float mask
-            attn_mask = ~attn_mask
-
-        # For pytorch sdpa: if attn_mask is bool, true means mask out.
-        # But wait, scaled_dot_product specifies: is_causal parameter
-        if attn_mask is not None and isinstance(attn_mask, torch.Tensor) and attn_mask.dtype == torch.bool:
-            float_mask = torch.zeros((seq_len, seq_len), dtype=query_states.dtype, device=query_states.device)
-            float_mask.masked_fill_(attn_mask, float('-inf'))
-            attn_mask = float_mask
+        else:
+            is_causal_arg = True
 
         attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
             attn_mask=attn_mask,
-            is_causal=(attention_mask is None and not use_sliding_window)
+            is_causal=is_causal_arg
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.head_dim)
 
         return self.o_proj(attn_output)
 

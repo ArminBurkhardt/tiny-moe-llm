@@ -13,15 +13,15 @@ class Decoder(nn.Module):
         self.hidden_size = hidden_size
         self.output_size = output_size
         
-        shifted_activation = ShiftActivation(shift=0.1, activation=InvertibleActivation(a=0.9, b=0.1))
+        shifted_activation = ShiftActivation(shift=0.1, activation=InvertibleActivation(a=0.9, b=0.1, suppress=True))
         
         self.layers = nn.ModuleList([
             InvertibleLinear(hidden_size, hidden_size, dtype=dtype),
             InvertibleLeakyReLUActivation(),
             InvertibleLinear(hidden_size, hidden_size, dtype=dtype),
-            InvertibleActivation(a=1, b=1),
+            InvertibleActivation(a=1, b=1, suppress=True),
             InvertibleLinearAttention(hidden_size, hidden_size, activation=shifted_activation, dtype=dtype),
-            InvertibleActivation(a=1, b=1)
+            InvertibleActivation(a=1, b=1, suppress=True)
         ])
         
         assert output_size >= hidden_size, "Output size must be greater than or equal to hidden size for grouped invertible linear layer."
@@ -31,6 +31,7 @@ class Decoder(nn.Module):
             num_groups=math.gcd(hidden_size, output_size), 
             dtype=dtype
         )
+        self.lm_head.enable_grad(True)
 
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
@@ -40,10 +41,11 @@ class Decoder(nn.Module):
             else:
                 x = layer(x)
             #print(f"After layer {i} ({layer.__class__.__name__}): range {x.min().item()} to {x.max().item()}")
+        x = self.lm_head(x)
         return x
     
     def inverse(self, output: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        y = output
+        y = self.lm_head.auto_inverse(output)
         for i, layer in enumerate(reversed(self.layers)):
             if isinstance(layer, InvertibleLinearAttention):
                 y = layer.inverse(y, other=context)
