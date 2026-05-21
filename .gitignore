@@ -1,0 +1,7 @@
+__pycache__
+data/datasets
+data/index
+ckpts
+*.key
+*.cmd
+*.json
