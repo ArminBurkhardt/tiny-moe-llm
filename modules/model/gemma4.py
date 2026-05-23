@@ -131,7 +131,7 @@ class Gemma4TextDecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(hidden_size, eps=rms_norm_eps)
         self.dropout = nn.Dropout(dropout)
         
-        self.register_parameter("layer_scalar", nn.Parameter(torch.ones(1)))
+        self.layer_scalar = nn.Parameter(torch.ones(1))
         
         if ple_size is not None:
             self.ple_proj = nn.Linear(ple_size, hidden_size, bias=False)
