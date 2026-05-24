@@ -64,12 +64,16 @@ class Gemma4TextAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        other_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
+        
+        if other_states is None:
+            other_states = hidden_states
 
         query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        key_states = self.k_proj(other_states)
+        value_states = self.v_proj(other_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
