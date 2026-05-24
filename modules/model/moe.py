@@ -2,6 +2,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
@@ -243,11 +244,21 @@ class LoopMixtureOfExperts(nn.Module):
         return output, load_balancing_loss
     
 
-    def forward(self, hidden_states: torch.Tensor, return_loss: bool = False, attention_mask: torch.Tensor = None):
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        return_loss: bool = False, 
+        attention_mask: torch.Tensor = None, 
+        identity_skew: float = 1.0,
+        use_checkpointing: bool = False,
+    ):
         total_load_balancing_loss = 0.0
         
         for loop in range(self.n_loops):
-            hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, attn_mask=attention_mask)
+            if self.training and use_checkpointing:
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, loop, identity_skew, attention_mask, use_reentrant=False)
+            else:
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, attn_mask=attention_mask, identity_skew=identity_skew)
             total_load_balancing_loss += load_balancing_loss
             
         if return_loss:

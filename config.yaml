@@ -1,0 +1,28 @@
+model:
+  vocab_size: 262144
+  max_seq_length: 4096
+  hidden_size: 1024
+  intermediate_size: 4096
+  num_layers: 8
+  num_attention_heads: 8
+  head_dim: 128
+  dropout: 0.1
+  per_layer_embeddings_size: 168
+
+  # num experts
+  num_mlp_experts: 16
+  num_attn_experts: 2
+
+  # routing
+  top_k: 2
+  n_loops: 8
+  identity_skew: 0.5
+
+  # information retrieval
+  num_ir_experts: 1
+  num_ir_entries: 8192
+  ir_dim: 256
+
+training:
+  batch_size: 2
+  seq_length: 4096
