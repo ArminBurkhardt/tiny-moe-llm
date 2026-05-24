@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
-from modules.model.experts import SelfAttention
+from modules.model.experts import InformationRetrievalExpert, SelfAttention
 
 
 
@@ -38,16 +38,18 @@ class ParallelSparseMoELayer(nn.Module):
         topk_indices = topk_indices.view(-1, topk_indices.shape[-1])  # [total_tokens, top_k]
 
         # map each token to its top k experts (one-hot)
-        b_matrix = F.one_hot(topk_indices, num_classes=self.num_experts).to(x_flat.dtype) # [total_tokens, top_k, num_experts]
+        unweighted_b_matrix = F.one_hot(topk_indices, num_classes=self.num_experts).to(x_flat.dtype) # [total_tokens, top_k, num_experts]
         
         # scale the one hot matrix by the corresponding topk weights
-        scaled_b_matrix = b_matrix * topk_weights.unsqueeze(-1)
+        scaled_b_matrix = unweighted_b_matrix * topk_weights.unsqueeze(-1)
         
         # collapse the top_k dimension to get a routing map per token
-        routing_map = scaled_b_matrix.sum(dim=1) # [total_tokens, num_experts]
+        unweighted_routing_map = unweighted_b_matrix.sum(dim=1) # [total_tokens, num_experts]
+        weighted_routing_map = scaled_b_matrix.sum(dim=1)
 
         # parallel token gathering (grouping tokens by expert)
-        gathered_tokens = torch.einsum("td,te->etd", x_flat, routing_map) # [num_experts, total_tokens, hidden_size]
+        # gather with the unweighted map so the inputs to the generic non linear functions inside the experts remain unscaled (first act then scale)
+        gathered_tokens = torch.einsum("td,te->etd", x_flat, unweighted_routing_map) # [num_experts, total_tokens, hidden_size]
 
 
         # expert (MLP) computations in parallel
@@ -59,7 +61,7 @@ class ParallelSparseMoELayer(nn.Module):
        
         # recombining the distributed representations
         # multiply expert outputs back by the routing weights and sum them together
-        combined_output = torch.einsum("etd,te->td", expert_outputs, routing_map) # [total_tokens, hidden_size]
+        combined_output = torch.einsum("etd,te->td", expert_outputs, weighted_routing_map) # [total_tokens, hidden_size]
 
         return combined_output.view(*orig_shape)
 
@@ -70,37 +72,59 @@ class LoopMixtureOfExperts(nn.Module):
         self,
         hidden_size: int, 
         intermediate_size: int, 
-        num_experts: int, 
+        num_mlp_experts: int, 
+        num_attn_experts: int = 4,
+        num_ir_experts: int = 0,
         top_k: int = 2,
         n_loops: int = 8, 
         dropout: float = 0.0,
-        num_attn_experts: int = 4,
         temperature: float = 1.0,
+        num_ir_entries: int = 1024,
+        ir_dim: int = 128,
+        ir_residual: bool = False,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
         Args:
             hidden_size (int): hidden size of the input and output representations
-            intermediate_size (int): intermediate size of the feedforward layers
-            num_experts (int): number of MLP experts in the mixture
+            intermediate_size (int): intermediate size of the feedforward layers (MLP)
+            num_mlp_experts (int): number of MLP experts in the mixture
+            num_attn_experts (int, optional): number of attention experts. Defaults to 4.
+            num_ir_experts (int, optional): number of intermediate representation experts. Defaults to 0.
             top_k (int, optional): number of top experts to route each token to. Defaults to 2.
             n_loops (int, optional): number of routing loops. Defaults to 8.
             dropout (float, optional): dropout probability. Defaults to 0.0.
-            num_attn_experts (int, optional): number of attention experts. Defaults to 4.
             temperature (float, optional): temperature for the router. Defaults to 1.0.
+            num_ir_entries (int, optional): number of entries in the information retrieval expert. Defaults to 1024.
+            ir_dim (int, optional): dimension of the information retrieval experts latent space. Defaults to 128.
+            ir_residual (bool, optional): whether the information retrieval expert should have a residual connection. Defaults to False.
         """
         super().__init__()
-        self._num_experts = num_experts
+        self._num_mlp_experts = num_mlp_experts
         self._num_attn_experts = num_attn_experts
+        self._num_ir_experts = num_ir_experts
         self.top_k = top_k
         self.n_loops = n_loops
         self.temperature = temperature
         
+        # num expert heads
+        n_heads = 16
+        
         # experts
         experts = []
         experts.extend([
-            SelfAttention(input_size=hidden_size, dropout=dropout, num_heads=16)
+            SelfAttention(input_size=hidden_size, dropout=dropout, num_heads=n_heads)
             for _ in range(num_attn_experts)
+        ])
+        experts.extend([
+            InformationRetrievalExpert(
+                input_size=hidden_size, 
+                num_entries=num_ir_entries, 
+                ir_dim=ir_dim,
+                num_heads=n_heads,
+                dropout=dropout,
+                residual=ir_residual
+            ) for _ in range(num_ir_experts)
         ])
         experts.append(nn.Identity()) # identity expert for skipping
         self.experts = nn.ModuleList(experts)
@@ -108,7 +132,7 @@ class LoopMixtureOfExperts(nn.Module):
         self.parallel_experts = ParallelSparseMoELayer(
             hidden_size=hidden_size, 
             intermediate_size=intermediate_size, 
-            num_experts=num_experts
+            num_experts=num_mlp_experts
         )
         
         # router
@@ -125,11 +149,11 @@ class LoopMixtureOfExperts(nn.Module):
         
     @property
     def num_experts(self):
-        return self._num_experts + self._num_attn_experts + 1
+        return self._num_attn_experts + self._num_ir_experts + 1 + self._num_mlp_experts
     
     @property
     def identity_expert_index(self):
-        return self._num_attn_experts
+        return self._num_attn_experts + self._num_ir_experts
     
     def route(self, hidden_states: torch.Tensor, temperature: float = 1.0, identity_skew: float = 1.0, on_loop: int = 0):
         """routes tokens to experts and computes the load balancing loss
@@ -177,7 +201,7 @@ class LoopMixtureOfExperts(nn.Module):
         )
         
         # index placement in the scores would be:
-        # [attn_experts..., identity, ff_experts...]
+        # [attn_experts..., num_ir_experts..., identity, ff_experts...]
         
         output = torch.zeros_like(hidden_states)
         
@@ -186,12 +210,12 @@ class LoopMixtureOfExperts(nn.Module):
             expert_indices = topk_indices[..., k] # [batch_size, seq_len]
             expert_scores = topk_scores[..., k]   # [batch_size, seq_len]
             
-            for i in range(self.identity_expert_index + 1): # loop through attention experts and identity
+            for i in range(self.identity_expert_index + 1): # loop through attention/ir experts and identity
                 mask = (expert_indices == i)      # [batch_size, seq_len]
                 if mask.sum() == 0:
                     continue
                                 
-                if isinstance(self.experts[i], SelfAttention):
+                if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
                     expert_output = self.experts[i](hidden_states, attn_mask)
                     # not sparse due to attention
                 else:

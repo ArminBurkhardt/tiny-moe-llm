@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextAttention as GroupedQueryAttention
-from modules.model.embeddings import RotaryPositionEmbeddingsFrequency as RoPEFreq
+from modules.model.information_retrieval import InformationRetrievalModule
 
    
 class SelfAttention(nn.Module):
@@ -26,4 +26,52 @@ class SelfAttention(nn.Module):
         )
         return self.dropout(attn_output)
 
+
+class InformationRetrievalExpert(nn.Module):
+    def __init__(
+        self, 
+        input_size: int, 
+        num_entries: int,
+        ir_dim: int,
+        num_heads: int = 8, 
+        dropout: float = 0.1,
+        residual: bool = False,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.dropout = nn.Dropout(dropout)
+        self.norm = RMSNorm(input_size)
+        self.attn = GroupedQueryAttention(
+            hidden_size=input_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            head_dim=input_size // num_heads,
+            dropout=dropout,
+        )
+        
+        # operate on the per-head dimension for more efficient retrieval
+        self.ir_module = InformationRetrievalModule(
+            num_entries=num_entries,
+            latent_dim=ir_dim,
+            output_dim=ir_dim,
+            temperature=1.0,
+            use_min_dist=False,
+            residual=residual,
+        )
+        self.down_proj = nn.Linear(input_size, ir_dim, bias=False)
+        self.up_proj = nn.Linear(ir_dim, input_size, bias=False)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+        x_norm = self.norm(x)
+        
+        down = self.down_proj(x_norm)
+        ir_output = self.ir_module(down)
+        information = self.up_proj(ir_output)
+        
+        attn_output = self.attn(
+            hidden_states=x_norm, 
+            attention_mask=attn_mask,
+            other_states=information,
+        )
+        return self.dropout(attn_output)
 
