@@ -17,9 +17,10 @@ class GemmaRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
     
     def forward(self, x: torch.Tensor):
-        mean_square = x.pow(2).mean(-1, keepdim=True)
-        norm_x = x / torch.sqrt(mean_square + self.eps)
-        return (norm_x * self.weight).type_as(x)
+        x_float = x.float()
+        mean_square = x_float.pow(2).mean(-1, keepdim=True)
+        norm_x = x_float * torch.rsqrt(mean_square + self.eps)
+        return (norm_x.type_as(x) * self.weight).type_as(x)
 
 class Gemma4MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
@@ -87,18 +88,14 @@ class Gemma4TextAttention(nn.Module):
         key_states = torch.repeat_interleave(key_states, self.num_key_value_groups, dim=1)
         value_states = torch.repeat_interleave(value_states, self.num_key_value_groups, dim=1)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
+        is_causal = True if attention_mask is None else False
         attn_output = F.scaled_dot_product_attention(
             query_states, 
             key_states, 
             value_states, 
             attn_mask=attention_mask, 
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False
+            is_causal=is_causal
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
