@@ -77,6 +77,18 @@ class LoopMixtureOfExperts(nn.Module):
         num_attn_experts: int = 4,
         temperature: float = 1.0,
     ):
+        """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
+
+        Args:
+            hidden_size (int): hidden size of the input and output representations
+            intermediate_size (int): intermediate size of the feedforward layers
+            num_experts (int): number of MLP experts in the mixture
+            top_k (int, optional): number of top experts to route each token to. Defaults to 2.
+            n_loops (int, optional): number of routing loops. Defaults to 8.
+            dropout (float, optional): dropout probability. Defaults to 0.0.
+            num_attn_experts (int, optional): number of attention experts. Defaults to 4.
+            temperature (float, optional): temperature for the router. Defaults to 1.0.
+        """
         super().__init__()
         self._num_experts = num_experts
         self._num_attn_experts = num_attn_experts
@@ -90,7 +102,7 @@ class LoopMixtureOfExperts(nn.Module):
             SelfAttention(input_size=hidden_size, dropout=dropout, num_heads=16)
             for _ in range(num_attn_experts)
         ])
-        experts.append(nn.Identity())
+        experts.append(nn.Identity()) # identity expert for skipping
         self.experts = nn.ModuleList(experts)
         
         self.parallel_experts = ParallelSparseMoELayer(
@@ -105,6 +117,11 @@ class LoopMixtureOfExperts(nn.Module):
         self.post_norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.identity_scalar = nn.Parameter(torch.ones(1))
+        
+        # note: the identity expert acts both as a skip connection and a way to indicate that the current representation is sufficient and doesnt need to be modified by any expert again
+        # during inference, landing on the identity expert could idicate that the model is confident in its current representation and can stop routing early. On the contrary, if the model never routes to the identity expert, 
+        # it may indicate that the model is not confident or does not know how to improve further (might not have an answer at all)
+        # adjust the identity skew encourages the model to end routing early, thus shortening the internal "reasoning path" and possible producing lower quality outputs.
         
     @property
     def num_experts(self):
