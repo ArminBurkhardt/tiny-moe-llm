@@ -217,7 +217,9 @@ def save_model_info(model: torch.nn.Module, file_prefix: str):
             f.write(f"{name}: {count}\n")
 
 
-def measure_transformer_training_memory():
+def measure_transformer_training_memory(
+    mtp=True,
+):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
 
@@ -227,9 +229,11 @@ def measure_transformer_training_memory():
     
     timer = time.time()
     
+    
     try:
         model = TinyMoETransformer(
-            **ModelConfig.Params
+            **ModelConfig.Params,
+            mtp_num_extra_tokens=2 if mtp else 0,
         ).to(device="cuda", dtype=torch.bfloat16)
         
         # create dummy input
@@ -238,16 +242,26 @@ def measure_transformer_training_memory():
         attn_mask = create_causal_attention_mask(TrainingConfig.Seq_length, dtype=torch.bool, device="cuda")
 
         optimizer = AdamW(model.parameters(), lr=1e-4)
-
-        logits = model(input_ids, attention_mask=attn_mask)[0]
         
         # loss
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = targets[..., 1:].contiguous()
-        loss = torch.nn.functional.cross_entropy(
-            shift_logits.view(-1, ModelConfig.Params["vocab_size"]), 
-            shift_labels.view(-1)
-        )
+        if mtp:
+            logits, aux_loss, mtp_outputs = model(input_ids, attention_mask=attn_mask, return_aux_loss=True)
+            from modules.model.mtp import compute_mtp_loss
+            loss = compute_mtp_loss(
+                outputs=logits, 
+                targets=targets, 
+                mtp_outputs=mtp_outputs, 
+                lm_head=model.mtp_head.lm_head,
+                lambda_mtp=0.1
+            ) + aux_loss
+        else:
+            logits, aux_loss = model(input_ids, attention_mask=attn_mask, return_aux_loss=True)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = targets[..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, ModelConfig.Params["vocab_size"]), 
+                shift_labels.view(-1)
+            ) + aux_loss
 
         loss.backward()
         
