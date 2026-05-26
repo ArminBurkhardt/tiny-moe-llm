@@ -9,7 +9,7 @@ logger.setLevel(logging.INFO)
 
 # set warning color to yellow
 ch = logging.StreamHandler()
-ch.setLevel(logging.WARNING)
+ch.setLevel(logging.INFO)
 formatter = logging.Formatter("\033[93m%(levelname)s: %(message)s\033[0m")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
@@ -18,3 +18,24 @@ FP32 = torch.float32
 FP16 = torch.float16
 BF16 = torch.bfloat16
 
+
+
+def save_checkpoint(model, optimizer, epoch, dataset_idx, path):
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "dataset_idx": dataset_idx,
+        "epoch": epoch,
+    }
+    torch.save(checkpoint, path)
+    logger.info(f"Checkpoint saved at {path}")
+
+
+def load_checkpoint(model, optimizer, path):
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    epoch = checkpoint["epoch"]
+    dataset_idx = checkpoint["dataset_idx"]
+    logger.info(f"Checkpoint loaded from {path}")
+    return epoch, dataset_idx

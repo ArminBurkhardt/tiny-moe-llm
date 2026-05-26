@@ -233,12 +233,12 @@ def measure_transformer_training_memory(
     try:
         model = TinyMoETransformer(
             **ModelConfig.Params,
-            mtp_num_extra_tokens=2 if mtp else 0,
+            #mtp_num_extra_tokens=2 if mtp else 0,
         ).to(device="cuda", dtype=torch.bfloat16)
         
         # create dummy input
         input_ids = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
-        targets = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
+        #targets = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
         attn_mask = create_causal_attention_mask(TrainingConfig.Seq_length, dtype=torch.bool, device="cuda")
 
         optimizer = AdamW(model.parameters(), lr=1e-4)
@@ -249,7 +249,7 @@ def measure_transformer_training_memory(
             from modules.model.mtp import compute_mtp_loss
             loss = compute_mtp_loss(
                 outputs=logits, 
-                targets=targets, 
+                targets=input_ids, # targets, 
                 mtp_outputs=mtp_outputs, 
                 lm_head=model.mtp_head.lm_head,
                 lambda_mtp=0.1
@@ -257,7 +257,7 @@ def measure_transformer_training_memory(
         else:
             logits, aux_loss = model(input_ids, attention_mask=attn_mask, return_aux_loss=True)
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = targets[..., 1:].contiguous()
+            shift_labels = input_ids[..., 1:].contiguous() # targets[..., 1:].contiguous()
             loss = torch.nn.functional.cross_entropy(
                 shift_logits.view(-1, ModelConfig.Params["vocab_size"]), 
                 shift_labels.view(-1)
