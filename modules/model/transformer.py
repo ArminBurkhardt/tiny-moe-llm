@@ -126,7 +126,7 @@ class TinyMoETransformer(nn.Module):
             
             If delayed_mtp_loss is False, the shape of each element in extra_token_outputs is [batch_size, seq_len, vocab_size]
         """
-        self._token_tracker.count_tokens(input_ids)
+        self._token_tracker.count_tokens(input_ids.detach().cpu())
         if self.training and self.use_checkpointing:
             x = checkpoint(self.gemma_decoder, input_ids, attention_mask, use_reentrant=False)
             x, aux_loss = checkpoint(self.moe, x.last_hidden_state, return_aux_loss, attention_mask, identity_skew, self.use_sub_checkpointing, use_reentrant=False)
@@ -158,6 +158,10 @@ class TinyMoETransformer(nn.Module):
     
     def delayed_mtp_loss(self, set_to_true: bool = None):
         """whether to delay MTP loss computation until after the main loss backward pass to save VRAM"""
-        if set_to_true is not None:
+        if (set_to_true is not None) and self.has_mtp:
             self.mtp_head.late_token_loss = set_to_true
         return self.mtp_head is not None and self.mtp_head.late_token_loss
+
+    @property
+    def has_mtp(self):
+        return self.mtp_head is not None

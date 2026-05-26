@@ -42,7 +42,13 @@ class MTPHead(nn.Module):
             return [self.lm_head(out[:, :, i, :]) for i in range(self.num_extra_tokens)]
 
 
-def compute_mtp_loss(outputs: torch.Tensor, targets: torch.Tensor, mtp_outputs: torch.Tensor = None, lm_head: nn.Module = None, lambda_mtp: float = 0.1):
+def compute_mtp_loss(
+    outputs: torch.Tensor, 
+    targets: torch.Tensor, 
+    mtp_outputs: torch.Tensor = None, 
+    lm_head: nn.Module = None, 
+    lambda_mtp: float = 0.1,
+):
     # main loss: targets shifted by 1 relative to inputs
     main_logits = outputs[:, :-1, :].contiguous()
     main_labels = targets[:, 1:].contiguous()
@@ -58,7 +64,7 @@ def compute_mtp_loss(outputs: torch.Tensor, targets: torch.Tensor, mtp_outputs: 
             hidden = mtp_outputs[:, :-shift, i, :].contiguous()
             aux_labels = targets[:, shift:].contiguous()
             
-            # apply LM head on flattened tensor to avoid large 3D intermediate buffers
+            # apply LM head on flattened tensor to avoid large intermediate buffers
             aux_logits = lm_head(hidden.view(-1, hidden.size(-1)))
             aux_loss = F.cross_entropy(aux_logits, aux_labels.view(-1))
             
