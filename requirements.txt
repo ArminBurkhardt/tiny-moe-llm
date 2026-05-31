@@ -4,4 +4,6 @@ sentence-transformers>=5.2.0
 numpy>=1.21.0
 pandas>=3.0.0
 fastparquet
+matplotlib>=3.10.0
 bitsandbytes>=0.30.0
+accelerate>=1.13.0

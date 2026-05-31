@@ -134,7 +134,7 @@ class Gemma4TextDecoderLayer(nn.Module):
         
         self.layer_scalar = nn.Parameter(torch.ones(1))
         
-        if ple_size is not None:
+        if (ple_size is not None) and (ple_size > 0):
             self.ple_proj = nn.Linear(ple_size, hidden_size, bias=False)
             self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
             self.post_feedforward_layernorm = GemmaRMSNorm(hidden_size, eps=rms_norm_eps)
@@ -194,7 +194,7 @@ class Gemma4TextModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size, pad_token_id)
         
-        if per_layer_embeddings_size is not None:
+        if (per_layer_embeddings_size is not None) and (per_layer_embeddings_size > 0):
             self.ple = nn.Embedding(
                 vocab_size, 
                 per_layer_embeddings_size * num_hidden_layers, 

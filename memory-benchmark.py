@@ -217,9 +217,7 @@ def save_model_info(model: torch.nn.Module, file_prefix: str):
             f.write(f"{name}: {count}\n")
 
 
-def measure_transformer_training_memory(
-    mtp=True,
-):
+def measure_transformer_training_memory():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
 
@@ -236,6 +234,8 @@ def measure_transformer_training_memory(
             #mtp_num_extra_tokens=2 if mtp else 0,
         ).to(device="cuda", dtype=torch.bfloat16)
         
+        model.set_checkpointing(True, True)
+        
         # create dummy input
         input_ids = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
         #targets = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
@@ -244,7 +244,7 @@ def measure_transformer_training_memory(
         optimizer = AdamW(model.parameters(), lr=1e-4)
         
         # loss
-        if mtp:
+        if model.has_mtp:
             logits, aux_loss, mtp_outputs = model(input_ids, attention_mask=attn_mask, return_aux_loss=True)
             from modules.model.mtp import compute_mtp_loss
             loss = compute_mtp_loss(
@@ -305,7 +305,9 @@ def check_all_dtypes(model: torch.nn.Module) -> dict[str, torch.dtype]:
     return dtypes
 
 if __name__ == "__main__":
-    dtypes_to_test = [torch.bfloat16]
+    dtypes_to_test = []
+    num_params = 0
+    training_time = 0.0
     
     print("--------------------------------------")
     print(" Gemma4 Causal LM Benchmark ")
@@ -359,6 +361,8 @@ if __name__ == "__main__":
     print("--------------------------------------")
     print(f"{'Dtype':<15} | {'Peak Memory (GB)':<20}")
     print("-" * 38)
+    
+    dtypes_to_test = [torch.bfloat16] 
     
     for dt in dtypes_to_test:
         try:

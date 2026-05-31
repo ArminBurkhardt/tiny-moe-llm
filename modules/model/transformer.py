@@ -106,6 +106,7 @@ class TinyMoETransformer(nn.Module):
         attention_mask: torch.Tensor = None, 
         return_aux_loss=False,
         identity_skew: float = 0.0,
+        return_hidden=False,
     ):
         """forward pass of the model
 
@@ -132,13 +133,15 @@ class TinyMoETransformer(nn.Module):
             x, aux_loss = checkpoint(self.moe, x.last_hidden_state, return_aux_loss, attention_mask, identity_skew, self.use_sub_checkpointing, use_reentrant=False)
             x = self.norm(x)
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
-            x = self.lm_head(x)
+            if not return_hidden:
+                x = self.lm_head(x)
         else:
             x = self.gemma_decoder(input_ids, attention_mask=attention_mask).last_hidden_state
             x, aux_loss = self.moe(x, attention_mask=attention_mask, return_loss=True, identity_skew=identity_skew)
             x = self.norm(x)
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)
-            x = self.lm_head(x)
+            if not return_hidden:
+                x = self.lm_head(x)
         
         if extra_token_outputs is not None:
             return x, aux_loss, extra_token_outputs if return_aux_loss else (x, extra_token_outputs)

@@ -4,7 +4,9 @@ tiny-moe-llm is an experimental research project exploring a small, modular mixt
 
 At a high level, the codebase combines:
 - Gemma4 style dense transformer layers,
-- dynamically routed experts.
+- dynamically routed experts,
+- multi-token prediction (MTP),
+- Pretraining and sft
 
 
 ## Credit

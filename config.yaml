@@ -1,34 +1,34 @@
 model:
-  vocab_size: 262144
-  max_seq_length: 3200
-  hidden_size: 1024
-  intermediate_size: 4096
-  num_layers: 8
+  vocab_size: 129280 # gemma: 262144
+  max_seq_length: 4096
+  hidden_size: 512
+  intermediate_size: 2048
+  num_layers: 4
   num_attention_heads: 8
-  head_dim: 128
+  head_dim: 32
   dropout: 0.1
-  per_layer_embeddings_size: 168
+  per_layer_embeddings_size: 32
 
   # num experts
-  num_mlp_experts: 16
+  num_mlp_experts: 32
   num_attn_experts: 2
 
   # routing
   top_k: 2
-  n_loops: 8
+  n_loops: 4
   identity_skew: 0.5
 
   # information retrieval
   num_ir_experts: 1
-  num_ir_entries: 8192
-  ir_dim: 256
+  num_ir_entries: 16384
+  ir_dim: 128
 
   # mtp
   mtp_num_extra_tokens: 2
 
 training:
-  batch_size: 2
-  seq_length: 3200
+  batch_size: 3
+  seq_length: 4096
   lr: 1e-4
   weight_decay: 0.01
   grad_clip: 1.0

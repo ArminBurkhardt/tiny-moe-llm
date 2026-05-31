@@ -48,11 +48,18 @@ def compute_mtp_loss(
     mtp_outputs: torch.Tensor = None, 
     lm_head: nn.Module = None, 
     lambda_mtp: float = 0.1,
+    main_lm_head: nn.Module = None,
 ):
-    # main loss: targets shifted by 1 relative to inputs
-    main_logits = outputs[:, :-1, :].contiguous()
-    main_labels = targets[:, 1:].contiguous()
-    loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), main_labels.view(-1))
+    if main_lm_head is not None:
+        hidden = outputs[:, :-1, :].contiguous()
+        main_logits = main_lm_head(hidden.view(-1, hidden.size(-1)))
+        main_labels = targets[:, 1:].contiguous()
+        loss = F.cross_entropy(main_logits, main_labels.view(-1))
+    else:
+        # main loss: targets shifted by 1 relative to inputs
+        main_logits = outputs[:, :-1, :].contiguous()
+        main_labels = targets[:, 1:].contiguous()
+        loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), main_labels.view(-1))
     
     if mtp_outputs is not None and lm_head is not None:
         # mtp_outputs shape: [batch_size, seq_len, num_extra_tokens, hidden_size // 2]

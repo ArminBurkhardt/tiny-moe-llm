@@ -67,6 +67,39 @@ class ParallelSparseMoELayer(nn.Module):
         return combined_output.view(*orig_shape)
 
 
+class _ExpertTracking():
+    def __init__(self, id_idx: int, num_experts: int):
+        self.prob_dist = torch.zeros(num_experts)
+        self.post_skew_dist = torch.zeros(num_experts)
+        self.choices = torch.zeros(num_experts)
+        self.id_idx = id_idx
+        self.sliding_window_size = 256
+    
+    def update(self, topk_indices: torch.Tensor, topk_scores: torch.Tensor, expert_scores: torch.Tensor):
+        topk_indices_collapsed = topk_indices.detach().cpu().view(-1, topk_indices.size(-1)) # [total_tokens, top_k]
+        topk_scores_collapsed = topk_scores.detach().cpu().view(-1, topk_scores.size(-1)) # [total_tokens, top_k]
+        expert_scores_collapsed = expert_scores.detach().cpu().view(-1, expert_scores.size(-1)) # [total_tokens, num_experts]
+        for i in range(self.prob_dist.size(0)):
+            mask = topk_indices_collapsed == i
+            one_hot_mask = F.one_hot(topk_indices_collapsed, num_classes=self.prob_dist.size(0)) # [total_tokens, top_k, num_experts]
+            one_hot_mask = one_hot_mask.any(dim=1) # [total_tokens, num_experts]
+            self.prob_dist[i] = self.prob_dist[i]*(1 - 1/self.sliding_window_size) + torch.sum(topk_scores_collapsed[mask]) * (1/self.sliding_window_size)
+            self.post_skew_dist[i] = self.post_skew_dist[i]*(1 - 1/self.sliding_window_size) + torch.sum(expert_scores_collapsed[one_hot_mask]) * (1/self.sliding_window_size)
+            self.choices[i] = self.choices[i]*(1 - 1/self.sliding_window_size) + mask.sum() * (1/self.sliding_window_size)
+    
+    def get_stats(self):
+        return {
+            "prob_dist": self.prob_dist.tolist(),
+            "post_skew_dist": self.post_skew_dist.tolist(),
+            "choices": self.choices.tolist(),
+            "id_idx": self.id_idx,
+        }
+        
+    def reset_stats(self):
+        self.prob_dist.zero_()
+        self.post_skew_dist.zero_()
+        self.choices.zero_()
+
 class LoopMixtureOfExperts(nn.Module):
     """a Mixture of Experts module that routes tokens to a mixture of attention and feedforward experts in multiple loops"""
     def __init__(
@@ -141,12 +174,14 @@ class LoopMixtureOfExperts(nn.Module):
         
         self.post_norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.identity_scalar = nn.Parameter(torch.ones(1))
+        self.identity_scalar = nn.Parameter(torch.ones(1) * 0.1)
         
         # note: the identity expert acts both as a skip connection and a way to indicate that the current representation is sufficient and doesnt need to be modified by any expert again
         # during inference, landing on the identity expert could idicate that the model is confident in its current representation and can stop routing early. On the contrary, if the model never routes to the identity expert, 
         # it may indicate that the model is not confident or does not know how to improve further (might not have an answer at all)
         # adjust the identity skew encourages the model to end routing early, thus shortening the internal "reasoning path" and possible producing lower quality outputs.
+        
+        self.expert_tracker = _ExpertTracking(id_idx=self.identity_expert_index, num_experts=self.num_experts)
         
     @property
     def num_experts(self):
@@ -185,11 +220,17 @@ class LoopMixtureOfExperts(nn.Module):
         expert_scores = expert_scores.clone() # avoid inplace modification to preserve scores for loss computation (funny error with torch.autograd.set_detect_anomaly(True) if this is removed)
         expert_scores[..., self.identity_expert_index] += id_skew - 1.0
         
+        # softmax again to get the new distribution after skewing
+        expert_scores = F.softmax(expert_scores / temperature, dim=-1)
+        
         # select topk experts
         topk_scores, topk_indices = torch.topk(expert_scores, self.top_k, dim=-1) # [batch_size, seq_len, top_k], [batch_size, seq_len, top_k]
         
         # normalize the topk scores
         topk_scores = topk_scores / torch.sum(topk_scores, dim=-1, keepdim=True)
+        
+        # track expert selection stats
+        self.expert_tracker.update(topk_indices, topk_scores, expert_scores)
         
         return topk_scores, topk_indices, load_balancing_loss
 

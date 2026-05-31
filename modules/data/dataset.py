@@ -56,7 +56,8 @@ class Dataset(IterableDataset):
         max_length: int = 1024,
         mode: str = "pretrain",
         config_path: str = "data_config.json",
-        padding: str = "max_length"
+        padding: str = "max_length",
+        start_step: int = 0
     ) -> None:
         """
         Dataset for LLM training. Configured via config (`config_path`)
@@ -74,6 +75,8 @@ class Dataset(IterableDataset):
         self.batch_size = batch_size
         self.max_length = max_length
         self.padding = padding
+        self.start_step = start_step
+        self._current_step = 0
         
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -82,6 +85,9 @@ class Dataset(IterableDataset):
             raise ValueError(f"mode '{mode}' not found in {config_path}")
             
         self.sources = config[mode]
+        
+        self._skip_tokenization = False
+        self._skip_batches = 0
 
     def _batch_iterator(self) -> Iterator[dict]:
         file_iter = FileIterator(self.sources)
@@ -89,6 +95,15 @@ class Dataset(IterableDataset):
         
         for records, column in file_iter:
             for record in records:
+                # if skipping, we don't even need to build the prompt or tokenize
+                if self._current_step < self.start_step:
+                    current_batch.append(None)
+                    if len(current_batch) == self.batch_size:
+                        yield {"input_ids": torch.zeros((self.batch_size, self.max_length), dtype=torch.long), "attention_mask": None, "labels": None}
+                        current_batch = []
+                        self._current_step += 1
+                    continue
+
                 # if column specifies messages and theres a list of dicts, apply chat template (likely SFT)
                 if column == "messages" and (isinstance(record, list) or isinstance(record, dict)):
                     try:
@@ -103,10 +118,12 @@ class Dataset(IterableDataset):
                 if len(current_batch) == self.batch_size:
                     yield self._tokenize_batch(current_batch)
                     current_batch = []
+                    self._current_step += 1
                     
         # yield remaining
         if current_batch:
             yield self._tokenize_batch(current_batch)
+            self._current_step += 1
 
     def _tokenize_batch(self, texts: list[str]) -> dict:
         tokenized = self.tokenizer(
