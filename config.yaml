@@ -3,15 +3,15 @@ model:
   max_seq_length: 4096
   hidden_size: 512
   intermediate_size: 2048
-  num_layers: 4
+  num_layers: 5
   num_attention_heads: 8
-  head_dim: 32
+  head_dim: 64
   dropout: 0.1
   per_layer_embeddings_size: 32
 
   # num experts
   num_mlp_experts: 32
-  num_attn_experts: 2
+  num_attn_experts: 1
 
   # routing
   top_k: 2

@@ -59,6 +59,8 @@ class TinyMoETransformer(nn.Module):
             per_layer_embeddings_size=ple_embeddings_size,
         )
         
+        self.moe_embeddings = nn.Embedding(vocab_size, ple_embeddings_size) if ple_embeddings_size is not None else None
+        self.moe_embed_proj = nn.Linear(ple_embeddings_size, hidden_size, bias=False) if ple_embeddings_size is not None else None
         self.moe = LoopMixtureOfExperts(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -100,6 +102,13 @@ class TinyMoETransformer(nn.Module):
             extra_token_outputs = self.mtp_head(hidden_state)
         return extra_token_outputs
     
+    def _moe_ple(self, input_ids: torch.Tensor):
+        if self.moe_embeddings is None or self.moe_embed_proj is None:
+            return None
+        moe_embeds = self.moe_embeddings(input_ids)
+        moe_embeds = self.moe_embed_proj(moe_embeds)
+        return moe_embeds
+    
     def forward(
         self, 
         input_ids: torch.Tensor, 
@@ -130,14 +139,14 @@ class TinyMoETransformer(nn.Module):
         self._token_tracker.count_tokens(input_ids.detach().cpu())
         if self.training and self.use_checkpointing:
             x = checkpoint(self.gemma_decoder, input_ids, attention_mask, use_reentrant=False)
-            x, aux_loss = checkpoint(self.moe, x.last_hidden_state, return_aux_loss, attention_mask, identity_skew, self.use_sub_checkpointing, use_reentrant=False)
+            x, aux_loss = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, attention_mask, identity_skew, self.use_sub_checkpointing, use_reentrant=False)
             x = self.norm(x)
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
             if not return_hidden:
                 x = self.lm_head(x)
         else:
             x = self.gemma_decoder(input_ids, attention_mask=attention_mask).last_hidden_state
-            x, aux_loss = self.moe(x, attention_mask=attention_mask, return_loss=True, identity_skew=identity_skew)
+            x, aux_loss = self.moe(x, other=self._moe_ple(input_ids), attention_mask=attention_mask, return_loss=True, identity_skew=identity_skew)
             x = self.norm(x)
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)
             if not return_hidden:

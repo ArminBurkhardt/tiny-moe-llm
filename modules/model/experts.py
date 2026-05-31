@@ -5,7 +5,7 @@ from modules.model.information_retrieval import InformationRetrievalModule
 
    
 class SelfAttention(nn.Module):
-    def __init__(self, input_size: int, dropout: float = 0.1, num_heads: int = 8):
+    def __init__(self, input_size: int, dropout: float = 0.1, num_heads: int = 8, num_kv_heads: int = 4):
         super().__init__()
         self.input_size = input_size
         self.dropout = nn.Dropout(dropout)
@@ -13,7 +13,7 @@ class SelfAttention(nn.Module):
         self.attn = GroupedQueryAttention(
             hidden_size=input_size,
             num_attention_heads=num_heads,
-            num_key_value_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
             head_dim=input_size // num_heads,
             dropout=dropout,
         )
@@ -27,6 +27,29 @@ class SelfAttention(nn.Module):
         return self.dropout(attn_output)
 
 
+class CrossAttention(nn.Module):
+    def __init__(self, input_size: int, dropout: float = 0.1, num_heads: int = 8, num_kv_heads: int = 4):
+        super().__init__()
+        self.input_size = input_size
+        self.dropout = nn.Dropout(dropout)
+        self.norm = RMSNorm(input_size)
+        self.attn = GroupedQueryAttention(
+            hidden_size=input_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            head_dim=input_size // num_heads,
+            dropout=dropout,
+        )
+
+    def forward(self, x: torch.Tensor, other: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+        x_norm = self.norm(x)
+        attn_output = self.attn(
+            hidden_states=x_norm, 
+            attention_mask=attn_mask,
+            other_states=other,
+        )
+        return self.dropout(attn_output)
+
 class InformationRetrievalExpert(nn.Module):
     def __init__(
         self, 
@@ -34,6 +57,7 @@ class InformationRetrievalExpert(nn.Module):
         num_entries: int,
         ir_dim: int,
         num_heads: int = 8, 
+        num_kv_heads: int = 4,
         dropout: float = 0.1,
         residual: bool = False,
     ):
@@ -44,7 +68,7 @@ class InformationRetrievalExpert(nn.Module):
         self.attn = GroupedQueryAttention(
             hidden_size=input_size,
             num_attention_heads=num_heads,
-            num_key_value_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
             head_dim=input_size // num_heads,
             dropout=dropout,
         )

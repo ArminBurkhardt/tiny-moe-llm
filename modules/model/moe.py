@@ -6,7 +6,7 @@ from torch.utils.checkpoint import checkpoint
 
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
-from modules.model.experts import InformationRetrievalExpert, SelfAttention
+from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
 
 
 
@@ -135,7 +135,7 @@ class LoopMixtureOfExperts(nn.Module):
         """
         super().__init__()
         self._num_mlp_experts = num_mlp_experts
-        self._num_attn_experts = num_attn_experts
+        self._num_attn_experts = num_attn_experts * 2 # account for both self and cross attention experts
         self._num_ir_experts = num_ir_experts
         self.top_k = top_k
         self.n_loops = n_loops
@@ -143,11 +143,16 @@ class LoopMixtureOfExperts(nn.Module):
         
         # num expert heads
         n_heads = 16
+        n_kv_heads = 4
         
         # experts
         experts = []
         experts.extend([
-            SelfAttention(input_size=hidden_size, dropout=dropout, num_heads=n_heads)
+            SelfAttention(input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads)
+            for _ in range(num_attn_experts)
+        ])
+        experts.extend([
+            CrossAttention(input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads)
             for _ in range(num_attn_experts)
         ])
         experts.extend([
@@ -156,6 +161,7 @@ class LoopMixtureOfExperts(nn.Module):
                 num_entries=num_ir_entries, 
                 ir_dim=ir_dim,
                 num_heads=n_heads,
+                num_kv_heads=n_kv_heads,
                 dropout=dropout,
                 residual=ir_residual
             ) for _ in range(num_ir_experts)
@@ -234,7 +240,7 @@ class LoopMixtureOfExperts(nn.Module):
         
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, on_loop: int = 0, identity_skew: float = 1.0, attn_mask: torch.Tensor = None):
+    def forward_step(self, hidden_states: torch.Tensor, on_loop: int = 0, identity_skew: float = 1.0, attn_mask: torch.Tensor = None, other: torch.Tensor = None):
         topk_scores, topk_indices, load_balancing_loss = self.route(
             hidden_states, 
             temperature=self.temperature,
@@ -260,6 +266,11 @@ class LoopMixtureOfExperts(nn.Module):
                 if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
                     expert_output = self.experts[i](hidden_states, attn_mask)
                     # not sparse due to attention
+                elif isinstance(self.experts[i], CrossAttention):
+                    # for cross attention, we can use the output of the previous loop as the "other" input to the cross attention (allowing information flow between loops even for tokens that route to different experts)
+                    if other is None:
+                        other = hidden_states
+                    expert_output = self.experts[i](hidden_states, other, attn_mask)
                 else:
                     expert_output = self.experts[i](hidden_states)
                 
@@ -288,6 +299,7 @@ class LoopMixtureOfExperts(nn.Module):
     def forward(
         self, 
         hidden_states: torch.Tensor, 
+        other: torch.Tensor = None,
         return_loss: bool = False, 
         attention_mask: torch.Tensor = None, 
         identity_skew: float = 1.0,
@@ -297,9 +309,9 @@ class LoopMixtureOfExperts(nn.Module):
         
         for loop in range(self.n_loops):
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, loop, identity_skew, attention_mask, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, loop, identity_skew, attention_mask, other, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, attn_mask=attention_mask, identity_skew=identity_skew)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, attn_mask=attention_mask, identity_skew=identity_skew, other=other)
             total_load_balancing_loss += load_balancing_loss
             
         if return_loss:
