@@ -57,7 +57,8 @@ class Dataset(IterableDataset):
         mode: str = "pretrain",
         config_path: str = "data_config.json",
         padding: str = "max_length",
-        start_step: int = 0
+        start_step: int = 0,
+        num_mtp_tokens: int = 1
     ) -> None:
         """
         Dataset for LLM training. Configured via config (`config_path`)
@@ -69,6 +70,8 @@ class Dataset(IterableDataset):
             mode: which mode to use from config (eg. "pretrain", "sft")
             config_path: path to json config file specifying data sources
             padding: padding strategy for tokenization (default: "max_length")
+            start_step: global step to resume from
+            num_mtp_tokens: number of padding tokens appended after each text for multi-token prediction
         """
         super().__init__()
         self.tokenizer = tokenizer
@@ -76,6 +79,7 @@ class Dataset(IterableDataset):
         self.max_length = max_length
         self.padding = padding
         self.start_step = start_step
+        self.num_mtp_tokens = num_mtp_tokens
         self._current_step = 0
         
         with open(config_path, "r", encoding="utf-8") as f:
@@ -91,20 +95,78 @@ class Dataset(IterableDataset):
 
     def _batch_iterator(self) -> Iterator[dict]:
         file_iter = FileIterator(self.sources)
-        current_batch = []
+        
+        current_batch_input_ids = []
+        current_batch_attention_mask = []
+        current_batch_labels = []
+        
+        current_seq = []
+        current_seq_sections = [] # list of tuples (text_len, num_pad)
+        
+        def push_sequence():
+            # pad to max_length
+            pad_len = self.max_length - len(current_seq)
+            padded_seq = current_seq + [self.tokenizer.pad_token_id] * pad_len
+            
+            mask = torch.zeros((1, self.max_length, self.max_length), dtype=torch.bool)
+            start = 0
+            for text_len, num_pad in current_seq_sections:
+                block_len = text_len + num_pad
+                block_end = min(start + block_len, self.max_length)
+                actual_block_len = block_end - start
+                
+                if actual_block_len > 0:
+                    mask[0, start:block_end, start:block_end] = torch.tril(torch.ones((actual_block_len, actual_block_len), dtype=torch.bool))
+                
+                start = block_end
+                
+            for i in range(start, self.max_length):
+                mask[0, i, i] = True
+                
+            label_seq = torch.tensor(padded_seq)
+            label_mask = torch.zeros(self.max_length, dtype=torch.bool)
+            start = 0
+            for text_len, num_pad in current_seq_sections:
+                l_end = min(start + text_len, self.max_length)
+                if l_end > start:
+                    label_mask[start:l_end] = True
+                start += text_len + num_pad
+            
+            label_seq[~label_mask] = -100
+            
+            current_batch_input_ids.append(padded_seq)
+            current_batch_attention_mask.append(mask)
+            current_batch_labels.append(label_seq)
+            
+            current_seq.clear()
+            current_seq_sections.clear()
+            
+        def yield_batch():
+            nonlocal current_batch_input_ids, current_batch_attention_mask, current_batch_labels
+            batch = {
+                "input_ids": torch.tensor(current_batch_input_ids, dtype=torch.long),
+                "attention_mask": torch.cat(current_batch_attention_mask, dim=0),
+                "labels": torch.stack(current_batch_labels)
+            }
+            current_batch_input_ids = []
+            current_batch_attention_mask = []
+            current_batch_labels = []
+            return batch
         
         for records, column in file_iter:
             for record in records:
-                # if skipping, we don't even need to build the prompt or tokenize
                 if self._current_step < self.start_step:
-                    current_batch.append(None)
-                    if len(current_batch) == self.batch_size:
-                        yield {"input_ids": torch.zeros((self.batch_size, self.max_length), dtype=torch.long), "attention_mask": None, "labels": None}
-                        current_batch = []
+                    current_seq.append(None)
+                    if len(current_seq) >= self.batch_size:
+                        yield {
+                            "input_ids": torch.zeros((self.batch_size, self.max_length), dtype=torch.long),
+                            "attention_mask": None,
+                            "labels": None
+                        }
+                        current_seq.clear()
                         self._current_step += 1
                     continue
 
-                # if column specifies messages and theres a list of dicts, apply chat template (likely SFT)
                 if column == "messages" and (isinstance(record, list) or isinstance(record, dict)):
                     try:
                         text = self.tokenizer.apply_chat_template(record, tokenize=False)
@@ -113,36 +175,45 @@ class Dataset(IterableDataset):
                 else:
                     text = str(record)
                     
-                current_batch.append(text)
-                
-                if len(current_batch) == self.batch_size:
-                    yield self._tokenize_batch(current_batch)
-                    current_batch = []
-                    self._current_step += 1
+                tokens = self.tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
+                if len(tokens) > self.max_length:
+                    tokens = tokens[:self.max_length]
                     
-        # yield remaining
-        if current_batch:
-            yield self._tokenize_batch(current_batch)
+                if len(current_seq) + len(tokens) > self.max_length:
+                    if len(current_seq) > 0:
+                        push_sequence()
+                        if len(current_batch_input_ids) == self.batch_size:
+                            yield yield_batch()
+                            self._current_step += 1
+                            
+                if len(tokens) == self.max_length:
+                    current_seq.extend(tokens)
+                    current_seq_sections.append((len(tokens), 0))
+                    push_sequence()
+                    if len(current_batch_input_ids) == self.batch_size:
+                        yield yield_batch()
+                        self._current_step += 1
+                    continue
+                    
+                current_seq.extend(tokens)
+                
+                pad_to_add = min(self.num_mtp_tokens, self.max_length - len(current_seq))
+                if pad_to_add > 0:
+                    current_seq.extend([self.tokenizer.pad_token_id] * pad_to_add)
+                    
+                current_seq_sections.append((len(tokens), pad_to_add))
+                
+                if len(current_seq) == self.max_length:
+                    push_sequence()
+                    if len(current_batch_input_ids) == self.batch_size:
+                        yield yield_batch()
+                        self._current_step += 1
+                        
+        if len(current_seq) > 0:
+            push_sequence()
+        if len(current_batch_input_ids) > 0:
+            yield yield_batch()
             self._current_step += 1
-
-    def _tokenize_batch(self, texts: list[str]) -> dict:
-        tokenized = self.tokenizer(
-            texts,
-            truncation=True,
-            max_length=self.max_length,
-            padding=self.padding,
-            return_tensors="pt"
-        )
-        
-        labels = tokenized["input_ids"].clone()
-        if "attention_mask" in tokenized:
-            labels = labels.masked_fill(tokenized["attention_mask"] == 0, -100)
-            
-        return {
-            "input_ids": tokenized["input_ids"],
-            "attention_mask": tokenized.get("attention_mask"),
-            "labels": labels
-        }
 
     def __iter__(self) -> Iterator[dict]:
         return self._batch_iterator()

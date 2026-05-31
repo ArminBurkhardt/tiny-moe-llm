@@ -29,6 +29,8 @@ def train_step(
     
     if len(attention_mask.shape) == 2:
         attention_mask = attention_mask[:, None, None, :]
+    elif len(attention_mask.shape) == 3:
+        attention_mask = attention_mask[:, None, :, :]
     
     if model.has_mtp:
         logits, aux_loss, extra_token_outputs = model(
