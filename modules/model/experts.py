@@ -82,8 +82,9 @@ class InformationRetrievalExpert(nn.Module):
             use_min_dist=False,
             residual=residual,
         )
-        self.down_proj = nn.Linear(input_size, ir_dim, bias=False)
-        self.up_proj = nn.Linear(ir_dim, input_size, bias=False)
+        import transformer_engine.pytorch as te
+        self.down_proj = te.Linear(input_size, ir_dim, bias=False)
+        self.up_proj = te.Linear(ir_dim, input_size, bias=False)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
         x_norm = self.norm(x)

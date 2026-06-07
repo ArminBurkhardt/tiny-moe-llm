@@ -59,8 +59,9 @@ class TinyMoETransformer(nn.Module):
             per_layer_embeddings_size=ple_embeddings_size,
         )
         
+        import transformer_engine.pytorch as te
         self.moe_embeddings = nn.Embedding(vocab_size, ple_embeddings_size) if ple_embeddings_size is not None else None
-        self.moe_embed_proj = nn.Linear(ple_embeddings_size, hidden_size, bias=False) if ple_embeddings_size is not None else None
+        self.moe_embed_proj = te.Linear(ple_embeddings_size, hidden_size, bias=False) if ple_embeddings_size is not None else None
         self.moe = LoopMixtureOfExperts(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,

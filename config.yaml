@@ -10,7 +10,7 @@ model:
   per_layer_embeddings_size: 32
 
   # num experts
-  num_mlp_experts: 32
+  num_mlp_experts: 36 # due to fp8 requirement, this + other experts must be divisible by 8
   num_attn_experts: 1
 
   # routing

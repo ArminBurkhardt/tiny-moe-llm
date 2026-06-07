@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import transformer_engine.pytorch as te
 
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency, apply_rotary_pos_emb
 from modules.model.utils import EncoderOutput
@@ -10,25 +11,15 @@ from modules.model.utils import EncoderOutput
 # https://github.com/huggingface/blog/blob/main/gemma4.md#overview-of-capabilities-and-architecture 
 # following the dense architecture
 
-class GemmaRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-    
-    def forward(self, x: torch.Tensor):
-        x_float = x.float()
-        mean_square = x_float.pow(2).mean(-1, keepdim=True)
-        norm_x = x_float * torch.rsqrt(mean_square + self.eps)
-        return (norm_x.type_as(x) * self.weight).type_as(x)
+GemmaRMSNorm = te.RMSNorm
 
 class Gemma4MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
         # intermediate size is 4x hidden size
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = te.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = te.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = te.Linear(intermediate_size, hidden_size, bias=False)
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
@@ -54,10 +45,10 @@ class Gemma4TextAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
 
-        self.q_proj = nn.Linear(hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, hidden_size, bias=False)
+        self.q_proj = te.Linear(hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = te.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = te.Linear(hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = te.Linear(self.num_heads * self.head_dim, hidden_size, bias=False)
         self.dropout_p = dropout
 
     def forward(
@@ -135,8 +126,8 @@ class Gemma4TextDecoderLayer(nn.Module):
         self.layer_scalar = nn.Parameter(torch.ones(1))
         
         if (ple_size is not None) and (ple_size > 0):
-            self.ple_proj = nn.Linear(ple_size, hidden_size, bias=False)
-            self.gate_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.ple_proj = te.Linear(ple_size, hidden_size, bias=False)
+            self.gate_proj = te.Linear(hidden_size, hidden_size, bias=False)
             self.post_feedforward_layernorm = GemmaRMSNorm(hidden_size, eps=rms_norm_eps)
         else:
             self.ple_proj = None
@@ -292,7 +283,7 @@ class Gemma4ForCausalLM(nn.Module):
             dropout=dropout,
             per_layer_embeddings_size=per_layer_embeddings_size
         )
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.lm_head = te.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
         hidden_states = self.model(input_ids, attention_mask).last_hidden_state

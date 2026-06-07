@@ -36,7 +36,8 @@ class InformationRetrievalModule(nn.Module):
         
         # g(x) = final transformation layer
         # project the retrieved information back into the latent space
-        self.g_proj = nn.Linear(
+        import transformer_engine.pytorch as te
+        self.g_proj = te.Linear(
             in_features=output_dim + latent_dim if residual else output_dim, 
             out_features=output_dim, 
             bias=False

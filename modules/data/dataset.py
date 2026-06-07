@@ -128,8 +128,8 @@ class Dataset(IterableDataset):
             start = 0
             for text_len, num_pad in current_seq_sections:
                 l_end = min(start + text_len, self.max_length)
-                if l_end > start:
-                    label_mask[start:l_end] = True
+                if l_end > start + 1: # mask to predict all tokens except the first one of each block
+                    label_mask[start+1:l_end] = True
                 start += text_len + num_pad
             
             label_seq[~label_mask] = -100

@@ -18,56 +18,67 @@ from config import ModelConfig, TrainingConfig
 from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16
 
 
+from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling, NVFP4BlockScaling
+import transformer_engine.pytorch as te
+
+fp8_format = Format.HYBRID  # E4M3 during forward pass, E5M2 during backward pass
+fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max")
+mxfp8_format = Format.E4M3  # E4M3 used everywhere
+mxfp8_recipe = MXFP8BlockScaling(fp8_format=mxfp8_format)
+nvfp4_recipe = NVFP4BlockScaling(disable_rht=True, disable_stochastic_rounding=True)
+
+chosen_recipe = nvfp4_recipe
+# Note: using NVFP4 for the router and MTP heads leads to issues with the backward pass (mainly the requirement of divisability)
+
 def train_step(
     model: TinyMoETransformer, 
-    optimizer: optim.Optimizer, 
     input_ids: torch.Tensor, 
     attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+    pad_mask: torch.Tensor,
+    accelerator: Accelerator = None,
+    optimizer: optim.Optimizer = None,
 ):
-    model.set_checkpointing(True, True)
-    model.delayed_mtp_loss(True)
-    
     if len(attention_mask.shape) == 2:
         attention_mask = attention_mask[:, None, None, :]
     elif len(attention_mask.shape) == 3:
         attention_mask = attention_mask[:, None, :, :]
     
-    if model.has_mtp:
-        logits, aux_loss, extra_token_outputs = model(
-        input_ids=input_ids, 
-        attention_mask=attention_mask.to(torch.bool), 
-        **ModelConfig.Forward,
-        return_aux_loss=True,
-        return_hidden=True,
-    )
-    else:
-        logits, aux_loss = model(
-            input_ids=input_ids, 
-            attention_mask=attention_mask.to(torch.bool), 
-            **ModelConfig.Forward,
-            return_aux_loss=True,
-            return_hidden=True,
-        )
-        extra_token_outputs = None
+    with accelerator.accumulate(model):
+        with te.autocast(enabled=True, recipe=chosen_recipe):
+            if model.has_mtp:
+                logits, aux_loss, extra_token_outputs = model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask.to(torch.bool), 
+                **ModelConfig.Forward,
+                return_aux_loss=True,
+                return_hidden=True,
+            )
+            else:
+                logits, aux_loss = model(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask.to(torch.bool), 
+                    **ModelConfig.Forward,
+                    return_aux_loss=True,
+                    return_hidden=True,
+                )
+            extra_token_outputs = None
         
-    loss = compute_mtp_loss(
-        logits, 
-        input_ids, 
-        mtp_outputs=extra_token_outputs, 
-        lm_head=model.mtp_head.lm_head if extra_token_outputs is not None else None, 
-        lambda_mtp=TrainingConfig.lambda_mtp,
-        main_lm_head=model.lm_head
-    ) + aux_loss
+            loss = compute_mtp_loss(
+                logits, 
+                labels, 
+                mtp_outputs=extra_token_outputs, 
+                lm_head=model.mtp_head.lm_head if extra_token_outputs is not None else None, 
+                lambda_mtp=TrainingConfig.lambda_mtp,
+                main_lm_head=model.lm_head,
+                pad_mask=pad_mask,
+            ) + aux_loss
+            
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
     
-    loss.backward()
-    
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    model.zero_grad(set_to_none=True)
-    
-    val_loss = loss.item()
-    
-    return val_loss
+    return loss
 
 def get_latest_checkpoint_epoch(checkpoint_dir: str):
     last_timestamp = 0
@@ -90,25 +101,28 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
     model.train().to(device).to(dtype)
     input_ids = torch.randint(0, config.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length)).to(device)
     attention_mask = create_causal_attention_mask(input_ids.size(1), dtype=torch.bool, device=device)
+    pad_mask = torch.zeros_like(input_ids, dtype=torch.bool)
     
-    logits, aux_loss, extra_token_outputs = model(
-        input_ids=input_ids, 
-        attention_mask=attention_mask, 
-        **ModelConfig.Forward,
-        return_aux_loss=True,
-        return_hidden=True,
-    )
-    loss = compute_mtp_loss(
-        logits, 
-        input_ids, 
-        mtp_outputs=extra_token_outputs, 
-        lm_head=model.mtp_head.lm_head if extra_token_outputs is not None else None, 
-        lambda_mtp=TrainingConfig.lambda_mtp,
-        main_lm_head=model.lm_head
-    ) + aux_loss
-    
-    loss.backward()
-    model.zero_grad(set_to_none=True)
+    with te.autocast(enabled=True, recipe=chosen_recipe):
+        logits, aux_loss, extra_token_outputs = model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            **ModelConfig.Forward,
+            return_aux_loss=True,
+            return_hidden=True,
+        )
+        loss = compute_mtp_loss(
+            logits, 
+            input_ids, 
+            mtp_outputs=extra_token_outputs, 
+            lm_head=model.mtp_head.lm_head if extra_token_outputs is not None else None, 
+            lambda_mtp=TrainingConfig.lambda_mtp,
+            main_lm_head=model.lm_head,
+            pad_mask=pad_mask,
+        ) + aux_loss
+        
+        loss.backward()
+        model.zero_grad(set_to_none=True)
 
 def save_expert_selection_graph(stats, path):
     import matplotlib
@@ -151,6 +165,21 @@ def save_expert_selection_graph(stats, path):
     plt.close()
     del fig, axs, plt
 
+
+def save_loss_graph(losses, path):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    
+    plt.figure(figsize=(8, 5))
+    plt.plot(losses, label="Training Loss")
+    plt.title("Training Loss Over Time")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.savefig(path)
+    plt.close()
+
 def pretrain():
     GEMMA4_TOKENIZER_PATH = os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer") # "gemma4-tokenizer"
     tokenizer = AutoTokenizer.from_pretrained(GEMMA4_TOKENIZER_PATH)
@@ -172,6 +201,11 @@ def pretrain():
     logger.info(f"Using device: {device}")
     
     model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16).train()
+    model.set_checkpointing(True, True)
+    model.delayed_mtp_loss(True)
+    
+    # model = torch.compile(model)
+    
     optimizer = optim.AdamW(model.parameters(), lr=TrainingConfig.lr, weight_decay=TrainingConfig.weight_decay)
     
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -192,12 +226,16 @@ def pretrain():
     logger.info("Dry run successful. Starting training loop...")
     
     # setup accelerator
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        device_placement=True, 
+        split_batches=True, 
+    )
     model, optimizer, dataloader = accelerator.prepare(
         model, optimizer, dataloader
     )
     
     timer = time.time()
+    losses = []
     
     try:
         for epoch in range(start_epoch, TrainingConfig.num_epochs):
@@ -212,21 +250,37 @@ def pretrain():
                 if (device == "cuda") and (step % 20 == 0):
                     torch.cuda.reset_peak_memory_stats()
                 
-                with accelerator.accumulate(model):
-                    loss = train_step(model, optimizer, input_ids, attention_mask)
+                pad_mask = (input_ids == tokenizer.pad_token_id)
+                
+                loss = train_step(
+                    model, 
+                    input_ids, 
+                    attention_mask, 
+                    batch["labels"].to(device),
+                    pad_mask,
+                    accelerator=accelerator,
+                    optimizer=optimizer,
+                )
+                    
+                
+                val_loss = loss.item()
+                losses.append(val_loss)
                 n_tokens = model.token_count
-                logger.info(f"Epoch {epoch} | Step {step} | Loss: {loss:.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {n_tokens / (time.time() - timer):.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+                logger.info(f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {n_tokens / (time.time() - timer):.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
                 
                 dataset_idx = step
                 
                 if step % model.moe.expert_tracker.sliding_window_size == 0:
                     stats = model.moe.expert_tracker.get_stats()
-                    model._token_tracker.reset()
                     timer = time.time()
                     try:
                         save_expert_selection_graph(stats, os.path.join(BASE_DIR, "ckpts", "training", f"expert_selection_epoch{epoch}_step{step}.png"))
                     except Exception as e:
                         logger.error(f"Error occurred while saving expert selection graph: {e}")
+                    try:
+                        save_loss_graph(losses, os.path.join(BASE_DIR, "ckpts", "training", f"loss_graph_epoch{epoch}_step{step}.png"))
+                    except Exception as e:
+                        logger.error(f"Error occurred while saving loss graph: {e}")
 
             # save checkpoint at the end of each epoch
             save_checkpoint(model, optimizer, epoch, dataset_idx, path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)))

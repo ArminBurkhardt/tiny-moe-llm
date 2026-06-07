@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+import transformer_engine.pytorch as te
 
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 

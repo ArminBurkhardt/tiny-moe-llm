@@ -1,11 +1,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te
 
 class SmallLMHead(nn.Module):
     def __init__(self, hidden_size: int, vocab_size: int, factor: int = 8):
         super().__init__()
-        self.projection = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.projection = te.Linear(hidden_size, hidden_size, bias=False)
         self.lm_heads = nn.ModuleList([nn.Linear(hidden_size // factor, vocab_size // factor, bias=False) for _ in range(factor)])
 
     def forward(self, x: torch.Tensor):
