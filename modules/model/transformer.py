@@ -7,7 +7,8 @@ from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
 
-from torch.utils.checkpoint import checkpoint
+# NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
+from transformer_engine.pytorch import checkpoint
 
 
 class TokenTracker():
@@ -73,6 +74,7 @@ class TinyMoETransformer(nn.Module):
             dropout=dropout,
             top_k=top_k,
             n_loops=n_loops,
+            max_seq_len=max_seq_len,
         )
         
         self.norm = RMSNorm(hidden_size)
@@ -111,9 +113,10 @@ class TinyMoETransformer(nn.Module):
         return moe_embeds
     
     def forward(
-        self, 
-        input_ids: torch.Tensor, 
-        attention_mask: torch.Tensor = None, 
+        self,
+        input_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor = None,
+        max_seqlen: int = None,
         return_aux_loss=False,
         identity_skew: float = 0.0,
         return_hidden=False,
@@ -122,7 +125,9 @@ class TinyMoETransformer(nn.Module):
 
         Args:
             input_ids (torch.Tensor): input token ids, shape [batch_size, seq_len]
-            attention_mask (torch.Tensor, optional): attention mask. Defaults to None.
+            cu_seqlens (torch.Tensor, optional): int32 cumulative segment boundaries over the
+                flattened [B*S] token axis for document-packed varlen attention. Defaults to None (normal causal attention).
+            max_seqlen (int, optional): longest packed segment length. Defaults to None.
             return_aux_loss (bool, optional): whether to return auxiliary loss. Defaults to False.
             identity_skew (float, optional): skew for identity routing. Defaults to 0.0.
 
@@ -137,25 +142,25 @@ class TinyMoETransformer(nn.Module):
             
             If delayed_mtp_loss is False, the shape of each element in extra_token_outputs is [batch_size, seq_len, vocab_size]
         """
-        self._token_tracker.count_tokens(input_ids.detach().cpu())
+        self._token_tracker.count_tokens(input_ids)
         if self.training and self.use_checkpointing:
-            x = checkpoint(self.gemma_decoder, input_ids, attention_mask, use_reentrant=False)
-            x, aux_loss = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, attention_mask, identity_skew, self.use_sub_checkpointing, use_reentrant=False)
+            x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
+            x, aux_loss = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, identity_skew, self.use_sub_checkpointing, use_reentrant=False)
             x = self.norm(x)
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
             if not return_hidden:
                 x = self.lm_head(x)
         else:
-            x = self.gemma_decoder(input_ids, attention_mask=attention_mask).last_hidden_state
-            x, aux_loss = self.moe(x, other=self._moe_ple(input_ids), attention_mask=attention_mask, return_loss=True, identity_skew=identity_skew)
+            x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen).last_hidden_state
+            x, aux_loss = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, identity_skew=identity_skew)
             x = self.norm(x)
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)
             if not return_hidden:
                 x = self.lm_head(x)
         
         if extra_token_outputs is not None:
-            return x, aux_loss, extra_token_outputs if return_aux_loss else (x, extra_token_outputs)
-        return x, aux_loss if return_aux_loss else x
+            return (x, aux_loss, extra_token_outputs) if return_aux_loss else (x, extra_token_outputs)
+        return (x, aux_loss) if return_aux_loss else x
 
 
     def set_checkpointing(self, use_checkpointing: bool, use_sub_checkpointing: bool = None):

@@ -22,12 +22,20 @@ class FileIterator:
                 logger.warning(f"root path {root} does not exist. Skipping")
                 continue
             
-            for path in Path(root).rglob("*"):
+            # sort so file order is deterministic across runs
+            for path in sorted(Path(root).rglob("*")):
                 if path.is_file() and path.suffix in [".parquet", ".jsonl", ".json"]:
                     self.files.append((str(path), column))
                     
     def __iter__(self):
-        for file_path, column in self.files:
+        # shard files across DataLoader workers to avoid every worker yielding
+        # the same batches (IterableDataset is replicated per worker otherwise)
+        files = self.files
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None and worker_info.num_workers > 1:
+            files = files[worker_info.id::worker_info.num_workers]
+
+        for file_path, column in files:
             try:
                 if file_path.endswith('.parquet'):
                     df = pd.read_parquet(file_path, columns=[column])
@@ -97,7 +105,7 @@ class Dataset(IterableDataset):
         file_iter = FileIterator(self.sources)
         
         current_batch_input_ids = []
-        current_batch_attention_mask = []
+        current_batch_doc_ids = []  # per sample [max_length] segment id list (batch aligned)
         current_batch_labels = []
         
         current_seq = []
@@ -107,22 +115,27 @@ class Dataset(IterableDataset):
             # pad to max_length
             pad_len = self.max_length - len(current_seq)
             padded_seq = current_seq + [self.tokenizer.pad_token_id] * pad_len
-            
-            mask = torch.zeros((1, self.max_length, self.max_length), dtype=torch.bool)
+
+            # per-token segment id covering all max_length positions: each document block is one causal segment
+            # any trailing padding positions become length-1 (self attention only) segments
+            # the model turns these into flash-attn cu_seqlens (equivalent to the old block mask)
+            # emitted as a batch aligned [max_length] id list so accelerates batch
+            # handling treats it like input_ids instead of truncating a ragged cu_seqlens
+            doc_ids = []
+            seg = 0
             start = 0
             for text_len, num_pad in current_seq_sections:
                 block_len = text_len + num_pad
                 block_end = min(start + block_len, self.max_length)
                 actual_block_len = block_end - start
-                
                 if actual_block_len > 0:
-                    mask[0, start:block_end, start:block_end] = torch.tril(torch.ones((actual_block_len, actual_block_len), dtype=torch.bool))
-                
+                    doc_ids.extend([seg] * actual_block_len)
+                    seg += 1
                 start = block_end
-                
-            for i in range(start, self.max_length):
-                mask[0, i, i] = True
-                
+            for _ in range(start, self.max_length):  # trailing pad -> own length-1 segment
+                doc_ids.append(seg)
+                seg += 1
+
             label_seq = torch.tensor(padded_seq)
             label_mask = torch.zeros(self.max_length, dtype=torch.bool)
             start = 0
@@ -135,21 +148,22 @@ class Dataset(IterableDataset):
             label_seq[~label_mask] = -100
             
             current_batch_input_ids.append(padded_seq)
-            current_batch_attention_mask.append(mask)
+            current_batch_doc_ids.append(doc_ids)
             current_batch_labels.append(label_seq)
-            
+
             current_seq.clear()
             current_seq_sections.clear()
-            
+
         def yield_batch():
-            nonlocal current_batch_input_ids, current_batch_attention_mask, current_batch_labels
+            nonlocal current_batch_input_ids, current_batch_doc_ids, current_batch_labels
             batch = {
                 "input_ids": torch.tensor(current_batch_input_ids, dtype=torch.long),
-                "attention_mask": torch.cat(current_batch_attention_mask, dim=0),
+                # batch aligned [B, max_length] segment ids -> model builds cu_seqlens from these
+                "document_ids": torch.tensor(current_batch_doc_ids, dtype=torch.long),
                 "labels": torch.stack(current_batch_labels)
             }
             current_batch_input_ids = []
-            current_batch_attention_mask = []
+            current_batch_doc_ids = []
             current_batch_labels = []
             return batch
         
@@ -160,7 +174,7 @@ class Dataset(IterableDataset):
                     if len(current_seq) >= self.batch_size:
                         yield {
                             "input_ids": torch.zeros((self.batch_size, self.max_length), dtype=torch.long),
-                            "attention_mask": None,
+                            "document_ids": None,
                             "labels": None
                         }
                         current_seq.clear()

@@ -4,10 +4,13 @@ tiny-moe-llm is an experimental research project exploring a small, modular mixt
 
 At a high level, the codebase combines:
 - Gemma4 style dense transformer layers,
-- dynamically routed experts,
+- dynamically and sparsely routed experts,
 - multi-token prediction (MTP),
-- Pretraining and sft
+- document packing with causal masks per text chunk,
+- Pretraining in nvfp4 precision, and 
+- SFT on reasoning datasets.
 
+The final model amounts to around 243M parameters.
 
 ## Credit
 Borrows heavily from [Gemma4](https://huggingface.co/google/gemma-4-31b-it)
@@ -33,3 +36,12 @@ Reasoning Datasets:
 
 Benchmarks:
 - [MMLU-Pro](https://github.com/TIGER-AI-Lab/MMLU-Pro)
+
+
+### Design Notes
+
+Should be noted, might be changed in the future. Minimal impact on the training.
+
+- Expert tracker stats are double counted under gradient checkpointing (due to recomputation on the backward pass)
+- Dry run and padding tokens (few due to document packing) inflate Token counts slighly not dramatically
+

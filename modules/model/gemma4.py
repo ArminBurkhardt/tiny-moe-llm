@@ -6,6 +6,7 @@ import transformer_engine.pytorch as te
 
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency, apply_rotary_pos_emb
 from modules.model.utils import EncoderOutput
+from modules.model.attention import varlen_attention
 
 # adapted from https://github.com/huggingface/transformers/tree/main/src/transformers/models/gemma4
 # https://github.com/huggingface/blog/blob/main/gemma4.md#overview-of-capabilities-and-architecture 
@@ -54,12 +55,13 @@ class Gemma4TextAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         other_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
-        
+
         if other_states is None:
             other_states = hidden_states
 
@@ -75,21 +77,19 @@ class Gemma4TextAttention(nn.Module):
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # repeat KV heads for Grouped Query Attention
-        key_states = torch.repeat_interleave(key_states, self.num_key_value_groups, dim=1)
-        value_states = torch.repeat_interleave(value_states, self.num_key_value_groups, dim=1)
-
-        is_causal = True if attention_mask is None else False
-        attn_output = F.scaled_dot_product_attention(
-            query_states, 
-            key_states, 
-            value_states, 
-            attn_mask=attention_mask, 
+        # block-diagonal causal attention over the packed documents (flash varlen handles GQA,
+        # so KV heads are not pre-repeated). Returns [B, S, Hq, D].
+        attn_output = varlen_attention(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens,
+            max_seqlen,
             dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=is_causal
+            softmax_scale=self.scaling,
+            causal=True,
         )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
         return self.o_proj(attn_output)
@@ -138,14 +138,15 @@ class Gemma4TextDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         per_layer_embeddings: torch.Tensor | None = None
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        
-        hidden_states = self.self_attn(hidden_states, attention_mask, position_embeddings)
+
+        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
         hidden_states = self.dropout(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -214,9 +215,9 @@ class Gemma4TextModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.hidden_size = hidden_size
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+    def forward(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor | None = None, max_seqlen: int | None = None):
         hidden_states = self.embed_tokens(input_ids)
-        
+
         # scale embeddings by sqrt(hidden_size)
         hidden_states = hidden_states * (self.hidden_size**0.5)
         hidden_states = self.dropout(hidden_states)
@@ -237,9 +238,10 @@ class Gemma4TextModel(nn.Module):
         layers_outputs = []
         for i, layer in enumerate(self.layers):
             hidden_states = layer(
-                hidden_states, 
-                attention_mask, 
-                position_embeddings, 
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                position_embeddings,
                 per_layer_embeddings=ple_emb[:, i] if ple_emb is not None else None
             )
             layers_outputs.append(hidden_states)
@@ -285,8 +287,8 @@ class Gemma4ForCausalLM(nn.Module):
         )
         self.lm_head = te.Linear(hidden_size, vocab_size, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
-        hidden_states = self.model(input_ids, attention_mask).last_hidden_state
+    def forward(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor | None = None, max_seqlen: int | None = None):
+        hidden_states = self.model(input_ids, cu_seqlens, max_seqlen).last_hidden_state
         logits = self.lm_head(hidden_states)
         return logits
 

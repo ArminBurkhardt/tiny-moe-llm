@@ -1,104 +1,130 @@
-import math
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
+import transformer_engine.pytorch as te
+# TE checkpoint required for quantized (FP8/NVFP4) layers; see transformer.py note.
+from transformer_engine.pytorch import checkpoint
 
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
+from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
 
 
 
 class ParallelSparseMoELayer(nn.Module):
-    """a sparse MoE layer that routes tokens to experts in parallel using matrix multiplication for efficiency"""
+    """a sparse MoE layer that dispatches each token only to its routed experts via a
+    grouped GEMM (Transformer Engine ``GroupedLinear``).
+
+    The previous implementation gathered tokens into a dense ``[num_experts, total_tokens, ...]``
+    tensor and ran every expert over every token (masking afterwards), so with ``top_k`` of
+    ``num_experts`` it spent ``num_experts / top_k`` more matmul FLOPs than necessary. Here we
+    sort the (token, slot) assignments by expert, run one variable-sized GEMM per expert group,
+    then scatter the weighted results back -- so the FF experts only do work for the tokens
+    actually routed to them.
+    """
     def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int):
         super().__init__()
         self.num_experts = num_experts
-        
-        # vectorized expert parameters (without bias)
-        # param layout (num_experts, inputs, outputs)
-        self.gate_proj = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
-        self.up_proj   = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
-        self.down_proj = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-        
-        # init weights
-        nn.init.kaiming_uniform_(self.gate_proj, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.up_proj, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.down_proj, a=math.sqrt(5))
-        
+        self.intermediate_size = intermediate_size
+
+        # fuse gate + up into a single grouped GEMM
+        # one weight per expert (Linear layout [out, in])
+        self.gate_up = te.GroupedLinear(num_experts, hidden_size, 2 * intermediate_size, bias=False)
+        self.down = te.GroupedLinear(num_experts, intermediate_size, hidden_size, bias=False)
+
         self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
-        # expects x of shape [batch_size, seq_len, hidden_size]
-        # topk_weights and topk_indices of shape [batch_size, seq_len, top_k]
-        orig_shape = x.shape
-        x_flat = x.view(-1, orig_shape[-1])  # [total_tokens, hidden_size]
-        
-        topk_weights = topk_weights.view(-1, topk_weights.shape[-1])  # [total_tokens, top_k]
-        topk_indices = topk_indices.view(-1, topk_indices.shape[-1])  # [total_tokens, top_k]
+        # x: [batch_size, seq_len, hidden_size]
+        # topk_weights, topk_indices: [batch_size, seq_len, top_k]
+        # null (non-MLP) slots arrive as index 0 with weight 0 -> contribute nothing after scaling
+        B, S, H = x.shape
+        top_k = topk_indices.shape[-1]
+        x_flat = x.reshape(-1, H)                       # [T, H]
+        T = x_flat.shape[0]
 
-        # map each token to its top k experts (one-hot)
-        unweighted_b_matrix = F.one_hot(topk_indices, num_classes=self.num_experts).to(x_flat.dtype) # [total_tokens, top_k, num_experts]
-        
-        # scale the one hot matrix by the corresponding topk weights
-        scaled_b_matrix = unweighted_b_matrix * topk_weights.unsqueeze(-1)
-        
-        # collapse the top_k dimension to get a routing map per token
-        unweighted_routing_map = unweighted_b_matrix.sum(dim=1) # [total_tokens, num_experts]
-        weighted_routing_map = scaled_b_matrix.sum(dim=1)
+        idx = topk_indices.reshape(-1)                  # [N] expert id per (token, slot), N = T*top_k
+        wgt = topk_weights.reshape(-1)                  # [N] routing weight per slot
+        tok = torch.arange(T, device=x.device).repeat_interleave(top_k)  # [N] owning token per slot
 
-        # parallel token gathering (grouping tokens by expert)
-        # gather with the unweighted map so the inputs to the generic non linear functions inside the experts remain unscaled (first act then scale)
-        gathered_tokens = torch.einsum("td,te->etd", x_flat, unweighted_routing_map) # [num_experts, total_tokens, hidden_size]
+        # sort assignments so each experts rows are contiguous (required by GroupedLinear)
+        # stable=True keeps the permutation deterministic across the checkpoint recompute pass
+        order = torch.argsort(idx, stable=True)         # [N]
+        idx_sorted = idx[order]
+        tok_sorted = tok[order]
+        wgt_sorted = wgt[order]
+        x_sorted = x_flat.index_select(0, tok_sorted)   # [N, H] each slot sees its (unscaled) token
 
+        # per expert group sizes
+        m_splits = torch.bincount(idx_sorted, minlength=self.num_experts).tolist() # .tolist() is the only host sync (E small ints)
 
-        # expert (MLP) computations in parallel
-        up = torch.bmm(gathered_tokens, self.up_proj)     # [num_experts, total_tokens, intermediate_size]
-        gate = torch.bmm(gathered_tokens, self.gate_proj) # [num_experts, total_tokens, intermediate_size]
-        act = self.activation(gate) * up                  # [num_experts, total_tokens, intermediate_size]
-        expert_outputs = torch.bmm(act, self.down_proj)   # [num_experts, total_tokens, hidden_size]
+        # run the experts in BF16: NVFP4 requires each GEMMs row count (a dynamic per expert group size here) 
+        # to be divisible by 16, which cant be guaranteed without padding every group.
+        # => sparsity
+        with te.autocast(enabled=False):
+            gate_up = self.gate_up(x_sorted, m_splits)  # [N, 2*intermediate]
+            gate, up = gate_up.chunk(2, dim=-1)
+            act = self.activation(gate) * up            # [N, intermediate]
+            out_sorted = self.down(act, m_splits)       # [N, H]
 
-       
-        # recombining the distributed representations
-        # multiply expert outputs back by the routing weights and sum them together
-        combined_output = torch.einsum("etd,te->td", expert_outputs, weighted_routing_map) # [total_tokens, hidden_size]
+        # scale each expert output by its routing weight (null slots -> *0), then scatter back
+        out_sorted = out_sorted * wgt_sorted.unsqueeze(-1)
+        combined = torch.zeros(T, H, device=x.device, dtype=out_sorted.dtype)
+        combined.index_add_(0, tok_sorted, out_sorted)
 
-        return combined_output.view(*orig_shape)
+        return combined.view(B, S, H)
 
 
 class _ExpertTracking():
     def __init__(self, id_idx: int, num_experts: int):
-        self.prob_dist = torch.zeros(num_experts)
-        self.post_skew_dist = torch.zeros(num_experts)
-        self.choices = torch.zeros(num_experts)
+        self._num_experts = num_experts
+        self.prob_dist = None      # lazily placed on device on first update
+        self.post_skew_dist = None
+        self.choices = None
         self.id_idx = id_idx
         self.sliding_window_size = 256
-    
+
     def update(self, topk_indices: torch.Tensor, topk_scores: torch.Tensor, expert_scores: torch.Tensor):
-        topk_indices_collapsed = topk_indices.detach().cpu().view(-1, topk_indices.size(-1)) # [total_tokens, top_k]
-        topk_scores_collapsed = topk_scores.detach().cpu().view(-1, topk_scores.size(-1)) # [total_tokens, top_k]
-        expert_scores_collapsed = expert_scores.detach().cpu().view(-1, expert_scores.size(-1)) # [total_tokens, num_experts]
-        for i in range(self.prob_dist.size(0)):
-            mask = topk_indices_collapsed == i
-            one_hot_mask = F.one_hot(topk_indices_collapsed, num_classes=self.prob_dist.size(0)) # [total_tokens, top_k, num_experts]
-            one_hot_mask = one_hot_mask.any(dim=1) # [total_tokens, num_experts]
-            self.prob_dist[i] = self.prob_dist[i]*(1 - 1/self.sliding_window_size) + torch.sum(topk_scores_collapsed[mask]) * (1/self.sliding_window_size)
-            self.post_skew_dist[i] = self.post_skew_dist[i]*(1 - 1/self.sliding_window_size) + torch.sum(expert_scores_collapsed[one_hot_mask]) * (1/self.sliding_window_size)
-            self.choices[i] = self.choices[i]*(1 - 1/self.sliding_window_size) + mask.sum() * (1/self.sliding_window_size)
-    
+        n = self._num_experts
+        device = topk_indices.device
+        if self.prob_dist is None or self.prob_dist.device != device:
+            self.prob_dist = torch.zeros(n, device=device)
+            self.post_skew_dist = torch.zeros(n, device=device)
+            self.choices = torch.zeros(n, device=device)
+
+        topk_indices_flat = topk_indices.detach().view(-1, topk_indices.size(-1))  # [T, k]
+        topk_scores_flat = topk_scores.detach().view(-1, topk_scores.size(-1))     # [T, k]
+        expert_scores_flat = expert_scores.detach().view(-1, n)                    # [T, n]
+
+        # compute once (not inside a per expert loop)
+        one_hot_mask = F.one_hot(topk_indices_flat, num_classes=n).any(dim=1)      # [T, n] bool
+
+        prob_updates = torch.zeros(n, device=device, dtype=topk_scores.dtype)
+        prob_updates.scatter_add_(0, topk_indices_flat.reshape(-1), topk_scores_flat.reshape(-1))
+
+        post_skew_updates = (expert_scores_flat * one_hot_mask.to(expert_scores.dtype)).sum(dim=0)
+        choices_updates = one_hot_mask.sum(dim=0).float()
+
+        decay = 1.0 - 1.0 / self.sliding_window_size
+        inv_w = 1.0 / self.sliding_window_size
+        self.prob_dist = self.prob_dist * decay + prob_updates * inv_w
+        self.post_skew_dist = self.post_skew_dist * decay + post_skew_updates * inv_w
+        self.choices = self.choices * decay + choices_updates * inv_w
+
     def get_stats(self):
         return {
-            "prob_dist": self.prob_dist.tolist(),
-            "post_skew_dist": self.post_skew_dist.tolist(),
-            "choices": self.choices.tolist(),
+            "prob_dist": self.prob_dist.cpu().tolist() if self.prob_dist is not None else [0.0] * self._num_experts,
+            "post_skew_dist": self.post_skew_dist.cpu().tolist() if self.post_skew_dist is not None else [0.0] * self._num_experts,
+            "choices": self.choices.cpu().tolist() if self.choices is not None else [0.0] * self._num_experts,
             "id_idx": self.id_idx,
         }
-        
+
     def reset_stats(self):
-        self.prob_dist.zero_()
-        self.post_skew_dist.zero_()
-        self.choices.zero_()
+        if self.prob_dist is not None:
+            self.prob_dist.zero_()
+            self.post_skew_dist.zero_()
+            self.choices.zero_()
 
 class LoopMixtureOfExperts(nn.Module):
     """a Mixture of Experts module that routes tokens to a mixture of attention and feedforward experts in multiple loops"""
@@ -116,6 +142,8 @@ class LoopMixtureOfExperts(nn.Module):
         num_ir_entries: int = 1024,
         ir_dim: int = 128,
         ir_residual: bool = False,
+        max_seq_len: int = 4096,
+        rope_theta: float = 100000.0,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -144,7 +172,18 @@ class LoopMixtureOfExperts(nn.Module):
         # num expert heads
         n_heads = 16
         n_kv_heads = 4
-        
+
+        # rotary embeddings for the attention experts. the experts run with their own head count
+        # (n_heads above), so their head_dim differs from the Gemma decoders
+        # they need a separately sized RoPE cache :( 
+        # Positions are global over the packed sequence (0..S-1),
+        # matching the decoders convention so cross document packing stays consistent
+        self.rotary_emb = RotaryPositionEmbeddingsFrequency(
+            dim=hidden_size // n_heads,
+            max_position_embeddings=max_seq_len,
+            base=rope_theta,
+        )
+
         # experts
         experts = []
         experts.extend([
@@ -221,6 +260,7 @@ class LoopMixtureOfExperts(nn.Module):
         load_balancing_loss = compute_aux_loss(torch.topk(expert_scores, self.top_k, dim=-1)[1], expert_scores, self.num_experts)
         
         # apply identity skew to encourage the router to select the identity towards the end of the loop
+        #assert identity_skew < 0.5
         id_skew = 1 + torch.exp(identity_skew * self.identity_scalar)
         id_skew = id_skew ** (on_loop / self.n_loops)
         expert_scores = expert_scores.clone() # avoid inplace modification to preserve scores for loss computation (funny error with torch.autograd.set_detect_anomaly(True) if this is removed)
@@ -240,7 +280,7 @@ class LoopMixtureOfExperts(nn.Module):
         
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, on_loop: int = 0, identity_skew: float = 1.0, attn_mask: torch.Tensor = None, other: torch.Tensor = None):
+    def forward_step(self, hidden_states: torch.Tensor, on_loop: int = 0, identity_skew: float = 1.0, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None):
         topk_scores, topk_indices, load_balancing_loss = self.route(
             hidden_states, 
             temperature=self.temperature,
@@ -252,30 +292,26 @@ class LoopMixtureOfExperts(nn.Module):
         # [attn_experts..., num_ir_experts..., identity, ff_experts...]
         
         output = torch.zeros_like(hidden_states)
-        
-        # sparsely route tokens to experts in self.experts
+        _other = other if other is not None else hidden_states
+
+        # compute each non-MLP expert exactly once per forward_step, then cache across k slots
+        # (attention runs over the full sequence regardless of routing, so recomputing per k-slot wastes compute)
+        expert_cache = []
+        for i in range(self.identity_expert_index + 1):
+            if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
+                expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings))
+            elif isinstance(self.experts[i], CrossAttention):
+                expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings))
+            else:  # identity
+                expert_cache.append(hidden_states)
+
+        # accumulate weighted outputs. mask multiply avoids mask.sum() device syncs. yay more tokens per second
         for k in range(self.top_k):
-            expert_indices = topk_indices[..., k] # [batch_size, seq_len]
-            expert_scores = topk_scores[..., k]   # [batch_size, seq_len]
-            
-            for i in range(self.identity_expert_index + 1): # loop through attention/ir experts and identity
-                mask = (expert_indices == i)      # [batch_size, seq_len]
-                if mask.sum() == 0:
-                    continue
-                                
-                if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
-                    expert_output = self.experts[i](hidden_states, attn_mask)
-                    # not sparse due to attention
-                elif isinstance(self.experts[i], CrossAttention):
-                    # for cross attention, we can use the output of the previous loop as the "other" input to the cross attention (allowing information flow between loops even for tokens that route to different experts)
-                    if other is None:
-                        other = hidden_states
-                    expert_output = self.experts[i](hidden_states, other, attn_mask)
-                else:
-                    expert_output = self.experts[i](hidden_states)
-                
-                # mask after attention
-                output[mask] += expert_scores[mask].unsqueeze(-1) * expert_output[mask]
+            expert_indices_k = topk_indices[..., k]   # [B, S]
+            expert_scores_k = topk_scores[..., k]     # [B, S]
+            for i in range(self.identity_expert_index + 1):
+                mask = (expert_indices_k == i).unsqueeze(-1)                         # [B, S, 1]
+                output = output + mask * expert_scores_k.unsqueeze(-1) * expert_cache[i]
         
         # routed tokens to parallel experts
         mlp_mask = topk_indices > self.identity_expert_index
@@ -297,21 +333,25 @@ class LoopMixtureOfExperts(nn.Module):
     
 
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
+        self,
+        hidden_states: torch.Tensor,
         other: torch.Tensor = None,
-        return_loss: bool = False, 
-        attention_mask: torch.Tensor = None, 
+        return_loss: bool = False,
+        cu_seqlens: torch.Tensor = None,
+        max_seqlen: int = None,
         identity_skew: float = 1.0,
         use_checkpointing: bool = False,
     ):
         total_load_balancing_loss = 0.0
-        
+
+        # rotary cos/sin for the expert attention, computed once and reused across loops/experts
+        position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
+
         for loop in range(self.n_loops):
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, loop, identity_skew, attention_mask, other, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, loop, identity_skew, cu_seqlens, max_seqlen, other, position_embeddings, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, attn_mask=attention_mask, identity_skew=identity_skew, other=other)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, identity_skew=identity_skew, other=other, position_embeddings=position_embeddings)
             total_load_balancing_loss += load_balancing_loss
             
         if return_loss:

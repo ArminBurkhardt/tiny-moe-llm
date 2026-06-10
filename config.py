@@ -38,7 +38,8 @@ class TrainingConfig:
     learning_rate = float(Config["training"]["lr"])
     lr = float(Config["training"]["lr"])
     weight_decay = float(Config["training"]["weight_decay"])
-    
-
-
+    grad_clip = float(Config["training"]["grad_clip"])
+    warmup_steps = int(Config["training"]["warmup_steps"])
+    target_tokens = int(Config["training"]["target_tokens"])
+    total_steps = int((Config["training"]["target_tokens"] // (Config["training"]["batch_size"] * Config["training"]["seq_length"])))
 

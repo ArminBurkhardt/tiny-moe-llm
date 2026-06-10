@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import transformer_engine.pytorch as te
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextAttention as GroupedQueryAttention
 from modules.model.information_retrieval import InformationRetrievalModule
 
@@ -18,11 +19,13 @@ class SelfAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
         x_norm = self.norm(x)
         attn_output = self.attn(
-            hidden_states=x_norm, 
-            attention_mask=attn_mask,
+            hidden_states=x_norm,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_embeddings=position_embeddings,
         )
         return self.dropout(attn_output)
 
@@ -41,11 +44,13 @@ class CrossAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, other: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
         x_norm = self.norm(x)
         attn_output = self.attn(
-            hidden_states=x_norm, 
-            attention_mask=attn_mask,
+            hidden_states=x_norm,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_embeddings=position_embeddings,
             other_states=other,
         )
         return self.dropout(attn_output)
@@ -82,20 +87,21 @@ class InformationRetrievalExpert(nn.Module):
             use_min_dist=False,
             residual=residual,
         )
-        import transformer_engine.pytorch as te
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
         x_norm = self.norm(x)
-        
+
         down = self.down_proj(x_norm)
         ir_output = self.ir_module(down)
         information = self.up_proj(ir_output)
-        
+
         attn_output = self.attn(
-            hidden_states=x_norm, 
-            attention_mask=attn_mask,
+            hidden_states=x_norm,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_embeddings=position_embeddings,
             other_states=information,
         )
         return self.dropout(attn_output)

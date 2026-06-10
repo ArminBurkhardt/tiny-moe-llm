@@ -7,3 +7,5 @@ fastparquet
 matplotlib>=3.10.0
 bitsandbytes>=0.30.0
 accelerate>=1.13.0
+flash-attn>=2.8.0
+transformer-engine[pytorch]>=2.15.0 # refer to https://github.com/NVIDIA/TransformerEngine#installation TODO: make te optional

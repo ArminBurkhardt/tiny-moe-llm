@@ -6,7 +6,7 @@ model:
   num_layers: 5
   num_attention_heads: 8
   head_dim: 64
-  dropout: 0.1
+  dropout: 0.00 # for pretraining only
   per_layer_embeddings_size: 32
 
   # num experts
@@ -16,7 +16,7 @@ model:
   # routing
   top_k: 2
   n_loops: 4
-  identity_skew: 0.5
+  identity_skew: 0.01
 
   # information retrieval
   num_ir_experts: 1
@@ -34,3 +34,5 @@ training:
   grad_clip: 1.0
   num_epochs: 10
   lambda_mtp: 0.1
+  warmup_steps: 500
+  target_tokens: 5000000000 # 5b tokens

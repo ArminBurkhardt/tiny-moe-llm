@@ -4,7 +4,6 @@ import os
 from torch.optim import AdamW
 from modules.model.gemma4 import Gemma4ForCausalLM
 from modules.model.moe import LoopMixtureOfExperts
-from modules.model.utils import create_causal_attention_mask
 from modules.model.transformer import TinyMoETransformer
 from config import ModelConfig, TrainingConfig
 
@@ -151,8 +150,6 @@ def measure_moe_training_memory(
             batch_size, seq_len, hidden_size, 
             device="cuda", dtype=dtype
         )
-        attn_mask = create_causal_attention_mask(seq_len, dtype=torch.bool, device="cuda")
-
         if optimizer_type.lower() == "adamw":
             optimizer = AdamW(model.parameters(), lr=1e-4)
         elif optimizer_type.lower() == "bnb":
@@ -162,8 +159,9 @@ def measure_moe_training_memory(
             raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
         output, aux_loss = model(
-            hidden_states, 
-            attention_mask=attn_mask,
+            hidden_states,
+            cu_seqlens=None,
+            max_seqlen=None,
             return_loss=True
         )
         
@@ -239,13 +237,12 @@ def measure_transformer_training_memory():
         # create dummy input
         input_ids = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
         #targets = torch.randint(0, ModelConfig.Params["vocab_size"], (TrainingConfig.Batch_size, TrainingConfig.Seq_length), device="cuda")
-        attn_mask = create_causal_attention_mask(TrainingConfig.Seq_length, dtype=torch.bool, device="cuda")
 
         optimizer = AdamW(model.parameters(), lr=1e-4)
         
         # loss
         if model.has_mtp:
-            logits, aux_loss, mtp_outputs = model(input_ids, attention_mask=attn_mask, return_aux_loss=True)
+            logits, aux_loss, mtp_outputs = model(input_ids, cu_seqlens=None, max_seqlen=None, return_aux_loss=True)
             from modules.model.mtp import compute_mtp_loss
             loss = compute_mtp_loss(
                 outputs=logits, 
@@ -255,7 +252,7 @@ def measure_transformer_training_memory():
                 lambda_mtp=0.1
             ) + aux_loss
         else:
-            logits, aux_loss = model(input_ids, attention_mask=attn_mask, return_aux_loss=True)
+            logits, aux_loss = model(input_ids, cu_seqlens=None, max_seqlen=None, return_aux_loss=True)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous() # targets[..., 1:].contiguous()
             loss = torch.nn.functional.cross_entropy(
