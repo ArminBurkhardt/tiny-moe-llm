@@ -84,8 +84,19 @@ class _ExpertTracking():
         self.choices = None
         self.id_idx = id_idx
         self.sliding_window_size = 256
+        # recompute guard: under activation checkpointing route() runs again during backward, which would double count every update
+        self._expected_updates = None
+        self._seen_updates = 0
+
+    def begin_forward(self, expected_updates: int):
+        self._expected_updates = expected_updates
+        self._seen_updates = 0
 
     def update(self, topk_indices: torch.Tensor, topk_scores: torch.Tensor, expert_scores: torch.Tensor):
+        if self._expected_updates is not None:
+            if self._seen_updates >= self._expected_updates:
+                return  # checkpoint recompute pass, already counted
+            self._seen_updates += 1
         n = self._num_experts
         device = topk_indices.device
         if self.prob_dist is None or self.prob_dist.device != device:
@@ -96,6 +107,7 @@ class _ExpertTracking():
         topk_indices_flat = topk_indices.detach().view(-1, topk_indices.size(-1))  # [T, k]
         topk_scores_flat = topk_scores.detach().view(-1, topk_scores.size(-1))     # [T, k]
         expert_scores_flat = expert_scores.detach().view(-1, n)                    # [T, n]
+        num_tokens = topk_indices_flat.size(0)
 
         # compute once (not inside a per expert loop)
         one_hot_mask = F.one_hot(topk_indices_flat, num_classes=n).any(dim=1)      # [T, n] bool
@@ -106,8 +118,9 @@ class _ExpertTracking():
         post_skew_updates = (expert_scores_flat * one_hot_mask.to(expert_scores.dtype)).sum(dim=0)
         choices_updates = one_hot_mask.sum(dim=0).float()
 
+        # normalize to per-token quantities so the EMAs are interpretable
         decay = 1.0 - 1.0 / self.sliding_window_size
-        inv_w = 1.0 / self.sliding_window_size
+        inv_w = (1.0 / self.sliding_window_size) / max(num_tokens, 1)
         self.prob_dist = self.prob_dist * decay + prob_updates * inv_w
         self.post_skew_dist = self.post_skew_dist * decay + post_skew_updates * inv_w
         self.choices = self.choices * decay + choices_updates * inv_w
@@ -219,7 +232,7 @@ class LoopMixtureOfExperts(nn.Module):
         
         self.post_norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.identity_scalar = nn.Parameter(torch.ones(1) * 0.1)
+        self.identity_scalar = nn.Parameter(torch.ones(1))
         
         # note: the identity expert acts both as a skip connection and a way to indicate that the current representation is sufficient and doesnt need to be modified by any expert again
         # during inference, landing on the identity expert could idicate that the model is confident in its current representation and can stop routing early. On the contrary, if the model never routes to the identity expert, 
@@ -242,7 +255,8 @@ class LoopMixtureOfExperts(nn.Module):
         Args:
             hidden_states (torch.Tensor): [batch_size, seq_len, hidden_size]
             temperature (float, optional): temperature for the router. Defaults to 1.0.
-            identity_skew (float, optional): skew for the identity expert. Defaults to 1.0.
+            identity_skew (float, optional): skew for the identity expert; higher values push harder
+                towards the identity on later loops, <= 0 disables the bias. Defaults to 1.0.
             on_loop (int, optional): current loop iteration. Defaults to 0.
 
         Returns:
@@ -253,21 +267,23 @@ class LoopMixtureOfExperts(nn.Module):
             load_balancing_loss (torch.Tensor): auxiliary loss to encourage balanced routing
         """
         # note: on_loop = 0 disables the identity bias
-        
-        expert_scores = self.router(hidden_states, temperature=temperature)       # [batch_size, seq_len, num_experts]
-        
-        # compute load balancing loss before applying
-        load_balancing_loss = compute_aux_loss(torch.topk(expert_scores, self.top_k, dim=-1)[1], expert_scores, self.num_experts)
-        
-        # apply identity skew to encourage the router to select the identity towards the end of the loop
-        #assert identity_skew < 0.5
-        id_skew = 1 + torch.exp(identity_skew * self.identity_scalar)
-        id_skew = id_skew ** (on_loop / self.n_loops)
-        expert_scores = expert_scores.clone() # avoid inplace modification to preserve scores for loss computation (funny error with torch.autograd.set_detect_anomaly(True) if this is removed)
-        expert_scores[..., self.identity_expert_index] += id_skew - 1.0
-        
-        # softmax again to get the new distribution after skewing
-        expert_scores = F.softmax(expert_scores / temperature, dim=-1)
+
+        expert_logits = self.router(hidden_states, temperature=temperature)       # [batch_size, seq_len, num_experts] raw logits
+
+        # load balancing loss on the PRE-skew distribution
+        pre_skew_probs = F.softmax(expert_logits / temperature, dim=-1)
+        load_balancing_loss = compute_aux_loss(torch.topk(pre_skew_probs, self.top_k, dim=-1)[1], pre_skew_probs, self.num_experts)
+
+        # apply identity skew (additive logit bias) to encourage the router to select the identity
+        # towards the end of the loop. identity_skew <= 0 disables the bias entirely
+        expert_logits = expert_logits.clone() # avoid inplace modification to preserve scores for loss computation (funny error with torch.autograd.set_detect_anomaly(True) if this is removed)
+        if identity_skew > 0:
+            id_skew = 1 + torch.exp(-self.identity_scalar.abs() / identity_skew)
+            id_skew = id_skew ** (on_loop / self.n_loops)
+            expert_logits[..., self.identity_expert_index] += id_skew - 1.0
+
+        # single softmax over the (skewed) logits gives the selection distribution
+        expert_scores = F.softmax(expert_logits / temperature, dim=-1)
         
         # select topk experts
         topk_scores, topk_indices = torch.topk(expert_scores, self.top_k, dim=-1) # [batch_size, seq_len, top_k], [batch_size, seq_len, top_k]
@@ -344,6 +360,8 @@ class LoopMixtureOfExperts(nn.Module):
     ):
         total_load_balancing_loss = 0.0
 
+        self.expert_tracker.begin_forward(self.n_loops)
+
         # rotary cos/sin for the expert attention, computed once and reused across loops/experts
         position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
 
@@ -361,6 +379,10 @@ class LoopMixtureOfExperts(nn.Module):
 
     def set_temperature(self, temperature: float):
         self.temperature = temperature
+
+    def set_router_noise(self, noise_factor: float):
+        """set the global multiplier on the router's exploration noise (annealed 1 -> 0 by the trainer over training). 0 disables the noise entirely."""
+        self.router.noise_factor = noise_factor
 
 
 

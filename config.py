@@ -24,6 +24,7 @@ class ModelConfig:
         "n_loops": int(Config["model"]["n_loops"]),
         "ple_embeddings_size": int(Config["model"]["per_layer_embeddings_size"]),
         "mtp_num_extra_tokens": int(Config["model"]["mtp_num_extra_tokens"]),
+        "lm_head_factor": int(Config["model"]["lm_head_factor"]),
     }
     
     Forward = {
@@ -34,12 +35,15 @@ class TrainingConfig:
     Batch_size = int(Config["training"]["batch_size"])
     Seq_length = int(Config["training"]["seq_length"])
     lambda_mtp = float(Config["training"]["lambda_mtp"])
+    aux_loss_weight = float(Config["training"]["aux_loss_weight"])
     num_epochs = int(Config["training"]["num_epochs"])
     learning_rate = float(Config["training"]["lr"])
     lr = float(Config["training"]["lr"])
     weight_decay = float(Config["training"]["weight_decay"])
     grad_clip = float(Config["training"]["grad_clip"])
-    warmup_steps = int(Config["training"]["warmup_steps"])
     target_tokens = int(Config["training"]["target_tokens"])
-    total_steps = int((Config["training"]["target_tokens"] // (Config["training"]["batch_size"] * Config["training"]["seq_length"])))
+    grad_accumulation_steps = int(Config["training"].get("grad_accumulation_steps", 1))
+    total_steps = int((Config["training"]["target_tokens"] // (Config["training"]["batch_size"] * Config["training"]["seq_length"] * grad_accumulation_steps)))
+    warmup_steps = int(Config["training"].get("warmup_steps", 0))
+    noise_anneal_tokens = int(Config["training"].get("noise_anneal_tokens", 0))
 

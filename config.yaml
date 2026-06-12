@@ -16,7 +16,7 @@ model:
   # routing
   top_k: 2
   n_loops: 4
-  identity_skew: 0.01
+  identity_skew: 0.8 # higher values encourage choosing the identity
 
   # information retrieval
   num_ir_experts: 1
@@ -25,14 +25,18 @@ model:
 
   # mtp
   mtp_num_extra_tokens: 2
+  lm_head_factor: 4
 
 training:
   batch_size: 3
   seq_length: 4096
-  lr: 1e-4
-  weight_decay: 0.01
+  lr: 4e-4
+  weight_decay: 0.02
   grad_clip: 1.0
   num_epochs: 10
   lambda_mtp: 0.1
-  warmup_steps: 500
+  aux_loss_weight: 0.01 # load balancing loss coefficient
   target_tokens: 5000000000 # 5b tokens
+  warmup_steps: 1000 # linear LR warmup before cosine decay
+  noise_anneal_tokens: 1000000000 # decay router exploration noise 1->0 over the first 1b tokens
+  grad_accumulation_steps: 8

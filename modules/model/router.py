@@ -17,18 +17,23 @@ class Router(nn.Module):
         
         self.noise_proj = nn.Linear(hidden_size, num_experts, bias=False)
         self.softmax = nn.Softmax(dim=-1)
-    
+
+        # global multiplier on the exploration noise, annealed 1 -> 0 over training 
+        # high early noise encourages to explore experts 
+        # once routing has specialized the noise only adds grad variance => decayed away
+        self.noise_factor = 1.0
+
     def forward(self, hidden_states, temperature: float = 1.0):
         expert_scores = self.router(hidden_states)       # [batch_size, seq_len, num_experts]
-        
-        # add noise for exploration
-        if self.training:
+
+        # add (annealed) noise for exploration
+        if self.training and self.noise_factor > 0.0:
             noise = torch.randn_like(expert_scores)
             noise_scale = F.softplus(self.noise_proj(hidden_states))
-            expert_scores = expert_scores + noise_scale * noise
+            expert_scores = expert_scores + self.noise_factor * noise_scale * noise
 
-        probs = self.softmax(expert_scores / temperature) 
-        return probs
+        # raw logits: the single softmax happens in LoopMixtureOfExperts.route()
+        return expert_scores
 
 
 def compute_aux_loss(indices: torch.Tensor, router_probs: torch.Tensor, num_experts: int) -> torch.Tensor:

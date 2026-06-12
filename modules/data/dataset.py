@@ -12,30 +12,37 @@ logger = logging.getLogger(__name__)
 
 class FileIterator:
     """iterates through data files (parquet/jsonl/json) in a given list of roots"""
-    def __init__(self, sources: list[dict]):
+    def __init__(self, sources: list[dict], start_file_idx: int = 0):
         self.sources = sources
+        self.start_file_idx = start_file_idx
         self.files = []
         for src in self.sources:
             root = src.get("root")
             column = src.get("column", "text")
+            # optional filename glob so stray non-data files (configs, READMEs) in a root
+            # are not ingested as training data
+            pattern = src.get("glob", "*")
             if root is None or not os.path.exists(root):
                 logger.warning(f"root path {root} does not exist. Skipping")
                 continue
             
             # sort so file order is deterministic across runs
-            for path in sorted(Path(root).rglob("*")):
+            for path in sorted(Path(root).rglob(pattern)):
                 if path.is_file() and path.suffix in [".parquet", ".jsonl", ".json"]:
                     self.files.append((str(path), column))
-                    
+
     def __iter__(self):
+        indexed = list(enumerate(self.files))
         # shard files across DataLoader workers to avoid every worker yielding
         # the same batches (IterableDataset is replicated per worker otherwise)
-        files = self.files
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None and worker_info.num_workers > 1:
-            files = files[worker_info.id::worker_info.num_workers]
+            indexed = indexed[worker_info.id::worker_info.num_workers]
 
-        for file_path, column in files:
+        for global_idx, (file_path, column) in indexed:
+            # fast forward on resume: skip already consumed files cheaply
+            if global_idx < self.start_file_idx:
+                continue
             try:
                 if file_path.endswith('.parquet'):
                     df = pd.read_parquet(file_path, columns=[column])
@@ -51,8 +58,8 @@ class FileIterator:
                     continue
                 
                 if records:
-                    yield records, column
-                    
+                    yield global_idx, records, column
+
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
 
@@ -65,12 +72,12 @@ class Dataset(IterableDataset):
         mode: str = "pretrain",
         config_path: str = "data_config.json",
         padding: str = "max_length",
-        start_step: int = 0,
-        num_mtp_tokens: int = 1
+        num_mtp_tokens: int = 1,
+        start_file_idx: int = 0,
     ) -> None:
         """
         Dataset for LLM training. Configured via config (`config_path`)
-        
+
         Args:
             tokenizer: tokenizer to use for tokenization
             batch_size: number of samples per batch
@@ -78,39 +85,49 @@ class Dataset(IterableDataset):
             mode: which mode to use from config (eg. "pretrain", "sft")
             config_path: path to json config file specifying data sources
             padding: padding strategy for tokenization (default: "max_length")
-            start_step: global step to resume from
-            num_mtp_tokens: number of padding tokens appended after each text for multi-token prediction
+            num_mtp_tokens: number of separator tokens appended after each document. The first one
+                is EOS (supervised, so the model learns to terminate documents), the rest are pads.
+                Must stay >= the models number of MTP heads to keep MTP from being supervised across document boundaries.
+            start_file_idx: global index of the first data file to read. On resume this skips the
+                already-consumed files without reading/tokenizing them. Mutate this attribute
+                between epochs (set back to 0 for fresh epochs).
         """
         super().__init__()
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.max_length = max_length
         self.padding = padding
-        self.start_step = start_step
         self.num_mtp_tokens = num_mtp_tokens
-        self._current_step = 0
-        
+        self.start_file_idx = start_file_idx
+
+        # document framing: prepend BOS ourselves if the tokenizer doesn't (e.g. the DeepSeek
+        # tokenizer adds no BOS even with add_special_tokens=True), and terminate each document
+        # with a supervised EOS so the model learns to stop generating
+        self._bos_id = getattr(tokenizer, "bos_token_id", None)
+        self._eos_id = getattr(tokenizer, "eos_token_id", None)
+        self._sep_id = self._eos_id if self._eos_id is not None else tokenizer.pad_token_id
+        self._supervise_eos = self._eos_id is not None
+
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
-            
+
         if mode not in config:
             raise ValueError(f"mode '{mode}' not found in {config_path}")
-            
+
         self.sources = config[mode]
-        
-        self._skip_tokenization = False
-        self._skip_batches = 0
 
     def _batch_iterator(self) -> Iterator[dict]:
-        file_iter = FileIterator(self.sources)
-        
+        file_iter = FileIterator(self.sources, start_file_idx=self.start_file_idx)
+
         current_batch_input_ids = []
         current_batch_doc_ids = []  # per sample [max_length] segment id list (batch aligned)
         current_batch_labels = []
-        
+        # global index of the file currently being consumed; checkpointed for resume
+        current_file_idx = self.start_file_idx
+
         current_seq = []
         current_seq_sections = [] # list of tuples (text_len, num_pad)
-        
+
         def push_sequence():
             # pad to max_length
             pad_len = self.max_length - len(current_seq)
@@ -143,10 +160,14 @@ class Dataset(IterableDataset):
                 l_end = min(start + text_len, self.max_length)
                 if l_end > start + 1: # mask to predict all tokens except the first one of each block
                     label_mask[start+1:l_end] = True
+                # supervise the EOS separator right after the document so the model learns to
+                # terminate documents (the remaining separator pads stay unsupervised)
+                if num_pad > 0 and self._supervise_eos and l_end < self.max_length:
+                    label_mask[l_end] = True
                 start += text_len + num_pad
-            
+
             label_seq[~label_mask] = -100
-            
+
             current_batch_input_ids.append(padded_seq)
             current_batch_doc_ids.append(doc_ids)
             current_batch_labels.append(label_seq)
@@ -160,27 +181,19 @@ class Dataset(IterableDataset):
                 "input_ids": torch.tensor(current_batch_input_ids, dtype=torch.long),
                 # batch aligned [B, max_length] segment ids -> model builds cu_seqlens from these
                 "document_ids": torch.tensor(current_batch_doc_ids, dtype=torch.long),
-                "labels": torch.stack(current_batch_labels)
+                "labels": torch.stack(current_batch_labels),
+                # global index of the data file being read when this batch was assembled.
+                # carried per-sample (shape [B]) so accelerate's batch splitting handles it like
+                # any other tensor; the trainer reads it to checkpoint the resume position.
+                "file_idx": torch.full((len(current_batch_input_ids),), current_file_idx, dtype=torch.long),
             }
             current_batch_input_ids = []
             current_batch_doc_ids = []
             current_batch_labels = []
             return batch
-        
-        for records, column in file_iter:
-            for record in records:
-                if self._current_step < self.start_step:
-                    current_seq.append(None)
-                    if len(current_seq) >= self.batch_size:
-                        yield {
-                            "input_ids": torch.zeros((self.batch_size, self.max_length), dtype=torch.long),
-                            "document_ids": None,
-                            "labels": None
-                        }
-                        current_seq.clear()
-                        self._current_step += 1
-                    continue
 
+        for current_file_idx, records, column in file_iter:
+            for record in records:
                 if column == "messages" and (isinstance(record, list) or isinstance(record, dict)):
                     try:
                         text = self.tokenizer.apply_chat_template(record, tokenize=False)
@@ -188,46 +201,38 @@ class Dataset(IterableDataset):
                         text = str(record)
                 else:
                     text = str(record)
-                    
+
                 tokens = self.tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
-                if len(tokens) > self.max_length:
-                    tokens = tokens[:self.max_length]
-                    
-                if len(current_seq) + len(tokens) > self.max_length:
-                    if len(current_seq) > 0:
+                if not tokens:
+                    continue
+                if self._bos_id is not None and tokens[0] != self._bos_id:
+                    tokens = [self._bos_id] + tokens
+
+                # pack the document, splitting it across sequences when it does not fit:
+                # the remainder continues at the start of the next sequence (its own attention segment)
+                offset = 0
+                while offset < len(tokens):
+                    space = self.max_length - len(current_seq)
+                    take = min(len(tokens) - offset, space)
+                    current_seq.extend(tokens[offset:offset + take])
+                    offset += take
+
+                    pad_to_add = 0
+                    if offset == len(tokens):  # document finished -> EOS + MTP separator pads
+                        pad_to_add = min(self.num_mtp_tokens, self.max_length - len(current_seq))
+                        if pad_to_add > 0:
+                            current_seq.extend([self._sep_id] + [self.tokenizer.pad_token_id] * (pad_to_add - 1))
+                    current_seq_sections.append((take, pad_to_add))
+
+                    if len(current_seq) >= self.max_length:
                         push_sequence()
                         if len(current_batch_input_ids) == self.batch_size:
                             yield yield_batch()
-                            self._current_step += 1
-                            
-                if len(tokens) == self.max_length:
-                    current_seq.extend(tokens)
-                    current_seq_sections.append((len(tokens), 0))
-                    push_sequence()
-                    if len(current_batch_input_ids) == self.batch_size:
-                        yield yield_batch()
-                        self._current_step += 1
-                    continue
-                    
-                current_seq.extend(tokens)
-                
-                pad_to_add = min(self.num_mtp_tokens, self.max_length - len(current_seq))
-                if pad_to_add > 0:
-                    current_seq.extend([self.tokenizer.pad_token_id] * pad_to_add)
-                    
-                current_seq_sections.append((len(tokens), pad_to_add))
-                
-                if len(current_seq) == self.max_length:
-                    push_sequence()
-                    if len(current_batch_input_ids) == self.batch_size:
-                        yield yield_batch()
-                        self._current_step += 1
-                        
+
         if len(current_seq) > 0:
             push_sequence()
         if len(current_batch_input_ids) > 0:
             yield yield_batch()
-            self._current_step += 1
 
     def __iter__(self) -> Iterator[dict]:
         return self._batch_iterator()

@@ -20,24 +20,30 @@ BF16 = torch.bfloat16
 
 
 
-def save_checkpoint(model, optimizer, epoch, dataset_idx, path, token_count=0):
+def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token_count=0, file_idx=0, losses=None):
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
         "dataset_idx": dataset_idx,
         "epoch": epoch,
         "token_count": token_count,
+        "file_idx": file_idx,
+        "losses": losses
     }
     torch.save(checkpoint, path)
     logger.info(f"Checkpoint saved at {path}")
 
 
-def load_checkpoint(model, optimizer, path):
+def load_checkpoint(model, optimizer, scheduler, path):
     checkpoint = torch.load(path)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     epoch = checkpoint["epoch"]
     dataset_idx = checkpoint["dataset_idx"]
     token_count = checkpoint.get("token_count", 0)
+    file_idx = checkpoint.get("file_idx", 0)
+    losses = checkpoint.get("losses", None)
     logger.info(f"Checkpoint loaded from {path}")
-    return epoch, dataset_idx, token_count
+    return epoch, dataset_idx, token_count, file_idx, losses

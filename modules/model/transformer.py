@@ -14,13 +14,17 @@ from transformer_engine.pytorch import checkpoint
 class TokenTracker():
     def __init__(self):
         self.num_tokens = 0
-    
+        self.pad_token_id = None  # when set, padding tokens are excluded from the count
+
     def count_tokens(self, input_ids: torch.Tensor):
-        self.num_tokens += input_ids.numel()
-    
+        if self.pad_token_id is None:
+            self.num_tokens += input_ids.numel()
+        else:
+            self.num_tokens += int((input_ids != self.pad_token_id).sum().item())
+
     def reset(self):
         self.num_tokens = 0
-        
+
     def get_count(self):
         return self.num_tokens
 
@@ -44,6 +48,7 @@ class TinyMoETransformer(nn.Module):
         dropout: float = 0.1,
         ple_embeddings_size: int = None,
         mtp_num_extra_tokens: int = 0,
+        lm_head_factor: int = 8,
     ):
         super().__init__()
         
@@ -78,13 +83,14 @@ class TinyMoETransformer(nn.Module):
         )
         
         self.norm = RMSNorm(hidden_size)
-        self.lm_head = SmallLMHead(hidden_size, vocab_size, factor=8)
+        self.lm_head = SmallLMHead(hidden_size, vocab_size, factor=lm_head_factor)
         
         self.mtp_head = MTPHead(
             hidden_size, 
             vocab_size,
             num_extra_tokens=mtp_num_extra_tokens, 
-            dropout=dropout
+            dropout=dropout,
+            lm_head_factor=lm_head_factor * 2, # reduce overhead
         ) if mtp_num_extra_tokens > 0 else None
         
         self.use_checkpointing = True

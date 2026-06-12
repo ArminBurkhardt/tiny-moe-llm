@@ -178,19 +178,19 @@ class Gemma4TextModel(nn.Module):
         num_key_value_heads: int,
         num_hidden_layers: int,
         rms_norm_eps: float = 1e-6,
-        pad_token_id: int = 0,
         rope_theta: float = 100000.0,
         dropout: float = 0.0,
         per_layer_embeddings_size: int | None = None,
     ):
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size, pad_token_id)
-        
+        # no padding_idx: with this tokenizer pad == eos (id 1, which must stay trainable) and
+        # the old default of 0 was actually the BOS id, freezing its embedding at zero
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+
         if (per_layer_embeddings_size is not None) and (per_layer_embeddings_size > 0):
             self.ple = nn.Embedding(
-                vocab_size, 
-                per_layer_embeddings_size * num_hidden_layers, 
-                pad_token_id
+                vocab_size,
+                per_layer_embeddings_size * num_hidden_layers
             )
         else:
             self.ple = None
@@ -264,7 +264,6 @@ class Gemma4ForCausalLM(nn.Module):
         num_key_value_heads: int,
         num_hidden_layers: int,
         rms_norm_eps: float = 1e-6,
-        pad_token_id: int = 0,
         rope_theta: float = 100000.0,
         dropout: float = 0.0,
         per_layer_embeddings_size: int | None = None,
@@ -280,7 +279,6 @@ class Gemma4ForCausalLM(nn.Module):
             num_key_value_heads=num_key_value_heads,
             num_hidden_layers=num_hidden_layers,
             rms_norm_eps=rms_norm_eps,
-            pad_token_id=pad_token_id,
             rope_theta=rope_theta,
             dropout=dropout,
             per_layer_embeddings_size=per_layer_embeddings_size

@@ -10,7 +10,7 @@ import transformer_engine.pytorch as te
 
 
 class MTPHead(nn.Module):
-    def __init__(self, hidden_size: int, vocab_size: int, num_extra_tokens: int = 3, dropout: float = 0.1):
+    def __init__(self, hidden_size: int, vocab_size: int, num_extra_tokens: int = 3, dropout: float = 0.1, lm_head_factor: int = 16):
         super().__init__()
         intermediate_size = int(hidden_size * num_extra_tokens * 1.5)
         
@@ -22,7 +22,7 @@ class MTPHead(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.act_fn = nn.SiLU()
         
-        self.lm_head = SmallLMHead(hidden_size // 2, vocab_size, factor=16)
+        self.lm_head = SmallLMHead(hidden_size // 2, vocab_size, factor=lm_head_factor)
         
         self.num_extra_tokens = num_extra_tokens
         self.late_token_loss = True  # whether to compute loss for the last few tokens that only have MTP supervision
@@ -56,11 +56,18 @@ def unpad(tensor: torch.Tensor, original_seq_len: int) -> torch.Tensor:
     """Removes padding from the input tensor to restore the original sequence length."""
     return tensor[:original_seq_len].contiguous()
 
+def _safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """cross entropy that returns a graph-connected zero instead of NaN when every label is -100"""
+    if (labels != -100).any():
+        return F.cross_entropy(logits, labels)
+    return logits.sum() * 0.0
+
+
 def compute_mtp_loss(
-    outputs: torch.Tensor, 
-    targets: torch.Tensor, 
-    mtp_outputs: torch.Tensor = None, 
-    lm_head: nn.Module = None, 
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+    mtp_outputs: torch.Tensor = None,
+    lm_head: nn.Module = None,
     lambda_mtp: float = 0.1,
     main_lm_head: nn.Module = None,
     pad_mask: torch.Tensor = None,
@@ -73,12 +80,14 @@ def compute_mtp_loss(
         main_logits = main_lm_head(hidden)
         main_logits = unpad(main_logits, hidden_0)
         main_labels = targets[:, 1:].contiguous()
-        loss = F.cross_entropy(main_logits, main_labels.view(-1))
+        loss_ce = _safe_cross_entropy(main_logits, main_labels.view(-1))
     else:
         # main loss: targets shifted by 1 relative to inputs
         main_logits = outputs[:, :-1, :].contiguous()
         main_labels = targets[:, 1:].contiguous()
-        loss = F.cross_entropy(main_logits.view(-1, main_logits.size(-1)), main_labels.view(-1))
+        loss_ce = _safe_cross_entropy(main_logits.view(-1, main_logits.size(-1)), main_labels.view(-1))
+    
+    loss = loss_ce
     
     if mtp_outputs is not None and lm_head is not None:
         # mtp_outputs shape: [batch_size, seq_len, num_extra_tokens, hidden_size // 2]
@@ -100,9 +109,9 @@ def compute_mtp_loss(
             hidden = pad_for_low_fp(hidden)
             aux_logits = lm_head(hidden)
             aux_logits = unpad(aux_logits, hidden_0)
-            aux_loss = F.cross_entropy(aux_logits, aux_labels.view(-1))
+            aux_loss = _safe_cross_entropy(aux_logits, aux_labels.view(-1))
             
             loss = loss + lambda_mtp * aux_loss
             
-    return loss
+    return loss, loss_ce.detach()
 

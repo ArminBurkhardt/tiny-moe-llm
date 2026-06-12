@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+from collections import deque
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 
@@ -27,12 +28,15 @@ fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_com
 mxfp8_format = Format.E4M3  # E4M3 used everywhere
 mxfp8_recipe = MXFP8BlockScaling(fp8_format=mxfp8_format)
 nvfp4_recipe = NVFP4BlockScaling(
-    disable_rht=True, 
-    disable_stochastic_rounding=True
+    disable_rht=False,
+    disable_stochastic_rounding=False,
 )
 
-chosen_recipe = nvfp4_recipe
+chosen_recipe = None #nvfp4_recipe
 # Note: using NVFP4 for the router and MTP heads leads to issues with the backward pass (mainly the requirement of divisability)
+
+# Not really great with Consumer Blackwell (only with stochastic rounding & rht disabled)
+USE_LOW_PRECISION = False
 
 def train_step(
     model: TinyMoETransformer,
@@ -50,7 +54,7 @@ def train_step(
     # goes through ``model`` so accelerate handles gradient sync.
     unwrapped = accelerator.unwrap_model(model)
     with accelerator.accumulate(model):
-        with te.autocast(enabled=True, recipe=chosen_recipe):
+        with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
             if unwrapped.has_mtp:
                 logits, aux_loss, extra_token_outputs = model(
                 input_ids=input_ids,
@@ -71,7 +75,7 @@ def train_step(
                 )
                 extra_token_outputs = None
 
-            loss = compute_mtp_loss(
+            loss, loss_ce = compute_mtp_loss(
                 logits,
                 labels,
                 mtp_outputs=extra_token_outputs,
@@ -79,7 +83,9 @@ def train_step(
                 lambda_mtp=TrainingConfig.lambda_mtp,
                 main_lm_head=unwrapped.lm_head,
                 pad_mask=pad_mask,
-            ) + aux_loss
+            ) 
+            
+            loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 
             accelerator.backward(loss)
             # clip on the real update step only (matters once gradient accumulation > 1).
@@ -92,7 +98,7 @@ def train_step(
     if scheduler is not None and accelerator.sync_gradients:
         scheduler.step()
 
-    return loss
+    return loss, loss_ce, aux_loss.detach()
 
 def get_latest_checkpoint_epoch(checkpoint_dir: str):
     last_timestamp = 0
@@ -113,6 +119,8 @@ def checkpoint_name(epoch: int, dataset_idx: int, loss: float, interrupted=False
 
 def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelConfig):
     model.train().to(device).to(dtype)
+    # the dry run must not pollute the (possibly checkpoint-restored) token counter
+    token_count_before = model._token_tracker.num_tokens
     B, S = TrainingConfig.Batch_size, TrainingConfig.Seq_length
     input_ids = torch.randint(0, config.Params["vocab_size"], (B, S)).to(device)
 
@@ -126,7 +134,7 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
     cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
     pad_mask = (input_ids == pad_id)
 
-    with te.autocast(enabled=True, recipe=chosen_recipe):
+    with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
         logits, aux_loss, extra_token_outputs = model(
             input_ids=input_ids,
             cu_seqlens=cu_seqlens,
@@ -135,7 +143,7 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
             return_aux_loss=True,
             return_hidden=True,
         )
-        loss = compute_mtp_loss(
+        loss, loss_ce = compute_mtp_loss(
             logits,
             input_ids,
             mtp_outputs=extra_token_outputs,
@@ -143,11 +151,14 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
             lambda_mtp=TrainingConfig.lambda_mtp,
             main_lm_head=model.lm_head,
             pad_mask=pad_mask,
-        ) + aux_loss
+        ) 
+        
+        loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 
         loss.backward()
         model.zero_grad(set_to_none=True)
 
+    model._token_tracker.num_tokens = token_count_before
     if not torch.isfinite(loss):
         raise RuntimeError(f"dry_run produced non-finite loss: {loss.item()}")
 
@@ -163,26 +174,27 @@ def save_expert_selection_graph(stats, path):
     
     fig, axs = plt.subplots(1, 3, figsize=(12, 5))
     
+    # tracker stats are per-token EMAs now: fractions/mean weights in [0, 1]
     axs[0].bar(range(len(expert_counts)), expert_counts)
-    axs[0].set_title("Expert Selection Counts")
+    axs[0].set_title("Expert Selection Fraction (EMA)")
     axs[0].set_xlabel("Expert Index")
-    axs[0].set_ylabel("Count")
-    
+    axs[0].set_ylabel("Fraction of Tokens")
+
     axs[0].axvline(x=id_idx, color="red", linestyle="--", label="Identity Expert")
     axs[0].legend()
-    
+
     axs[1].bar(range(len(expert_probs)), expert_probs)
-    axs[1].set_title("Average Expert Selection Probabilities")
+    axs[1].set_title("Mean Routed Weight per Token (EMA)")
     axs[1].set_xlabel("Expert Index")
-    axs[1].set_ylabel("Average Probability")
-    
+    axs[1].set_ylabel("Mean Weight")
+
     axs[1].axvline(x=id_idx, color="red", linestyle="--", label="Identity Expert")
     axs[1].legend()
-    
+
     axs[2].bar(range(len(post_skew_probs)), post_skew_probs)
-    axs[2].set_title("Average Expert Probabilities After Skewing")
+    axs[2].set_title("Mean Post-Skew Probability When Selected (EMA)")
     axs[2].set_xlabel("Expert Index")
-    axs[2].set_ylabel("Average Probability")
+    axs[2].set_ylabel("Mean Probability")
     
     axs[2].axvline(x=id_idx, color="red", linestyle="--", label="Identity Expert")
     axs[2].legend()
@@ -231,26 +243,43 @@ def pretrain():
     model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
+    # count only real (non-pad) tokens towards the trained-token total
+    model._token_tracker.pad_token_id = tokenizer.pad_token_id
     
     # model = torch.compile(model)
     # from bitsandbytes.optim import AdamW8bit
     
     optimizer = optim.AdamW(model.parameters(), lr=TrainingConfig.lr, weight_decay=TrainingConfig.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=TrainingConfig.total_steps - TrainingConfig.warmup_steps)
+    # linear warmup -> cosine decay
+    warmup_steps = min(TrainingConfig.warmup_steps, max(TrainingConfig.total_steps - 1, 1))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=max(warmup_steps, 1),
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(TrainingConfig.total_steps - warmup_steps, 1),
+        eta_min=TrainingConfig.lr * 0.1,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
+    )
     
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
-    logger.info(f"Scheduler total steps: {TrainingConfig.total_steps:,}, warmup steps: {TrainingConfig.warmup_steps}")
+    logger.info(f"Scheduler total steps: {TrainingConfig.total_steps:,}")
     
-    start_epoch, dataset_idx = 0, 0
+    start_epoch, dataset_idx, start_file_idx = 0, 0, 0
+    resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
+    losses = []
     try:
         checkpoint_path = os.path.join(checkpoint_dir, get_latest_checkpoint_epoch(checkpoint_dir))
-        start_epoch, dataset_idx, resume_token_count = load_checkpoint(model, optimizer, checkpoint_path)
+        start_epoch, dataset_idx, resume_token_count, start_file_idx, losses = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
         model._token_tracker.num_tokens = resume_token_count
+        resumed = True
     except Exception as e:
         logger.warning(f"No checkpoint found. Starting training from scratch")
 
-    logger.info(f"Starting training from epoch {start_epoch}, dataset index {dataset_idx}")
+    logger.info(f"Starting training from epoch {start_epoch}, dataset file index {start_file_idx}")
     
     dry_run(model, device=device, dtype=BF16, config=ModelConfig)
     logger.info("Dry run successful. Starting training loop...")
@@ -259,6 +288,7 @@ def pretrain():
     accelerator = Accelerator(
         device_placement=True, 
         split_batches=True, 
+        gradient_accumulation_steps=TrainingConfig.grad_accumulation_steps,
     )
     model, optimizer, dataloader = accelerator.prepare(
         model, optimizer, dataloader
@@ -266,19 +296,23 @@ def pretrain():
     unwrapped_model = accelerator.unwrap_model(model)
 
     timer = time.time()
-    losses = []
     last_token_count = unwrapped_model.token_count
-    
+    last_log_time = timer
+
+    # allows for correctly tracking multiple workers 
+    RESUME_SAFETY_WINDOW = 4
+    recent_file_idxs = deque(maxlen=RESUME_SAFETY_WINDOW)
+    resume_file_idx = start_file_idx
+
     try:
         for epoch in range(start_epoch, TrainingConfig.num_epochs):
+            dataset.start_file_idx = start_file_idx if (resumed and epoch == start_epoch) else 0
+            recent_file_idxs.clear()
+
             for step, batch in enumerate(dataloader):
-                # skip steps until dataset_idx from checkpoint is reached
-                if epoch == start_epoch and step < dataset_idx:
-                    continue
-                # dataset yields dummy batches (labels=None) during its fast-skip phase
-                # guard here in case dataset and dataloader step counters drift
-                if batch["labels"] is None:
-                    continue
+                # global data-file index this batch was assembled from (for resume safety)
+                recent_file_idxs.append(int(batch["file_idx"][0].item()))
+                resume_file_idx = min(recent_file_idxs)
 
                 input_ids = batch["input_ids"].to(device)
                 # document_ids: batch-aligned [B, S] segment ids for the packed documents
@@ -294,7 +328,12 @@ def pretrain():
 
                 pad_mask = (input_ids == tokenizer.pad_token_id)
 
-                loss = train_step(
+                # anneal router exploration noise 1 -> 0 over the first noise_anneal_tokens tokens
+                if TrainingConfig.noise_anneal_tokens > 0:
+                    noise_factor = max(0.0, 1.0 - unwrapped_model.token_count / TrainingConfig.noise_anneal_tokens)
+                    unwrapped_model.moe.set_router_noise(noise_factor)
+
+                loss, loss_ce, aux_loss = train_step(
                     model,
                     input_ids,
                     cu_seqlens,
@@ -310,8 +349,12 @@ def pretrain():
                 val_loss = loss.item()
                 losses.append(val_loss)
                 n_tokens = unwrapped_model.token_count
-                logger.info(f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {(n_tokens - last_token_count) / (time.time() - timer):.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(time.time() - timer) / 60:.2f} min")
-                
+                now = time.time()
+                tokens_per_sec = (n_tokens - last_token_count) / max(now - last_log_time, 1e-6)
+                last_token_count = n_tokens
+                last_log_time = now
+                logger.info(f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce:.4f} | Aux Loss: {aux_loss:.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min")
+
                 dataset_idx = step
                 
                 if step % unwrapped_model.moe.expert_tracker.sliding_window_size == 0:
@@ -325,15 +368,35 @@ def pretrain():
                     except Exception as e:
                         logger.error(f"Error occurred while saving loss graph: {e}")
 
-                # save checkpoint every 5000 steps 
+                # save checkpoint every 5000 steps
                 if (step % 5000 == 0) and (step > 0):
-                    save_checkpoint(unwrapped_model, optimizer, epoch, dataset_idx, path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)), token_count=unwrapped_model.token_count)
+                    save_checkpoint(
+                        unwrapped_model, 
+                        optimizer, 
+                        scheduler, 
+                        epoch, 
+                        dataset_idx, 
+                        path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)), 
+                        token_count=unwrapped_model.token_count, 
+                        file_idx=resume_file_idx,
+                        losses=losses
+                    )
             dataset_idx = 0
     except KeyboardInterrupt:
         try:
             input("Training interrupted. Press Enter to save checkpoint and exit...")
             logger.info("Training interrupted. Saving checkpoint...")
-            save_checkpoint(unwrapped_model, optimizer, epoch, dataset_idx, path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)), token_count=unwrapped_model.token_count)
+            save_checkpoint(
+                unwrapped_model, 
+                optimizer, 
+                scheduler, 
+                epoch, 
+                dataset_idx, 
+                path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)), 
+                token_count=unwrapped_model.token_count, 
+                file_idx=resume_file_idx,
+                losses=losses
+            )
         except Exception as e:
             logger.error(f"Exiting with: {e}")
 
