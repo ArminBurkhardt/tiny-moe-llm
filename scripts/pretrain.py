@@ -296,27 +296,44 @@ def pretrain():
     unwrapped_model = accelerator.unwrap_model(model)
 
     timer = time.time()
-    last_token_count = unwrapped_model.token_count
+    last_token_count = unwrapped_model._token_tracker.sync()
     last_log_time = timer
 
-    # allows for correctly tracking multiple workers 
+    # log/sync cadence: pulling loss/aux/token-count to the host forces CPU/GPU syncs, so do it
+    # every LOG_INTERVAL steps instead of every step (the model is small -> per-step syncs dominate)
+    LOG_INTERVAL = 10
+
+    # allows for correctly tracking multiple workers
     RESUME_SAFETY_WINDOW = 4
     recent_file_idxs = deque(maxlen=RESUME_SAFETY_WINDOW)
     resume_file_idx = start_file_idx
 
+    def resolve_resume_file_idx():
+        # windowed min over the most recent batches file indices. file_idx scalars are kept on
+        # device and only pulled to the host here (at checkpoint/interrupt), not every step.
+        if not recent_file_idxs:
+            return resume_file_idx
+        return int(torch.stack(list(recent_file_idxs)).min().item())
+
     try:
         for epoch in range(start_epoch, TrainingConfig.num_epochs):
-            dataset.start_file_idx = start_file_idx if (resumed and epoch == start_epoch) else 0
+            resume_epoch = resumed and epoch == start_epoch
+            dataset.start_file_idx = start_file_idx if resume_epoch else 0
+            # continue the step counter from the checkpointed step on the resumed epoch (the
+            # dataloader's enumerate restarts at 0, but the dataset has fast-forwarded past the
+            # already-consumed files). every later epoch starts fresh at 0.
+            step_offset = dataset_idx if resume_epoch else 0
             recent_file_idxs.clear()
 
-            for step, batch in enumerate(dataloader):
-                # global data-file index this batch was assembled from (for resume safety)
-                recent_file_idxs.append(int(batch["file_idx"][0].item()))
-                resume_file_idx = min(recent_file_idxs)
+            for local_step, batch in enumerate(dataloader):
+                step = local_step + step_offset
+                recent_file_idxs.append(batch["file_idx"][0].detach())
 
                 input_ids = batch["input_ids"].to(device)
-                # document_ids: batch-aligned [B, S] segment ids for the packed documents
-                # build flash varlen cu_seqlens from them. None: plain causal
+                # document_ids: batch-aligned [B, S] segment ids for the packed documents. cu_seqlens
+                # is built from them HERE (in-thread) and never carried in the batch: a ragged
+                # cu_seqlens (dim0 = num_segments+1) gets truncated to the batch size by accelerates
+                # split_batches, which silently corrupts the attention segmentation.
                 document_ids = batch["document_ids"].to(device) if batch["document_ids"] is not None else None
                 if document_ids is not None:
                     cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
@@ -346,17 +363,19 @@ def pretrain():
                 )
                     
                 
-                val_loss = loss.item()
-                losses.append(val_loss)
-                n_tokens = unwrapped_model.token_count
-                now = time.time()
-                tokens_per_sec = (n_tokens - last_token_count) / max(now - last_log_time, 1e-6)
-                last_token_count = n_tokens
-                last_log_time = now
-                logger.info(f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce:.4f} | Aux Loss: {aux_loss:.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min")
-
                 dataset_idx = step
-                
+
+                # logging pulls loss/aux/token-count to the host (syncs). Throttle to LOG_INTERVAL.
+                if step % LOG_INTERVAL == 0:
+                    val_loss = loss.item()
+                    losses.append(val_loss)
+                    n_tokens = unwrapped_model._token_tracker.sync()
+                    now = time.time()
+                    tokens_per_sec = (n_tokens - last_token_count) / max(now - last_log_time, 1e-6)
+                    last_token_count = n_tokens
+                    last_log_time = now
+                    logger.info(f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | Aux Loss: {aux_loss.item():.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min")
+
                 if step % unwrapped_model.moe.expert_tracker.sliding_window_size == 0:
                     stats = unwrapped_model.moe.expert_tracker.get_stats()
                     try:
@@ -369,15 +388,16 @@ def pretrain():
                         logger.error(f"Error occurred while saving loss graph: {e}")
 
                 # save checkpoint every 5000 steps
-                if (step % 5000 == 0) and (step > 0):
+                if (step % 5000 == 0) and (local_step > 0):
+                    resume_file_idx = resolve_resume_file_idx()
                     save_checkpoint(
-                        unwrapped_model, 
-                        optimizer, 
-                        scheduler, 
-                        epoch, 
-                        dataset_idx, 
-                        path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)), 
-                        token_count=unwrapped_model.token_count, 
+                        unwrapped_model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        dataset_idx,
+                        path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
+                        token_count=unwrapped_model._token_tracker.sync(),
                         file_idx=resume_file_idx,
                         losses=losses
                     )
@@ -386,14 +406,15 @@ def pretrain():
         try:
             input("Training interrupted. Press Enter to save checkpoint and exit...")
             logger.info("Training interrupted. Saving checkpoint...")
+            resume_file_idx = resolve_resume_file_idx()
             save_checkpoint(
-                unwrapped_model, 
-                optimizer, 
-                scheduler, 
-                epoch, 
-                dataset_idx, 
-                path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)), 
-                token_count=unwrapped_model.token_count, 
+                unwrapped_model,
+                optimizer,
+                scheduler,
+                epoch,
+                dataset_idx,
+                path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)),
+                token_count=unwrapped_model._token_tracker.sync(),
                 file_idx=resume_file_idx,
                 losses=losses
             )

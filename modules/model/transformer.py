@@ -12,21 +12,57 @@ from transformer_engine.pytorch import checkpoint
 
 
 class TokenTracker():
+    """Counts trained tokens without forcing a host sync on every forward.
+
+    When ``pad_token_id`` is set the per step non pad count is a reduction over a CUDA tensor;
+    reading it with ``.item()`` every forward would drain the stream and serialize CPU/GPU. Instead
+    the increments accumulate into an on-device scalar and are only pulled to the host on ``sync()``
+    (called at log/checkpoint cadence). ``num_tokens`` stays readable/writable as a plain int so
+    existing call sites (resume, dry run save/restore) keep working.
+    """
     def __init__(self):
-        self.num_tokens = 0
-        self.pad_token_id = None  # when set, padding tokens are excluded from the count
+        self._cached = 0           # host-side total as of the last sync()
+        self._device_count = None  # pending on-device increments not yet drained to the host
+        self.pad_token_id = None   # when set, padding tokens are excluded from the count
 
     def count_tokens(self, input_ids: torch.Tensor):
         if self.pad_token_id is None:
-            self.num_tokens += input_ids.numel()
-        else:
-            self.num_tokens += int((input_ids != self.pad_token_id).sum().item())
+            # numel() is a python int already -> no sync
+            self._cached += input_ids.numel()
+            return
+        # keep the reduction on-device and accumulate; no host transfer here
+        n = (input_ids != self.pad_token_id).sum()
+        if self._device_count is None or self._device_count.device != n.device:
+            self._device_count = torch.zeros((), dtype=torch.long, device=n.device)
+        self._device_count += n
+
+    def sync(self):
+        """Drain pending on-device counts into the host total. The only host sync; call it at
+        logging/checkpoint cadence rather than every step."""
+        if self._device_count is not None:
+            self._cached += int(self._device_count.item())
+            self._device_count.zero_()
+        return self._cached
 
     def reset(self):
-        self.num_tokens = 0
+        self._cached = 0
+        if self._device_count is not None:
+            self._device_count.zero_()
 
     def get_count(self):
-        return self.num_tokens
+        # sync-free read; may lag real-time by up to one logging interval of pending tokens
+        return self._cached
+
+    @property
+    def num_tokens(self):
+        return self._cached
+
+    @num_tokens.setter
+    def num_tokens(self, value):
+        # explicit set (resume / dry run restore) replaces the host total and clears any pending
+        self._cached = int(value)
+        if self._device_count is not None:
+            self._device_count.zero_()
 
 class TinyMoETransformer(nn.Module):
     def __init__(

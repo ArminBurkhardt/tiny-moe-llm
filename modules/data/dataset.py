@@ -36,13 +36,18 @@ class FileIterator:
         # shard files across DataLoader workers to avoid every worker yielding
         # the same batches (IterableDataset is replicated per worker otherwise)
         worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
         if worker_info is not None and worker_info.num_workers > 1:
             indexed = indexed[worker_info.id::worker_info.num_workers]
+
+        start = self.start_file_idx
+        logger.info(f"[worker {worker_id}] FileIterator starting: {len(self.files)} total files, resuming from file_idx={start}")
 
         for global_idx, (file_path, column) in indexed:
             # fast forward on resume: skip already consumed files cheaply
             if global_idx < self.start_file_idx:
                 continue
+            logger.info(f"[worker {worker_id}] Reading file {global_idx}/{len(self.files)-1}: {file_path}")
             try:
                 if file_path.endswith('.parquet'):
                     df = pd.read_parquet(file_path, columns=[column])
@@ -179,11 +184,14 @@ class Dataset(IterableDataset):
             nonlocal current_batch_input_ids, current_batch_doc_ids, current_batch_labels
             batch = {
                 "input_ids": torch.tensor(current_batch_input_ids, dtype=torch.long),
-                # batch aligned [B, max_length] segment ids -> model builds cu_seqlens from these
+                # batch aligned [B, max_length] segment ids -> model builds cu_seqlens from these.
+                # NOTE: the trainer must derive cu_seqlens from these in thread; a ragged cu_seqlens
+                # cannot be carried in the batch because accelerates split_batches truncates its
+                # dim-0 to the batch size (see modules/model/attention.py).
                 "document_ids": torch.tensor(current_batch_doc_ids, dtype=torch.long),
                 "labels": torch.stack(current_batch_labels),
                 # global index of the data file being read when this batch was assembled.
-                # carried per-sample (shape [B]) so accelerate's batch splitting handles it like
+                # carried per-sample (shape [B]) so accelerates batch splitting handles it like
                 # any other tensor; the trainer reads it to checkpoint the resume position.
                 "file_idx": torch.full((len(current_batch_input_ids),), current_file_idx, dtype=torch.long),
             }
