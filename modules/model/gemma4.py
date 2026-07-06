@@ -11,6 +11,7 @@ from modules.model.attention import varlen_attention
 # adapted from https://github.com/huggingface/transformers/tree/main/src/transformers/models/gemma4
 # https://github.com/huggingface/blog/blob/main/gemma4.md#overview-of-capabilities-and-architecture 
 # following the dense architecture
+# also recommend: https://github.com/rasbt/llm-architecture-gallery 
 
 GemmaRMSNorm = te.RMSNorm
 

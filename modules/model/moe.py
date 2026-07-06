@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
-# TE checkpoint required for quantized (FP8/NVFP4) layers; see transformer.py note.
+# TE checkpoint required for quantized (FP8/NVFP4) layers, see transformer.py note
 from transformer_engine.pytorch import checkpoint
 
 from modules.model.router import Router, compute_aux_loss
@@ -13,15 +13,13 @@ from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
 
 
 class ParallelSparseMoELayer(nn.Module):
-    """a sparse MoE layer that dispatches each token only to its routed experts via a
-    grouped GEMM (Transformer Engine ``GroupedLinear``).
+    """a sparse MoE layer that dispatches each token only to its routed experts via a grouped GEMM (Transformer Engine ``GroupedLinear`` does the Grouped MatMul).
 
-    The previous implementation gathered tokens into a dense ``[num_experts, total_tokens, ...]``
-    tensor and ran every expert over every token (masking afterwards), so with ``top_k`` of
-    ``num_experts`` it spent ``num_experts / top_k`` more matmul FLOPs than necessary. Here we
-    sort the (token, slot) assignments by expert, run one variable-sized GEMM per expert group,
-    then scatter the weighted results back -- so the FF experts only do work for the tokens
-    actually routed to them.
+    Flow:
+    1. sort the (token, slot) assignments by expert
+    2. run one variable sized GEMM per expert group
+    3. scatter the weighted results back
+    => FF experts only do work for the tokens actually routed to them
     """
     def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int):
         super().__init__()
@@ -38,7 +36,7 @@ class ParallelSparseMoELayer(nn.Module):
     def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
         # x: [batch_size, seq_len, hidden_size]
         # topk_weights, topk_indices: [batch_size, seq_len, top_k]
-        # null (non-MLP) slots arrive as index 0 with weight 0 -> contribute nothing after scaling
+        # non MLP (null) slots arrive as index 0 with weight 0 => contribute nothing after scaling
         B, S, H = x.shape
         top_k = topk_indices.shape[-1]
         x_flat = x.reshape(-1, H)                       # [T, H]
@@ -49,7 +47,7 @@ class ParallelSparseMoELayer(nn.Module):
         tok = torch.arange(T, device=x.device).repeat_interleave(top_k)  # [N] owning token per slot
 
         # sort assignments so each experts rows are contiguous (required by GroupedLinear)
-        # stable=True keeps the permutation deterministic across the checkpoint recompute pass
+        # stable=True for determinism across checkpoint recompute pass
         order = torch.argsort(idx, stable=True)         # [N]
         idx_sorted = idx[order]
         tok_sorted = tok[order]
@@ -57,18 +55,17 @@ class ParallelSparseMoELayer(nn.Module):
         x_sorted = x_flat.index_select(0, tok_sorted)   # [N, H] each slot sees its (unscaled) token
 
         # per expert group sizes
-        m_splits = torch.bincount(idx_sorted, minlength=self.num_experts).tolist() # .tolist() is the only host sync (E small ints)
+        m_splits = torch.bincount(idx_sorted, minlength=self.num_experts).tolist() # host sync :(
 
-        # run the experts in BF16: NVFP4 requires each GEMMs row count (a dynamic per expert group size here) 
-        # to be divisible by 16, which cant be guaranteed without padding every group.
-        # => sparsity
+        # run the experts in BF16: NVFP4 requires each GEMMs row count (a dynamic per expert group size here) to be divisible by 16, which cant be guaranteed
+        # => sparsity more important
         with te.autocast(enabled=False):
             gate_up = self.gate_up(x_sorted, m_splits)  # [N, 2*intermediate]
             gate, up = gate_up.chunk(2, dim=-1)
             act = self.activation(gate) * up            # [N, intermediate]
             out_sorted = self.down(act, m_splits)       # [N, H]
 
-        # scale each expert output by its routing weight (null slots -> *0), then scatter back
+        # scale each expert output by its routing weight (null slots => *0), then scatter back
         out_sorted = out_sorted * wgt_sorted.unsqueeze(-1)
         combined = torch.zeros(T, H, device=x.device, dtype=out_sorted.dtype)
         combined.index_add_(0, tok_sorted, out_sorted)
@@ -118,7 +115,7 @@ class _ExpertTracking():
         post_skew_updates = (expert_scores_flat * one_hot_mask.to(expert_scores.dtype)).sum(dim=0)
         choices_updates = one_hot_mask.sum(dim=0).float()
 
-        # normalize to per-token quantities so the EMAs are interpretable
+        # normalize to per token quantities so the EMAs have a meaning
         decay = 1.0 - 1.0 / self.sliding_window_size
         inv_w = (1.0 / self.sliding_window_size) / max(num_tokens, 1)
         self.prob_dist = self.prob_dist * decay + prob_updates * inv_w

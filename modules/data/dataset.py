@@ -19,8 +19,7 @@ class FileIterator:
         for src in self.sources:
             root = src.get("root")
             column = src.get("column", "text")
-            # optional filename glob so stray non-data files (configs, READMEs) in a root
-            # are not ingested as training data
+            # filename glob so stray non data files in a root are not ingested
             pattern = src.get("glob", "*")
             if root is None or not os.path.exists(root):
                 logger.warning(f"root path {root} does not exist. Skipping")
@@ -87,10 +86,10 @@ class Dataset(IterableDataset):
             padding: padding strategy for tokenization (default: "max_length")
             num_mtp_tokens: number of separator tokens appended after each document. The first one
                 is EOS (supervised, so the model learns to terminate documents), the rest are pads.
-                Must stay >= the models number of MTP heads to keep MTP from being supervised across document boundaries.
+                Must stay >= the models number of MTP heads to keep MTP from being supervised across document boundaries
             start_file_idx: global index of the first data file to read. On resume this skips the
-                already-consumed files without reading/tokenizing them. Mutate this attribute
-                between epochs (set back to 0 for fresh epochs).
+                already consumed files without reading/tokenizing them. Mutate this attribute
+                between epochs (set back to 0 for fresh epochs)
         """
         super().__init__()
         self.tokenizer = tokenizer
@@ -100,9 +99,8 @@ class Dataset(IterableDataset):
         self.num_mtp_tokens = num_mtp_tokens
         self.start_file_idx = start_file_idx
 
-        # document framing: prepend BOS ourselves if the tokenizer doesn't (e.g. the DeepSeek
-        # tokenizer adds no BOS even with add_special_tokens=True), and terminate each document
-        # with a supervised EOS so the model learns to stop generating
+        # document framing: prepend BOS if the tokenizer doesnt (eg. the DeepSeek tokenizer adds no BOS)
+        # and terminate each document with a supervised EOS
         self._bos_id = getattr(tokenizer, "bos_token_id", None)
         self._eos_id = getattr(tokenizer, "eos_token_id", None)
         self._sep_id = self._eos_id if self._eos_id is not None else tokenizer.pad_token_id
@@ -120,24 +118,24 @@ class Dataset(IterableDataset):
         file_iter = FileIterator(self.sources, start_file_idx=self.start_file_idx)
 
         current_batch_input_ids = []
-        current_batch_doc_ids = []  # per sample [max_length] segment id list (batch aligned)
+        current_batch_doc_ids = []      # per sample [max_length] segment id list (batch aligned)
         current_batch_labels = []
-        # global index of the file currently being consumed; checkpointed for resume
+        # global idx of the file currently being consumed & checkpointed for resume
         current_file_idx = self.start_file_idx
 
         current_seq = []
-        current_seq_sections = [] # list of tuples (text_len, num_pad)
+        current_seq_sections = []       # list of tuples (text_len, num_pad)
 
         def push_sequence():
             # pad to max_length
             pad_len = self.max_length - len(current_seq)
             padded_seq = current_seq + [self.tokenizer.pad_token_id] * pad_len
 
-            # per-token segment id covering all max_length positions: each document block is one causal segment
+            # per token segment id covering all max_length positions
+            # => each document block is one causal segment
             # any trailing padding positions become length-1 (self attention only) segments
-            # the model turns these into flash-attn cu_seqlens (equivalent to the old block mask)
-            # emitted as a batch aligned [max_length] id list so accelerates batch
-            # handling treats it like input_ids instead of truncating a ragged cu_seqlens
+            # the model turns these into flash-attn cu_seqlens
+            # emitted as a batch aligned [max_length] id list for accelerates batch handling
             doc_ids = []
             seg = 0
             start = 0
@@ -149,7 +147,7 @@ class Dataset(IterableDataset):
                     doc_ids.extend([seg] * actual_block_len)
                     seg += 1
                 start = block_end
-            for _ in range(start, self.max_length):  # trailing pad -> own length-1 segment
+            for _ in range(start, self.max_length):     # trailing pad => own length-1 segment
                 doc_ids.append(seg)
                 seg += 1
 
@@ -158,10 +156,9 @@ class Dataset(IterableDataset):
             start = 0
             for text_len, num_pad in current_seq_sections:
                 l_end = min(start + text_len, self.max_length)
-                if l_end > start + 1: # mask to predict all tokens except the first one of each block
+                if l_end > start + 1:                   # mask to predict all tokens except the first one of each block
                     label_mask[start+1:l_end] = True
-                # supervise the EOS separator right after the document so the model learns to
-                # terminate documents (the remaining separator pads stay unsupervised)
+                # supervise the EOS separator right after the document so the model learns to terminate documents (the remaining separator pads stay unsupervised)
                 if num_pad > 0 and self._supervise_eos and l_end < self.max_length:
                     label_mask[l_end] = True
                 start += text_len + num_pad
@@ -179,12 +176,11 @@ class Dataset(IterableDataset):
             nonlocal current_batch_input_ids, current_batch_doc_ids, current_batch_labels
             batch = {
                 "input_ids": torch.tensor(current_batch_input_ids, dtype=torch.long),
-                # batch aligned [B, max_length] segment ids -> model builds cu_seqlens from these
+                # batch aligned [B, max_length] segment ids => model builds cu_seqlens from these
                 "document_ids": torch.tensor(current_batch_doc_ids, dtype=torch.long),
                 "labels": torch.stack(current_batch_labels),
-                # global index of the data file being read when this batch was assembled.
-                # carried per-sample (shape [B]) so accelerate's batch splitting handles it like
-                # any other tensor; the trainer reads it to checkpoint the resume position.
+                # global index of the data file being for this batch, emitted per sample (shape [B]) 
+                # (as above, so accelerate batch splitting handles it like any other tensor)
                 "file_idx": torch.full((len(current_batch_input_ids),), current_file_idx, dtype=torch.long),
             }
             current_batch_input_ids = []
@@ -208,8 +204,8 @@ class Dataset(IterableDataset):
                 if self._bos_id is not None and tokens[0] != self._bos_id:
                     tokens = [self._bos_id] + tokens
 
-                # pack the document, splitting it across sequences when it does not fit:
-                # the remainder continues at the start of the next sequence (its own attention segment)
+                # pack the document, splitting it across sequences when it does not fit
+                # => the remainder continues at the start of the next sequence (with its own attention segment)
                 offset = 0
                 while offset < len(tokens):
                     space = self.max_length - len(current_seq)
@@ -218,7 +214,7 @@ class Dataset(IterableDataset):
                     offset += take
 
                     pad_to_add = 0
-                    if offset == len(tokens):  # document finished -> EOS + MTP separator pads
+                    if offset == len(tokens):  # document finished => EOS + MTP separator pads
                         pad_to_add = min(self.num_mtp_tokens, self.max_length - len(current_seq))
                         if pad_to_add > 0:
                             current_seq.extend([self._sep_id] + [self.tokenizer.pad_token_id] * (pad_to_add - 1))
