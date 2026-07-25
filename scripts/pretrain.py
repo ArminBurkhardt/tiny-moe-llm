@@ -2,7 +2,7 @@ import os
 import sys
 import time
 import math
-from collections import deque
+import warnings
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 
@@ -99,6 +99,21 @@ def train_step(
         scheduler.step()
 
     return loss, loss_ce, aux_loss.detach()
+
+def build_scheduler(optimizer: optim.Optimizer):
+    # linear warmup -> cosine decay, adjusted for the current total steps
+    warmup_steps = min(TrainingConfig.warmup_steps, max(TrainingConfig.total_steps - 1, 1))
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.01, end_factor=1.0, total_iters=max(warmup_steps, 1),
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(TrainingConfig.total_steps - warmup_steps, 1),
+        eta_min=TrainingConfig.lr * 0.1,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
+    )
 
 def get_latest_checkpoint_epoch(checkpoint_dir: str):
     last_timestamp = 0
@@ -232,9 +247,13 @@ def pretrain():
         mode="pretrain",
         config_path=os.path.join(BASE_DIR, "data_config.json"),
         num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
+        seed=TrainingConfig.seed,
+        max_tokens_per_shard=TrainingConfig.max_tokens_per_shard,
     )
-    dataloader = DataLoader(dataset, batch_size=None, num_workers=2, prefetch_factor=2)
-    
+    # must stay the same across checkpoints
+    NUM_DATA_WORKERS = 4
+    dataloader = DataLoader(dataset, batch_size=None, num_workers=NUM_DATA_WORKERS, prefetch_factor=2)
+
     logger.info(f"Initialized dataset with {len(dataset.sources)} sources")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -250,32 +269,57 @@ def pretrain():
     # from bitsandbytes.optim import AdamW8bit
     
     optimizer = optim.AdamW(model.parameters(), lr=TrainingConfig.lr, weight_decay=TrainingConfig.weight_decay)
-    # linear warmup -> cosine decay
-    warmup_steps = min(TrainingConfig.warmup_steps, max(TrainingConfig.total_steps - 1, 1))
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=max(warmup_steps, 1),
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(TrainingConfig.total_steps - warmup_steps, 1),
-        eta_min=TrainingConfig.lr * 0.1,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
-    )
-    
+    scheduler = build_scheduler(optimizer)
+
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
     logger.info(f"Scheduler total steps: {TrainingConfig.total_steps:,}")
     
-    start_epoch, dataset_idx, start_file_idx = 0, 0, 0
+    start_epoch, dataset_idx, start_file_idx, start_record_idx, start_shard_tc = 0, 0, 0, 0, 0
+    resume_worker_start = None
     resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
     losses = []
     try:
         checkpoint_path = os.path.join(checkpoint_dir, get_latest_checkpoint_epoch(checkpoint_dir))
-        start_epoch, dataset_idx, resume_token_count, start_file_idx, losses = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+        start_epoch, dataset_idx, resume_token_count, start_file_idx, start_record_idx, losses, file_order, start_shard_tc, worker_positions, saved_num_workers = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
         model._token_tracker.num_tokens = resume_token_count
         resumed = True
+
+        # per worker exact resume only when the worker count is unchanged
+        if worker_positions is not None and saved_num_workers == NUM_DATA_WORKERS:
+            resume_worker_start = {int(k): tuple(int(x) for x in v) for k, v in worker_positions.items()}
+            logger.info(f"Restored per-worker resume positions for {len(resume_worker_start)} workers: {resume_worker_start}")
+        elif worker_positions is not None:
+            logger.warning(
+                f"Data worker count changed ({saved_num_workers} -> {NUM_DATA_WORKERS}), per worker "
+                f"positions are invalid. Falling back to global resume at file_idx={start_file_idx}"
+            )
+
+        # restore the file ordering so already consumed shards are skipped
+        if file_order:
+            dataset.set_order(file_order)
+            logger.info(f"Restored saved file ordering ({len(file_order)} files) from checkpoint")
+        else:
+            # legacy checkpoint
+            dataset.build_legacy_order(start_file_idx, seed=TrainingConfig.seed + start_epoch)
+            logger.info(
+                f"No saved file ordering, treating {start_file_idx} sorted files as consumed and "
+                f"shuffling the remaining {len(dataset.file_order) - start_file_idx} shards"
+            )
+
+        # total_steps moves with batch size / grad accum, so reanchor the LR schedule by tokens
+        tokens_per_step = TrainingConfig.Batch_size * TrainingConfig.Seq_length * TrainingConfig.grad_accumulation_steps
+        resumed_sched_step = min(resume_token_count // tokens_per_step, TrainingConfig.total_steps)
+        scheduler = build_scheduler(optimizer)
+        with warnings.catch_warnings():
+            # silence the "step() called before optimizer.step()" warning during fast forward
+            warnings.simplefilter("ignore")
+            for _ in range(resumed_sched_step):
+                scheduler.step()
+        logger.info(
+            f"Reanchored LR scheduler to step {resumed_sched_step:,}/{TrainingConfig.total_steps:,} "
+            f"({resume_token_count / 1e9:.3f}B tokens trained, current LR {scheduler.get_last_lr()[0]:.3e})"
+        )
     except Exception as e:
         logger.warning(f"No checkpoint found. Starting training from scratch")
 
@@ -303,31 +347,49 @@ def pretrain():
     # every LOG_INTERVAL steps instead of every step (the model is small -> per-step syncs dominate)
     LOG_INTERVAL = 10
 
-    # allows for correctly tracking multiple workers
-    RESUME_SAFETY_WINDOW = 4
-    recent_file_idxs = deque(maxlen=RESUME_SAFETY_WINDOW)
-    resume_file_idx = start_file_idx
+    # per worker (file_idx, record_idx, shard_token_count), kept on device; -1 = nothing seen yet
+    worker_state = torch.full((max(NUM_DATA_WORKERS, 1), 3), -1, dtype=torch.long, device=device)
+    
+    if resume_worker_start:
+        for wid, (f, r, s) in resume_worker_start.items():
+            if 0 <= wid < worker_state.shape[0]:
+                worker_state[wid] = torch.tensor([f, r, s], dtype=torch.long, device=device)
 
-    def resolve_resume_file_idx():
-        # windowed min over the most recent batches file indices. file_idx scalars are kept on
-        # device and only pulled to the host here (at checkpoint/interrupt), not every step.
-        if not recent_file_idxs:
-            return resume_file_idx
-        return int(torch.stack(list(recent_file_idxs)).min().item())
+    def snapshot_resume_positions():
+        # only host sync of this state, done at checkpoint time
+        rows = worker_state.cpu().tolist()
+        positions = {wid: tuple(row) for wid, row in enumerate(rows) if row[0] >= 0}
+        if positions:
+            g_file, g_record, g_shard = min(positions.values(), key=lambda p: (p[0], p[1]))
+        else:
+            g_file, g_record, g_shard = start_file_idx, start_record_idx, start_shard_tc
+        return positions, g_file, g_record, g_shard
 
     try:
         for epoch in range(start_epoch, TrainingConfig.num_epochs):
             resume_epoch = resumed and epoch == start_epoch
+            # fresh => reshuffle
+            if not resume_epoch:
+                dataset.reshuffle(TrainingConfig.seed + epoch)
             dataset.start_file_idx = start_file_idx if resume_epoch else 0
-            # continue the step counter from the checkpointed step on the resumed epoch (the
-            # dataloader's enumerate restarts at 0, but the dataset has fast-forwarded past the
-            # already-consumed files). every later epoch starts fresh at 0.
+            # within shard resume offsets (global + per-worker)
+            dataset.start_record_idx = start_record_idx if resume_epoch else 0
+            dataset.start_shard_token_count = start_shard_tc if resume_epoch else 0
+            dataset.worker_start = resume_worker_start if resume_epoch else None
+            if not resume_epoch:
+                worker_state.fill_(-1)
+            # continue the step counter from the checkpointed step on the resumed epoch
             step_offset = dataset_idx if resume_epoch else 0
-            recent_file_idxs.clear()
 
             for local_step, batch in enumerate(dataloader):
                 step = local_step + step_offset
-                recent_file_idxs.append(batch["file_idx"][0].detach())
+                # record this workers progress, no host sync
+                w_id = batch["worker_id"][0].to(worker_state.device)
+                worker_state[w_id] = torch.stack((
+                    batch["file_idx"][0],
+                    batch["record_idx"][0],
+                    batch["shard_token_count"][0],
+                )).to(worker_state.device)
 
                 input_ids = batch["input_ids"].to(device)
                 # document_ids: batch-aligned [B, S] segment ids for the packed documents. cu_seqlens
@@ -389,7 +451,7 @@ def pretrain():
 
                 # save checkpoint every 5000 steps
                 if (step % 5000 == 0) and (local_step > 0):
-                    resume_file_idx = resolve_resume_file_idx()
+                    worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
                     save_checkpoint(
                         unwrapped_model,
                         optimizer,
@@ -399,14 +461,19 @@ def pretrain():
                         path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
                         token_count=unwrapped_model._token_tracker.sync(),
                         file_idx=resume_file_idx,
-                        losses=losses
+                        record_idx=resume_record_idx,
+                        shard_token_count=resume_shard_tc,
+                        losses=losses,
+                        file_order=dataset.file_order,
+                        worker_positions=worker_positions,
+                        num_data_workers=NUM_DATA_WORKERS,
                     )
             dataset_idx = 0
     except KeyboardInterrupt:
         try:
             input("Training interrupted. Press Enter to save checkpoint and exit...")
             logger.info("Training interrupted. Saving checkpoint...")
-            resume_file_idx = resolve_resume_file_idx()
+            worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
             save_checkpoint(
                 unwrapped_model,
                 optimizer,
@@ -416,7 +483,12 @@ def pretrain():
                 path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)),
                 token_count=unwrapped_model._token_tracker.sync(),
                 file_idx=resume_file_idx,
-                losses=losses
+                record_idx=resume_record_idx,
+                shard_token_count=resume_shard_tc,
+                losses=losses,
+                file_order=dataset.file_order,
+                worker_positions=worker_positions,
+                num_data_workers=NUM_DATA_WORKERS,
             )
         except Exception as e:
             logger.error(f"Exiting with: {e}")

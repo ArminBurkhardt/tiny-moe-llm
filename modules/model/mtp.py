@@ -7,6 +7,10 @@ import torch.nn.functional as F
 from modules.model.gemma4 import Gemma4MLP, GemmaRMSNorm as RMSNorm
 from modules.model.modules import SmallLMHead
 import transformer_engine.pytorch as te
+from transformer_engine.pytorch import checkpoint
+
+# token chunk size for the chunked LM head cross entropy (see _chunked_linear_ce)
+CE_CHUNK_SIZE = 2048
 
 
 class MTPHead(nn.Module):
@@ -63,6 +67,39 @@ def _safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Ten
     return logits.sum() * 0.0
 
 
+def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.Tensor,
+                       chunk_size: int = CE_CHUNK_SIZE) -> torch.Tensor:
+    """mean cross entropy of lm_head(hidden) [T, H] vs labels [T], without ever materializing the full [T, vocab] logits.
+
+    tokens go through in chunks, each projection checkpointed so its logits are freed after the forward and recomputed in backward. 
+    peak logit memory is chunk_size * vocab instead of T * vocab
+    the logits dominate activation memory here. otherwise equivalent to a normal F.cross_entropy(lm_head(hidden), labels, ignore_index=-100).
+    """
+    n_valid = (labels != -100).sum()
+    if n_valid == 0:
+        # keep the head in the autograd graph so DDP still sees its grads
+        return lm_head(hidden[:1]).sum() * 0.0
+
+    def _chunk_loss(h: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+        h0 = h.size(0)
+        h = pad_for_low_fp(h)
+        logits = lm_head(h)
+        logits = unpad(logits, h0)
+        # sum, not mean: divided by the global valid token count below
+        return F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
+
+    loss_sum = hidden.new_zeros(())
+    T = hidden.size(0)
+    for start in range(0, T, chunk_size):
+        h_chunk = hidden[start:start + chunk_size]
+        l_chunk = labels[start:start + chunk_size]
+        if torch.is_grad_enabled() and h_chunk.requires_grad:
+            loss_sum = loss_sum + checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False)
+        else:
+            loss_sum = loss_sum + _chunk_loss(h_chunk, l_chunk)
+    return loss_sum / n_valid
+
+
 def compute_mtp_loss(
     outputs: torch.Tensor,
     targets: torch.Tensor,
@@ -73,16 +110,12 @@ def compute_mtp_loss(
     pad_mask: torch.Tensor = None,
 ):
     if main_lm_head is not None:
-        hidden = outputs[:, :-1, :].contiguous()
-        hidden = hidden.view(-1, hidden.size(-1))
-        hidden_0 = hidden.size(0)
-        hidden = pad_for_low_fp(hidden)
-        main_logits = main_lm_head(hidden)
-        main_logits = unpad(main_logits, hidden_0)
-        main_labels = targets[:, 1:].contiguous()
-        loss_ce = _safe_cross_entropy(main_logits, main_labels.view(-1))
+        # outputs are hidden states; project + CE in chunks so the logits are never all live at once
+        hidden = outputs[:, :-1, :].contiguous().view(-1, outputs.size(-1))
+        main_labels = targets[:, 1:].contiguous().view(-1)
+        loss_ce = _chunked_linear_ce(main_lm_head, hidden, main_labels)
     else:
-        # main loss: targets shifted by 1 relative to inputs
+        # main loss: targets shifted by 1 relative to inputs (outputs are already logits)
         main_logits = outputs[:, :-1, :].contiguous()
         main_labels = targets[:, 1:].contiguous()
         loss_ce = _safe_cross_entropy(main_logits.view(-1, main_logits.size(-1)), main_labels.view(-1))
@@ -102,14 +135,10 @@ def compute_mtp_loss(
             if pad_mask is not None:
                 source_is_pad = pad_mask[:, :-shift]
                 aux_labels[source_is_pad] = -100
-                
-            # apply LM head on flattened tensor to avoid large intermediate buffers
+
+            # chunked LM head + CE, bounds the per head logit memory
             hidden = hidden.view(-1, hidden.size(-1))
-            hidden_0 = hidden.size(0)
-            hidden = pad_for_low_fp(hidden)
-            aux_logits = lm_head(hidden)
-            aux_logits = unpad(aux_logits, hidden_0)
-            aux_loss = _safe_cross_entropy(aux_logits, aux_labels.view(-1))
+            aux_loss = _chunked_linear_ce(lm_head, hidden, aux_labels.view(-1))
             
             loss = loss + lambda_mtp * aux_loss
             

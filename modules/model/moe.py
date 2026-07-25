@@ -87,12 +87,19 @@ class _ExpertTracking():
         # recompute guard: under activation checkpointing route() runs again during backward, which would double count every update
         self._expected_updates = None
         self._seen_updates = 0
+        self.sample_interval = 8
+        self._forward_counter = 0
+        self._active = True
 
     def begin_forward(self, expected_updates: int):
         self._expected_updates = expected_updates
         self._seen_updates = 0
+        self._active = (self._forward_counter % self.sample_interval) == 0
+        self._forward_counter += 1
 
     def update(self, topk_indices: torch.Tensor, topk_scores: torch.Tensor, expert_scores: torch.Tensor):
+        if not self._active:
+            return  # throttled forward, skip the stats gather
         if self._expected_updates is not None:
             if self._seen_updates >= self._expected_updates:
                 return  # checkpoint recompute pass, already counted

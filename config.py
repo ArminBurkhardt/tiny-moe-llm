@@ -46,4 +46,6 @@ class TrainingConfig:
     total_steps = int((Config["training"]["target_tokens"] // (Config["training"]["batch_size"] * Config["training"]["seq_length"] * grad_accumulation_steps)))
     warmup_steps = int(Config["training"].get("warmup_steps", 0))
     noise_anneal_tokens = int(Config["training"].get("noise_anneal_tokens", 0))
+    seed = int(Config["training"].get("seed", 42))
+    max_tokens_per_shard = int(Config["training"].get("max_tokens_per_shard", 200_000_000))
 

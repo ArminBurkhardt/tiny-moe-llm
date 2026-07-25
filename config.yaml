@@ -28,7 +28,7 @@ model:
   lm_head_factor: 4
 
 training:
-  batch_size: 3
+  batch_size: 8
   seq_length: 4096
   lr: 4e-4
   weight_decay: 0.02
@@ -39,4 +39,6 @@ training:
   target_tokens: 5000000000 # 5b tokens
   warmup_steps: 1000 # linear LR warmup before cosine decay
   noise_anneal_tokens: 1000000000 # decay router exploration noise 1->0 over the first 1b tokens
-  grad_accumulation_steps: 8
+  grad_accumulation_steps: 16
+  seed: 42
+  max_tokens_per_shard: 200000000 # 200m tokens per shard 

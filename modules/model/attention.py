@@ -48,7 +48,8 @@ def cu_seqlens_from_doc_ids(document_ids: torch.Tensor) -> tuple[torch.Tensor, i
     seg_lens = ends - starts
     cu = torch.zeros(starts.numel() + 1, dtype=torch.int32, device=device)
     cu[1:] = seg_lens.cumsum(0).to(torch.int32)
-    return cu, int(seg_lens.max().item())
+    # max_seqlen only has to be an upper bound for flashs scheduling, and segments never span a sample, so S works. the true max would cost a .item() host sync every step (which is too much overhead)
+    return cu, S
 
 
 def varlen_attention(
