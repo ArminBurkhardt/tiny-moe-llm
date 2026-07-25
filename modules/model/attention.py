@@ -1,3 +1,16 @@
+import torch
+import torch.nn.functional as F
+
+try:
+    from flash_attn import flash_attn_varlen_func
+    _HAS_FLASH = True
+except Exception:  # pragma: no cover
+    # testing is gitignored (oopsie), TODO: push the tests
+    flash_attn_varlen_func = None
+    _HAS_FLASH = False
+
+
+
 """Block-diagonal (document-packed) causal attention.
 
 During pretraining several documents are packed into each ``max_length`` sequence. A token must
@@ -11,16 +24,12 @@ the flattened ``B*S`` token axis) and call ``flash_attn_varlen_func``. This skip
 compute (attention cost scales with sum(segment_len^2) rather than S^2) and never materializes a
 mask.
 """
-import torch
-import torch.nn.functional as F
 
-try:
-    from flash_attn import flash_attn_varlen_func
-    _HAS_FLASH = True
-except Exception:  # pragma: no cover
-    flash_attn_varlen_func = None
-    _HAS_FLASH = False
-
+# block diagonal (document-packed) causal attention is implemented in flash-attn as a variable length attention
+# each token only attends to tokens in its own segment (document) and the segments are packed into a batch of sequences
+# [B, 1, S, S] masks cant be used, as it disqualifies FlashAttention and forces the SDPA fallback
+# the segments are defined by the cumulative segment lengths (cu_seqlens) over the flattened B*S token axis
+# => O(sum(segment_len^2)) rather than O(S^2) compute and memory and no full mask is materialized :D
 
 def _default_cu_seqlens(batch_size: int, seq_len: int, device) -> torch.Tensor:
     # one full-length segment per sample -> plain causal attention (the no-packing case)
@@ -62,22 +71,25 @@ def varlen_attention(
     softmax_scale: float | None = None,
     causal: bool = True,
 ) -> torch.Tensor:
-    """Document-packed causal attention.
+    """Document packed causal attention
 
     Args:
         q: queries, shape ``[B, Hq, S, D]``.
-        k, v: keys/values, shape ``[B, Hkv, S, D]`` (GQA: ``Hkv`` may divide ``Hq``; flash handles
-            the head broadcast natively, so KV heads are not pre-repeated).
-        cu_seqlens: int32 tensor ``[num_segments + 1]`` of cumulative segment lengths over the
-            flattened ``B*S`` token axis (row-major: all of sample 0's tokens, then sample 1, ...).
-            ``None`` falls back to one segment per sample (plain causal).
-        max_seqlen: longest segment length (Python int). Ignored when ``cu_seqlens`` is ``None``.
-        dropout_p: attention dropout probability (training only).
-        softmax_scale: attention scale; defaults to ``D ** -0.5``.
-        causal: apply causal masking within each segment.
+        k, v: keys/values, shape ``[B, Hkv, S, D]`` (GQA: ``Hkv`` may divide ``Hq``, flash handles the head broadcast natively, so KV heads are not pre repeated)
+        cu_seqlens: int32 tensor ``[num_segments + 1]`` of cumulative segment lengths over the flattened ``B*S`` token axis (row major: all of sample 0s tokens, then sample 1, etc).
+            ``None`` falls back to one segment per sample (plain causal attn)
+        max_seqlen: longest segment length (int). Ignored when ``cu_seqlens`` is ``None``
+        dropout_p: attention dropout probability
+        softmax_scale: attention scale. Defaults to ``D ** -0.5``
+        causal: apply causal masking within each segment
 
     Returns:
-        Attention output, shape ``[B, S, Hq, D]``.
+        Attention output, shape ``[B, S, Hq, D]``
+
+    Notes: 
+        - Hq: number of query heads 
+        - Hkv: number of key/value heads
+        - GQA: Hkv must divide Hq and Hq > Hkv
     """
     B, Hq, S, D = q.shape
     Hkv = k.shape[1]
@@ -89,7 +101,7 @@ def varlen_attention(
         max_seqlen = S
 
     if _HAS_FLASH:
-        # flash wants [total_tokens, H, D]; transpose+reshape forces contiguity
+        # flash wants [total_tokens, H, D], transpose+reshape forces contiguity
         qf = q.transpose(1, 2).reshape(B * S, Hq, D)
         kf = k.transpose(1, 2).reshape(B * S, Hkv, D)
         vf = v.transpose(1, 2).reshape(B * S, Hkv, D)
@@ -104,22 +116,23 @@ def varlen_attention(
         )
         return out.reshape(B, S, Hq, D)
 
-    # --- fallback (no flash-attn): rebuild the block mask and use SDPA. correct, slow. ---
+    # fallback (no flash-attn): rebuild the block mask and use SDPA => slowwww
     return _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal)
 
 
 def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal):
+    # default scaled product attention with a block diagonal mask (one block per document segment)
     device = q.device
-    # derive a per-token segment id from the internal boundaries, then mask same-segment pairs
+    # derive a per token segment id from the internal boundaries, then mask same segment pairs
     seg_id = torch.zeros(B * S, dtype=torch.long, device=device)
     internal = cu_seqlens[1:-1].long()
     if internal.numel() > 0:
         seg_id[internal] = 1
-    seg_id = torch.cumsum(seg_id, dim=0).view(B, S)              # [B, S]
+    seg_id = torch.cumsum(seg_id, dim=0).view(B, S)             # [B, S]
     same = seg_id[:, :, None] == seg_id[:, None, :]             # [B, S, S]
     if causal:
         same = same & torch.tril(torch.ones(S, S, dtype=torch.bool, device=device))
-    attn_mask = same[:, None, :, :]                            # [B, 1, S, S]
+    attn_mask = same[:, None, :, :]                             # [B, 1, S, S]
 
     if Hkv != Hq:
         k = k.repeat_interleave(Hq // Hkv, dim=1)

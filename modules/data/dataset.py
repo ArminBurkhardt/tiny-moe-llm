@@ -85,12 +85,12 @@ class Dataset(IterableDataset):
             num_mtp_tokens: number of separator tokens appended after each document. The first one
                 is EOS (supervised, so the model learns to terminate documents), the rest are pads.
                 Must stay >= the models number of MTP heads to keep MTP from being supervised across document boundaries.
-            start_file_idx: position in the current file_order to start reading at. 
+            start_file_idx: position in the current file_order to start reading at.
                 On resume this skips the already consumed files without tokenizing them. Mutate this attribute between epochs (set back to 0 for fresh epochs).
             seed: base RNG seed for the cross-source file shuffle
             max_tokens_per_shard: if set, move on to the next shard once this many tokens have been taken from the current one
             start_shard_token_count: tokens already taken from the shard at start_file_idx, so the shard budget continues instead of restarting on resume
-            start_record_idx: records already consumed from the shard at start_file_idx, so resume continues mid shard. 
+            start_record_idx: records already consumed from the shard at start_file_idx, so resume continues mid shard.
                 A value of 0 (also what legacy checkpoints decode to) re-reads that shard from the top.
         """
         super().__init__()
@@ -106,9 +106,8 @@ class Dataset(IterableDataset):
         self.start_record_idx = start_record_idx
         self.worker_start = None
 
-        # document framing: prepend BOS ourselves if the tokenizer doesn't (e.g. the DeepSeek
-        # tokenizer adds no BOS even with add_special_tokens=True), and terminate each document
-        # with a supervised EOS so the model learns to stop generating
+        # document framing: prepend BOS if the tokenizer doesnt (eg. the DeepSeek tokenizer adds no BOS)
+        # and terminate each document with a supervised EOS
         self._bos_id = getattr(tokenizer, "bos_token_id", None)
         self._eos_id = getattr(tokenizer, "eos_token_id", None)
         self._sep_id = self._eos_id if self._eos_id is not None else tokenizer.pad_token_id
@@ -196,7 +195,7 @@ class Dataset(IterableDataset):
         file_iter = FileIterator(self.file_order, start_file_idx=wstart_file)
 
         current_batch_input_ids = []
-        current_batch_doc_ids = []  # per sample [max_length] segment id list (batch aligned)
+        current_batch_doc_ids = []      # per sample [max_length] segment id list (batch aligned)
         current_batch_labels = []
         # position within the data, all three checkpointed together for resume:
         # file being consumed, record (row) within it, tokens taken from it so far
@@ -205,18 +204,18 @@ class Dataset(IterableDataset):
         shard_token_count = wstart_shard
 
         current_seq = []
-        current_seq_sections = [] # list of tuples (text_len, num_pad)
+        current_seq_sections = []       # list of tuples (text_len, num_pad)
 
         def push_sequence():
             # pad to max_length
             pad_len = self.max_length - len(current_seq)
             padded_seq = current_seq + [self.tokenizer.pad_token_id] * pad_len
 
-            # per-token segment id covering all max_length positions: each document block is one causal segment
+            # per token segment id covering all max_length positions
+            # => each document block is one causal segment
             # any trailing padding positions become length-1 (self attention only) segments
-            # the model turns these into flash-attn cu_seqlens (equivalent to the old block mask)
-            # emitted as a batch aligned [max_length] id list so accelerates batch
-            # handling treats it like input_ids instead of truncating a ragged cu_seqlens
+            # the model turns these into flash-attn cu_seqlens
+            # emitted as a batch aligned [max_length] id list for accelerates batch handling
             doc_ids = []
             seg = 0
             start = 0
@@ -228,7 +227,7 @@ class Dataset(IterableDataset):
                     doc_ids.extend([seg] * actual_block_len)
                     seg += 1
                 start = block_end
-            for _ in range(start, self.max_length):  # trailing pad -> own length-1 segment
+            for _ in range(start, self.max_length):     # trailing pad => own length-1 segment
                 doc_ids.append(seg)
                 seg += 1
 
@@ -237,10 +236,9 @@ class Dataset(IterableDataset):
             start = 0
             for text_len, num_pad in current_seq_sections:
                 l_end = min(start + text_len, self.max_length)
-                if l_end > start + 1: # mask to predict all tokens except the first one of each block
+                if l_end > start + 1:                   # mask to predict all tokens except the first one of each block
                     label_mask[start+1:l_end] = True
-                # supervise the EOS separator right after the document so the model learns to
-                # terminate documents (the remaining separator pads stay unsupervised)
+                # supervise the EOS separator right after the document so the model learns to terminate documents (the remaining separator pads stay unsupervised)
                 if num_pad > 0 and self._supervise_eos and l_end < self.max_length:
                     label_mask[l_end] = True
                 start += text_len + num_pad
@@ -322,7 +320,7 @@ class Dataset(IterableDataset):
                     offset += take
 
                     pad_to_add = 0
-                    if offset == len(tokens):  # document finished -> EOS + MTP separator pads
+                    if offset == len(tokens):  # document finished => EOS + MTP separator pads
                         pad_to_add = min(self.num_mtp_tokens, self.max_length - len(current_seq))
                         if pad_to_add > 0:
                             current_seq.extend([self._sep_id] + [self.tokenizer.pad_token_id] * (pad_to_add - 1))
