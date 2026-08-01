@@ -17,7 +17,6 @@ model:
   # routing
   top_k: 2
   n_loops: 4
-  identity_skew: 0.8 # higher values encourage choosing the identity
 
   # information retrieval
   num_ir_experts: 1
@@ -40,6 +39,9 @@ training:
   target_tokens: 5000000000 # 5b tokens
   warmup_steps: 1000 # linear LR warmup before cosine decay
   noise_anneal_tokens: 1000000000 # decay router exploration noise 1->0 over the first 1b tokens
+  lambda_ponder: 3e-3 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens
+  ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 until loop_scale has had room to grow (deadlock avoidance)
+  ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
   grad_accumulation_steps: 16
   seed: 42
   max_tokens_per_shard: 200000000 # 200m tokens per shard 

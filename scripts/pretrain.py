@@ -56,7 +56,7 @@ def train_step(
     with accelerator.accumulate(model):
         with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
             if unwrapped.has_mtp:
-                logits, aux_loss, extra_token_outputs = model(
+                logits, aux_loss, p_halt, extra_token_outputs = model(
                 input_ids=input_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
@@ -65,7 +65,7 @@ def train_step(
                 return_hidden=True,
             )
             else:
-                logits, aux_loss = model(
+                logits, aux_loss, p_halt = model(
                     input_ids=input_ids,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
@@ -83,9 +83,18 @@ def train_step(
                 lambda_mtp=TrainingConfig.lambda_mtp,
                 main_lm_head=unwrapped.lm_head,
                 pad_mask=pad_mask,
-            ) 
-            
+            )
+
             loss = loss + TrainingConfig.aux_loss_weight * aux_loss
+
+            # ponder loss: penalize not-halting on real tokens, ramped from 0 so it can't deadlock
+            # loop_scale before the loop has learned to do anything (see loop_scale's docstring).
+            tokens = unwrapped.token_count
+            warm, ramp = TrainingConfig.ponder_warmup_tokens, TrainingConfig.ponder_ramp_tokens
+            lambda_ponder_now = TrainingConfig.lambda_ponder * min(1.0, max(0.0, (tokens - warm) / ramp))
+            valid_mask = (~pad_mask).to(p_halt.dtype)
+            ponder = ((1.0 - p_halt) * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            loss = loss + lambda_ponder_now * ponder
 
             accelerator.backward(loss)
             # clip on the real update step only (matters once gradient accumulation > 1).
@@ -150,7 +159,7 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
     pad_mask = (input_ids == pad_id)
 
     with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
-        logits, aux_loss, extra_token_outputs = model(
+        logits, aux_loss, p_halt, extra_token_outputs = model(
             input_ids=input_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -185,35 +194,25 @@ def save_expert_selection_graph(stats, path):
     expert_counts = stats["choices"]
     expert_probs = stats["prob_dist"]
     post_skew_probs = stats["post_skew_dist"]
-    id_idx = stats["id_idx"]
-    
+
     fig, axs = plt.subplots(1, 3, figsize=(12, 5))
-    
+
     # tracker stats are per-token EMAs now: fractions/mean weights in [0, 1]
     axs[0].bar(range(len(expert_counts)), expert_counts)
     axs[0].set_title("Expert Selection Fraction (EMA)")
     axs[0].set_xlabel("Expert Index")
     axs[0].set_ylabel("Fraction of Tokens")
 
-    axs[0].axvline(x=id_idx, color="red", linestyle="--", label="Identity Expert")
-    axs[0].legend()
-
     axs[1].bar(range(len(expert_probs)), expert_probs)
     axs[1].set_title("Mean Routed Weight per Token (EMA)")
     axs[1].set_xlabel("Expert Index")
     axs[1].set_ylabel("Mean Weight")
 
-    axs[1].axvline(x=id_idx, color="red", linestyle="--", label="Identity Expert")
-    axs[1].legend()
-
     axs[2].bar(range(len(post_skew_probs)), post_skew_probs)
     axs[2].set_title("Mean Post-Skew Probability When Selected (EMA)")
     axs[2].set_xlabel("Expert Index")
     axs[2].set_ylabel("Mean Probability")
-    
-    axs[2].axvline(x=id_idx, color="red", linestyle="--", label="Identity Expert")
-    axs[2].legend()
-    
+
     plt.tight_layout()
     plt.savefig(path)
     plt.close()

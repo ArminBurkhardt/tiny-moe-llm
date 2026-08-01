@@ -39,9 +39,9 @@ def main():
 
     tok_before = model.token_count
     with te.autocast(enabled=True, recipe=recipe):
-        logits, aux_loss, mtp = model(
+        logits, aux_loss, p_halt, mtp = model(
             input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
-            identity_skew=0.0, return_aux_loss=True, return_hidden=True,
+            return_aux_loss=True, return_hidden=True,
         )
         loss, _ = compute_mtp_loss(
             logits, input_ids, mtp_outputs=mtp,
@@ -68,7 +68,7 @@ def main():
     model.zero_grad(set_to_none=True)
     with te.autocast(enabled=True, recipe=recipe):
         out2 = model(input_ids=input_ids, cu_seqlens=None, max_seqlen=None,
-                     identity_skew=0.0, return_aux_loss=True, return_hidden=True)
+                     return_aux_loss=True, return_hidden=True)
     assert torch.isfinite(out2[0]).all()
     print("[ok] plain-causal (cu_seqlens=None) path runs")
     print("\nMODEL GPU CHECK PASSED")

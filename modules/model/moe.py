@@ -91,12 +91,11 @@ class SharedMLP(nn.Module):
 
 
 class _ExpertTracking():
-    def __init__(self, id_idx: int, num_experts: int):
+    def __init__(self, num_experts: int):
         self._num_experts = num_experts
         self.prob_dist = None      # lazily placed on device on first update
         self.post_skew_dist = None
         self.choices = None
-        self.id_idx = id_idx
         self.sliding_window_size = 256
         # recompute guard: under activation checkpointing route() runs again during backward, which would double count every update
         self._expected_updates = None
@@ -151,7 +150,6 @@ class _ExpertTracking():
             "prob_dist": self.prob_dist.cpu().tolist() if self.prob_dist is not None else [0.0] * self._num_experts,
             "post_skew_dist": self.post_skew_dist.cpu().tolist() if self.post_skew_dist is not None else [0.0] * self._num_experts,
             "choices": self.choices.cpu().tolist() if self.choices is not None else [0.0] * self._num_experts,
-            "id_idx": self.id_idx,
         }
 
     def reset_stats(self):
@@ -230,8 +228,8 @@ class LoopMixtureOfExperts(nn.Module):
         ])
         experts.extend([
             InformationRetrievalExpert(
-                input_size=hidden_size, 
-                num_entries=num_ir_entries, 
+                input_size=hidden_size,
+                num_entries=num_ir_entries,
                 ir_dim=ir_dim,
                 num_heads=n_heads,
                 num_kv_heads=n_kv_heads,
@@ -239,7 +237,6 @@ class LoopMixtureOfExperts(nn.Module):
                 residual=ir_residual
             ) for _ in range(num_ir_experts)
         ])
-        experts.append(nn.Identity()) # identity expert for skipping
         self.experts = nn.ModuleList(experts)
 
         # always-on dense transform + full-sequence attention, seeded into forward_step's
@@ -260,67 +257,54 @@ class LoopMixtureOfExperts(nn.Module):
         
         self.post_norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.identity_scalar = nn.Parameter(torch.ones(1))
 
         # LayerScale/ReZero-style gate: loop starts as a near-no-op, learns how much refinement to apply.
-        # init 0.1, NOT 0: at loop_scale == 0 the CE loss has exactly zero gradient wrt p_halt (Step 3),
+        # init 0.1, NOT 0: at loop_scale == 0 the CE loss has exactly zero gradient wrt p_halt,
         # so the ponder term becomes the halt head's only signal, saturates p_halt at 1, and freezes
         # loop_scale in turn -- the whole loop silently goes dead while the loss curve still descends.
         # not the same mechanism as gemma4's layer_scalar (init-1 gain on a whole layer output) --
         # that precedent doesn't transfer to this init value.
         self.loop_scale = nn.Parameter(torch.full((1,), 0.1))
-        
-        # note: the identity expert acts both as a skip connection and a way to indicate that the current representation is sufficient and doesnt need to be modified by any expert again
-        # during inference, landing on the identity expert could idicate that the model is confident in its current representation and can stop routing early. On the contrary, if the model never routes to the identity expert, 
-        # it may indicate that the model is not confident or does not know how to improve further (might not have an answer at all)
-        # adjust the identity skew encourages the model to end routing early, thus shortening the internal "reasoning path" and possible producing lower quality outputs.
-        
-        self.expert_tracker = _ExpertTracking(id_idx=self.identity_expert_index, num_experts=self.num_experts)
-        
+
+        # soft, differentiable halting gate (PLAN.md Step 3a): a compute-allocation signal
+        # ("is more refinement useful here"), not a correctness signal (see Step 4b's separate
+        # correct_proj). Greedy per-loop, recomputed from the current hidden state each loop --
+        # not cumulative ACT -- so a token can halt at one loop and un-halt at the next.
+        self.halt_proj = nn.Linear(hidden_size, 1, bias=True)
+        nn.init.zeros_(self.halt_proj.weight)
+        nn.init.constant_(self.halt_proj.bias, -2.0)   # p_halt ~ 0.12 at init
+
+        self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
+
     @property
     def num_experts(self):
-        return self._num_attn_experts + self._num_ir_experts + 1 + self._num_mlp_experts
-    
+        return self._num_attn_experts + self._num_ir_experts + self._num_mlp_experts
+
     @property
-    def identity_expert_index(self):
+    def first_mlp_index(self):
+        """index of the first MLP expert in the flat router pool: [self-attn x A | cross-attn x A | IR x I | MLP x M]."""
         return self._num_attn_experts + self._num_ir_experts
     
-    def route(self, hidden_states: torch.Tensor, temperature: float = 1.0, identity_skew: float = 1.0, on_loop: int = 0):
+    def route(self, hidden_states: torch.Tensor, temperature: float = 1.0):
         """routes tokens to experts and computes the load balancing loss
 
         Args:
             hidden_states (torch.Tensor): [batch_size, seq_len, hidden_size]
             temperature (float, optional): temperature for the router. Defaults to 1.0.
-            identity_skew (float, optional): skew for the identity expert; higher values push harder
-                towards the identity on later loops, <= 0 disables the bias. Defaults to 1.0.
-            on_loop (int, optional): current loop iteration. Defaults to 0.
 
         Returns:
             topk_scores (torch.Tensor): [batch_size, seq_len, top_k] normalized scores for the selected experts
-            
+
             topk_indices (torch.Tensor): [batch_size, seq_len, top_k] indices of the selected experts
-            
+
             load_balancing_loss (torch.Tensor): auxiliary loss to encourage balanced routing
         """
-        # note: on_loop = 0 disables the identity bias
-
         expert_logits = self.router(hidden_states, temperature=temperature)       # [batch_size, seq_len, num_experts] raw logits
 
-        # load balancing loss on the PRE-skew distribution
-        pre_skew_probs = F.softmax(expert_logits / temperature, dim=-1)
-        load_balancing_loss = compute_aux_loss(torch.topk(pre_skew_probs, self.top_k, dim=-1)[1], pre_skew_probs, self.num_experts)
-
-        # apply identity skew (additive logit bias) to encourage the router to select the identity
-        # towards the end of the loop. identity_skew <= 0 disables the bias entirely
-        expert_logits = expert_logits.clone() # avoid inplace modification to preserve scores for loss computation (funny error with torch.autograd.set_detect_anomaly(True) if this is removed)
-        if identity_skew > 0:
-            id_skew = 1 + torch.exp(-self.identity_scalar.abs() / identity_skew)
-            id_skew = id_skew ** (on_loop / self.n_loops)
-            expert_logits[..., self.identity_expert_index] += id_skew - 1.0
-
-        # single softmax over the (skewed) logits gives the selection distribution
+        # single softmax over the logits gives both the load balancing signal and the selection distribution
         expert_scores = F.softmax(expert_logits / temperature, dim=-1)
-        
+        load_balancing_loss = compute_aux_loss(torch.topk(expert_scores, self.top_k, dim=-1)[1], expert_scores, self.num_experts)
+
         # select topk experts
         topk_scores, topk_indices = torch.topk(expert_scores, self.top_k, dim=-1) # [batch_size, seq_len, top_k], [batch_size, seq_len, top_k]
         
@@ -332,16 +316,11 @@ class LoopMixtureOfExperts(nn.Module):
         
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, on_loop: int = 0, identity_skew: float = 1.0, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None):
-        topk_scores, topk_indices, load_balancing_loss = self.route(
-            hidden_states, 
-            temperature=self.temperature,
-            on_loop=on_loop, 
-            identity_skew=identity_skew
-        )
-        
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None):
+        topk_scores, topk_indices, load_balancing_loss = self.route(hidden_states, temperature=self.temperature)
+
         # index placement in the scores would be:
-        # [attn_experts..., num_ir_experts..., identity, ff_experts...]
+        # [attn_experts..., num_ir_experts..., ff_experts...]
 
         # seed with the always-on shared experts (Step 2) before accumulating routed outputs
         output = self.shared_mlp(hidden_states) + self.shared_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
@@ -350,43 +329,45 @@ class LoopMixtureOfExperts(nn.Module):
         # compute each non-MLP expert exactly once per forward_step, then cache across k slots
         # (attention runs over the full sequence regardless of routing, so recomputing per k-slot wastes compute)
         expert_cache = []
-        for i in range(self.identity_expert_index + 1):
+        for i in range(self.first_mlp_index):
             if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
                 expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings))
             elif isinstance(self.experts[i], CrossAttention):
                 expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings))
-            else:  # identity
-                expert_cache.append(hidden_states)
 
         # accumulate weighted outputs. mask multiply avoids mask.sum() device syncs. yay more tokens per second
         for k in range(self.top_k):
             expert_indices_k = topk_indices[..., k]   # [B, S]
             expert_scores_k = topk_scores[..., k]     # [B, S]
-            for i in range(self.identity_expert_index + 1):
+            for i in range(self.first_mlp_index):
                 mask = (expert_indices_k == i).unsqueeze(-1)                         # [B, S, 1]
                 output = output + mask * expert_scores_k.unsqueeze(-1) * expert_cache[i]
-        
-        # routed tokens to parallel experts
-        mlp_mask = topk_indices > self.identity_expert_index
-        mlp_indices = torch.where(mlp_mask, topk_indices - (self.identity_expert_index + 1), torch.zeros_like(topk_indices))
+
+        # routed tokens to parallel experts. non-MLP slots collapse to (index 0, weight 0) via
+        # mask multiply -- never mask.sum()/boolean indexing (per-expert device sync)
+        mlp_mask = topk_indices >= self.first_mlp_index
+        mlp_indices = torch.where(mlp_mask, topk_indices - self.first_mlp_index, torch.zeros_like(topk_indices))
         mlp_scores = torch.where(mlp_mask, topk_scores, torch.zeros_like(topk_scores))
 
-
         parallel_output = self.parallel_experts(
-            hidden_states, 
-            mlp_scores, 
+            hidden_states,
+            mlp_scores,
             mlp_indices
         )
         output += parallel_output
+
+        # p_halt -> 1 means "don't modify me further"; gates how much of this loop's update
+        # actually lands. computed from the incoming hidden state, before the update below.
+        p_halt = torch.sigmoid(self.halt_proj(hidden_states))   # [B, S, 1]
 
         # residual update, not a replacement: loop_scale starts near-zero (see __init__) so the
         # loop begins as a no-op and learns how much refinement to apply, with a gradient path
         # across loop boundaries that doesn't depend on which expert got routed to.
         delta = self.dropout(self.post_norm(output))
-        hidden_states = hidden_states + self.loop_scale * delta
+        hidden_states = hidden_states + (1.0 - p_halt) * self.loop_scale * delta
 
-        return hidden_states, load_balancing_loss
-    
+        return hidden_states, load_balancing_loss, p_halt
+
 
     def forward(
         self,
@@ -395,10 +376,10 @@ class LoopMixtureOfExperts(nn.Module):
         return_loss: bool = False,
         cu_seqlens: torch.Tensor = None,
         max_seqlen: int = None,
-        identity_skew: float = 1.0,
         use_checkpointing: bool = False,
     ):
         total_load_balancing_loss = 0.0
+        p_halt_all = []
 
         self.expert_tracker.begin_forward(self.n_loops)
 
@@ -407,15 +388,20 @@ class LoopMixtureOfExperts(nn.Module):
 
         for loop in range(self.n_loops):
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, loop, identity_skew, cu_seqlens, max_seqlen, other, position_embeddings, use_reentrant=False)
+                hidden_states, load_balancing_loss, p_halt = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, on_loop=loop, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, identity_skew=identity_skew, other=other, position_embeddings=position_embeddings)
+                hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings)
             total_load_balancing_loss += load_balancing_loss
-            
+            p_halt_all.append(p_halt)
+
+        # [n_loops, B, S] -- per-loop, per-token halt probability. stacked, never reduced with
+        # .item() here; the trainer computes the ponder loss and logging means from this.
+        p_halt_all = torch.stack(p_halt_all, dim=0).squeeze(-1)
+
         if return_loss:
-            return hidden_states, total_load_balancing_loss / self.n_loops
+            return hidden_states, total_load_balancing_loss / self.n_loops, p_halt_all
         else:
-            return hidden_states
+            return hidden_states, p_halt_all
 
     def set_temperature(self, temperature: float):
         self.temperature = temperature

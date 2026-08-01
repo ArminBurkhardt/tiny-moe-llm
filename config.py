@@ -30,10 +30,8 @@ class ModelConfig:
         "lm_head_factor": int(Config["model"]["lm_head_factor"]),
     }
     
-    Forward = {
-        "identity_skew": float(Config["model"]["identity_skew"]),
-    }
-    
+    Forward = {}
+
 class TrainingConfig:
     Batch_size = int(Config["training"]["batch_size"])
     Seq_length = int(Config["training"]["seq_length"])
@@ -51,4 +49,9 @@ class TrainingConfig:
     noise_anneal_tokens = int(Config["training"].get("noise_anneal_tokens", 0))
     seed = int(Config["training"].get("seed", 42))
     max_tokens_per_shard = int(Config["training"].get("max_tokens_per_shard", 200_000_000))
+    # ponder loss (PLAN.md Step 3b): held at 0 while loop_scale grows, then ramped -- see the
+    # deadlock note on LoopMixtureOfExperts.loop_scale for why the warmup is load-bearing.
+    lambda_ponder = float(Config["training"].get("lambda_ponder", 3e-3))
+    ponder_warmup_tokens = int(Config["training"].get("ponder_warmup_tokens", 1_000_000_000))
+    ponder_ramp_tokens = int(Config["training"].get("ponder_ramp_tokens", 1_000_000_000))
 

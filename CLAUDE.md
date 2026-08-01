@@ -7,9 +7,9 @@ map: what lives where, what the non-obvious invariants are, and how to run thing
 
 `tiny-moe-llm`: an experimental ~243M-param LM. A dense Gemma4-style decoder feeds a **single
 MoE block applied `n_loops` times** (LoopLM-style recurrence), with a heterogeneous expert pool
-(self-attn / cross-attn / information-retrieval / MLP / identity) behind one router, plus
-multi-token prediction heads. Trained on document-packed streams with flash-attn varlen
-attention, optionally in FP8/NVFP4 via NVIDIA Transformer Engine.
+(self-attn / cross-attn / information-retrieval / MLP) behind one router plus always-on shared
+experts, a per-loop halt head, and multi-token prediction heads. Trained on document-packed
+streams with flash-attn varlen attention, optionally in FP8/NVFP4 via NVIDIA Transformer Engine.
 
 Research code, not a library: no packaging, no test framework, no CI. Entry points are the two
 scripts under [scripts/](scripts/).
@@ -38,7 +38,7 @@ modules/model/
   embeddings.py             RoPE cache + apply_rotary_pos_emb
   utils.py                  EncoderOutput dataclass
 modules/data/dataset.py     streaming IterableDataset with document packing + resume
-tests/                      gitignored sanity scripts (see "Tests")
+tests/                      tracked sanity scripts (see "Tests")
 ckpts/                      gitignored: pretrained/<tokenizer dirs>, training/<*.pt, *.png>
 data/datasets/              gitignored parquet/jsonl shards
 ```
@@ -70,20 +70,23 @@ bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
 ```
 
 Tests are plain scripts (no pytest): each `sys.path.insert`s the repo root, asserts, and prints.
-Most require a GPU. `tests/` is gitignored — it exists locally but never lands in a commit, so
-don't assume a reviewer can see it.
+Most require a GPU. `tests/` is tracked (the `.gitignore` line for it is commented out) — edits
+land in normal commits like any other source file.
 
 ## Config
 
 `config.yaml` -> `config.py` exposes three surfaces:
 
 - `ModelConfig.Params` — kwargs splatted straight into `TinyMoETransformer(**...)`.
-- `ModelConfig.Forward` — kwargs splatted into `model(...)` (currently just `identity_skew`).
+- `ModelConfig.Forward` — kwargs splatted into `model(...)`; currently empty (`identity_skew` was
+  its only key, deleted in PLAN.md Step 3).
 - `TrainingConfig` — class attributes; `total_steps` is *derived* as
-  `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`.
+  `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`. Also holds the ponder
+  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`) even though they read
+  from `config.yaml`'s `training:` block rather than `model:` — they're consumed directly in
+  `scripts/pretrain.py`'s loss calc, not passed into the model.
 
 Constraints worth remembering:
-- `num_mlp_experts` + attn + IR + identity should be divisible by 8 for FP8 GEMMs.
 - `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
   MLP/attn (see "Model invariants" below); defaults to `intermediate_size` if omitted from
   `config.yaml`. `Gemma4TextModel`'s dense decoder always uses plain `intermediate_size`, so this
@@ -102,12 +105,13 @@ Constraints worth remembering:
 **Expert index layout** (one router over the whole pool, order matters everywhere):
 
 ```
-[ SelfAttention x A | CrossAttention x A | IR x I | identity | MLP x M ]
-                                            ^ identity_expert_index = 2A + I
+[ SelfAttention x A | CrossAttention x A | IR x I | MLP x M ]
+                                            ^ first_mlp_index = 2A + I
 ```
 
+No identity expert (removed in PLAN.md Step 3c — see "Halt head" below for its replacement).
 `LoopMixtureOfExperts._num_attn_experts` is `num_attn_experts * 2` (self + cross). Indices
-`> identity_expert_index` are remapped into `ParallelSparseMoELayer`'s local expert space in
+`>= first_mlp_index` are remapped into `ParallelSparseMoELayer`'s local expert space in
 `forward_step`; non-MLP slots become `(index 0, weight 0)` so they contribute nothing.
 
 - **Non-MLP experts run unconditionally**, once per `forward_step`, and are cached across the
@@ -120,11 +124,26 @@ Constraints worth remembering:
   (`B*S`), so unlike `ParallelSparseMoELayer` they run inside the outer `te.autocast` — don't wrap
   them in `te.autocast(enabled=False)`.
 - **`forward_step` returns an updated `hidden_states`, not a replacement** (PLAN.md Step 1):
-  `hidden_states = hidden_states + loop_scale * dropout(post_norm(output))`, giving a gradient
-  path across loop boundaries independent of routing. `loop_scale` (`nn.Parameter`, init `0.1`,
-  not `0` — see the comment at its definition in [moe.py](modules/model/moe.py)) is a
+  `hidden_states = hidden_states + (1 - p_halt) * loop_scale * dropout(post_norm(output))`, giving
+  a gradient path across loop boundaries independent of routing. `loop_scale` (`nn.Parameter`,
+  init `0.1`, not `0` — see the comment at its definition in [moe.py](modules/model/moe.py)) is a
   LayerScale/ReZero-style per-loop gate, distinct from `layer_scalar` in the dense decoder
   (init-1 whole-layer gain).
+- **Halt head** (PLAN.md Step 3a, replaces the deleted identity expert): `self.halt_proj` is a
+  `Linear(hidden_size, 1)`, zero-init weight / bias `-2.0` (`p_halt ~ 0.12` at init), applied to
+  the *incoming* hidden state each loop before the update above. `p_halt -> 1` means "don't modify
+  me further" — a compute-allocation signal, not a correctness score (that's Step 4b's separate
+  `correct_proj`, not yet implemented). It's **greedy per-loop, not cumulative ACT**: recomputed
+  fresh each loop, so a token can halt at loop 1 and un-halt at loop 2. `LoopMixtureOfExperts.forward`
+  stacks per-loop `p_halt` into `[n_loops, B, S]` and returns it alongside `hidden_states` — never
+  reduced with `.item()` inside the model.
+- **Ponder loss requires its warmup to actually be wired up** (`TrainingConfig.ponder_warmup_tokens`
+  / `ponder_ramp_tokens`, applied in `scripts/pretrain.py`'s `train_step`) — this is a correctness
+  requirement, not tuning. At `loop_scale ~ 0.1`, CE loss has near-zero gradient wrt `p_halt`, so an
+  un-warmed ponder term is briefly the halt head's only (constant-sign) signal; AdamW climbs the
+  halt bias regardless of `lambda_ponder`'s magnitude, `p_halt` saturates before `loop_scale` grows,
+  and the loop goes silently dead while the dense decoder keeps the loss descending. See
+  `tests/test_ponder_deadlock.py` for a reproduction of both the failure mode and the fix.
 - Selection is applied with a **mask multiply**, not `mask.sum()`/boolean indexing, deliberately:
   boolean indexing forces a device sync per expert per step.
 - `ParallelSparseMoELayer.forward` runs its GEMMs under `te.autocast(enabled=False)` — NVFP4
@@ -132,9 +151,8 @@ Constraints worth remembering:
   wins over precision here. `m_splits` via `.tolist()` is a known, accepted host sync.
 - `torch.argsort(..., stable=True)` in the same function is required for determinism between the
   checkpoint forward and the recompute pass.
-- The aux (load-balancing) loss is computed on the **pre-skew** probabilities; the identity skew
-  is an additive logit bias applied afterwards and scales with `on_loop / n_loops`, so loop 0 is
-  unbiased.
+- The aux (load-balancing) loss is computed directly on the router's softmax probabilities — no
+  skew/bias step anymore (that was the deleted identity mechanism).
 - `_ExpertTracking` guards against activation-checkpoint recompute double counting
   (`begin_forward(expected_updates)`) and only samples every 8th forward. Its stats are per-token
   EMAs in [0, 1], plotted to `ckpts/training/expert_selection_*.png`.
@@ -175,6 +193,9 @@ for a sync-free (slightly stale) value; assign `.num_tokens` to restore on resum
   with batch size / grad accumulation.
 - Router exploration noise anneals 1 -> 0 over `noise_anneal_tokens`, driven from the live token
   count each step.
+- Ponder loss (`TrainingConfig.lambda_ponder`, applied to `(1 - p_halt)` on real tokens) ramps
+  0 -> `lambda_ponder` over `ponder_warmup_tokens` -> `ponder_warmup_tokens + ponder_ramp_tokens`,
+  also driven from the live token count — see the ponder-deadlock invariant above.
 - Everything that needs the host (loss `.item()`, token sync, tokens/sec, peak mem) is throttled
   to `LOG_INTERVAL`. Keep it that way — the model is small enough that per-step syncs dominate.
 - Anything touching `has_mtp`, `lm_head`, `mtp_head`, `_token_tracker`, or `moe` must go through
@@ -227,7 +248,7 @@ purely so accelerate's batch splitting treats them like `input_ids`.
 
 Current branch `train-build`; PRs target `main`. Commit style is
 `feat:` / `docs:` / `chore:` / `merge:`. Note the `.gitignore` swallows `*.json` (so
-`data_config.json` is untracked), `*.cmd`, `ckpts/`, `venv/`, `tests/`, and `env_init`.
+`data_config.json` is untracked), `*.cmd`, `ckpts/`, `venv/`, and `env_init`. `tests/` is tracked.
 
 ## Known rough edges
 

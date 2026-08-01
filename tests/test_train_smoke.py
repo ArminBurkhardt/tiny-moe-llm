@@ -61,8 +61,8 @@ for step, batch in enumerate(dl):
     pad_mask = input_ids == tok.pad_token_id
 
     with acc.accumulate(model):
-        logits, aux_loss, mtp = model(input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                                      identity_skew=0.8, return_aux_loss=True, return_hidden=True)
+        logits, aux_loss, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                                      return_aux_loss=True, return_hidden=True)
         loss, loss_ce = compute_mtp_loss(logits, labels, mtp_outputs=mtp,
                                          lm_head=unwrapped.mtp_head.lm_head, lambda_mtp=0.1,
                                          main_lm_head=unwrapped.lm_head, pad_mask=pad_mask)
