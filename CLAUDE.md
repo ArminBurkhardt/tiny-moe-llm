@@ -109,6 +109,12 @@ Constraints worth remembering:
 - **Non-MLP experts run unconditionally**, once per `forward_step`, and are cached across the
   top-k slots — attention has to see the whole sequence regardless of routing. Only the MLP
   experts are genuinely sparse (grouped GEMM over sorted assignments).
+- **`forward_step` returns an updated `hidden_states`, not a replacement** (PLAN.md Step 1):
+  `hidden_states = hidden_states + loop_scale * dropout(post_norm(output))`, giving a gradient
+  path across loop boundaries independent of routing. `loop_scale` (`nn.Parameter`, init `0.1`,
+  not `0` — see the comment at its definition in [moe.py](modules/model/moe.py)) is a
+  LayerScale/ReZero-style per-loop gate, distinct from `layer_scalar` in the dense decoder
+  (init-1 whole-layer gain).
 - Selection is applied with a **mask multiply**, not `mask.sum()`/boolean indexing, deliberately:
   boolean indexing forces a device sync per expert per step.
 - `ParallelSparseMoELayer.forward` runs its GEMMs under `te.autocast(enabled=False)` — NVFP4

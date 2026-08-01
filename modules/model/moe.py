@@ -237,6 +237,14 @@ class LoopMixtureOfExperts(nn.Module):
         self.post_norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
         self.identity_scalar = nn.Parameter(torch.ones(1))
+
+        # LayerScale/ReZero-style gate: loop starts as a near-no-op, learns how much refinement to apply.
+        # init 0.1, NOT 0: at loop_scale == 0 the CE loss has exactly zero gradient wrt p_halt (Step 3),
+        # so the ponder term becomes the halt head's only signal, saturates p_halt at 1, and freezes
+        # loop_scale in turn -- the whole loop silently goes dead while the loss curve still descends.
+        # not the same mechanism as gemma4's layer_scalar (init-1 gain on a whole layer output) --
+        # that precedent doesn't transfer to this init value.
+        self.loop_scale = nn.Parameter(torch.full((1,), 0.1))
         
         # note: the identity expert acts both as a skip connection and a way to indicate that the current representation is sufficient and doesnt need to be modified by any expert again
         # during inference, landing on the identity expert could idicate that the model is confident in its current representation and can stop routing early. On the contrary, if the model never routes to the identity expert, 
@@ -345,11 +353,14 @@ class LoopMixtureOfExperts(nn.Module):
             mlp_indices
         )
         output += parallel_output
-        
-        output = self.post_norm(output)
-        output = self.dropout(output)
-        
-        return output, load_balancing_loss
+
+        # residual update, not a replacement: loop_scale starts near-zero (see __init__) so the
+        # loop begins as a no-op and learns how much refinement to apply, with a gradient path
+        # across loop boundaries that doesn't depend on which expert got routed to.
+        delta = self.dropout(self.post_norm(output))
+        hidden_states = hidden_states + self.loop_scale * delta
+
+        return hidden_states, load_balancing_loss
     
 
     def forward(
