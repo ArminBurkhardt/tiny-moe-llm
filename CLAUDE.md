@@ -209,7 +209,7 @@ purely so accelerate's batch splitting treats them like `input_ids`.
 
 ## Git
 
-Current branch `train-build`; PRs target `prototype` (not `main`). Commit style is
+Current branch `train-build`; PRs target `main`. Commit style is
 `feat:` / `docs:` / `chore:` / `merge:`. Note the `.gitignore` swallows `*.json` (so
 `data_config.json` is untracked), `*.cmd`, `ckpts/`, `venv/`, `tests/`, and `env_init`.
 
