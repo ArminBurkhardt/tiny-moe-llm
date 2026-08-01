@@ -69,10 +69,10 @@ class TinyMoETransformer(nn.Module):
         self, 
         vocab_size: int, 
         max_seq_len: int, 
-        hidden_size: int, 
-        intermediate_size: int, 
+        hidden_size: int,
+        intermediate_size: int,
         head_dim: int,
-        num_layers: int, 
+        num_layers: int,
         num_heads: int,
         num_mlp_experts: int,
         num_attn_experts: int,
@@ -85,9 +85,13 @@ class TinyMoETransformer(nn.Module):
         ple_embeddings_size: int = None,
         mtp_num_extra_tokens: int = 0,
         lm_head_factor: int = 8,
+        moe_intermediate_size: int = None,
     ):
         super().__init__()
-        
+
+        # routed + shared MoE experts only -- Gemma4TextModel below keeps plain intermediate_size
+        moe_intermediate_size = moe_intermediate_size if moe_intermediate_size is not None else intermediate_size
+
         self.gemma_decoder = Gemma4TextModel(
             vocab_size=vocab_size,
             max_position_embeddings=max_seq_len,
@@ -106,7 +110,7 @@ class TinyMoETransformer(nn.Module):
         self.moe_embed_proj = te.Linear(ple_embeddings_size, hidden_size, bias=False) if ple_embeddings_size is not None else None
         self.moe = LoopMixtureOfExperts(
             hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
+            intermediate_size=moe_intermediate_size,
             num_mlp_experts=num_mlp_experts,
             num_attn_experts=num_attn_experts,
             num_ir_experts=num_ir_experts,

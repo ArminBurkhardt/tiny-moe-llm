@@ -3,6 +3,7 @@ model:
   max_seq_length: 4096
   hidden_size: 512
   intermediate_size: 2048
+  # moe_intermediate_size: 2048  # optional -- routed + shared MoE experts only, defaults to intermediate_size if absent
   num_layers: 5
   num_attention_heads: 8
   head_dim: 64

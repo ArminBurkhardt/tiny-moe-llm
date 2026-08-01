@@ -73,6 +73,23 @@ class ParallelSparseMoELayer(nn.Module):
         return combined.view(B, S, H)
 
 
+class SharedMLP(nn.Module):
+    """dense SwiGLU MLP applied to every token unconditionally (PLAN.md Step 2) -- gives the loop
+    a guaranteed dense transform independent of routing, unlike ``ParallelSparseMoELayer`` which
+    only touches the tokens routed to each expert. Static row count (``B*S``), so it may run
+    inside ``te.autocast`` rather than being forced to BF16 like the routed grouped GEMM.
+    """
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.gate_up = te.Linear(hidden_size, 2 * intermediate_size, bias=False)
+        self.down = te.Linear(intermediate_size, hidden_size, bias=False)
+        self.activation = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up(x).chunk(2, dim=-1)
+        return self.down(self.activation(gate) * up)
+
+
 class _ExpertTracking():
     def __init__(self, id_idx: int, num_experts: int):
         self._num_experts = num_experts
@@ -224,10 +241,17 @@ class LoopMixtureOfExperts(nn.Module):
         ])
         experts.append(nn.Identity()) # identity expert for skipping
         self.experts = nn.ModuleList(experts)
-        
+
+        # always-on dense transform + full-sequence attention, seeded into forward_step's
+        # accumulator every loop. neither is in the router pool (not in Router's output dim,
+        # not in compute_aux_loss) -- stabilises early training and lets routed experts
+        # specialise instead of all re-learning the same generic function (PLAN.md Step 2).
+        self.shared_mlp = SharedMLP(hidden_size, intermediate_size)
+        self.shared_attn = SelfAttention(input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads)
+
         self.parallel_experts = ParallelSparseMoELayer(
-            hidden_size=hidden_size, 
-            intermediate_size=intermediate_size, 
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
             num_experts=num_mlp_experts
         )
         
@@ -318,8 +342,9 @@ class LoopMixtureOfExperts(nn.Module):
         
         # index placement in the scores would be:
         # [attn_experts..., num_ir_experts..., identity, ff_experts...]
-        
-        output = torch.zeros_like(hidden_states)
+
+        # seed with the always-on shared experts (Step 2) before accumulating routed outputs
+        output = self.shared_mlp(hidden_states) + self.shared_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
         _other = other if other is not None else hidden_states
 
         # compute each non-MLP expert exactly once per forward_step, then cache across k slots

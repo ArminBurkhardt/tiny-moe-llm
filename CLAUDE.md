@@ -84,6 +84,10 @@ don't assume a reviewer can see it.
 
 Constraints worth remembering:
 - `num_mlp_experts` + attn + IR + identity should be divisible by 8 for FP8 GEMMs.
+- `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
+  MLP/attn (see "Model invariants" below); defaults to `intermediate_size` if omitted from
+  `config.yaml`. `Gemma4TextModel`'s dense decoder always uses plain `intermediate_size`, so this
+  is the only knob that moves total params without moving active (dense-decoder) params.
 - `mtp_num_extra_tokens` must be <= the dataset's `num_mtp_tokens` separator budget, otherwise
   MTP gets supervised across document boundaries.
 - `vocab_size` and `hidden_size` must both be divisible by `lm_head_factor` (SmallLMHead chunks
@@ -109,6 +113,12 @@ Constraints worth remembering:
 - **Non-MLP experts run unconditionally**, once per `forward_step`, and are cached across the
   top-k slots — attention has to see the whole sequence regardless of routing. Only the MLP
   experts are genuinely sparse (grouped GEMM over sorted assignments).
+- **`shared_mlp` + `shared_attn` seed `forward_step`'s output accumulator unconditionally, every
+  loop** (PLAN.md Step 2) — a dense SwiGLU MLP and a `SelfAttention` reused for its RoPE/varlen
+  path, neither in the router pool (not in `Router`'s output dim, not in `compute_aux_loss`).
+  Sized by `moe_intermediate_size`, not the dense decoder's `intermediate_size`. Static row count
+  (`B*S`), so unlike `ParallelSparseMoELayer` they run inside the outer `te.autocast` — don't wrap
+  them in `te.autocast(enabled=False)`.
 - **`forward_step` returns an updated `hidden_states`, not a replacement** (PLAN.md Step 1):
   `hidden_states = hidden_states + loop_scale * dropout(post_norm(output))`, giving a gradient
   path across loop boundaries independent of routing. `loop_scale` (`nn.Parameter`, init `0.1`,

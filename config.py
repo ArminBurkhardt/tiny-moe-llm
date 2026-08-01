@@ -11,6 +11,9 @@ class ModelConfig:
         "max_seq_len": int(Config["model"]["max_seq_length"]),
         "hidden_size": int(Config["model"]["hidden_size"]),
         "intermediate_size": int(Config["model"]["intermediate_size"]),
+        # routed + shared MoE experts only (Gemma4TextModel keeps plain intermediate_size);
+        # defaults to intermediate_size so config.yaml can omit the key entirely.
+        "moe_intermediate_size": int(Config["model"].get("moe_intermediate_size", Config["model"]["intermediate_size"])),
         "num_layers": int(Config["model"]["num_layers"]),
         "num_heads": int(Config["model"]["num_attention_heads"]),
         "head_dim": int(Config["model"]["head_dim"]),
