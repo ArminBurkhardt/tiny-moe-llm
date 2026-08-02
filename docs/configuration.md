@@ -7,28 +7,36 @@ All hyperparameters live in [config.yaml](../config.yaml) and are surfaced as `M
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `vocab_size` | 129280 | Tokenizer vocabulary size |
+| `vocab_size` | 65536 | Tokenizer vocabulary size (`<= 65536`, asserted -- Step 8's `train.bin` is uint16) |
 | `max_seq_length` | 4096 | Max context / RoPE cache length |
-| `hidden_size` | 512 | Model dimension |
-| `intermediate_size` | 2048 | FFN inner dimension (decoder + MLP experts) |
-| `num_layers` | 5 | Dense decoder layers |
-| `num_attention_heads` | 8 | Decoder attention heads (KV heads = `//4`, GQA) |
+| `hidden_size` | 768 | Model dimension |
+| `intermediate_size` | 2304 | Dense decoder FFN inner dimension only |
+| `moe_intermediate_size` | 2304 | Routed + shared MoE expert FFN size; defaults to `intermediate_size` if omitted |
+| `num_layers` | 8 | Dense decoder layers |
+| `num_attention_heads` | 12 | Decoder attention heads (KV heads = `//4`, GQA) |
 | `head_dim` | 64 | Per-head dimension |
 | `dropout` | 0.0 | Dropout (pretraining uses 0) |
 | `per_layer_embeddings_size` | 32 | PLE vector size per layer. `0` disables PLE |
-| `num_mlp_experts` | 36 | Sparse MLP experts |
+| `num_mlp_experts` | 32 | Sparse MLP experts |
 | `num_attn_experts` | 1 | Attention experts, counts self and cross (thus contributes `2x`) |
 | `num_ir_experts` | 1 | Information-retrieval (IR) experts |
-| `num_ir_entries` | 16384 | Entries in each IR key/value memory |
+| `num_ir_entries` | 8192 | Entries in each IR key/value memory |
 | `ir_dim` | 128 | IR latent dimension |
 | `top_k` | 2 | Experts selected per token per loop |
-| `n_loops` | 4 | MoE routing iterations |
+| `n_loops` | 3 | MoE routing iterations |
 | `mtp_num_extra_tokens` | 2 | Extra future tokens predicted (`0` disables MTP) |
 | `lm_head_factor` | 4 | Factorization factor of the LM head (higher = cheaper, lower rank) |
 
 There is no identity expert / `identity_skew` anymore (removed, PLAN.md Step 3) — a halt head
 (`p_halt`, see [moe.md](moe.md)) replaces it as the early-exit signal. `ModelConfig.Forward` is
 currently empty.
+
+**Construction-time assertions** (`TinyMoETransformer.__init__`, PLAN.md Step 5): `vocab_size` and
+`hidden_size` must each be divisible by `lm_head_factor`; if MTP is enabled, `vocab_size` and
+`hidden_size // 2` must each also be divisible by `lm_head_factor * 2` (the MTP head's own
+`SmallLMHead`); `vocab_size <= 65536`. These raise immediately on a bad config instead of silently
+truncating inside `SmallLMHead`'s chunking. The model also prints total/active param counts and a
+forward FLOP/token estimate at construction — see [moe.md](moe.md) for the methodology.
 
 ## `training`
 

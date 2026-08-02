@@ -6,6 +6,7 @@ from modules.model.moe import LoopMixtureOfExperts
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
+from utils import logger
 
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
 from transformer_engine.pytorch import checkpoint
@@ -89,6 +90,29 @@ class TinyMoETransformer(nn.Module):
     ):
         super().__init__()
 
+        # construction-time invariants (PLAN.md Step 5) -- SmallLMHead chunks both dims into
+        # `factor` pieces, so a bad vocab/hidden/lm_head_factor combo would silently truncate
+        # instead of raising; catch it here instead of at the first forward.
+        assert vocab_size % lm_head_factor == 0, (
+            f"vocab_size ({vocab_size}) must be divisible by lm_head_factor ({lm_head_factor})"
+        )
+        assert hidden_size % lm_head_factor == 0, (
+            f"hidden_size ({hidden_size}) must be divisible by lm_head_factor ({lm_head_factor})"
+        )
+        if mtp_num_extra_tokens > 0:
+            # MTPHead's own SmallLMHead runs on hidden_size//2 with lm_head_factor*2 (see
+            # mtp_head construction below) -- same chunking constraint, different dims/factor.
+            mtp_lm_head_factor = lm_head_factor * 2
+            assert vocab_size % mtp_lm_head_factor == 0, (
+                f"vocab_size ({vocab_size}) must be divisible by lm_head_factor*2 ({mtp_lm_head_factor}) for MTP"
+            )
+            assert (hidden_size // 2) % mtp_lm_head_factor == 0, (
+                f"hidden_size//2 ({hidden_size // 2}) must be divisible by lm_head_factor*2 ({mtp_lm_head_factor}) for MTP"
+            )
+        # uint16 fit for Step 8's train.bin dtype -- not a hard architectural limit, just the
+        # data pipeline's contract.
+        assert vocab_size <= 65536, f"vocab_size ({vocab_size}) exceeds 65536 (Step 8's train.bin is uint16)"
+
         # routed + shared MoE experts only -- Gemma4TextModel below keeps plain intermediate_size
         moe_intermediate_size = moe_intermediate_size if moe_intermediate_size is not None else intermediate_size
 
@@ -143,8 +167,42 @@ class TinyMoETransformer(nn.Module):
         
         self.use_checkpointing = True
         self.use_sub_checkpointing = True
-        
+
         self._token_tracker = TokenTracker()
+
+        # param/FLOP accounting (PLAN.md Step 5) -- printed at construction so the budget math in
+        # PLAN.md's Step 11 has a live number to check against instead of going stale silently.
+        # "active" excludes the routed MLP experts' unused capacity: parallel_experts holds
+        # num_mlp_experts worth of weights but only top_k/num_mlp_experts of them run per token
+        # (every other expert in the pool -- attention/IR/shared -- runs densely every loop
+        # regardless of routing, so it's already fully "active"). "excl. emb" further drops the
+        # embedding-table lookups (embed_tokens, the dense decoder's PLE table, this model's own
+        # PLE projection table) since they're memory lookups, not matmuls.
+        total_params = sum(p.numel() for p in self.parameters())
+        moe_params = sum(p.numel() for p in self.moe.parameters())
+        mlp_expert_params = sum(p.numel() for p in self.moe.parallel_experts.parameters())
+        active_frac = top_k / num_mlp_experts
+        moe_active_params = moe_params - mlp_expert_params + int(mlp_expert_params * active_frac)
+        embed_params = self.gemma_decoder.embed_tokens.weight.numel()
+        if self.gemma_decoder.ple is not None:
+            embed_params += self.gemma_decoder.ple.weight.numel()
+        if self.moe_embeddings is not None:
+            embed_params += self.moe_embeddings.weight.numel()
+        non_moe_params = total_params - moe_params - embed_params
+        active_excl_emb = non_moe_params + moe_active_params
+        active_params = active_excl_emb + embed_params
+
+        # FLOPs, unlike the param counts above, must multiply the MoE portion by n_loops: its
+        # weights are reused every loop (one shared self.moe, not one per loop), so the param
+        # count only appears once but the compute happens n_loops times per token. The dense
+        # decoder + heads (non_moe_params) run once regardless. Standard "2N" forward-pass
+        # approximation otherwise (embeddings excluded -- lookups, not matmuls); this is an
+        # estimate, not a measured MFU number.
+        flops_per_token = 2 * (non_moe_params + n_loops * moe_active_params)
+        logger.info(
+            f"params: total={total_params/1e6:.1f}M active={active_params/1e6:.1f}M "
+            f"(excl. emb={active_excl_emb/1e6:.1f}M) | forward FLOP/token ~= {flops_per_token/1e6:.0f}M"
+        )
     
     @property
     def token_count(self):

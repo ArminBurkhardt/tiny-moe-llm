@@ -95,13 +95,28 @@ Constraints worth remembering:
   `config.yaml`. `Gemma4TextModel`'s dense decoder always uses plain `intermediate_size`, so this
   is the only knob that moves total params without moving active (dense-decoder) params.
 - `mtp_num_extra_tokens` must be <= the dataset's `num_mtp_tokens` separator budget, otherwise
-  MTP gets supervised across document boundaries.
+  MTP gets supervised across document boundaries. Currently trivially true: `scripts/pretrain.py`
+  passes `Dataset(..., num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"])` -- the same
+  value on both sides -- so there's nothing to assert yet. Revisit once Step 9's mmap dataset
+  bakes a separator budget into `train.bin` independent of the model config.
 - `vocab_size` and `hidden_size` must both be divisible by `lm_head_factor` (SmallLMHead chunks
-  both dims).
+  both dims), and (if MTP is enabled) by `lm_head_factor * 2` for the MTP head's own `SmallLMHead`
+  (which runs on `hidden_size // 2`). `vocab_size` must also be `<= 65536` (Step 8's `train.bin` is
+  uint16). **Asserted at model construction** (`TinyMoETransformer.__init__`, PLAN.md Step 5) --
+  distinct from `loop_ce_weights`' config-load-time assert above.
 - Things *not* in the yaml but hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL=10`, checkpoint
   every 5000 steps ([pretrain.py](scripts/pretrain.py)), expert head counts `n_heads=16 /
   n_kv_heads=4` and `rope_theta` ([moe.py](modules/model/moe.py)), `CE_CHUNK_SIZE=2048`
   ([mtp.py](modules/model/mtp.py)).
+- `TinyMoETransformer.__init__` prints total/active param counts and a forward FLOP/token estimate
+  (PLAN.md Step 5) -- PLAN.md's Step 11 budget math is keyed to this number and goes stale
+  silently if it's not recomputed after a config change. "Active" excludes the routed MLP experts'
+  unused capacity (`num_mlp_experts` weights exist but only `top_k` run per token); "excl. emb"
+  further drops `embed_tokens` / the decoder's PLE table / this model's own PLE table (lookups, not
+  matmuls). The FLOP estimate multiplies only the MoE block's active params by `n_loops` -- its
+  weights are one shared module reused every loop, so the param count appears once but the compute
+  happens `n_loops` times; the dense decoder and the heads (`lm_head`/`mtp_head`/`correct_proj`)
+  run once regardless and aren't multiplied.
 
 ## Model invariants
 

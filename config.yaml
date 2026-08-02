@@ -1,26 +1,26 @@
 model:
-  vocab_size: 129280 # gemma: 262144
+  vocab_size: 65536 # gemma: 262144 -- pruned to fit uint16 train.bin (Step 8), was 129280
   max_seq_length: 4096
-  hidden_size: 512
-  intermediate_size: 2048
-  # moe_intermediate_size: 2048  # optional -- routed + shared MoE experts only, defaults to intermediate_size if absent
-  num_layers: 5
-  num_attention_heads: 8
+  hidden_size: 768 # was 512 -- 512 kept every GEMM skinny and MFU low
+  intermediate_size: 2304 # dense decoder MLP only
+  moe_intermediate_size: 2304 # routed + shared MoE experts only, defaults to intermediate_size if absent
+  num_layers: 8 # was 5
+  num_attention_heads: 12 # was 8
   head_dim: 64
   dropout: 0.00 # for pretraining only
   per_layer_embeddings_size: 32
 
   # num experts
-  num_mlp_experts: 36 # due to fp8 requirement, this + other experts must be divisible by 8
+  num_mlp_experts: 32 # was 36 -- end of the free-lunch total-params-at-zero-active-compute range, see PLAN.md Step 5
   num_attn_experts: 1
 
   # routing
   top_k: 2
-  n_loops: 4
+  n_loops: 3 # was 4 -- non-MLP experts run densely every loop, so fewer loops means fewer dense attention passes
 
   # information retrieval
   num_ir_experts: 1
-  num_ir_entries: 16384
+  num_ir_entries: 8192 # was 16384 -- dense every loop, ~11% of forward FLOPs, halving frees throughput + ~2GB peak mem
   ir_dim: 128
 
   # mtp
@@ -42,7 +42,7 @@ training:
   lambda_ponder: 3e-3 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens
   ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 until loop_scale has had room to grow (deadlock avoidance)
   ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
-  loop_ce_weights: [0.1, 0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
+  loop_ce_weights: [0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
   lambda_conf: 0.05 # weight on the correctness head's BCE loss (final loop only)
   grad_accumulation_steps: 16
   seed: 42
