@@ -1,18 +1,22 @@
-"""Runs the real Dataset with the real tokenizer over one fineweb parquet shard and checks:
+"""Runs the real Dataset with the real tokenizer over a handful of real fineweb documents,
+pre-tokenized into a synthetic {split}.bin/.idx pair (mirroring what scripts/prepare_data.py,
+PLAN.md Step 11, will produce), and checks:
 - batch shapes and packing density (non-pad fraction; should be ~99% with doc splitting)
 - invariants: labels mirror input_ids where unmasked, segment starts masked, only the EOS
   separator may be supervised among pad-id positions, document_ids segment the row
-- BOS handling (prepended by the dataset since the tokenizer adds none)
+- BOS handling (prepended by the dataset since train.bin stores raw, BOS-less token ids)
 CPU is fine (no model involved).
 """
-import os, sys, json, tempfile
+import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import pandas as pd
+import numpy as np
 from transformers import AutoTokenizer
 
 from modules.data.dataset import Dataset
 
-TOK = "ckpts/pretrained/DeepSeek-V4-Pro-tokenizer"
+TOK = "ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536"
 tok = AutoTokenizer.from_pretrained(TOK)
 print(f"pad_token_id={tok.pad_token_id} eos_token_id={tok.eos_token_id} bos_token_id={tok.bos_token_id}")
 
@@ -20,18 +24,27 @@ print(f"pad_token_id={tok.pad_token_id} eos_token_id={tok.eos_token_id} bos_toke
 probe = tok("hello world", add_special_tokens=True)["input_ids"]
 print(f"tokenized 'hello world' -> {probe[:4]} (tokenizer adds BOS: {probe[0] == tok.bos_token_id})")
 
-# point a temp config at a single shard so the test is fast
+# tokenize a real fineweb shard's documents (no special tokens -- train.bin stores raw content
+# ids only; BOS-prepending is the dataset's job) into a synthetic phase1.bin/.idx pair
 shard_root = "data/datasets/parquet/fineweb/CC-MAIN-2021-49"
 shard = sorted(os.listdir(shard_root))[0]
+df = pd.read_parquet(os.path.join(shard_root, shard), columns=["content"])
+texts = df["content"].dropna().tolist()[:200]
+
+tokens, offsets = [], [0]
+for text in texts:
+    ids = tok(str(text), truncation=False, add_special_tokens=False)["input_ids"]
+    if not ids:
+        continue
+    tokens.extend(ids)
+    offsets.append(len(tokens))
+
 d = tempfile.mkdtemp()
-root = os.path.join(d, "root"); os.makedirs(root)
-os.symlink(os.path.abspath(os.path.join(shard_root, shard)), os.path.join(root, shard))
-cfg = os.path.join(d, "cfg.json")  # keep cfg OUTSIDE root: FileIterator rglobs data files in root
-with open(cfg, "w") as f:
-    json.dump({"pretrain": [{"root": root, "column": "content"}]}, f)
+np.array(tokens, dtype=np.uint16).tofile(os.path.join(d, "phase1.bin"))
+np.array(offsets, dtype=np.uint64).tofile(os.path.join(d, "phase1.idx"))
 
 B, S = 3, 4096
-ds = Dataset(tok, batch_size=B, max_length=S, mode="pretrain", config_path=cfg, num_mtp_tokens=2)
+ds = Dataset(data_dir=d, tokenizer=tok, batch_size=B, max_length=S, num_mtp_tokens=2)
 
 it = iter(ds)
 densities, n_batches = [], 4

@@ -19,7 +19,10 @@ scripts under [scripts/](scripts/).
 ```
 config.py / config.yaml     all hyperparameters (yaml -> ModelConfig / TrainingConfig)
 utils.py                    logger, BASE_DIR, dtype aliases, save/load_checkpoint
-data_config.json            data source roots + column names per mode (gitignored)
+data_config.json            local parquet source roots + column names per mode (gitignored) --
+                             no longer read by any script since the Step 9 mmap dataset rewrite
+                             (`prune_vocab.py` hardcodes its own mix instead); kept around as a
+                             record of the pre-Step-9 local shard layout
 memory-benchmark.py         standalone peak-VRAM probes (not used by training)
 env_init                    WSL/CUDA env + venv activation (gitignored, `source env_init`)
 scripts/
@@ -38,7 +41,7 @@ modules/model/
   modules.py                SmallLMHead (factored vocab projection)
   embeddings.py             RoPE cache + apply_rotary_pos_emb
   utils.py                  EncoderOutput dataclass
-modules/data/dataset.py     streaming IterableDataset with document packing + resume
+modules/data/dataset.py     mmap flat-file IterableDataset (bin/idx) with document packing (Step 9)
 tests/                      tracked sanity scripts (see "Tests")
 ckpts/                      gitignored: pretrained/<tokenizer dirs>, training/<*.pt, *.png>
 data/datasets/              gitignored parquet/jsonl shards
@@ -88,7 +91,10 @@ land in normal commits like any other source file.
   `config.yaml`'s `training:` block rather than `model:` — they're consumed directly in
   `scripts/pretrain.py`'s / `compute_mtp_loss`'s loss calc, not passed into the model.
   `loop_ce_weights`' length is asserted against `n_loops` at config-load time (import-time
-  `assert` in `config.py`, not construction time).
+  `assert` in `config.py`, not construction time). `data_dir` (default `data/prepared`) and
+  `phase` (default `phase1`) pick which `{phase}.bin`/`{phase}.idx` pair the mmap `Dataset`
+  reads (PLAN.md Step 9) -- both are gitignored artifacts `scripts/prepare_data.py` (Step 11)
+  hasn't been written yet to produce, so a real `pretrain()` run has nothing to read until then.
 
 Constraints worth remembering:
 - `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
@@ -98,8 +104,10 @@ Constraints worth remembering:
 - `mtp_num_extra_tokens` must be <= the dataset's `num_mtp_tokens` separator budget, otherwise
   MTP gets supervised across document boundaries. Currently trivially true: `scripts/pretrain.py`
   passes `Dataset(..., num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"])` -- the same
-  value on both sides -- so there's nothing to assert yet. Revisit once Step 9's mmap dataset
-  bakes a separator budget into `train.bin` independent of the model config.
+  value on both sides -- so there's nothing to assert yet. The Step 9 mmap dataset still adds
+  the EOS/pad separator dynamically at pack time (not baked into `train.bin`), so this stays
+  trivially true for now; revisit if a later step bakes the separator budget into the bin file
+  itself, independent of the model config.
 - `vocab_size` and `hidden_size` must both be divisible by `lm_head_factor` (SmallLMHead chunks
   both dims), and (if MTP is enabled) by `lm_head_factor * 2` for the MTP head's own `SmallLMHead`
   (which runs on `hidden_size // 2`). `vocab_size` must also be `<= 65536` (Step 8's `train.bin` is
@@ -311,33 +319,59 @@ by default. The prune script:
 
 `ckpts/training/checkpoint_epoch{E}_idx{STEP}_loss{L}[_interrupted].pt`; "latest" means newest
 mtime, not highest step. Payload (see [utils.py](utils.py)): model/optimizer/scheduler states,
-`token_count`, `losses`, `file_order`, a **global** `(file_idx, record_idx, shard_token_count)`,
-and **per-worker** positions keyed by worker id plus the `num_data_workers` they were produced
-with.
+`token_count`, `losses`, and a single **`global_offset`** (PLAN.md Step 9) -- a doc index into the
+flat, unshuffled document stream. There is no per-file or per-worker state anymore: doc sharding
+across `DataLoader` workers is pure `doc_idx % num_workers` arithmetic (see "Dataset" below), so
+one conservative (min-across-workers) scalar is enough to resume from without skipping any
+worker's unconsumed documents. Workers further ahead than the minimum at checkpoint time just
+redo a few already-seen documents on resume -- harmless, and the same kind of slop the pre-Step-9
+design already accepted when the worker count changed.
 
-- Per-worker resume is only valid when `NUM_DATA_WORKERS` is unchanged; otherwise the loader falls
-  back to the conservative global minimum (and re-reads some data).
-- Restoring `file_order` is what stops consumed shards from reappearing — `file_idx` indexes into
-  that order, not into the sorted file list. `build_legacy_order` handles pre-`file_order`
-  checkpoints.
+- `pretrain.py`'s `snapshot_global_offset()` computes this: each worker records the last `doc_idx`
+  it reached (`batch["doc_idx"]`, host-synced only at checkpoint time), and the checkpoint stores
+  `min(seen) + NUM_DATA_WORKERS` (the smallest "next document any worker still wants").
+- Resume is document-granular, not sub-document: if a worker was frozen mid-way through packing a
+  document that spans a batch boundary, that document's still-unflushed remainder is not
+  separately tracked and is simply redone. `tests/test_dataset_resume.py` checks the guarantee
+  the design actually makes (no full document skipped or duplicated at the granularity it
+  checkpoints), using corpora where every document fills exactly one row to keep the boundary
+  unambiguous.
+- Legacy (pre-Step-9) checkpoints have no `global_offset` and restart the doc stream from 0 --
+  there's no sound mapping from the old per-file position into the new flat corpus.
 - All `load_checkpoint` extras use `.get(..., default)` so old checkpoints still load. Keep that
   when adding fields, and add them to `save_checkpoint`'s signature with a default too.
 
 ## Dataset ([modules/data/dataset.py](modules/data/dataset.py))
 
-`IterableDataset` yielding **fully assembled batches** (hence `batch_size=None` on the DataLoader).
-Files are discovered from `data_config.json` roots (parquet/json/jsonl, optional `glob`), sorted
-for determinism, then shuffled per epoch with `seed + epoch`. Workers shard the *same* global
-order by `idx::num_workers`, so `file_idx` is globally meaningful.
+`IterableDataset` yielding **fully assembled batches** (hence `batch_size=None` on the DataLoader),
+reading from a pre-tokenized flat-file corpus (PLAN.md Step 9): `{data_dir}/{phase}.bin` (a flat
+uint16 token stream) and `{data_dir}/{phase}.idx` (uint64 document-start offsets, one entry per
+document plus a trailing entry == `len(bin)`). Both files are produced by `scripts/prepare_data.py`
+(PLAN.md Step 11, not written yet) -- `phase1`/`phase2` are the two mix ratios described there.
 
-Packing: documents are concatenated into `max_length` sequences, split across sequence boundaries
-when they don't fit, each followed by `EOS + (num_mtp_tokens - 1)` pads. Trailing padding becomes
-length-1 attention segments. Labels are `-100` everywhere except the interior of each document
-block plus the terminating EOS. `max_tokens_per_shard` caps how much is drawn from one file before
-moving on.
+Both files are opened via `np.memmap` **inside** `_batch_iterator` (once per worker/epoch, not
+held on the `Dataset` object across its lifetime) -- a long-lived memmap handed across DataLoader
+worker restarts is a known leak vector.
 
-Batches carry `file_idx / record_idx / shard_token_count / worker_id` as `[B]`-shaped tensors
-purely so accelerate's batch splitting treats them like `input_ids`.
+Documents are read **once, in on-disk order, with no shuffling**: Step 11 already interleaves
+sources at the target mix ratios while writing the bin file, so a straight sequential read
+reproduces that mix -- reshuffling here would undo it. Workers shard the doc stream by pure
+`doc_idx % num_workers == worker_id` arithmetic (no file lists, no `file_order`, no
+`build_legacy_order` -- all dead code from the pre-Step-9 parquet design and removed). `start_doc_idx`
+(from the checkpoint's `global_offset`) is the one resume input; each worker derives its own first
+owned index from it via `first = start_doc_idx + ((worker_id - start_doc_idx) % num_workers)`.
+
+Packing is otherwise unchanged from the pre-Step-9 design: documents are concatenated into
+`max_length` sequences, split across sequence boundaries when they don't fit, each followed by
+`EOS + (num_mtp_tokens - 1)` pads. Trailing padding becomes length-1 attention segments. Labels are
+`-100` everywhere except the interior of each document block plus the terminating EOS. BOS is
+prepended if the document's first stored token isn't already BOS -- idempotent whether or not a
+future `prepare_data.py` bakes one in, since `train.bin` stores raw (BOS-less, in the current
+implementation) content ids only.
+
+Batches carry `doc_idx / worker_id` as `[B]`-shaped tensors purely so accelerate's batch splitting
+treats them like `input_ids`; `doc_idx` is the last global document index this worker had reached
+when the batch was assembled, read by the trainer for checkpointing (see "Checkpoints & resume").
 
 ## Conventions
 
@@ -353,7 +387,8 @@ purely so accelerate's batch splitting treats them like `input_ids`.
 
 Current branch `train-build`; PRs target `main`. Commit style is
 `feat:` / `docs:` / `chore:` / `merge:`. Note the `.gitignore` swallows `*.json` (so
-`data_config.json` is untracked), `*.cmd`, `ckpts/`, `venv/`, and `env_init`. `tests/` is tracked.
+`data_config.json` is untracked), `*.cmd`, `ckpts/`, `venv/`, `env_init`, and `data/prepared`
+(the Step 9/11 `{phase}.bin`/`.idx` corpus). `tests/` is tracked.
 
 ## Known rough edges
 

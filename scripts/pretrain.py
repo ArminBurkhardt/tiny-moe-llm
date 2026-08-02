@@ -253,20 +253,16 @@ def pretrain():
     logger.info(f"Tokenizer loaded from {GEMMA4_TOKENIZER_PATH} with vocab size {tokenizer.vocab_size}")
     
     dataset = Dataset(
+        data_dir=os.path.join(BASE_DIR, TrainingConfig.data_dir),
         tokenizer=tokenizer,
         batch_size=TrainingConfig.Batch_size,
         max_length=TrainingConfig.Seq_length,
-        mode="pretrain",
-        config_path=os.path.join(BASE_DIR, "data_config.json"),
+        split=TrainingConfig.phase,
         num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
-        seed=TrainingConfig.seed,
-        max_tokens_per_shard=TrainingConfig.max_tokens_per_shard,
     )
     # must stay the same across checkpoints
     NUM_DATA_WORKERS = 4
     dataloader = DataLoader(dataset, batch_size=None, num_workers=NUM_DATA_WORKERS, prefetch_factor=2)
-
-    logger.info(f"Initialized dataset with {len(dataset.sources)} sources")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
@@ -286,38 +282,15 @@ def pretrain():
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
     logger.info(f"Scheduler total steps: {TrainingConfig.total_steps:,}")
     
-    start_epoch, dataset_idx, start_file_idx, start_record_idx, start_shard_tc = 0, 0, 0, 0, 0
-    resume_worker_start = None
+    start_epoch, dataset_idx, start_doc_idx = 0, 0, 0
     resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
     losses = []
     try:
         checkpoint_path = os.path.join(checkpoint_dir, get_latest_checkpoint_epoch(checkpoint_dir))
-        start_epoch, dataset_idx, resume_token_count, start_file_idx, start_record_idx, losses, file_order, start_shard_tc, worker_positions, saved_num_workers = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+        start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
         model._token_tracker.num_tokens = resume_token_count
         resumed = True
-
-        # per worker exact resume only when the worker count is unchanged
-        if worker_positions is not None and saved_num_workers == NUM_DATA_WORKERS:
-            resume_worker_start = {int(k): tuple(int(x) for x in v) for k, v in worker_positions.items()}
-            logger.info(f"Restored per-worker resume positions for {len(resume_worker_start)} workers: {resume_worker_start}")
-        elif worker_positions is not None:
-            logger.warning(
-                f"Data worker count changed ({saved_num_workers} -> {NUM_DATA_WORKERS}), per worker "
-                f"positions are invalid. Falling back to global resume at file_idx={start_file_idx}"
-            )
-
-        # restore the file ordering so already consumed shards are skipped
-        if file_order:
-            dataset.set_order(file_order)
-            logger.info(f"Restored saved file ordering ({len(file_order)} files) from checkpoint")
-        else:
-            # legacy checkpoint
-            dataset.build_legacy_order(start_file_idx, seed=TrainingConfig.seed + start_epoch)
-            logger.info(
-                f"No saved file ordering, treating {start_file_idx} sorted files as consumed and "
-                f"shuffling the remaining {len(dataset.file_order) - start_file_idx} shards"
-            )
 
         # total_steps moves with batch size / grad accum, so reanchor the LR schedule by tokens
         tokens_per_step = TrainingConfig.Batch_size * TrainingConfig.Seq_length * TrainingConfig.grad_accumulation_steps
@@ -335,7 +308,7 @@ def pretrain():
     except Exception as e:
         logger.warning(f"No checkpoint found. Starting training from scratch")
 
-    logger.info(f"Starting training from epoch {start_epoch}, dataset file index {start_file_idx}")
+    logger.info(f"Starting training from epoch {start_epoch}, document index {start_doc_idx}")
     
     dry_run(model, device=device, dtype=BF16, config=ModelConfig)
     logger.info("Dry run successful. Starting training loop...")
@@ -359,36 +332,25 @@ def pretrain():
     # every LOG_INTERVAL steps instead of every step (the model is small -> per-step syncs dominate)
     LOG_INTERVAL = 10
 
-    # per worker (file_idx, record_idx, shard_token_count), kept on device; -1 = nothing seen yet
-    worker_state = torch.full((max(NUM_DATA_WORKERS, 1), 3), -1, dtype=torch.long, device=device)
-    
-    if resume_worker_start:
-        for wid, (f, r, s) in resume_worker_start.items():
-            if 0 <= wid < worker_state.shape[0]:
-                worker_state[wid] = torch.tensor([f, r, s], dtype=torch.long, device=device)
+    # per worker, last doc_idx that worker had reached, kept on device; -1 = nothing seen yet
+    worker_state = torch.full((max(NUM_DATA_WORKERS, 1),), -1, dtype=torch.long, device=device)
 
-    def snapshot_resume_positions():
-        # only host sync of this state, done at checkpoint time
+    def snapshot_global_offset():
+        # only host sync of this state, done at checkpoint time. conservative min across workers:
+        # a worker at doc_idx d will next want d + NUM_DATA_WORKERS (PLAN.md Step 9 sharding), so
+        # taking the min "next wanted" doc guarantees no worker's unconsumed docs are skipped --
+        # workers further ahead just redo a few already-seen docs, which is harmless.
         rows = worker_state.cpu().tolist()
-        positions = {wid: tuple(row) for wid, row in enumerate(rows) if row[0] >= 0}
-        if positions:
-            g_file, g_record, g_shard = min(positions.values(), key=lambda p: (p[0], p[1]))
-        else:
-            g_file, g_record, g_shard = start_file_idx, start_record_idx, start_shard_tc
-        return positions, g_file, g_record, g_shard
+        seen = [r for r in rows if r >= 0]
+        if not seen:
+            return start_doc_idx
+        return min(seen) + NUM_DATA_WORKERS
 
     stop_training = False
     try:
         for epoch in range(start_epoch, TrainingConfig.num_epochs):
             resume_epoch = resumed and epoch == start_epoch
-            # fresh => reshuffle
-            if not resume_epoch:
-                dataset.reshuffle(TrainingConfig.seed + epoch)
-            dataset.start_file_idx = start_file_idx if resume_epoch else 0
-            # within shard resume offsets (global + per-worker)
-            dataset.start_record_idx = start_record_idx if resume_epoch else 0
-            dataset.start_shard_token_count = start_shard_tc if resume_epoch else 0
-            dataset.worker_start = resume_worker_start if resume_epoch else None
+            dataset.start_doc_idx = start_doc_idx if resume_epoch else 0
             if not resume_epoch:
                 worker_state.fill_(-1)
             # continue the step counter from the checkpointed step on the resumed epoch
@@ -398,11 +360,7 @@ def pretrain():
                 step = local_step + step_offset
                 # record this workers progress, no host sync
                 w_id = batch["worker_id"][0].to(worker_state.device)
-                worker_state[w_id] = torch.stack((
-                    batch["file_idx"][0],
-                    batch["record_idx"][0],
-                    batch["shard_token_count"][0],
-                )).to(worker_state.device)
+                worker_state[w_id] = batch["doc_idx"][0].to(worker_state.device)
 
                 input_ids = batch["input_ids"].to(device)
                 # document_ids: batch-aligned [B, S] segment ids for the packed documents. cu_seqlens
@@ -478,7 +436,6 @@ def pretrain():
                     # eta_min instead of stopping where the cosine decay was anchored.
                     if n_tokens >= TrainingConfig.target_tokens:
                         logger.info(f"Reached target_tokens ({TrainingConfig.target_tokens:,}); saving final checkpoint and stopping.")
-                        worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
                         save_checkpoint(
                             unwrapped_model,
                             optimizer,
@@ -487,13 +444,8 @@ def pretrain():
                             dataset_idx,
                             path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
                             token_count=n_tokens,
-                            file_idx=resume_file_idx,
-                            record_idx=resume_record_idx,
-                            shard_token_count=resume_shard_tc,
+                            global_offset=snapshot_global_offset(),
                             losses=losses,
-                            file_order=dataset.file_order,
-                            worker_positions=worker_positions,
-                            num_data_workers=NUM_DATA_WORKERS,
                         )
                         stop_training = True
                         break
@@ -512,7 +464,6 @@ def pretrain():
                 # save checkpoint every 1500 steps (was 5000, PLAN.md Step 6 -- makes the run
                 # interruptible at a granularity that matches the vast.ai preemptible-instance flow)
                 if (step % 1500 == 0) and (local_step > 0):
-                    worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
                     save_checkpoint(
                         unwrapped_model,
                         optimizer,
@@ -521,13 +472,8 @@ def pretrain():
                         dataset_idx,
                         path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
                         token_count=unwrapped_model._token_tracker.sync(),
-                        file_idx=resume_file_idx,
-                        record_idx=resume_record_idx,
-                        shard_token_count=resume_shard_tc,
+                        global_offset=snapshot_global_offset(),
                         losses=losses,
-                        file_order=dataset.file_order,
-                        worker_positions=worker_positions,
-                        num_data_workers=NUM_DATA_WORKERS,
                     )
             dataset_idx = 0
             if stop_training:
@@ -536,7 +482,6 @@ def pretrain():
         try:
             input("Training interrupted. Press Enter to save checkpoint and exit...")
             logger.info("Training interrupted. Saving checkpoint...")
-            worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
             save_checkpoint(
                 unwrapped_model,
                 optimizer,
@@ -545,13 +490,8 @@ def pretrain():
                 dataset_idx,
                 path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)),
                 token_count=unwrapped_model._token_tracker.sync(),
-                file_idx=resume_file_idx,
-                record_idx=resume_record_idx,
-                shard_token_count=resume_shard_tc,
+                global_offset=snapshot_global_offset(),
                 losses=losses,
-                file_order=dataset.file_order,
-                worker_positions=worker_positions,
-                num_data_workers=NUM_DATA_WORKERS,
             )
         except Exception as e:
             logger.error(f"Exiting with: {e}")

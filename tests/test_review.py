@@ -1,23 +1,19 @@
 """Standalone correctness checks for dataset packing, attention masks, and label/MTP shifting.
 Runs on CPU (no transformer_engine / flash-attn needed)."""
-import os, sys, json, tempfile
+import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import numpy as np
 
 from modules.data.dataset import Dataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 
 
 class MockTok:
-    """[BOS=1] + one token (=2) per character. pad=0, no eos -> no EOS supervision."""
+    """pad=0, bos=1, no eos -> no EOS supervision."""
     pad_token_id = 0
-    bos_token_id = None
+    bos_token_id = 1
     eos_token_id = None
-    def __call__(self, text, truncation=False, add_special_tokens=True):
-        ids = ([1] if add_special_tokens else []) + [2] * len(text)
-        return {"input_ids": ids}
-    def apply_chat_template(self, record, tokenize=False):
-        return str(record)
 
 
 class MockTokEos(MockTok):
@@ -25,17 +21,23 @@ class MockTokEos(MockTok):
     eos_token_id = 3
 
 
-def make_dataset(records, max_length, num_mtp, batch_size=1, tok=None):
+def write_corpus(data_dir, docs, split="phase1"):
+    """docs: list[list[int]] of raw (no BOS) token ids per document. Writes {split}.bin (uint16
+    flat stream) and {split}.idx (uint64 doc-start offsets, len(docs)+1 entries)."""
+    tokens, offsets = [], [0]
+    for doc in docs:
+        tokens.extend(doc)
+        offsets.append(len(tokens))
+    np.array(tokens, dtype=np.uint16).tofile(os.path.join(data_dir, f"{split}.bin"))
+    np.array(offsets, dtype=np.uint64).tofile(os.path.join(data_dir, f"{split}.idx"))
+
+
+def make_dataset(docs, max_length, num_mtp, batch_size=1, tok=None):
+    """docs: list of strings, one char -> one token id 2 (mirrors the old MockTok behavior)."""
     d = tempfile.mkdtemp()
-    root = os.path.join(d, "root"); os.makedirs(root)
-    with open(os.path.join(root, "a.jsonl"), "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps({"text": r}) + "\n")
-    cfg = os.path.join(d, "cfg.json")  # outside root: FileIterator rglobs *.json inside roots
-    with open(cfg, "w") as f:
-        json.dump({"pretrain": [{"root": root, "column": "text"}]}, f)
-    return Dataset(tok or MockTok(), batch_size=batch_size, max_length=max_length,
-                   mode="pretrain", config_path=cfg, num_mtp_tokens=num_mtp)
+    write_corpus(d, [[2] * len(text) for text in docs])
+    return Dataset(data_dir=d, tokenizer=tok or MockTok(), batch_size=batch_size,
+                   max_length=max_length, num_mtp_tokens=num_mtp)
 
 
 def brute_block_mask(doc_ids):
@@ -131,9 +133,9 @@ def test_cu_seqlens_matches_blockmask():
         ref = brute_block_mask(did)
         got = mask_from_cu(cu, B, S)
         assert torch.equal(ref, got), (did, cu)
-        # max_seqlen must be the true longest segment
-        seg_lens = (cu[1:] - cu[:-1])
-        assert maxlen == int(seg_lens.max()), (maxlen, seg_lens)
+        # max_seqlen is deliberately S (a valid upper bound), not the true longest segment --
+        # the true max would cost a .item() host sync every step (see cu_seqlens_from_doc_ids)
+        assert maxlen == S, (maxlen, S)
     print("[ok] cu_seqlens_from_doc_ids == brute-force block-causal mask (incl. cross-row seam)")
 
 

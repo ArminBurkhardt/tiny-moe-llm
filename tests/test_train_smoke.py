@@ -1,14 +1,16 @@
 """End-to-end regression test for the cu_seqlens/accelerate NaN.
 
-Runs the REAL training pipeline in miniature: real Dataset over a fineweb shard -> DataLoader with
-workers -> accelerate.prepare(split_batches=True, grad accumulation) -> real TinyMoETransformer ->
-compute_mtp_loss -> accelerator.backward/step. cu_seqlens is derived in-thread from document_ids,
-exactly as scripts/pretrain.py does. Loss must stay finite past the first optimizer update (where the
-truncated-cu_seqlens bug surfaced as NaN). GPU required; BF16 like real training.
+Runs the REAL training pipeline in miniature: real Dataset over a synthetic phase1.bin/.idx
+corpus -> DataLoader with workers -> accelerate.prepare(split_batches=True, grad accumulation) ->
+real TinyMoETransformer -> compute_mtp_loss -> accelerator.backward/step. cu_seqlens is derived
+in-thread from document_ids, exactly as scripts/pretrain.py does. Loss must stay finite past the
+first optimizer update (where the truncated-cu_seqlens bug surfaced as NaN). GPU required; BF16
+like real training.
 """
-import os, sys, json, tempfile
+import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import numpy as np
 from torch import optim
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
@@ -17,23 +19,27 @@ from accelerate import Accelerator
 from modules.model.transformer import TinyMoETransformer
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.mtp import compute_mtp_loss
+from modules.data.dataset import Dataset
 
 assert torch.cuda.is_available(), "GPU required"
 torch.manual_seed(0)
 dev = "cuda"
 
-tok = AutoTokenizer.from_pretrained("ckpts/pretrained/DeepSeek-V4-Pro-tokenizer")
-shard_root = "data/datasets/parquet/fineweb/CC-MAIN-2021-49"
-shard = sorted(os.listdir(shard_root))[0]
-d = tempfile.mkdtemp(); root = os.path.join(d, "root"); os.makedirs(root)
-os.symlink(os.path.abspath(os.path.join(shard_root, shard)), os.path.join(root, shard))
-cfg = os.path.join(d, "cfg.json")
-with open(cfg, "w") as f:
-    json.dump({"pretrain": [{"root": root, "column": "content"}]}, f)
+tok = AutoTokenizer.from_pretrained("ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536")
+
+# synthetic corpus: varying-length documents of random ids, bounded by the tokenizer's vocab
+rng = np.random.default_rng(0)
+docs = [rng.integers(3, len(tok), size=int(n)).tolist() for n in rng.integers(50, 3000, size=200)]
+tokens, offsets = [], [0]
+for doc in docs:
+    tokens.extend(doc)
+    offsets.append(len(tokens))
+d = tempfile.mkdtemp()
+np.array(tokens, dtype=np.uint16).tofile(os.path.join(d, "phase1.bin"))
+np.array(offsets, dtype=np.uint64).tofile(os.path.join(d, "phase1.idx"))
 
 B, S = 2, 1024
-from modules.data.dataset import Dataset
-ds = Dataset(tok, batch_size=B, max_length=S, mode="pretrain", config_path=cfg, num_mtp_tokens=2)
+ds = Dataset(data_dir=d, tokenizer=tok, batch_size=B, max_length=S, num_mtp_tokens=2)
 dl = DataLoader(ds, batch_size=None, num_workers=2, prefetch_factor=2)
 
 # small model, but full architecture (MoE loops, attention experts, MTP, PLE)

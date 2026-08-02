@@ -48,7 +48,8 @@ class TrainingConfig:
     warmup_steps = int(Config["training"].get("warmup_steps", 0))
     noise_anneal_tokens = int(Config["training"].get("noise_anneal_tokens", 0))
     seed = int(Config["training"].get("seed", 42))
-    max_tokens_per_shard = int(Config["training"].get("max_tokens_per_shard", 200_000_000))
+    data_dir = str(Config["training"].get("data_dir", "data/prepared"))
+    phase = str(Config["training"].get("phase", "phase1"))
     # ponder loss (PLAN.md Step 3b): held at 0 while loop_scale grows, then ramped -- see the
     # deadlock note on LoopMixtureOfExperts.loop_scale for why the warmup is load-bearing.
     lambda_ponder = float(Config["training"].get("lambda_ponder", 3e-3))

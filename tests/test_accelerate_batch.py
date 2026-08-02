@@ -1,34 +1,45 @@
 """Regression guard for the cu_seqlens-through-accelerate trap.
 
 Reproduces the REAL input pipeline (DataLoader workers + accelerate.prepare with split_batches=True)
-and asserts the contract the trainer relies on:
+over a synthetic phase1.bin/.idx corpus and asserts the contract the trainer relies on:
   1. document_ids (batch-aligned, dim0 == B) survives accelerate's batch dispatch intact, so
      cu_seqlens derived from it in the training thread is correct.
   2. the dataset must NOT carry a ragged cu_seqlens (dim0 == num_segments+1) in the batch: accelerate
      truncates its dim0 to the batch size, silently corrupting the attention segmentation (which
      poisons gradients -> NaN after the first optimizer step). This test fails if that key reappears.
 """
-import os, sys, json, tempfile
+import os, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+import numpy as np
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 from accelerate import Accelerator
 
 from modules.data.dataset import Dataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 
-tok = AutoTokenizer.from_pretrained("ckpts/pretrained/DeepSeek-V4-Pro-tokenizer")
-shard_root = "data/datasets/parquet/fineweb/CC-MAIN-2021-49"
-shard = sorted(os.listdir(shard_root))[0]
-d = tempfile.mkdtemp(); root = os.path.join(d, "root"); os.makedirs(root)
-os.symlink(os.path.abspath(os.path.join(shard_root, shard)), os.path.join(root, shard))
-cfg = os.path.join(d, "cfg.json")
-with open(cfg, "w") as f:
-    json.dump({"pretrain": [{"root": root, "column": "content"}]}, f)
+
+class MockTok:
+    pad_token_id = 0
+    bos_token_id = 1
+    eos_token_id = 2
+
+
+# synthetic corpus: 500 documents of varying length so packing/splitting actually exercises
+# the segment boundaries this test cares about
+rng = np.random.default_rng(0)
+docs = [rng.integers(3, 1000, size=int(n)).tolist() for n in rng.integers(50, 6000, size=500)]
+tokens, offsets = [], [0]
+for doc in docs:
+    tokens.extend(doc)
+    offsets.append(len(tokens))
+
+d = tempfile.mkdtemp()
+np.array(tokens, dtype=np.uint16).tofile(os.path.join(d, "phase1.bin"))
+np.array(offsets, dtype=np.uint64).tofile(os.path.join(d, "phase1.idx"))
 
 B, S = 3, 4096
-ds = Dataset(tok, batch_size=B, max_length=S, mode="pretrain", config_path=cfg, num_mtp_tokens=2)
+ds = Dataset(data_dir=d, tokenizer=MockTok(), batch_size=B, max_length=S, num_mtp_tokens=2)
 dl = DataLoader(ds, batch_size=None, num_workers=2, prefetch_factor=2)
 acc = Accelerator(device_placement=True, split_batches=True, gradient_accumulation_steps=8)
 dl = acc.prepare(dl)
