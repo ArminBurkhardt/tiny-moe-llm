@@ -32,11 +32,11 @@ nvfp4_recipe = NVFP4BlockScaling(
     disable_stochastic_rounding=False,
 )
 
-chosen_recipe = None #nvfp4_recipe
 # Note: using NVFP4 for the router and MTP heads leads to issues with the backward pass (mainly the requirement of divisability)
 
-# Not really great with Consumer Blackwell (only with stochastic rounding & rht disabled)
-USE_LOW_PRECISION = False
+# off on the 5090 (BF16); set USE_FP8=1 on the H100 rental to switch chosen_recipe to fp8_recipe
+USE_LOW_PRECISION = os.environ.get("USE_FP8", "0") == "1"
+chosen_recipe = fp8_recipe if USE_LOW_PRECISION else None
 
 def train_step(
     model: TinyMoETransformer,

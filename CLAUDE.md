@@ -62,6 +62,11 @@ fully qualified (`from modules.model.moe import ...`).
   block-mask path).
 - `config.py` opens `"config.yaml"` with a **relative** path, so every script must be launched
   from the repo root (`python scripts/pretrain.py`, not `cd scripts && python pretrain.py`).
+- **FP8 is gated by an env var, off by default** (PLAN.md Step 10): `scripts/pretrain.py`'s
+  `USE_LOW_PRECISION = os.environ.get("USE_FP8", "0") == "1"` picks `chosen_recipe = fp8_recipe`
+  (TE `DelayedScaling`, `Format.HYBRID`) when set, else `None`/BF16 — same code path on the local
+  5090 (`USE_FP8` unset) and a rented H100 (`USE_FP8=1`). `te.autocast(enabled=False)` still wraps
+  `ParallelSparseMoELayer`'s GEMMs regardless (NVFP4/row-divisibility reasons, see moe.py).
 
 ## Commands
 
