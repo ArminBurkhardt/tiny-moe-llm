@@ -29,6 +29,8 @@ scripts/
   pretrain.py               THE training loop
   inference.py              greedy/top-k sampling CLI
   prune_vocab.py            one-shot 129280 -> 65536 vocab prune (Step 8), not part of training
+  prepare_data.py           builds phase1/phase2.bin/.idx from the Hub source mix (Step 11), runs
+                             on the rented box, not locally -- see "Data prep" below
 modules/model/
   transformer.py            TinyMoETransformer (top level) + TokenTracker
   gemma4.py                 dense decoder: GQA, RoPE, RMSNorm(te), per-layer embeddings
@@ -98,8 +100,9 @@ land in normal commits like any other source file.
   `loop_ce_weights`' length is asserted against `n_loops` at config-load time (import-time
   `assert` in `config.py`, not construction time). `data_dir` (default `data/prepared`) and
   `phase` (default `phase1`) pick which `{phase}.bin`/`{phase}.idx` pair the mmap `Dataset`
-  reads (PLAN.md Step 9) -- both are gitignored artifacts `scripts/prepare_data.py` (Step 11)
-  hasn't been written yet to produce, so a real `pretrain()` run has nothing to read until then.
+  reads (PLAN.md Step 9) -- both are gitignored artifacts produced by `scripts/prepare_data.py`
+  (Step 11, see "Data prep" below); a real `pretrain()` run has nothing to read until that's
+  been run once, normally on the rented box.
 
 Constraints worth remembering:
 - `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
@@ -277,6 +280,61 @@ by default. The prune script:
   sample, same source mix) via `manifest.json`'s `vocab_prune` key; last measured overall
   regression 0.15% (well under the 3% acceptance bound), worst single source (wiki) 0.37%.
 
+## Data prep (`scripts/prepare_data.py`, PLAN.md Step 11)
+
+Builds `phase1.bin`/`.idx` and `phase2.bin`/`.idx` from the seven-source Hub mix, meant to run
+**on the rented, interruptible, unattended box**, not locally -- interruption safety is a design
+requirement here, not an afterthought.
+
+- **One shard file in flight per source at a time**: download -> tokenize -> append raw content
+  ids to `{phase}.bin` + cumulative offsets to `{phase}.idx` -> delete the local shard. Peak disk
+  is bounded by final bin size plus a handful of in-flight files, never the source corpora
+  (terabytes for fineweb-edu/finepdfs-edu alone).
+- **Sources are interleaved document-by-document via smooth weighted round-robin** (`run_phase`'s
+  `swrr` dict), not written source-by-source then concatenated -- `modules/data/dataset.py` reads
+  sequentially with no shuffling, so the mix ratio has to already be baked into on-disk order.
+- **`PLAN.md`'s phase-1 mix row sums to 90%, not 100%** (55+10+7+12+3+3, FineWeb/DCLM/FinePDFs/
+  Nemotron-Code/Nemotron-Math/Wikipedia) -- almost certainly a spec gap rather than an intentional
+  10% shortfall. `run_phase`'s caller renormalizes each phase's active weights to sum to 1.0,
+  preserving relative ratios rather than leaving part of the token budget unwritten. Revisit if
+  PLAN.md is ever corrected with an explicit 8th phase-1 row.
+- **Checkpointed every `--checkpoint-docs` documents** (default 2000): `bin`/`idx` are `fsync`ed
+  and a `_prepare_state_{phase}.json` sidecar records each source's `(file_idx, row_idx, tokens,
+  done)`. On restart, `truncate_to_state` trims `bin`/`idx` back down to exactly what the sidecar
+  last confirmed *before* reopening them for append -- a crash between checkpoints can only redo
+  up to one checkpoint interval, never desyncs the `bin`/`idx` pairing.
+- **State is only advanced on a document actually committed, never at pick time** -- `run_phase`
+  buffers a `tokenize_batch`-sized group of `(source, file_idx, row_idx, text)` picks, tokenizes
+  them together (batched, avoids per-doc tokenizer call overhead), and only then commits each to
+  `bin`/`idx` and advances that source's `file_idx`/`row_idx`. Advancing at pick time was an actual
+  bug caught by `tests/test_prepare_data.py`: the commit loop can break mid-batch (target token
+  count reached), and any already-"picked" documents past that point would never be written yet
+  would be marked consumed, silently losing them forever on the next resume.
+- **Two independent `run_phase` calls (fresh process, e.g. across a real interruption) do not
+  reproduce the same interleave order** as one uninterrupted call -- the SWRR fractional counters
+  live only in memory and reset on every call. This is fine: each source's own document sequence
+  is still exactly gap-free and repeat-free across the boundary (what `test_prepare_data.py`
+  actually checks), and the acceptance bar is realized token counts within 2% of target, not exact
+  byte-for-byte reproducibility.
+- **Gated sources** (`nvidia/Nemotron-CC-Code-v1`, `nvidia/Nemotron-CC-Math-v1`, `SourceSpec.gated
+  =True`) need `HF_TOKEN` set *and* the dataset's access request accepted on huggingface.co first;
+  `main()` and the per-file downloader both fail with that hint on a 401/403 instead of hanging.
+- **Text column is auto-detected at runtime**, not hardcoded, via `SourceSpec.text_columns`
+  candidate tuples (`pick_text_column`) -- several sources here (the two gated Nemotron ones
+  especially) had schemas that couldn't be verified offline; failing loudly with the actual
+  observed columns beats silently reading the wrong field for 25B tokens unattended.
+- `smoltalk2`'s `messages` field is rendered as plain `"role: content"` turns (not a real chat
+  template -- that's Step 12 SFT's job), and only its non-reasoning (`_no_think`) SFT splits are
+  used. Every document actually consumed from it gets a `sha1(text)[:16]` recorded into
+  `manifest.json`'s `data_prep.smoltalk2_holdout_hashes`, so Step 12 can exclude anything already
+  seen in phase-2 pretraining.
+- Tokenization relies on the fast tokenizer's own Rust-side thread parallelism (all cores) rather
+  than wrapping it in a `ProcessPoolExecutor` -- multiprocessing plus a loaded fast tokenizer is a
+  known fork-deadlock risk, a bad trade for an unattended box with no one watching to restart it.
+- `tests/test_prepare_data.py` exercises `run_phase`/`truncate_to_state` against synthetic
+  in-memory sources (no HF Hub calls, no GPU/TE) -- mix-ratio tracking, bin/idx consistency,
+  interrupt-then-resume gap/repeat-freedom, and holdout-hash bookkeeping.
+
 ## Training loop notes ([scripts/pretrain.py](scripts/pretrain.py))
 
 - Order: tokenizer -> `Dataset` -> `DataLoader(batch_size=None, num_workers=4)` -> model ->
@@ -352,7 +410,7 @@ design already accepted when the worker count changed.
 reading from a pre-tokenized flat-file corpus (PLAN.md Step 9): `{data_dir}/{phase}.bin` (a flat
 uint16 token stream) and `{data_dir}/{phase}.idx` (uint64 document-start offsets, one entry per
 document plus a trailing entry == `len(bin)`). Both files are produced by `scripts/prepare_data.py`
-(PLAN.md Step 11, not written yet) -- `phase1`/`phase2` are the two mix ratios described there.
+(PLAN.md Step 11, see "Data prep" below) -- `phase1`/`phase2` are the two mix ratios described there.
 
 Both files are opened via `np.memmap` **inside** `_batch_iterator` (once per worker/epoch, not
 held on the `Dataset` object across its lifetime) -- a long-lived memmap handed across DataLoader
@@ -370,9 +428,8 @@ Packing is otherwise unchanged from the pre-Step-9 design: documents are concate
 `max_length` sequences, split across sequence boundaries when they don't fit, each followed by
 `EOS + (num_mtp_tokens - 1)` pads. Trailing padding becomes length-1 attention segments. Labels are
 `-100` everywhere except the interior of each document block plus the terminating EOS. BOS is
-prepended if the document's first stored token isn't already BOS -- idempotent whether or not a
-future `prepare_data.py` bakes one in, since `train.bin` stores raw (BOS-less, in the current
-implementation) content ids only.
+prepended if the document's first stored token isn't already BOS -- idempotent regardless, since
+`train.bin` stores raw (BOS-less) content ids only; `prepare_data.py` doesn't bake one in either.
 
 Batches carry `doc_idx / worker_id` as `[B]`-shaped tensors purely so accelerate's batch splitting
 treats them like `input_ids`; `doc_idx` is the last global document index this worker had reached
