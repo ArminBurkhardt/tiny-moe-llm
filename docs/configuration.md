@@ -49,6 +49,7 @@ currently empty.
 | `ponder_warmup_tokens` | 1e9 | Tokens before `lambda_ponder` starts ramping up from 0 |
 | `ponder_ramp_tokens` | 1e9 | Tokens over which `lambda_ponder` ramps from 0 to its target after warmup |
 | `loop_ce_weights` | none, required | Per-loop CE weight, ascending, e.g. `[0.1, 0.2, 0.3, 1.0]`. Length must equal `model.n_loops` (asserted at config-load time) |
+| `lambda_conf` | 0.05 | Weight on the correctness head's BCE loss (`correct_proj`, final loop only). Not warmup-ramped |
 | `grad_accumulation_steps` | 8 | Mini batches accumulated per optim step |
 
 `total_steps` is derived as `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`

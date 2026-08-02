@@ -65,3 +65,8 @@ class TrainingConfig:
         f"(n_loops={ModelConfig.Params['n_loops']})"
     )
 
+    # correctness head (PLAN.md Step 4b): weight on the correct_proj BCE loss, final loop only.
+    # same yaml-block deviation as the ponder/loop_ce knobs above -- consumed directly in
+    # compute_mtp_loss's call sites, not passed into the model.
+    lambda_conf = float(Config["training"].get("lambda_conf", 0.05))
+

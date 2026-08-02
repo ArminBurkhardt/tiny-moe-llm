@@ -124,7 +124,15 @@ class TinyMoETransformer(nn.Module):
         
         self.norm = RMSNorm(hidden_size)
         self.lm_head = SmallLMHead(hidden_size, vocab_size, factor=lm_head_factor)
-        
+
+        # correctness head (PLAN.md Step 4b): separate from the MoE's p_halt on purpose -- p_halt
+        # asks "is more compute useful", this asks "is this prediction correct"; they come apart
+        # on confident hallucinations. Applied externally (like lm_head/mtp_head) to the final
+        # loop's post-norm hidden state inside compute_mtp_loss, not inside forward().
+        self.correct_proj = nn.Linear(hidden_size, 1, bias=True)
+        nn.init.zeros_(self.correct_proj.weight)
+        nn.init.constant_(self.correct_proj.bias, 0.0)
+
         self.mtp_head = MTPHead(
             hidden_size, 
             vocab_size,

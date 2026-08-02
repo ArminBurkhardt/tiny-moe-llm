@@ -68,35 +68,64 @@ def _safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Ten
 
 
 def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.Tensor,
-                       chunk_size: int = CE_CHUNK_SIZE) -> torch.Tensor:
+                       chunk_size: int = CE_CHUNK_SIZE,
+                       correct_proj: nn.Module = None):
     """mean cross entropy of lm_head(hidden) [T, H] vs labels [T], without ever materializing the full [T, vocab] logits.
 
-    tokens go through in chunks, each projection checkpointed so its logits are freed after the forward and recomputed in backward. 
+    tokens go through in chunks, each projection checkpointed so its logits are freed after the forward and recomputed in backward.
     peak logit memory is chunk_size * vocab instead of T * vocab
     the logits dominate activation memory here. otherwise equivalent to a normal F.cross_entropy(lm_head(hidden), labels, ignore_index=-100).
+
+    when correct_proj is given (PLAN.md Step 4b), also returns the mean correctness head BCE loss
+    for the same tokens, reusing each chunk's already-live logits for the free is_correct target
+    instead of a second lm_head(hidden) pass. Returns (ce_loss, conf_loss) then, else just ce_loss.
     """
     n_valid = (labels != -100).sum()
     if n_valid == 0:
-        # keep the head in the autograd graph so DDP still sees its grads
-        return lm_head(hidden[:1]).sum() * 0.0
+        # keep the head(s) in the autograd graph so DDP still sees their grads
+        z = lm_head(hidden[:1]).sum() * 0.0
+        return (z, correct_proj(hidden[:1]).sum() * 0.0) if correct_proj is not None else z
 
-    def _chunk_loss(h: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
-        h0 = h.size(0)
-        h = pad_for_low_fp(h)
-        logits = lm_head(h)
-        logits = unpad(logits, h0)
-        # sum, not mean: divided by the global valid token count below
-        return F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
+    if correct_proj is not None:
+        def _chunk_loss(h: torch.Tensor, l: torch.Tensor):
+            h0 = h.size(0)
+            logits = unpad(lm_head(pad_for_low_fp(h)), h0)
+            ce = F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
+            valid = (l != -100).to(logits.dtype)
+            with torch.no_grad():
+                # free target: no labels, no extra forward pass needed. must stay no_grad -- a
+                # differentiable target here would leak gradient back into the LM logits/lm_head
+                # through the "correct" label itself, on top of correct_proj's own gradient.
+                is_correct = (logits.argmax(-1) == l).float()
+            correct_logit = correct_proj(h).squeeze(-1)
+            conf = F.binary_cross_entropy_with_logits(correct_logit, is_correct, reduction="none")
+            return ce, (conf * valid).sum()
+    else:
+        def _chunk_loss(h: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
+            h0 = h.size(0)
+            logits = unpad(lm_head(pad_for_low_fp(h)), h0)
+            # sum, not mean: divided by the global valid token count below
+            return F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
 
     loss_sum = hidden.new_zeros(())
+    conf_sum = hidden.new_zeros(()) if correct_proj is not None else None
     T = hidden.size(0)
     for start in range(0, T, chunk_size):
         h_chunk = hidden[start:start + chunk_size]
         l_chunk = labels[start:start + chunk_size]
         if torch.is_grad_enabled() and h_chunk.requires_grad:
-            loss_sum = loss_sum + checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False)
+            out = checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False)
         else:
-            loss_sum = loss_sum + _chunk_loss(h_chunk, l_chunk)
+            out = _chunk_loss(h_chunk, l_chunk)
+        if correct_proj is not None:
+            ce, conf = out
+            conf_sum = conf_sum + conf
+        else:
+            ce = out
+        loss_sum = loss_sum + ce
+
+    if correct_proj is not None:
+        return loss_sum / n_valid, conf_sum / n_valid
     return loss_sum / n_valid
 
 
@@ -109,6 +138,8 @@ def compute_mtp_loss(
     main_lm_head: nn.Module = None,
     pad_mask: torch.Tensor = None,
     loop_ce_weights: list = None,
+    correct_proj: nn.Module = None,
+    lambda_conf: float = 0.0,
 ):
     if main_lm_head is not None:
         # outputs: [n_loops, B, S, H] per-loop post-norm hidden states (PLAN.md Step 4a). Project +
@@ -122,9 +153,17 @@ def compute_mtp_loss(
         main_labels = targets[:, 1:].contiguous().view(-1)
         loss_ce = None
         loss = outputs.new_zeros(())
+        n_loops = len(loop_ce_weights)
         for loop, weight in enumerate(loop_ce_weights):
             hidden = outputs[loop, :, :-1, :].contiguous().view(-1, outputs.size(-1))
-            loop_ce = _chunked_linear_ce(main_lm_head, hidden, main_labels)
+            # correctness head (PLAN.md Step 4b) reads only the final loop's hidden states --
+            # p_halt asks "is more compute useful", this asks "is this prediction correct", and
+            # they come apart on confident hallucinations, so it's deliberately not per-loop.
+            if loop == n_loops - 1 and correct_proj is not None:
+                loop_ce, conf_loss = _chunked_linear_ce(main_lm_head, hidden, main_labels, correct_proj=correct_proj)
+                loss = loss + lambda_conf * conf_loss
+            else:
+                loop_ce = _chunked_linear_ce(main_lm_head, hidden, main_labels)
             loss = loss + weight * loop_ce
             loss_ce = loop_ce  # last iteration is the final loop's raw (unweighted) CE, for logging
     else:

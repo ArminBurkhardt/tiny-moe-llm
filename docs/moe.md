@@ -95,6 +95,36 @@ Missing or wrong-length `loop_ce_weights` is a hard error (`compute_mtp_loss` as
 `len(loop_ce_weights) == n_loops`); `config.py` also asserts this against `ModelConfig.Params`
 at import time so a config typo fails fast instead of at the first training step.
 
+## Correctness head
+
+`p_halt` answers "is more compute useful here" (a compute-allocation signal); it is trained by LM
+loss + ponder cost, so it learns whether refinement *changes* the prediction, not whether the
+prediction is *right*. A confidently hallucinated fact is stable under refinement -- it halts early
+and reads as maximum certainty. `TinyMoETransformer.correct_proj` (PLAN.md Step 4b) is a second,
+independent `Linear(hidden_size, 1)` head (zero-init) that asks the right question directly: is
+this prediction correct.
+
+Like `lm_head`/`mtp_head`, `correct_proj` is applied externally rather than inside `forward()` --
+`compute_mtp_loss` calls it only on the **final loop's** hidden states (never per loop, unlike the
+CE terms above) when passed `correct_proj=` and `lambda_conf > 0`. Its target is free: inside the
+same chunked pass that already computes the final loop's CE, `is_correct = (logits.argmax(-1) ==
+labels)` under `torch.no_grad()` -- no extra forward pass, no labels beyond what CE already uses.
+The `no_grad` is load-bearing: without it, the "correct" target would itself carry gradient back
+through the shared CE logits, on top of `correct_proj`'s own gradient, quietly corrupting the LM
+loss. `tests/test_correctness_head.py` checks this directly by comparing `lm_head`'s gradient with
+the correctness term on vs. off -- it must be bit-identical.
+
+Unlike the ponder loss, `lambda_conf` (`TrainingConfig.lambda_conf`, default `0.05`) is **not**
+warmup-ramped -- there's no `loop_scale`-style deadlock precondition here, since `correct_proj`
+doesn't gate anything else's gradient the way `p_halt` gates the loop's residual update.
+
+This head is provisional. `p_max = softmax(logits).max()` is already a strong, free per-token
+correctness predictor with no extra parameters. Gate 5 (`scripts/eval_calibration.py`, not written
+yet) compares `p_correct = sigmoid(correct_proj(hidden))`'s ECE and abstention AUROC against
+`p_max`'s on a held-out slice; if `p_correct` doesn't win on both, the plan is to revert this head
+entirely (see PLAN.md's Step 4b for the exact revert scope) and use `p_max` for abstention
+throughout post-training instead.
+
 ## Sparse MLP dispatch - `ParallelSparseMoELayer`
 
 A naive MoE gathers a dense `[num_experts, tokens, ...]` tensor and runs every expert over every

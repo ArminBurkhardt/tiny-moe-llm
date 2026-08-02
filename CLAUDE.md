@@ -82,11 +82,12 @@ land in normal commits like any other source file.
   its only key, deleted in PLAN.md Step 3).
 - `TrainingConfig` — class attributes; `total_steps` is *derived* as
   `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`. Also holds the ponder
-  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`) and `loop_ce_weights`
-  (PLAN.md Step 4a) even though they read from `config.yaml`'s `training:` block rather than
-  `model:` — they're consumed directly in `scripts/pretrain.py`'s / `compute_mtp_loss`'s loss calc,
-  not passed into the model. `loop_ce_weights`' length is asserted against `n_loops` at
-  config-load time (import-time `assert` in `config.py`, not construction time).
+  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`), `loop_ce_weights`
+  (PLAN.md Step 4a), and `lambda_conf` (PLAN.md Step 4b) even though they read from
+  `config.yaml`'s `training:` block rather than `model:` — they're consumed directly in
+  `scripts/pretrain.py`'s / `compute_mtp_loss`'s loss calc, not passed into the model.
+  `loop_ce_weights`' length is asserted against `n_loops` at config-load time (import-time
+  `assert` in `config.py`, not construction time).
 
 Constraints worth remembering:
 - `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
@@ -179,7 +180,28 @@ to the next loop, never as something `lm_head` can read, which is what an early-
 `TrainingConfig.loop_ce_weights`, length-checked against `n_loops` at config-load time) whenever
 `main_lm_head` is set, and applies the chunked CE per loop — never materializing more than one
 loop's one chunk of `[chunk, vocab]` logits at a time. `loss_ce` (the value returned for logging)
-is still just the *final* loop's raw, unweighted CE.
+is still just the *final* loop's raw, unweighted CE. Ascending weights don't guarantee a strictly
+descending per-loop CE once training is deep into an overfit regime: earlier loops backprop-receive
+gradient from every later loop's CE too (that's just backprop through the recurrence), not only
+their own `loop_ce_weights` entry, so their remaining headroom can let them read out a *lower* CE
+than a later loop despite the smaller weight. `tests/test_per_loop_ce.py` samples early in training
+for exactly this reason — see its comment before changing its step count.
+
+**Correctness head** (PLAN.md Step 4b): `self.correct_proj` (`TinyMoETransformer`, zero-init
+weight/bias) is a second, independent head from `p_halt` — `p_halt` asks "is more compute useful
+here", `correct_proj` asks "is this specific prediction right", and they come apart on confident
+hallucinations (a stable-under-refinement wrong answer halts early *and* reads as certain). Applied
+externally, like `lm_head`/`mtp_head`, only inside `compute_mtp_loss` on the **final loop's** hidden
+states — never per loop, never inside `forward()`. Its BCE target `is_correct` is free (derived
+from the same chunk's CE logits' argmax vs. labels, no extra forward pass) but **must** be computed
+under `torch.no_grad()`: without that, the "correct" label would itself carry gradient back through
+the LM logits, on top of `correct_proj`'s own gradient — the exact leak `tests/test_correctness_head.py`
+checks for by comparing `lm_head`'s gradient with the conf term on vs. off. `lambda_conf` (`TrainingConfig.lambda_conf`,
+default `0.05`) is not warmup-gated like `lambda_ponder` — no deadlock precondition applies here,
+`correct_proj` doesn't gate anything else's gradient. This head is provisional: Gate 5
+(`scripts/eval_calibration.py`, not written yet) compares its ECE/abstention-AUROC against the
+free `p_max = softmax(logits).max()` baseline, and Step 4b reverts (head, loss term, `lambda_conf`)
+if `p_correct` doesn't beat `p_max` on both.
 
 **Document packing**: the dataset emits batch-aligned `document_ids [B, S]`; the trainer converts
 them to `cu_seqlens` **in-thread** via `cu_seqlens_from_doc_ids`. Never put `cu_seqlens` in the
@@ -212,6 +234,8 @@ for a sync-free (slightly stale) value; assign `.num_tokens` to restore on resum
   also driven from the live token count — see the ponder-deadlock invariant above.
 - Main CE is now a weighted sum over `n_loops` per-loop CE terms (`TrainingConfig.loop_ce_weights`,
   PLAN.md Step 4a) rather than just the final loop's — see the per-loop CE invariant above.
+- The correctness head's BCE loss (`TrainingConfig.lambda_conf`, PLAN.md Step 4b) is added
+  unconditionally, no warmup ramp — see the correctness-head invariant above.
 - Everything that needs the host (loss `.item()`, token sync, tokens/sec, peak mem) is throttled
   to `LOG_INTERVAL`. Keep it that way — the model is small enough that per-step syncs dominate.
 - Anything touching `has_mtp`, `lm_head`, `mtp_head`, `_token_tracker`, or `moe` must go through
