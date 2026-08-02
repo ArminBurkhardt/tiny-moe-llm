@@ -65,7 +65,8 @@ for step, batch in enumerate(dl):
                                       return_aux_loss=True, return_hidden=True)
         loss, loss_ce = compute_mtp_loss(logits, labels, mtp_outputs=mtp,
                                          lm_head=unwrapped.mtp_head.lm_head, lambda_mtp=0.1,
-                                         main_lm_head=unwrapped.lm_head, pad_mask=pad_mask)
+                                         main_lm_head=unwrapped.lm_head, pad_mask=pad_mask,
+                                         loop_ce_weights=[0.3, 1.0])  # len == P["n_loops"]
         loss = loss + 0.01 * aux_loss
         acc.backward(loss)
         if acc.sync_gradients:

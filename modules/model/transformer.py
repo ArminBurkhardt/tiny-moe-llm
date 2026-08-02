@@ -176,7 +176,10 @@ class TinyMoETransformer(nn.Module):
             return_aux_loss (bool, optional): whether to return auxiliary loss (and p_halt). Defaults to False.
 
         Returns:
-            torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]
+            torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
+                is True, returns the post-norm hidden states for every loop instead, shape
+                [n_loops, batch_size, seq_len, hidden_size] (PLAN.md Step 4a) -- index [-1] is the
+                final loop, matching the pre-Step-4a single-loop shape.
 
             float (optional): auxiliary loss from MoE routing, returned if return_aux_loss is True
 
@@ -192,18 +195,20 @@ class TinyMoETransformer(nn.Module):
         self._token_tracker.count_tokens(input_ids)
         if self.training and self.use_checkpointing:
             x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
-            x, aux_loss, p_halt = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, use_reentrant=False)
-            x = self.norm(x)
+            _, aux_loss, p_halt, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, use_reentrant=False)
+            # final RMSNorm applied at every loop, not just the last (PLAN.md Step 4a) -- lm_head
+            # reads self.norm(x), never the raw residual stream, so per-loop CE needs this too.
+            x_all = self.norm(hidden_states_all)
+            x = x_all[-1]
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
-            if not return_hidden:
-                x = self.lm_head(x)
+            x = x_all if return_hidden else self.lm_head(x)
         else:
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen).last_hidden_state
-            x, aux_loss, p_halt = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True)
-            x = self.norm(x)
+            _, aux_loss, p_halt, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True)
+            x_all = self.norm(hidden_states_all)
+            x = x_all[-1]
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)
-            if not return_hidden:
-                x = self.lm_head(x)
+            x = x_all if return_hidden else self.lm_head(x)
 
         if extra_token_outputs is not None:
             return (x, aux_loss, p_halt, extra_token_outputs) if return_aux_loss else (x, extra_token_outputs)

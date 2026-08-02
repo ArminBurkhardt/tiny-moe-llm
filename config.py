@@ -55,3 +55,13 @@ class TrainingConfig:
     ponder_warmup_tokens = int(Config["training"].get("ponder_warmup_tokens", 1_000_000_000))
     ponder_ramp_tokens = int(Config["training"].get("ponder_ramp_tokens", 1_000_000_000))
 
+    # per-loop CE supervision (PLAN.md Step 4a): ascending weights, one per loop, so lm_head has
+    # *some* incentive to make intermediate loops' hidden states legible without competing with
+    # the final loop's dominant supervision. Same yaml-block deviation as the ponder knobs above --
+    # consumed directly in compute_mtp_loss's call sites, not passed into the model.
+    loop_ce_weights = [float(w) for w in Config["training"]["loop_ce_weights"]]
+    assert len(loop_ce_weights) == ModelConfig.Params["n_loops"], (
+        f"loop_ce_weights ({loop_ce_weights}) must have exactly one weight per loop "
+        f"(n_loops={ModelConfig.Params['n_loops']})"
+    )
+

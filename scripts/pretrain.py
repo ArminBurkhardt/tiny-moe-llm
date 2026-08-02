@@ -83,6 +83,7 @@ def train_step(
                 lambda_mtp=TrainingConfig.lambda_mtp,
                 main_lm_head=unwrapped.lm_head,
                 pad_mask=pad_mask,
+                loop_ce_weights=TrainingConfig.loop_ce_weights,
             )
 
             loss = loss + TrainingConfig.aux_loss_weight * aux_loss
@@ -175,7 +176,8 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
             lambda_mtp=TrainingConfig.lambda_mtp,
             main_lm_head=model.lm_head,
             pad_mask=pad_mask,
-        ) 
+            loop_ce_weights=TrainingConfig.loop_ce_weights,
+        )
         
         loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 

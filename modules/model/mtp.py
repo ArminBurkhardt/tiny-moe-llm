@@ -108,20 +108,32 @@ def compute_mtp_loss(
     lambda_mtp: float = 0.1,
     main_lm_head: nn.Module = None,
     pad_mask: torch.Tensor = None,
+    loop_ce_weights: list = None,
 ):
     if main_lm_head is not None:
-        # outputs are hidden states; project + CE in chunks so the logits are never all live at once
-        hidden = outputs[:, :-1, :].contiguous().view(-1, outputs.size(-1))
+        # outputs: [n_loops, B, S, H] per-loop post-norm hidden states (PLAN.md Step 4a). Project +
+        # CE per loop, each internally chunked, so logits for more than one loop/chunk are never
+        # live at once. Without per-loop supervision, intermediate hidden states are only ever
+        # optimized as inputs to the next loop, never as something lm_head can read.
+        assert loop_ce_weights is not None and len(loop_ce_weights) == outputs.size(0), (
+            f"loop_ce_weights must have exactly one weight per loop, got {loop_ce_weights} "
+            f"for {outputs.size(0)} loops"
+        )
         main_labels = targets[:, 1:].contiguous().view(-1)
-        loss_ce = _chunked_linear_ce(main_lm_head, hidden, main_labels)
+        loss_ce = None
+        loss = outputs.new_zeros(())
+        for loop, weight in enumerate(loop_ce_weights):
+            hidden = outputs[loop, :, :-1, :].contiguous().view(-1, outputs.size(-1))
+            loop_ce = _chunked_linear_ce(main_lm_head, hidden, main_labels)
+            loss = loss + weight * loop_ce
+            loss_ce = loop_ce  # last iteration is the final loop's raw (unweighted) CE, for logging
     else:
         # main loss: targets shifted by 1 relative to inputs (outputs are already logits)
         main_logits = outputs[:, :-1, :].contiguous()
         main_labels = targets[:, 1:].contiguous()
         loss_ce = _safe_cross_entropy(main_logits.view(-1, main_logits.size(-1)), main_labels.view(-1))
-    
-    loss = loss_ce
-    
+        loss = loss_ce
+
     if mtp_outputs is not None and lm_head is not None:
         # mtp_outputs shape: [batch_size, seq_len, num_extra_tokens, hidden_size // 2]
         num_extra_tokens = mtp_outputs.size(2)

@@ -44,7 +44,8 @@ for step in range(150):
     hidden, aux, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
                              return_aux_loss=True, return_hidden=True)
     loss, _ = compute_mtp_loss(hidden, labels, mtp_outputs=mtp, lm_head=model.mtp_head.lm_head,
-                            lambda_mtp=0.1, main_lm_head=model.lm_head, pad_mask=pad_mask)
+                            lambda_mtp=0.1, main_lm_head=model.lm_head, pad_mask=pad_mask,
+                            loop_ce_weights=[0.3, 1.0])  # len == P["n_loops"]
     total = loss + aux
     total.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

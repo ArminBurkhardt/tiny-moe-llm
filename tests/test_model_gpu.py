@@ -47,13 +47,14 @@ def main():
             logits, input_ids, mtp_outputs=mtp,
             lm_head=model.mtp_head.lm_head, lambda_mtp=0.1,
             main_lm_head=model.lm_head, pad_mask=pad_mask,
+            loop_ce_weights=[0.3, 1.0],  # len == P["n_loops"]
         )
         loss = loss + aux_loss
         loss.backward()
 
     assert torch.isfinite(loss), loss
-    # return_hidden=True => model returns hidden states, not logits
-    assert logits.shape == (B, S, P["hidden_size"]), logits.shape
+    # return_hidden=True => model returns per-loop hidden states, not logits (PLAN.md Step 4a)
+    assert logits.shape == (P["n_loops"], B, S, P["hidden_size"]), logits.shape
     assert mtp.shape == (B, S, P["mtp_num_extra_tokens"], P["hidden_size"]//2), mtp.shape
     # token tracker incremented by exactly B*S
     assert model.token_count - tok_before == B * S, (model.token_count, tok_before)

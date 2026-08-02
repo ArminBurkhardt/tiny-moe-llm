@@ -82,9 +82,11 @@ land in normal commits like any other source file.
   its only key, deleted in PLAN.md Step 3).
 - `TrainingConfig` — class attributes; `total_steps` is *derived* as
   `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`. Also holds the ponder
-  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`) even though they read
-  from `config.yaml`'s `training:` block rather than `model:` — they're consumed directly in
-  `scripts/pretrain.py`'s loss calc, not passed into the model.
+  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`) and `loop_ce_weights`
+  (PLAN.md Step 4a) even though they read from `config.yaml`'s `training:` block rather than
+  `model:` — they're consumed directly in `scripts/pretrain.py`'s / `compute_mtp_loss`'s loss calc,
+  not passed into the model. `loop_ce_weights`' length is asserted against `n_loops` at
+  config-load time (import-time `assert` in `config.py`, not construction time).
 
 Constraints worth remembering:
 - `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
@@ -167,6 +169,18 @@ per-MTP substages. Training currently runs with both **off**.
 cross-entropy so `[T, vocab]` logits are never fully materialized. If you add a call site,
 pass `main_lm_head=` or you'll silently double the activation peak.
 
+**Per-loop CE supervision** (PLAN.md Step 4a): with `return_hidden=True` the returned "hidden
+states" are actually `self.norm` applied at *every* loop, stacked to `[n_loops, B, S, H]` (index
+`[-1]` is the final loop, what MTP reads and what `return_hidden=False` projects to logits) —
+`LoopMixtureOfExperts.forward` already returns this stack as a 4th value alongside
+`hidden_states`/`aux_loss`/`p_halt`. Without it, intermediate loops are optimized only as inputs
+to the next loop, never as something `lm_head` can read, which is what an early-exit policy on
+`p_halt` would actually need. `compute_mtp_loss` requires `loop_ce_weights` (one entry per loop,
+`TrainingConfig.loop_ce_weights`, length-checked against `n_loops` at config-load time) whenever
+`main_lm_head` is set, and applies the chunked CE per loop — never materializing more than one
+loop's one chunk of `[chunk, vocab]` logits at a time. `loss_ce` (the value returned for logging)
+is still just the *final* loop's raw, unweighted CE.
+
 **Document packing**: the dataset emits batch-aligned `document_ids [B, S]`; the trainer converts
 them to `cu_seqlens` **in-thread** via `cu_seqlens_from_doc_ids`. Never put `cu_seqlens` in the
 batch dict — it's ragged (`dim0 = num_segments + 1`) and accelerate's `split_batches` truncates
@@ -196,6 +210,8 @@ for a sync-free (slightly stale) value; assign `.num_tokens` to restore on resum
 - Ponder loss (`TrainingConfig.lambda_ponder`, applied to `(1 - p_halt)` on real tokens) ramps
   0 -> `lambda_ponder` over `ponder_warmup_tokens` -> `ponder_warmup_tokens + ponder_ramp_tokens`,
   also driven from the live token count — see the ponder-deadlock invariant above.
+- Main CE is now a weighted sum over `n_loops` per-loop CE terms (`TrainingConfig.loop_ce_weights`,
+  PLAN.md Step 4a) rather than just the final loop's — see the per-loop CE invariant above.
 - Everything that needs the host (loss `.item()`, token sync, tokens/sec, peak mem) is throttled
   to `LOG_INTERVAL`. Keep it that way — the model is small enough that per-step syncs dominate.
 - Anything touching `has_mtp`, `lm_head`, `mtp_head`, `_token_tracker`, or `moe` must go through

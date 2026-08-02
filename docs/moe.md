@@ -72,6 +72,29 @@ The trainer adds a **ponder loss** on `(1 - p_halt)` over real (non-pad) tokens,
 The warmup is load-bearing, not tunable: see the ponder-deadlock note in
 [CLAUDE.md](../CLAUDE.md) and `tests/test_ponder_deadlock.py`.
 
+## Per-loop CE supervision
+
+Using `p_halt` for early exit at inference means `lm_head` must be able to read *any* loop's
+hidden state, not just the last one -- otherwise thresholding `p_halt` and exiting early reads
+from an interface never trained (PLAN.md Step 4a). `LoopMixtureOfExperts.forward` returns a 4th
+value alongside `hidden_states`/`aux_loss`/`p_halt`: `hidden_states_all`, the stack of every
+loop's (pre-norm) hidden state, `[n_loops, B, S, H]`. `TinyMoETransformer.forward` applies the
+final `RMSNorm` to the whole stack (not just the last loop) before returning it as `x` when
+`return_hidden=True` -- `lm_head` never reads the raw residual stream, so skipping this makes
+per-loop losses meaningless.
+
+`compute_mtp_loss` (`modules/model/mtp.py`) takes a `loop_ce_weights` list (one entry per loop,
+`TrainingConfig.loop_ce_weights`, ascending -- e.g. `[0.1, 0.2, 0.3, 1.0]`) and computes the
+chunked CE once per loop, summing the weighted results. Each loop's CE is independently chunked
+(`CE_CHUNK_SIZE`), so at most one loop's one chunk of `[chunk, vocab]` logits is ever live --
+looping over loops does not multiply peak logit memory the way materializing all loops' logits at
+once would. The returned `loss_ce` (used for logging) is always the *final* loop's raw, unweighted
+CE, matching its pre-Step-4a meaning. MTP heads still apply to the final loop only, never per loop.
+
+Missing or wrong-length `loop_ce_weights` is a hard error (`compute_mtp_loss` asserts
+`len(loop_ce_weights) == n_loops`); `config.py` also asserts this against `ModelConfig.Params`
+at import time so a config typo fails fast instead of at the first training step.
+
 ## Sparse MLP dispatch - `ParallelSparseMoELayer`
 
 A naive MoE gathers a dense `[num_experts, tokens, ...]` tensor and runs every expert over every

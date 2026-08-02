@@ -35,7 +35,8 @@ labels[:, 0] = -100
 def ce_loss_and_p_halt(model):
     hidden, aux, p_halt, mtp = model(input_ids=input_ids, return_aux_loss=True, return_hidden=True)
     loss, _ = compute_mtp_loss(hidden, labels, mtp_outputs=mtp, lm_head=model.mtp_head.lm_head,
-                            lambda_mtp=0.1, main_lm_head=model.lm_head, pad_mask=pad_mask)
+                            lambda_mtp=0.1, main_lm_head=model.lm_head, pad_mask=pad_mask,
+                            loop_ce_weights=[0.3, 1.0])  # len == P["n_loops"]
     return loss, p_halt
 
 

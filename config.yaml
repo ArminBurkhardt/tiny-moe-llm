@@ -42,6 +42,7 @@ training:
   lambda_ponder: 3e-3 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens
   ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 until loop_scale has had room to grow (deadlock avoidance)
   ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
+  loop_ce_weights: [0.1, 0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
   grad_accumulation_steps: 16
   seed: 42
   max_tokens_per_shard: 200000000 # 200m tokens per shard 

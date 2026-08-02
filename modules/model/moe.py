@@ -380,6 +380,7 @@ class LoopMixtureOfExperts(nn.Module):
     ):
         total_load_balancing_loss = 0.0
         p_halt_all = []
+        hidden_states_all = []
 
         self.expert_tracker.begin_forward(self.n_loops)
 
@@ -393,15 +394,20 @@ class LoopMixtureOfExperts(nn.Module):
                 hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings)
             total_load_balancing_loss += load_balancing_loss
             p_halt_all.append(p_halt)
+            hidden_states_all.append(hidden_states)
 
         # [n_loops, B, S] -- per-loop, per-token halt probability. stacked, never reduced with
         # .item() here; the trainer computes the ponder loss and logging means from this.
         p_halt_all = torch.stack(p_halt_all, dim=0).squeeze(-1)
 
+        # [n_loops, B, S, H] -- per-loop hidden states, so lm_head can be applied at every loop
+        # (PLAN.md Step 4a) instead of only the last one. hidden_states_all[-1] is hidden_states.
+        hidden_states_all = torch.stack(hidden_states_all, dim=0)
+
         if return_loss:
-            return hidden_states, total_load_balancing_loss / self.n_loops, p_halt_all
+            return hidden_states, total_load_balancing_loss / self.n_loops, p_halt_all, hidden_states_all
         else:
-            return hidden_states, p_halt_all
+            return hidden_states, p_halt_all, hidden_states_all
 
     def set_temperature(self, temperature: float):
         self.temperature = temperature
