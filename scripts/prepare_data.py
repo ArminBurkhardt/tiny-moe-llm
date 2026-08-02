@@ -81,7 +81,7 @@ SOURCES = [
                format="parquet", text_columns=("text",), phase1_weight=0.55, phase2_weight=0.15),
     SourceSpec("dclm", "mlfoundations/dclm-baseline-1.0", "global-shard_01_of_10/", (".jsonl.zst",),
                format="jsonl.zst", text_columns=("text",), phase1_weight=0.10, phase2_weight=0.0),
-    SourceSpec("finepdfs", "HuggingFaceFW/finepdfs-edu", "eng_Latn/", (".parquet",),
+    SourceSpec("finepdfs", "HuggingFaceFW/finepdfs-edu", "data/eng_Latn/train/", (".parquet",),
                format="parquet", text_columns=("text",), phase1_weight=0.07, phase2_weight=0.10),
     # Common Pile's stack-edu re-release: Stack-Edu's educational-quality code selection with
     # actual text materialized (unlike HuggingFaceTB/stack-edu, which only ships SWHIDs and
@@ -134,7 +134,11 @@ def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
     """returns this file's documents as a list[str], shuffled at document granularity
     (PLAN.md: "shuffle at document granularity within each phase")."""
     if spec.messages_field is not None:
-        df = pd.read_parquet(local_path, columns=[spec.messages_field])
+        # engine forced to pyarrow: fastparquet cannot decode list<struct<role,content>> columns
+        # and silently returns None for every row instead of raising, which would make a chat
+        # source like smoltalk2 contribute zero documents with no error at all (found via a real
+        # smoke run -- see TODO.md history).
+        df = pd.read_parquet(local_path, columns=[spec.messages_field], engine="pyarrow")
         texts = []
         for msgs in df[spec.messages_field]:
             if msgs is None or len(msgs) == 0:
@@ -143,7 +147,7 @@ def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
             if rendered:
                 texts.append(rendered)
     elif spec.format == "parquet":
-        df = pd.read_parquet(local_path)
+        df = pd.read_parquet(local_path, engine="pyarrow")
         col = pick_text_column(set(df.columns), spec.text_columns, spec.key)
         texts = [t for t in df[col].dropna().astype(str).tolist() if t]
     elif spec.format in ("jsonl.zst", "jsonl.gz"):
