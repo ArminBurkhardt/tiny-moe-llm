@@ -75,7 +75,7 @@ def train_step(
                 )
                 extra_token_outputs = None
 
-            loss, loss_ce = compute_mtp_loss(
+            loss, loss_ce, metrics = compute_mtp_loss(
                 logits,
                 labels,
                 mtp_outputs=extra_token_outputs,
@@ -86,6 +86,7 @@ def train_step(
                 loop_ce_weights=TrainingConfig.loop_ce_weights,
                 correct_proj=unwrapped.correct_proj,
                 lambda_conf=TrainingConfig.lambda_conf,
+                return_metrics=True,
             )
 
             loss = loss + TrainingConfig.aux_loss_weight * aux_loss
@@ -99,6 +100,12 @@ def train_step(
             ponder = ((1.0 - p_halt) * valid_mask).sum() / valid_mask.sum().clamp(min=1)
             loss = loss + lambda_ponder_now * ponder
 
+            # instrumentation (PLAN.md Step 7): all tensors, no host sync here -- the caller only
+            # pulls these to the host inside its own LOG_INTERVAL-throttled block.
+            metrics["p_halt_mean"] = ((p_halt * valid_mask).sum() / valid_mask.sum().clamp(min=1)).detach()
+            metrics["ponder"] = ponder.detach()
+            metrics["lambda_ponder_now"] = lambda_ponder_now
+
             accelerator.backward(loss)
             # clip on the real update step only (matters once gradient accumulation > 1).
             # accelerator.clip_grad_norm_ unscales/handles the wrapped params correctly.
@@ -110,7 +117,7 @@ def train_step(
     if scheduler is not None and accelerator.sync_gradients:
         scheduler.step()
 
-    return loss, loss_ce, aux_loss.detach()
+    return loss, loss_ce, aux_loss.detach(), metrics
 
 def build_scheduler(optimizer: optim.Optimizer):
     # linear warmup -> cosine decay, adjusted for the current total steps
@@ -370,6 +377,7 @@ def pretrain():
             g_file, g_record, g_shard = start_file_idx, start_record_idx, start_shard_tc
         return positions, g_file, g_record, g_shard
 
+    stop_training = False
     try:
         for epoch in range(start_epoch, TrainingConfig.num_epochs):
             resume_epoch = resumed and epoch == start_epoch
@@ -417,7 +425,7 @@ def pretrain():
                     noise_factor = max(0.0, 1.0 - unwrapped_model.token_count / TrainingConfig.noise_anneal_tokens)
                     unwrapped_model.moe.set_router_noise(noise_factor)
 
-                loss, loss_ce, aux_loss = train_step(
+                loss, loss_ce, aux_loss, metrics = train_step(
                     model,
                     input_ids,
                     cu_seqlens,
@@ -428,11 +436,13 @@ def pretrain():
                     optimizer=optimizer,
                     scheduler=scheduler,
                 )
-                    
-                
+
+
                 dataset_idx = step
 
-                # logging pulls loss/aux/token-count to the host (syncs). Throttle to LOG_INTERVAL.
+                # logging pulls loss/aux/token-count/metrics to the host (syncs). Throttle to
+                # LOG_INTERVAL -- everything read here (metrics dict, loop_scale) stayed a tensor
+                # until this point, so this is the only sync, same cadence as the existing ones.
                 if step % LOG_INTERVAL == 0:
                     val_loss = loss.item()
                     losses.append(val_loss)
@@ -441,7 +451,52 @@ def pretrain():
                     tokens_per_sec = (n_tokens - last_token_count) / max(now - last_log_time, 1e-6)
                     last_token_count = n_tokens
                     last_log_time = now
-                    logger.info(f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | Aux Loss: {aux_loss.item():.4f} | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min")
+
+                    # PLAN.md Step 7 instrumentation: loop_scale, halt/correctness/confidence
+                    # signals, and per-loop CE, all through unwrap_model per the training-loop rule.
+                    loop_scale = unwrapped_model.moe.loop_scale.item()
+                    per_loop_ce_str = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
+                    p_halt_mean = metrics["p_halt_mean"].item()
+                    ponder_val = metrics["ponder"].item()
+                    conf_loss_val = metrics["conf_loss"].item() if metrics["conf_loss"] is not None else float("nan")
+                    p_correct_val = metrics["p_correct"].item() if metrics["p_correct"] is not None else float("nan")
+                    p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
+                    top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
+
+                    logger.info(
+                        f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
+                        f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} (lambda={metrics['lambda_ponder_now']:.2e}) | "
+                        f"Conf Loss: {conf_loss_val:.4f} | loop_scale: {loop_scale:.4f} | p_halt: {p_halt_mean:.4f} | "
+                        f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
+                        f"per-loop CE: [{per_loop_ce_str}] | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
+                        f"Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min"
+                    )
+
+                    # stop at the token budget the LR schedule is anchored to (PLAN.md Step 6) --
+                    # checked at this same sync-free-until-now cadence, not per step. Without this,
+                    # a run with more data than target_tokens keeps training past the schedule at
+                    # eta_min instead of stopping where the cosine decay was anchored.
+                    if n_tokens >= TrainingConfig.target_tokens:
+                        logger.info(f"Reached target_tokens ({TrainingConfig.target_tokens:,}); saving final checkpoint and stopping.")
+                        worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
+                        save_checkpoint(
+                            unwrapped_model,
+                            optimizer,
+                            scheduler,
+                            epoch,
+                            dataset_idx,
+                            path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
+                            token_count=n_tokens,
+                            file_idx=resume_file_idx,
+                            record_idx=resume_record_idx,
+                            shard_token_count=resume_shard_tc,
+                            losses=losses,
+                            file_order=dataset.file_order,
+                            worker_positions=worker_positions,
+                            num_data_workers=NUM_DATA_WORKERS,
+                        )
+                        stop_training = True
+                        break
 
                 if step % unwrapped_model.moe.expert_tracker.sliding_window_size == 0:
                     stats = unwrapped_model.moe.expert_tracker.get_stats()
@@ -454,8 +509,9 @@ def pretrain():
                     except Exception as e:
                         logger.error(f"Error occurred while saving loss graph: {e}")
 
-                # save checkpoint every 5000 steps
-                if (step % 5000 == 0) and (local_step > 0):
+                # save checkpoint every 1500 steps (was 5000, PLAN.md Step 6 -- makes the run
+                # interruptible at a granularity that matches the vast.ai preemptible-instance flow)
+                if (step % 1500 == 0) and (local_step > 0):
                     worker_positions, resume_file_idx, resume_record_idx, resume_shard_tc = snapshot_resume_positions()
                     save_checkpoint(
                         unwrapped_model,
@@ -474,6 +530,8 @@ def pretrain():
                         num_data_workers=NUM_DATA_WORKERS,
                     )
             dataset_idx = 0
+            if stop_training:
+                break
     except KeyboardInterrupt:
         try:
             input("Training interrupted. Press Enter to save checkpoint and exit...")

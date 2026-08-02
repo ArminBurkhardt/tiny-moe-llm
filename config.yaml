@@ -33,7 +33,7 @@ training:
   lr: 4e-4
   weight_decay: 0.02
   grad_clip: 1.0
-  num_epochs: 10
+  num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient
   target_tokens: 5000000000 # 5b tokens

@@ -105,7 +105,8 @@ Constraints worth remembering:
   uint16). **Asserted at model construction** (`TinyMoETransformer.__init__`, PLAN.md Step 5) --
   distinct from `loop_ce_weights`' config-load-time assert above.
 - Things *not* in the yaml but hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL=10`, checkpoint
-  every 5000 steps ([pretrain.py](scripts/pretrain.py)), expert head counts `n_heads=16 /
+  every 1500 steps (was 5000, PLAN.md Step 6 -- interruptible-instance granularity)
+  ([pretrain.py](scripts/pretrain.py)), expert head counts `n_heads=16 /
   n_kv_heads=4` and `rope_theta` ([moe.py](modules/model/moe.py)), `CE_CHUNK_SIZE=2048`
   ([mtp.py](modules/model/mtp.py)).
 - `TinyMoETransformer.__init__` prints total/active param counts and a forward FLOP/token estimate
@@ -256,6 +257,24 @@ for a sync-free (slightly stale) value; assign `.num_tokens` to restore on resum
 - Anything touching `has_mtp`, `lm_head`, `mtp_head`, `_token_tracker`, or `moe` must go through
   `accelerator.unwrap_model(model)`; the DDP wrapper has none of those attributes.
 - `KeyboardInterrupt` prompts on stdin before saving an `*_interrupted.pt`.
+- **Training stops at `target_tokens`, not a fixed epoch count** (PLAN.md Step 6): `num_epochs: 1`
+  in `config.yaml` now just bounds the outer loop as a safety net; the real stop condition is
+  `n_tokens >= TrainingConfig.target_tokens`, checked inside the existing `LOG_INTERVAL` block (the
+  sync-free counter is already being drained there for logging, so this adds no extra sync). On
+  hitting it, a final checkpoint is saved (same `save_checkpoint` call as the periodic one) before
+  breaking both loops via a `stop_training` flag. Without this, a dataset bigger than `target_tokens`
+  would keep training past the point the cosine LR schedule was anchored to, wasting the phase-2
+  anneal (see PLAN.md's "Budget decision").
+- **`compute_mtp_loss(..., return_metrics=True)`** (PLAN.md Step 7) returns a 3rd value, a dict of
+  still-on-device tensors: `per_loop_ce` (list, one per loop), `conf_loss`, `p_correct`, `p_max`,
+  `top1_acc` (the last three `None` if `correct_proj` wasn't passed). `train_step` adds `p_halt_mean`,
+  `ponder`, and `lambda_ponder_now` (already host-side, see the ponder ramp above) to the same dict
+  and returns it as a 4th value. Default `return_metrics=False` (2-tuple return) is unchanged, so
+  existing test call sites don't need updating. The metrics are cheap reductions over each chunk's
+  *already-materialized* logits/`correct_logit` inside `_chunked_linear_ce`'s existing chunked/
+  checkpointed loop — not a second forward pass — so requesting them doesn't add a real sync or
+  meaningfully more compute; only `.item()`-ing the dict's values (done once, inside the
+  `LOG_INTERVAL` block) is the actual host sync.
 
 ## Checkpoints & resume
 
