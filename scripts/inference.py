@@ -101,8 +101,8 @@ def main():
     )
     parser.add_argument(
         "--tokenizer", "-t",
-        default=os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer"),
-        help="Path to the tokenizer directory (default: DeepSeek-V4-Pro-tokenizer)",
+        default=os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536"),
+        help="Path to the tokenizer directory (default: DeepSeek-V4-Pro-tokenizer-65536)",
     )
     parser.add_argument(
         "--prompt", "-p",

@@ -11,7 +11,7 @@ MoE block applied `n_loops` times** (LoopLM-style recurrence), with a heterogene
 experts, a per-loop halt head, and multi-token prediction heads. Trained on document-packed
 streams with flash-attn varlen attention, optionally in FP8/NVFP4 via NVIDIA Transformer Engine.
 
-Research code, not a library: no packaging, no test framework, no CI. Entry points are the two
+Research code, not a library: no packaging, no test framework, no CI. Entry points are the
 scripts under [scripts/](scripts/).
 
 ## Layout
@@ -25,6 +25,7 @@ env_init                    WSL/CUDA env + venv activation (gitignored, `source 
 scripts/
   pretrain.py               THE training loop
   inference.py              greedy/top-k sampling CLI
+  prune_vocab.py            one-shot 129280 -> 65536 vocab prune (Step 8), not part of training
 modules/model/
   transformer.py            TinyMoETransformer (top level) + TokenTracker
   gemma4.py                 dense decoder: GQA, RoPE, RMSNorm(te), per-layer embeddings
@@ -232,6 +233,36 @@ for a sync-free (slightly stale) value; assign `.num_tokens` to restore on resum
 
 **Tokenizer quirk**: with the DeepSeek tokenizer `pad_token_id == eos_token_id`, and id 0 is BOS.
 `Gemma4TextModel.embed_tokens` therefore has **no `padding_idx`** — setting one froze BOS at zero.
+Both invariants (and the byte-level round-trip guarantee) carry over unchanged into the pruned
+65536-vocab tokenizer below — they hold on the *old* id numbering trivially, and the prune's id
+remap sorts kept old ids ascending before renumbering, so id 0 (the global minimum, always kept)
+lands on new id 0 again and the single pad/eos id keeps whatever new id it's remapped to.
+
+**Vocab prune** (`scripts/prune_vocab.py`, PLAN.md Step 8): `ckpts/pretrained/DeepSeek-V4-Pro-tokenizer`
+(129280 tokens) is pruned to exactly 65536 so `scripts/prepare_data.py`'s `train.bin` (Step 11) can
+be uint16 instead of uint32 — a disk constraint, not a param-count one. `scripts/pretrain.py` and
+`scripts/inference.py` both point at the pruned `ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536`
+by default. The prune script:
+- Samples ~2GB of text from a **local stand-in** for Step 11's phase-1 mix (`data_config.json`'s
+  `pretrain` sources: `fineweb`=web -- absorbing the DCLM/FinePDFs weight that has no local shard,
+  `nemotron-pre-specialized-v1.1`=code, `nemotron-pre-math-v1/4plus_MIND`=math, `wikipedia/en`=wiki;
+  `nemotron-pre-specialized-v1`/InfiniByte-Reasoning is deliberately excluded, it isn't one of
+  Step 11's phase-1 rows), counts how often the **current** tokenizer emits each of its 128000 base
+  BPE ids over that sample, and keeps the most frequent ones.
+- Every special/added token (1283 ids) and the 256-entry byte-level alphabet are unconditionally
+  required regardless of frequency — with `byte_fallback` disabled on this tokenizer, that
+  alphabet is the only thing guaranteeing arbitrary text stays encodable after merges are dropped.
+- Kept tokens are closed under BPE merge dependency (`select_kept_ids`/`closure` in the script): a
+  multi-piece token is only kept if both the pieces it was merged from are kept too, recursively
+  down to the byte alphabet — "a kept merge never depends on a dropped one."
+- The id remap sorts all kept *old* ids ascending and renumbers `0..65535`, which is why BOS
+  staying at id 0 and pad==eos need no special-casing (see above). Written alongside the new
+  tokenizer as `id_remap.json`.
+- Gated on **fertility** (tokens/byte), not round-trip identity — byte-level fallback makes
+  round-trips pass almost regardless of prune damage; the real cost of a bad prune is common text
+  costing more tokens. Measured on a held-out ~200MB sample (disjoint files from the frequency
+  sample, same source mix) via `manifest.json`'s `vocab_prune` key; last measured overall
+  regression 0.15% (well under the 3% acceptance bound), worst single source (wiki) 0.37%.
 
 ## Training loop notes ([scripts/pretrain.py](scripts/pretrain.py))
 

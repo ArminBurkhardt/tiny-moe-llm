@@ -247,7 +247,7 @@ def save_loss_graph(losses, path):
     plt.close()
 
 def pretrain():
-    GEMMA4_TOKENIZER_PATH = os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer") # "gemma4-tokenizer"
+    GEMMA4_TOKENIZER_PATH = os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536") # pruned to fit uint16 (PLAN.md Step 8), matches config.yaml's vocab_size: 65536
     tokenizer = AutoTokenizer.from_pretrained(GEMMA4_TOKENIZER_PATH)
     
     logger.info(f"Tokenizer loaded from {GEMMA4_TOKENIZER_PATH} with vocab size {tokenizer.vocab_size}")
