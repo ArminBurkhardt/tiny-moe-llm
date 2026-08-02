@@ -38,6 +38,26 @@ nvfp4_recipe = NVFP4BlockScaling(
 USE_LOW_PRECISION = os.environ.get("USE_FP8", "0") == "1"
 chosen_recipe = fp8_recipe if USE_LOW_PRECISION else None
 
+# dense (non-sparse) BF16 tensor-core peak TFLOPS, for the MFU estimate in the training log
+# (PLAN.md's Step 11 budget decision). NVIDIA's marketing figures are 2:4-sparse (2x dense) --
+# 209.5 TFLOPS here is the 5090's sparse 419 halved; 990 TFLOPS matches PLAN.md's own H100 SXM
+# assumption. Matched by substring against torch.cuda.get_device_name(0); add entries here as
+# needed rather than guessing a number for an unrecognized GPU.
+GPU_BF16_PEAK_TFLOPS = {
+    "RTX 5090": 209.5e12,
+    "H100": 990e12,
+}
+
+
+def detect_gpu_peak_flops():
+    if not torch.cuda.is_available():
+        return None
+    name = torch.cuda.get_device_name(0)
+    for key, peak in GPU_BF16_PEAK_TFLOPS.items():
+        if key in name:
+            return peak
+    return None
+
 def train_step(
     model: TinyMoETransformer,
     input_ids: torch.Tensor,
@@ -266,7 +286,15 @@ def pretrain():
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
-    
+
+    gpu_peak_flops = detect_gpu_peak_flops()
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        if gpu_peak_flops is not None:
+            logger.info(f"GPU: {gpu_name} | assumed BF16 dense peak: {gpu_peak_flops / 1e12:.1f} TFLOPS (MFU will be logged)")
+        else:
+            logger.warning(f"GPU: {gpu_name} not in GPU_BF16_PEAK_TFLOPS -- MFU will be logged as n/a, add an entry to enable it")
+
     model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
@@ -410,6 +438,15 @@ def pretrain():
                     last_token_count = n_tokens
                     last_log_time = now
 
+                    # MFU estimate: training FLOPs/token ~= 3x the forward estimate printed at
+                    # construction (fwd+bwd+recompute, PLAN.md's convention -- see Step 11's budget
+                    # decision). n/a on an unrecognized GPU rather than a silently wrong number.
+                    if gpu_peak_flops is not None:
+                        training_flops_per_token = 3 * unwrapped_model.flops_per_token_fwd
+                        mfu_str = f"{100 * tokens_per_sec * training_flops_per_token / gpu_peak_flops:.1f}%"
+                    else:
+                        mfu_str = "n/a"
+
                     # PLAN.md Step 7 instrumentation: loop_scale, halt/correctness/confidence
                     # signals, and per-loop CE, all through unwrap_model per the training-loop rule.
                     loop_scale = unwrapped_model.moe.loop_scale.item()
@@ -427,7 +464,7 @@ def pretrain():
                         f"Conf Loss: {conf_loss_val:.4f} | loop_scale: {loop_scale:.4f} | p_halt: {p_halt_mean:.4f} | "
                         f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
                         f"per-loop CE: [{per_loop_ce_str}] | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
-                        f"Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min"
+                        f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min"
                     )
 
                     # stop at the token budget the LR schedule is anchored to (PLAN.md Step 6) --

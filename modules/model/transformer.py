@@ -199,6 +199,7 @@ class TinyMoETransformer(nn.Module):
         # approximation otherwise (embeddings excluded -- lookups, not matmuls); this is an
         # estimate, not a measured MFU number.
         flops_per_token = 2 * (non_moe_params + n_loops * moe_active_params)
+        self.flops_per_token_fwd = flops_per_token  # read by scripts/pretrain.py's MFU logging
         logger.info(
             f"params: total={total_params/1e6:.1f}M active={active_params/1e6:.1f}M "
             f"(excl. emb={active_excl_emb/1e6:.1f}M) | forward FLOP/token ~= {flops_per_token/1e6:.0f}M"
