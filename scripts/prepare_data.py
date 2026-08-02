@@ -17,9 +17,10 @@ the bin/idx pairing, and never silently skips or double-counts a document. This 
 codebase's existing resume philosophy (see the mmap Dataset's doc-granular resume): bounded,
 harmless redo beats exact-replay complexity.
 
-Nemotron-CC-Code/Math are Hub-gated -- set HF_TOKEN and accept each dataset's access request at
-https://huggingface.co/datasets/<repo_id> before running, or those two sources fail fast with a
-clear error instead of hanging.
+Nemotron-CC-Math is Hub-gated -- set HF_TOKEN and accept the dataset's access request at
+https://huggingface.co/datasets/<repo_id> before running, or that source fails fast with a
+clear error instead of hanging. The code source (`common-pile/stackv2_edu_filtered`) is fully
+public -- no token or access request needed.
 
 NOTE: PLAN.md's phase-1 mix-ratio row sums to 90%, not 100% (55+10+7+12+3+3) -- likely a spec gap
 rather than an intentional 10% gap. We preserve the relative ratios and renormalize to 100% of
@@ -60,7 +61,7 @@ class SourceSpec:
     repo_id: str
     file_prefix: str
     file_suffix: tuple
-    format: str                                   # "parquet" | "jsonl.zst"
+    format: str                                   # "parquet" | "jsonl.zst" | "jsonl.gz"
     text_columns: tuple = ("text",)                # first matching column wins, auto-detected at runtime
     messages_field: Optional[str] = None           # if set, render chat turns instead of text_columns
     file_filter: Optional[Callable[[str], bool]] = None
@@ -82,8 +83,12 @@ SOURCES = [
                format="jsonl.zst", text_columns=("text",), phase1_weight=0.10, phase2_weight=0.0),
     SourceSpec("finepdfs", "HuggingFaceFW/finepdfs-edu", "eng_Latn/", (".parquet",),
                format="parquet", text_columns=("text",), phase1_weight=0.07, phase2_weight=0.10),
-    SourceSpec("nemotron_code", "nvidia/Nemotron-CC-Code-v1", "data/", (".parquet",),
-               format="parquet", text_columns=("text", "content", "code"), gated=True,
+    # Common Pile's stack-edu re-release: Stack-Edu's educational-quality code selection with
+    # actual text materialized (unlike HuggingFaceTB/stack-edu, which only ships SWHIDs and
+    # needs a separate Software Heritage S3 reconstruction step), filtered to openly-licensed
+    # repos only (Blue Oak Council list) -- fully public, no gate, no access request.
+    SourceSpec("code_edu", "common-pile/stackv2_edu_filtered", "", (".json.gz",),
+               format="jsonl.gz", text_columns=("text",),
                phase1_weight=0.12, phase2_weight=0.22),
     SourceSpec("nemotron_math", "nvidia/Nemotron-CC-Math-v1", "4plus/", (".parquet",),
                format="parquet", text_columns=("text", "content"), gated=True,
@@ -116,6 +121,15 @@ def read_jsonl_zst(path: str) -> Iterator[dict]:
                 yield json.loads(line)
 
 
+def read_jsonl_gz(path: str) -> Iterator[dict]:
+    import gzip
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+
 def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
     """returns this file's documents as a list[str], shuffled at document granularity
     (PLAN.md: "shuffle at document granularity within each phase")."""
@@ -132,9 +146,10 @@ def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
         df = pd.read_parquet(local_path)
         col = pick_text_column(set(df.columns), spec.text_columns, spec.key)
         texts = [t for t in df[col].dropna().astype(str).tolist() if t]
-    elif spec.format == "jsonl.zst":
+    elif spec.format in ("jsonl.zst", "jsonl.gz"):
+        reader = read_jsonl_zst if spec.format == "jsonl.zst" else read_jsonl_gz
         texts, col = [], None
-        for row in read_jsonl_zst(local_path):
+        for row in reader(local_path):
             if col is None:
                 col = pick_text_column(set(row.keys()), spec.text_columns, spec.key)
             t = row.get(col)

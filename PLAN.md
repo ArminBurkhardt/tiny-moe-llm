@@ -501,13 +501,19 @@ reconstruction, sliceable by file):
 | `HuggingFaceFW/fineweb-edu` | `data/CC-MAIN-2025-26/`, partial | 15B |
 | `mlfoundations/dclm-baseline-1.0` | handful of global shards | 2.5B |
 | `HuggingFaceFW/finepdfs-edu` | `eng_Latn`, few files | 2.2B |
-| `nvidia/Nemotron-CC-Code-v1` | few shards | 4B |
+| `common-pile/stackv2_edu_filtered` | few `.json.gz` shards | 4B |
 | `nvidia/Nemotron-CC-Math-v1` | config `4plus`, few shards | 2B |
 | `wikimedia/wikipedia` | `20231101.en`, subset | 1.1B |
 | `HuggingFaceTB/smoltalk2` | non-reasoning splits, whole | 0.7B |
 
-Do **not** substitute `HuggingFaceTB/stack-edu`, `nvidia/Nemotron-Pretraining-Code-v1/v2`, or
-`HuggingFaceTB/smollm-corpus` — all need reconstruction from an external store or are superseded.
+Do **not** substitute `HuggingFaceTB/stack-edu` (real text needs a separate Software Heritage S3
+reconstruction pass), `nvidia/Nemotron-Pretraining-Code-v1/v2`, or `HuggingFaceTB/smollm-corpus` —
+all need reconstruction from an external store or are superseded. `nvidia/Nemotron-CC-Code-v1` was
+the original code row here but is Hub-gated behind NVIDIA's manual, org-only approval (rejects
+independent-developer requests); `common-pile/stackv2_edu_filtered` is the Common Pile project's
+fully public re-release of the same Stack-Edu educational-code selection with text already
+materialized (openly-licensed repos only, gzipped JSONL, no gate) — it didn't exist when this
+table was first written.
 
 Write two bin/idx pairs, sources **interleaved at mix ratios during writing** (straight
 sequential read at train time, no online sampling):
@@ -517,7 +523,7 @@ sequential read at train time, no online sampling):
 | FineWeb-Edu | 55% | 15% |
 | DCLM-baseline | 10% | — |
 | FinePDFs-Edu | 7% | 10% |
-| Nemotron-CC-Code | 12% | 22% |
+| Stack-Edu-code (Common Pile) | 12% | 22% |
 | Nemotron-CC-Math `4plus` | 3% | 30% |
 | Wikipedia | 3% | 8% |
 | SmolTalk2 | — | 15% |

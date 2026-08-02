@@ -294,7 +294,7 @@ requirement here, not an afterthought.
   `swrr` dict), not written source-by-source then concatenated -- `modules/data/dataset.py` reads
   sequentially with no shuffling, so the mix ratio has to already be baked into on-disk order.
 - **`PLAN.md`'s phase-1 mix row sums to 90%, not 100%** (55+10+7+12+3+3, FineWeb/DCLM/FinePDFs/
-  Nemotron-Code/Nemotron-Math/Wikipedia) -- almost certainly a spec gap rather than an intentional
+  Stack-Edu-code/Nemotron-Math/Wikipedia) -- almost certainly a spec gap rather than an intentional
   10% shortfall. `run_phase`'s caller renormalizes each phase's active weights to sum to 1.0,
   preserving relative ratios rather than leaving part of the token budget unwritten. Revisit if
   PLAN.md is ever corrected with an explicit 8th phase-1 row.
@@ -316,11 +316,21 @@ requirement here, not an afterthought.
   is still exactly gap-free and repeat-free across the boundary (what `test_prepare_data.py`
   actually checks), and the acceptance bar is realized token counts within 2% of target, not exact
   byte-for-byte reproducibility.
-- **Gated sources** (`nvidia/Nemotron-CC-Code-v1`, `nvidia/Nemotron-CC-Math-v1`, `SourceSpec.gated
-  =True`) need `HF_TOKEN` set *and* the dataset's access request accepted on huggingface.co first;
-  `main()` and the per-file downloader both fail with that hint on a 401/403 instead of hanging.
+- **Gated sources**: only `nvidia/Nemotron-CC-Math-v1` (`SourceSpec.gated=True`) needs `HF_TOKEN`
+  set *and* the dataset's access request accepted on huggingface.co first; `main()` and the
+  per-file downloader both fail with that hint on a 401/403 instead of hanging. The code source
+  (`common-pile/stackv2_edu_filtered`, key `code_edu`) replaced the originally-planned
+  `nvidia/Nemotron-CC-Code-v1` -- NVIDIA's gate on that one requires a recognized-org account and
+  was rejecting independent-developer access requests outright, not just delaying them. Common
+  Pile's release is fully public: it's Stack-Edu's educational-quality code selection (same
+  classifier-based curation, filtered to openly-licensed repos only) with the actual `text`
+  re-materialized as gzipped JSONL, sidestepping the Software Heritage-ID reconstruction step that
+  the *original* `HuggingFaceTB/stack-edu` would have required (that's why PLAN.md's Step 11 table
+  explicitly ruled plain `stack-edu` out -- the Common Pile derivative didn't exist yet when that
+  was written). Format is `"jsonl.gz"`, read via Python's stdlib `gzip` (no new dependency, unlike
+  `dclm`'s `zstandard`-based `"jsonl.zst"`).
 - **Text column is auto-detected at runtime**, not hardcoded, via `SourceSpec.text_columns`
-  candidate tuples (`pick_text_column`) -- several sources here (the two gated Nemotron ones
+  candidate tuples (`pick_text_column`) -- several sources here (the gated Nemotron-Math one
   especially) had schemas that couldn't be verified offline; failing loudly with the actual
   observed columns beats silently reading the wrong field for 25B tokens unattended.
 - `smoltalk2`'s `messages` field is rendered as plain `"role: content"` turns (not a real chat
