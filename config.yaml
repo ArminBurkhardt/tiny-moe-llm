@@ -42,7 +42,15 @@ training:
   warmup_steps: 30 # GATE4 TEST -- real value: 1000. At grad_accumulation_steps=4 this is ~3.9M tokens (~9% of
                    # the 45M target); the real 1000 steps would be ~524M tokens, more than this whole test run.
   noise_anneal_tokens: 10000000 # GATE4 TEST -- real value: 1000000000, scaled proportionally down
-  lambda_ponder: 3e-3 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens
+  lambda_ponder: 0.05 # GATE4 TEST -- was 3e-3, then 0.5. Two measured points now bracket the band:
+                     # 3e-3 -> p_halt plateaus ~0.003-0.006 (CE gradient dominates, never enters
+                     # band); 0.5 -> p_halt plateaus ~0.73-0.75 (ponder dominates, loop's (1-p_halt)
+                     # update gets ~75% muted, which is why the idx1380 loss curve goes flat right
+                     # as p_halt climbs -- ponder was strangling the mechanism it's meant to just
+                     # discourage). Treating p_halt as sigmoid(a + b*ln(lambda)) and fitting those
+                     # two points targets p_halt~0.15 (mid-band) at lambda~0.05 -- extrapolated, not
+                     # independently measured. Read off the real Gate 4 run's own logs rather than
+                     # spending another dedicated test-config run on it.
   ponder_warmup_tokens: 8000000 # GATE4 TEST -- real value: 1000000000. Ponder turns on at ~18% into the run so
                                 # there's still runway afterward to check loop_scale doesn't collapse once it does.
   ponder_ramp_tokens: 8000000 # GATE4 TEST -- real value: 1000000000. Full lambda_ponder weight by ~36% into the
