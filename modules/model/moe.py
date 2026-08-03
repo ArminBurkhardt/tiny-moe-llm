@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -176,6 +178,9 @@ class LoopMixtureOfExperts(nn.Module):
         ir_residual: bool = False,
         max_seq_len: int = 4096,
         rope_theta: float = 100000.0,
+        loop_scale_init: float = None,
+        loop_enc_dim: int = 32,
+        max_enc_loops: int = 64,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -192,6 +197,15 @@ class LoopMixtureOfExperts(nn.Module):
             num_ir_entries (int, optional): number of entries in the information retrieval expert. Defaults to 1024.
             ir_dim (int, optional): dimension of the information retrieval experts latent space. Defaults to 128.
             ir_residual (bool, optional): whether the information retrieval expert should have a residual connection. Defaults to False.
+            loop_scale_init (float, optional): init value for every entry of the per-loop
+                ``loop_scale`` gate. Defaults to ``1 / sqrt(n_loops)``, which makes the whole loop
+                stack contribute roughly as much variance as the dense decoder's output at init
+                instead of the ~1.5% a 0.1 init gave.
+            loop_enc_dim (int, optional): width of the sinusoidal loop-index encoding that biases
+                the router per loop. Defaults to 32.
+            max_enc_loops (int, optional): size of the precomputed loop-encoding table. Loop
+                indices past it reuse the last row, so running more loops at inference than were
+                trained still works. Defaults to 64.
         """
         super().__init__()
         self._num_mlp_experts = num_mlp_experts
@@ -258,13 +272,46 @@ class LoopMixtureOfExperts(nn.Module):
         self.post_norm = RMSNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
 
-        # LayerScale/ReZero-style gate: loop starts as a near-no-op, learns how much refinement to apply.
-        # init 0.1, NOT 0: at loop_scale == 0 the CE loss has exactly zero gradient wrt p_halt,
-        # so the ponder term becomes the halt head's only signal, saturates p_halt at 1, and freezes
-        # loop_scale in turn -- the whole loop silently goes dead while the loss curve still descends.
+        # LayerScale/ReZero-style gate, ONE ENTRY PER LOOP: each loop learns independently how much
+        # refinement it contributes, instead of all n_loops sharing a single scalar.
+        #
+        # init 1/sqrt(n_loops), NOT 0 and not 0.1. Two constraints meet here:
+        #   * strictly > 0, because at loop_scale == 0 the CE loss has exactly zero gradient wrt
+        #     p_halt, so the ponder term becomes the halt head's only signal, saturates p_halt at 1,
+        #     and freezes loop_scale in turn -- the loop silently goes dead while the loss still
+        #     descends (tests/test_ponder_deadlock.py).
+        #   * large enough to matter. post_norm makes every delta unit-RMS, so with the old 0.1 the
+        #     n_loops deltas summed to ~sqrt(n_loops)*0.1 ~ 0.17 against a unit-RMS decoder output:
+        #     the entire MoE block (most of the model's parameters) was a ~1.5% perturbation, and a
+        #     lone scalar at lr=4e-4 cannot climb out of that inside a short run. 1/sqrt(n_loops)
+        #     puts the loop stack at ~1.0, i.e. on par with the decoder, from step 0.
         # not the same mechanism as gemma4's layer_scalar (init-1 gain on a whole layer output) --
         # that precedent doesn't transfer to this init value.
-        self.loop_scale = nn.Parameter(torch.full((1,), 0.1))
+        # excluded from weight decay by scripts/pretrain.py's param grouping (ndim <= 1): decaying
+        # this toward 0 is decaying the loop toward "off".
+        loop_scale_init = loop_scale_init if loop_scale_init is not None else 1.0 / math.sqrt(n_loops)
+        self.loop_scale = nn.Parameter(torch.full((n_loops,), float(loop_scale_init)))
+
+        # per-loop router conditioning: without it the router sees near-identical inputs on every
+        # loop (consecutive loop inputs differ only by loop_scale * unit-RMS delta), picks the same
+        # top_k experts all n_loops times, and the recurrence degenerates into running one expert
+        # pair n_loops times over.
+        #
+        # encoded as a SINUSOIDAL function of the absolute loop index rather than a learned
+        # [n_loops, num_experts] table, so the loop count is not baked into the weights: any loop
+        # index has a defined encoding, and n_loops can be changed at inference (see forward's
+        # n_loops override). Precomputed as a table so per-loop lookup is a device index, never a
+        # host->device copy in the step path.
+        loop_enc_dim = int(loop_enc_dim) // 2 * 2  # sin/cos halves
+        inv_freq = 1.0 / (100.0 ** (torch.arange(0, loop_enc_dim, 2).float() / loop_enc_dim))
+        angles = torch.arange(max_enc_loops).float().unsqueeze(1) * inv_freq.unsqueeze(0)
+        self.register_buffer(
+            "loop_enc", torch.cat([angles.sin(), angles.cos()], dim=-1), persistent=False
+        )  # [max_enc_loops, loop_enc_dim]
+        # zero-init: the loop bias starts as an exact no-op, so routing at step 0 is identical to
+        # the un-conditioned router and this cannot perturb the load-balance loss at init.
+        self.loop_router_bias = nn.Linear(loop_enc_dim, self.num_experts, bias=False)
+        nn.init.zeros_(self.loop_router_bias.weight)
 
         # soft, differentiable halting gate (PLAN.md Step 3a): a compute-allocation signal
         # ("is more refinement useful here"), not a correctness signal (see Step 4b's separate
@@ -285,12 +332,24 @@ class LoopMixtureOfExperts(nn.Module):
         """index of the first MLP expert in the flat router pool: [self-attn x A | cross-attn x A | IR x I | MLP x M]."""
         return self._num_attn_experts + self._num_ir_experts
     
-    def route(self, hidden_states: torch.Tensor, temperature: float = 1.0):
+    def loop_bias(self, loop_idx: int) -> torch.Tensor:
+        """per-loop additive bias on the router logits, shape [num_experts].
+
+        Derived from a sinusoidal encoding of the *absolute* loop index, so it is defined for any
+        index -- ``n_loops`` is a runtime choice, not something baked into the weight shapes.
+        Indices past the precomputed table reuse its last row.
+        """
+        row = min(int(loop_idx), self.loop_enc.size(0) - 1)
+        return self.loop_router_bias(self.loop_enc[row].to(self.loop_router_bias.weight.dtype))
+
+    def route(self, hidden_states: torch.Tensor, temperature: float = 1.0, loop_idx: int = 0):
         """routes tokens to experts and computes the load balancing loss
 
         Args:
             hidden_states (torch.Tensor): [batch_size, seq_len, hidden_size]
             temperature (float, optional): temperature for the router. Defaults to 1.0.
+            loop_idx (int, optional): which loop this call belongs to, used for the per-loop router
+                bias so consecutive loops do not all select the same experts. Defaults to 0.
 
         Returns:
             topk_scores (torch.Tensor): [batch_size, seq_len, top_k] normalized scores for the selected experts
@@ -300,24 +359,29 @@ class LoopMixtureOfExperts(nn.Module):
             load_balancing_loss (torch.Tensor): auxiliary loss to encourage balanced routing
         """
         expert_logits = self.router(hidden_states, temperature=temperature)       # [batch_size, seq_len, num_experts] raw logits
+        # broadcasts over [B, S, num_experts]; zero-init, so a no-op until it learns something
+        expert_logits = expert_logits + self.loop_bias(loop_idx)
 
         # single softmax over the logits gives both the load balancing signal and the selection distribution
         expert_scores = F.softmax(expert_logits / temperature, dim=-1)
-        load_balancing_loss = compute_aux_loss(torch.topk(expert_scores, self.top_k, dim=-1)[1], expert_scores, self.num_experts)
 
-        # select topk experts
+        # one topk, reused for both the aux loss and the selection (the aux loss only needs the
+        # indices, which the score normalization below does not change)
         topk_scores, topk_indices = torch.topk(expert_scores, self.top_k, dim=-1) # [batch_size, seq_len, top_k], [batch_size, seq_len, top_k]
-        
+        load_balancing_loss = compute_aux_loss(topk_indices, expert_scores, self.num_experts)
+
         # normalize the topk scores
         topk_scores = topk_scores / torch.sum(topk_scores, dim=-1, keepdim=True)
-        
+
         # track expert selection stats
         self.expert_tracker.update(topk_indices, topk_scores, expert_scores)
-        
+
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None):
-        topk_scores, topk_indices, load_balancing_loss = self.route(hidden_states, temperature=self.temperature)
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0):
+        topk_scores, topk_indices, load_balancing_loss = self.route(
+            hidden_states, temperature=self.temperature, loop_idx=loop_idx
+        )
 
         # index placement in the scores would be:
         # [attn_experts..., num_ir_experts..., ff_experts...]
@@ -335,13 +399,24 @@ class LoopMixtureOfExperts(nn.Module):
             elif isinstance(self.experts[i], CrossAttention):
                 expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings))
 
-        # accumulate weighted outputs. mask multiply avoids mask.sum() device syncs. yay more tokens per second
-        for k in range(self.top_k):
-            expert_indices_k = topk_indices[..., k]   # [B, S]
-            expert_scores_k = topk_scores[..., k]     # [B, S]
-            for i in range(self.first_mlp_index):
-                mask = (expert_indices_k == i).unsqueeze(-1)                         # [B, S, 1]
-                output = output + mask * expert_scores_k.unsqueeze(-1) * expert_cache[i]
+        # accumulate the non-MLP experts' weighted outputs. still a mask multiply (never
+        # mask.sum()/boolean indexing -- that's a per-expert device sync), but the per-(slot, expert)
+        # masks are folded into ONE [B, S, first_mlp_index] gate tensor first: the old
+        # top_k * first_mlp_index nested loop built that many [B, S, H] intermediates and kept every
+        # one of them alive for backward.
+        if self.first_mlp_index > 0:
+            dense_slot = topk_indices < self.first_mlp_index
+            dense_gate = torch.zeros(
+                *topk_indices.shape[:-1], self.first_mlp_index,
+                device=topk_scores.device, dtype=topk_scores.dtype,
+            )
+            dense_gate.scatter_add_(
+                -1,
+                torch.where(dense_slot, topk_indices, torch.zeros_like(topk_indices)),
+                topk_scores * dense_slot.to(topk_scores.dtype),
+            )
+            for i, cached in enumerate(expert_cache):
+                output = output + dense_gate[..., i].unsqueeze(-1) * cached
 
         # routed tokens to parallel experts. non-MLP slots collapse to (index 0, weight 0) via
         # mask multiply -- never mask.sum()/boolean indexing (per-expert device sync)
@@ -354,17 +429,19 @@ class LoopMixtureOfExperts(nn.Module):
             mlp_scores,
             mlp_indices
         )
-        output += parallel_output
+        output = output + parallel_output
 
         # p_halt -> 1 means "don't modify me further"; gates how much of this loop's update
         # actually lands. computed from the incoming hidden state, before the update below.
         p_halt = torch.sigmoid(self.halt_proj(hidden_states))   # [B, S, 1]
 
-        # residual update, not a replacement: loop_scale starts near-zero (see __init__) so the
-        # loop begins as a no-op and learns how much refinement to apply, with a gradient path
-        # across loop boundaries that doesn't depend on which expert got routed to.
+        # residual update, not a replacement: a gradient path across loop boundaries that doesn't
+        # depend on which expert got routed to. loop_scale is per-loop (see __init__); loop indices
+        # past the trained count reuse the last entry so extra inference-time loops keep the final
+        # loop's learned gain rather than falling off a table.
+        loop_scale = self.loop_scale[min(int(loop_idx), self.loop_scale.numel() - 1)]
         delta = self.dropout(self.post_norm(output))
-        hidden_states = hidden_states + (1.0 - p_halt) * self.loop_scale * delta
+        hidden_states = hidden_states + (1.0 - p_halt) * loop_scale * delta
 
         return hidden_states, load_balancing_loss, p_halt
 
@@ -377,21 +454,31 @@ class LoopMixtureOfExperts(nn.Module):
         cu_seqlens: torch.Tensor = None,
         max_seqlen: int = None,
         use_checkpointing: bool = False,
+        n_loops: int = None,
     ):
+        """
+        Args:
+            n_loops (int, optional): overrides the configured loop count for this call. Both the
+                per-loop router bias and ``loop_scale`` are indexed by absolute loop index (with
+                out-of-range indices reusing the last trained entry), so a checkpoint trained at
+                ``n_loops=3`` can be run with more or fewer loops without reshaping any weight.
+                Defaults to None (use the configured ``self.n_loops``).
+        """
+        n_loops = self.n_loops if n_loops is None else int(n_loops)
         total_load_balancing_loss = 0.0
         p_halt_all = []
         hidden_states_all = []
 
-        self.expert_tracker.begin_forward(self.n_loops)
+        self.expert_tracker.begin_forward(n_loops)
 
         # rotary cos/sin for the expert attention, computed once and reused across loops/experts
         position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
 
-        for loop in range(self.n_loops):
+        for loop in range(n_loops):
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss, p_halt = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, use_reentrant=False)
+                hidden_states, load_balancing_loss, p_halt = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings)
+                hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop)
             total_load_balancing_loss += load_balancing_loss
             p_halt_all.append(p_halt)
             hidden_states_all.append(hidden_states)
@@ -405,7 +492,7 @@ class LoopMixtureOfExperts(nn.Module):
         hidden_states_all = torch.stack(hidden_states_all, dim=0)
 
         if return_loss:
-            return hidden_states, total_load_balancing_loss / self.n_loops, p_halt_all, hidden_states_all
+            return hidden_states, total_load_balancing_loss / n_loops, p_halt_all, hidden_states_all
         else:
             return hidden_states, p_halt_all, hidden_states_all
 

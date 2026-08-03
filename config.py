@@ -66,6 +66,13 @@ class TrainingConfig:
         f"(n_loops={ModelConfig.Params['n_loops']})"
     )
 
+    # fraction of token positions supervised on the non-final loops. the final loop is always
+    # supervised in full, so this only cheapens the low-weight intermediate readouts.
+    loop_ce_subsample = float(Config["training"].get("loop_ce_subsample", 1.0))
+    assert 0.0 < loop_ce_subsample <= 1.0, (
+        f"loop_ce_subsample ({loop_ce_subsample}) must be in (0, 1]"
+    )
+
     # correctness head (PLAN.md Step 4b): weight on the correct_proj BCE loss, final loop only.
     # same yaml-block deviation as the ponder/loop_ce knobs above -- consumed directly in
     # compute_mtp_loss's call sites, not passed into the model.

@@ -5,9 +5,9 @@ CE loss has EXACTLY zero gradient wrt p_halt (the update `(1 - p_halt) * loop_sc
 multiplied by loop_scale, so its derivative wrt p_halt is `-loop_scale * delta`, an exact zero
 when loop_scale == 0 regardless of delta). An un-warmed ponder loss would then be p_halt's ONLY
 gradient source, constant-sign, and AdamW would climb the halt bias regardless of how small
-lambda_ponder is -- deadlocking the halt head before loop_scale (starting at the safe 0.1 init,
-not 0) has any chance to grow. This is tested directly and deterministically via autograd rather
-than via a noisy multi-step training simulation. GPU required (TE layers).
+lambda_ponder is -- deadlocking the halt head before loop_scale (starting at the safe
+1/sqrt(n_loops) init, not 0) has any chance to grow. This is tested directly and deterministically
+via autograd rather than via a noisy multi-step training simulation. GPU required (TE layers).
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -55,7 +55,9 @@ print("[ok] loop_scale=0: CE loss gives exactly zero gradient into halt_proj (th
 model.zero_grad(set_to_none=True)
 loss, p_halt = ce_loss_and_p_halt(model)
 valid_mask = (~pad_mask).to(p_halt.dtype)
-ponder = ((1.0 - p_halt) * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+# same normalization as scripts/pretrain.py's train_step: p_halt is [n_loops, B, S], so the
+# denominator carries the loop axis too (without it the term is n_loops x too large)
+ponder = ((1.0 - p_halt) * valid_mask).sum() / (valid_mask.sum().clamp(min=1) * p_halt.size(0))
 (loss + 0.1 * ponder).backward()
 g = model.moe.halt_proj.weight.grad
 assert g is not None and torch.count_nonzero(g).item() > 0, \
@@ -63,15 +65,18 @@ assert g is not None and torch.count_nonzero(g).item() > 0, \
 print("[ok] loop_scale=0: adding the (un-warmed) ponder term gives halt_proj its only gradient -- "
       "constant-sign, so AdamW would climb the halt bias regardless of lambda_ponder's magnitude")
 
-# --- 3. away from the pathological loop_scale=0 case (the real 0.1 init), CE already gives the
-#         halt head a real gradient -- warmup is defense-in-depth, not the only thing keeping it alive
+# --- 3. away from the pathological loop_scale=0 case (the real 1/sqrt(n_loops) init), CE already
+#         gives the halt head a real gradient -- warmup is defense-in-depth, not the only thing
+#         keeping it alive
 model2 = TinyMoETransformer(**P).to(dev).to(torch.bfloat16).train()
+init_scales = model2.moe.loop_scale.tolist()
 loss, p_halt = ce_loss_and_p_halt(model2)
 loss.backward()
 g = model2.moe.halt_proj.weight.grad
 assert g is not None and torch.count_nonzero(g).item() > 0, \
-    "expected a nonzero CE gradient into halt_proj at the real loop_scale=0.1 init"
-print("[ok] loop_scale=0.1 (real init): CE loss already gives halt_proj a nonzero gradient")
+    f"expected a nonzero CE gradient into halt_proj at the real loop_scale={init_scales} init"
+print(f"[ok] loop_scale={[round(s, 4) for s in init_scales]} (real per-loop init): "
+      "CE loss already gives halt_proj a nonzero gradient")
 
 # --- 4. the warmup ramp formula itself (as used in scripts/pretrain.py's train_step) ---
 def lambda_ponder_now(tokens, warm, ramp, target):

@@ -192,17 +192,57 @@ class TinyMoETransformer(nn.Module):
         active_excl_emb = non_moe_params + moe_active_params
         active_params = active_excl_emb + embed_params
 
-        # FLOPs, unlike the param counts above, must multiply the MoE portion by n_loops: its
-        # weights are reused every loop (one shared self.moe, not one per loop), so the param
-        # count only appears once but the compute happens n_loops times per token. The dense
-        # decoder + heads (non_moe_params) run once regardless. Standard "2N" forward-pass
-        # approximation otherwise (embeddings excluded -- lookups, not matmuls); this is an
-        # estimate, not a measured MFU number.
-        flops_per_token = 2 * (non_moe_params + n_loops * moe_active_params)
-        self.flops_per_token_fwd = flops_per_token  # read by scripts/pretrain.py's MFU logging
+        # FLOP accounting, read by scripts/pretrain.py's MFU logging. Split into three pieces
+        # because they do NOT scale together, and folding them into one per-token number is what
+        # made the pre-fix estimate understate real compute by roughly 2x:
+        #
+        #  1. body -- dense decoder + MoE block matmuls. The MoE portion multiplies by n_loops
+        #     (its weights are one shared module reused every loop, so the param count appears
+        #     once but the compute happens n_loops times); the decoder runs once. Standard "2N"
+        #     approximation, embeddings excluded (lookups, not matmuls).
+        #  2. heads -- lm_head runs once PER LOOP (per-loop CE, PLAN.md Step 4a), not once, and
+        #     the MTP head's own lm_head runs once per extra token. compute_mtp_loss chunk-
+        #     checkpoints all of them, so they cost fwd + recompute + bwd (4x) while the body
+        #     (checkpointing off) costs 3x. Exposed per-application so the trainer can weight
+        #     lm_head by the actual number of supervised loops (loop_ce_subsample).
+        #  3. attention -- scales with sum(segment_len^2), not with token count, so it cannot be a
+        #     per-token constant at all under document packing. Exposed as a coefficient the
+        #     trainer multiplies by the packing structure it actually saw. Per attention layer and
+        #     causal segment of length L the two matmuls cost 2 * hidden_size * L^2 (H heads x
+        #     head_dim = hidden_size, L^2/2 attended pairs, 2 FLOPs per MAC, twice for QK^T + AV).
+        lm_head_params = sum(p.numel() for p in self.lm_head.parameters())
+        if self.mtp_head is not None:
+            mtp_lm_head_params = sum(p.numel() for p in self.mtp_head.lm_head.parameters())
+            mtp_body_params = sum(p.numel() for p in self.mtp_head.parameters()) - mtp_lm_head_params
+        else:
+            mtp_lm_head_params, mtp_body_params = 0, 0
+        body_params = non_moe_params - lm_head_params - mtp_lm_head_params - mtp_body_params
+
+        # 1 shared_attn + (self + cross) per attn expert + 1 per IR expert, every loop
+        moe_attn_per_loop = 1 + 2 * num_attn_experts + num_ir_experts
+        n_attn_layers = num_layers + n_loops * moe_attn_per_loop
+
+        self.body_flops_per_token = 2 * (body_params + n_loops * moe_active_params)
+        self.lm_head_flops_per_token = 2 * lm_head_params           # per application (once per loop)
+        self.mtp_flops_per_token = 2 * (mtp_body_params + mtp_num_extra_tokens * mtp_lm_head_params)
+        self.attn_flops_per_seqsq = 2 * hidden_size * n_attn_layers  # multiply by sum(segment_len^2)
+
+        # single representative number for the log line: one forward, every loop's lm_head, and
+        # attention at a fully-packed max_seq_len (a single max_seq_len document per row, the
+        # worst case -- real packing splits it into shorter segments and costs less).
+        flops_per_token = (
+            self.body_flops_per_token
+            + n_loops * self.lm_head_flops_per_token
+            + self.mtp_flops_per_token
+            + self.attn_flops_per_seqsq * max_seq_len   # sum(L^2)/tokens == max_seq_len when L == max_seq_len
+        )
+        self.flops_per_token_fwd = flops_per_token
         logger.info(
             f"params: total={total_params/1e6:.1f}M active={active_params/1e6:.1f}M "
-            f"(excl. emb={active_excl_emb/1e6:.1f}M) | forward FLOP/token ~= {flops_per_token/1e6:.0f}M"
+            f"(excl. emb={active_excl_emb/1e6:.1f}M) | forward FLOP/token ~= {flops_per_token/1e6:.0f}M "
+            f"(body {self.body_flops_per_token/1e6:.0f}M + heads "
+            f"{(n_loops * self.lm_head_flops_per_token + self.mtp_flops_per_token)/1e6:.0f}M + attn "
+            f"{self.attn_flops_per_seqsq * max_seq_len/1e6:.0f}M @ seq_len={max_seq_len})"
         )
     
     @property
@@ -232,6 +272,7 @@ class TinyMoETransformer(nn.Module):
         max_seqlen: int = None,
         return_aux_loss=False,
         return_hidden=False,
+        n_loops: int = None,
     ):
         """forward pass of the model
 
@@ -241,6 +282,11 @@ class TinyMoETransformer(nn.Module):
                 flattened [B*S] token axis for document-packed varlen attention. Defaults to None (normal causal attention).
             max_seqlen (int, optional): longest packed segment length. Defaults to None.
             return_aux_loss (bool, optional): whether to return auxiliary loss (and p_halt). Defaults to False.
+            n_loops (int, optional): run the MoE block a different number of times than it was
+                configured with. Both the per-loop router bias and loop_scale are indexed by
+                absolute loop index, so this needs no weight reshaping -- see
+                LoopMixtureOfExperts.forward. Training should leave this None (loop_ce_weights is
+                length-checked against the configured n_loops). Defaults to None.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -262,7 +308,7 @@ class TinyMoETransformer(nn.Module):
         self._token_tracker.count_tokens(input_ids)
         if self.training and self.use_checkpointing:
             x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
-            _, aux_loss, p_halt, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, use_reentrant=False)
+            _, aux_loss, p_halt, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, use_reentrant=False)
             # final RMSNorm applied at every loop, not just the last (PLAN.md Step 4a) -- lm_head
             # reads self.norm(x), never the raw residual stream, so per-loop CE needs this too.
             x_all = self.norm(hidden_states_all)
@@ -271,7 +317,7 @@ class TinyMoETransformer(nn.Module):
             x = x_all if return_hidden else self.lm_head(x)
         else:
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen).last_hidden_state
-            _, aux_loss, p_halt, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True)
+            _, aux_loss, p_halt, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)

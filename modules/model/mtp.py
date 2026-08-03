@@ -108,13 +108,22 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
                 # free target: no labels, no extra forward pass needed. must stay no_grad -- a
                 # differentiable target here would leak gradient back into the LM logits/lm_head
                 # through the "correct" label itself, on top of correct_proj's own gradient.
-                is_correct = (logits.argmax(-1) == l).float()
+                max_logit, argmax = logits.max(-1)
+                is_correct = (argmax == l).float()
             correct_logit = correct_proj(h).squeeze(-1)
             conf = F.binary_cross_entropy_with_logits(correct_logit, is_correct, reduction="none")
             if collect_metrics:
                 with torch.no_grad():
                     p_correct_sum = (torch.sigmoid(correct_logit) * valid).sum()
-                    p_max_sum = (logits.float().softmax(-1).max(-1).values * valid).sum()
+                    # p_max == softmax(logits).max() == 1 / sum_j exp(l_j - l_max). computed this
+                    # way to avoid an fp32 copy of the [chunk, vocab] logits: at chunk_size=2048 /
+                    # vocab=65536 a `.float().softmax(-1)` is two ~537MB transients, allocated on
+                    # every step AND again on the checkpoint recompute. the exp() temporary here
+                    # stays in the logits' own dtype and the sum accumulates in fp32.
+                    p_max_sum = (
+                        (1.0 / (logits - max_logit.unsqueeze(-1)).exp().sum(-1, dtype=torch.float32))
+                        * valid
+                    ).sum()
                     top1_sum = (is_correct * valid).sum()
                 return ce, (conf * valid).sum(), p_correct_sum, p_max_sum, top1_sum
             return ce, (conf * valid).sum()
@@ -176,7 +185,18 @@ def compute_mtp_loss(
     correct_proj: nn.Module = None,
     lambda_conf: float = 0.0,
     return_metrics: bool = False,
+    loop_ce_subsample: float = 1.0,
 ):
+    """
+    Args:
+        loop_ce_subsample (float, optional): fraction of token positions to supervise on the
+            NON-final loops (the final loop is always supervised in full). The LM head is the
+            single most expensive GEMM in the model and per-loop CE runs it once per loop, so at
+            n_loops=3 two thirds of that cost buys the low-weight intermediate readouts. Those
+            readouts are a regularizer, not the main objective, and a CE mean over a uniform token
+            subsample is an unbiased estimate of the full mean -- so the ``loop_ce_weights``
+            semantics are unchanged, only the variance goes up. 1.0 disables subsampling.
+    """
     metrics = {} if return_metrics else None
     if main_lm_head is not None:
         # outputs: [n_loops, B, S, H] per-loop post-norm hidden states (PLAN.md Step 4a). Project +
@@ -193,22 +213,42 @@ def compute_mtp_loss(
         n_loops = len(loop_ce_weights)
         per_loop_ce = [] if return_metrics else None
         conf_loss = None
+
+        # token subsample for the non-final loops (see loop_ce_subsample in the docstring).
+        # indices are built in the flat [B*S] space rather than [B*(S-1)] so each loop's hidden
+        # slice can be gathered straight out of its contiguous [B, S, H] plane -- indexing the
+        # [:, :-1, :] view instead would force a full [B*(S-1), H] copy first, which is most of
+        # what the subsample is trying to avoid.
+        S, H = outputs.size(2), outputs.size(-1)
+        sub_flat, sub_labels = None, None
+        if 0.0 < loop_ce_subsample < 1.0 and n_loops > 1:
+            n_pos = main_labels.numel()
+            k = max(1, int(round(n_pos * loop_ce_subsample)))
+            sel = torch.randperm(n_pos, device=outputs.device)[:k]
+            sub_flat = (sel // (S - 1)) * S + (sel % (S - 1))
+            sub_labels = main_labels.index_select(0, sel)
+
         for loop, weight in enumerate(loop_ce_weights):
-            hidden = outputs[loop, :, :-1, :].contiguous().view(-1, outputs.size(-1))
+            if sub_flat is not None and loop != n_loops - 1:
+                hidden = outputs[loop].reshape(-1, H).index_select(0, sub_flat)
+                labels_for_loop = sub_labels
+            else:
+                hidden = outputs[loop, :, :-1, :].contiguous().view(-1, H)
+                labels_for_loop = main_labels
             # correctness head (PLAN.md Step 4b) reads only the final loop's hidden states --
             # p_halt asks "is more compute useful", this asks "is this prediction correct", and
             # they come apart on confident hallucinations, so it's deliberately not per-loop.
             if loop == n_loops - 1 and correct_proj is not None:
                 if return_metrics:
                     loop_ce, conf_loss, head_metrics = _chunked_linear_ce(
-                        main_lm_head, hidden, main_labels, correct_proj=correct_proj, collect_metrics=True,
+                        main_lm_head, hidden, labels_for_loop, correct_proj=correct_proj, collect_metrics=True,
                     )
                     metrics.update(head_metrics)
                 else:
-                    loop_ce, conf_loss = _chunked_linear_ce(main_lm_head, hidden, main_labels, correct_proj=correct_proj)
+                    loop_ce, conf_loss = _chunked_linear_ce(main_lm_head, hidden, labels_for_loop, correct_proj=correct_proj)
                 loss = loss + lambda_conf * conf_loss
             else:
-                loop_ce = _chunked_linear_ce(main_lm_head, hidden, main_labels)
+                loop_ce = _chunked_linear_ce(main_lm_head, hidden, labels_for_loop)
             loss = loss + weight * loop_ce
             loss_ce = loop_ce  # last iteration is the final loop's raw (unweighted) CE, for logging
             if return_metrics:

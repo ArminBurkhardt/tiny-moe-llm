@@ -93,8 +93,8 @@ land in normal commits like any other source file.
   its only key, deleted in PLAN.md Step 3).
 - `TrainingConfig` — class attributes; `total_steps` is *derived* as
   `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`. Also holds the ponder
-  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`), `loop_ce_weights`
-  (PLAN.md Step 4a), and `lambda_conf` (PLAN.md Step 4b) even though they read from
+  loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`), `loop_ce_weights` +
+  `loop_ce_subsample` (PLAN.md Step 4a), and `lambda_conf` (PLAN.md Step 4b) even though they read from
   `config.yaml`'s `training:` block rather than `model:` — they're consumed directly in
   `scripts/pretrain.py`'s / `compute_mtp_loss`'s loss calc, not passed into the model.
   `loop_ce_weights`' length is asserted against `n_loops` at config-load time (import-time
@@ -131,10 +131,21 @@ Constraints worth remembering:
   silently if it's not recomputed after a config change. "Active" excludes the routed MLP experts'
   unused capacity (`num_mlp_experts` weights exist but only `top_k` run per token); "excl. emb"
   further drops `embed_tokens` / the decoder's PLE table / this model's own PLE table (lookups, not
-  matmuls). The FLOP estimate multiplies only the MoE block's active params by `n_loops` -- its
-  weights are one shared module reused every loop, so the param count appears once but the compute
-  happens `n_loops` times; the dense decoder and the heads (`lm_head`/`mtp_head`/`correct_proj`)
-  run once regardless and aren't multiplied.
+  matmuls).
+- **FLOPs are exposed as three separately-scaled components, not one per-token constant** --
+  folding them together is what made the pre-fix estimate understate real compute by ~2x:
+  - `body_flops_per_token` -- dense decoder + MoE matmuls. The MoE portion multiplies by `n_loops`
+    (one shared module reused every loop: param count appears once, compute happens `n_loops`
+    times); the decoder runs once.
+  - `lm_head_flops_per_token` (**per application** -- `lm_head` runs once *per loop* for per-loop
+    CE, not once) and `mtp_flops_per_token`. Both are chunk-checkpointed inside `compute_mtp_loss`,
+    so they cost fwd + recompute + bwd (**4x**) while the body costs 3x (activation checkpointing
+    is off).
+  - `attn_flops_per_seqsq` -- attention scales with `sum(segment_len^2)`, not token count, so it
+    can't be a per-token number under document packing at all. `scripts/pretrain.py` accumulates
+    the real `sum(seg^2)` on-device from `cu_seqlens` and drains it at `LOG_INTERVAL`.
+  `flops_per_token_fwd` is still published as a single log-line figure, now assuming a fully-packed
+  `max_seq_len` (worst case for the attention term).
 
 ## Model invariants
 
@@ -160,11 +171,23 @@ No identity expert (removed in PLAN.md Step 3c — see "Halt head" below for its
   (`B*S`), so unlike `ParallelSparseMoELayer` they run inside the outer `te.autocast` — don't wrap
   them in `te.autocast(enabled=False)`.
 - **`forward_step` returns an updated `hidden_states`, not a replacement** (PLAN.md Step 1):
-  `hidden_states = hidden_states + (1 - p_halt) * loop_scale * dropout(post_norm(output))`, giving
-  a gradient path across loop boundaries independent of routing. `loop_scale` (`nn.Parameter`,
-  init `0.1`, not `0` — see the comment at its definition in [moe.py](modules/model/moe.py)) is a
-  LayerScale/ReZero-style per-loop gate, distinct from `layer_scalar` in the dense decoder
-  (init-1 whole-layer gain).
+  `hidden_states = hidden_states + (1 - p_halt) * loop_scale[loop] * dropout(post_norm(output))`,
+  giving a gradient path across loop boundaries independent of routing. `loop_scale` is an
+  `nn.Parameter` of shape `[n_loops]` — **one gate per loop**, init `1/sqrt(n_loops)`, not `0` and
+  no longer the old shared `0.1` scalar (see the comment at its definition in
+  [moe.py](modules/model/moe.py): `post_norm` makes every delta unit-RMS, so at `0.1` the whole
+  MoE block was a ~1.5% perturbation of a unit-RMS decoder output, and a lone scalar at `lr=4e-4`
+  can't climb out of that inside a short run). Distinct from `layer_scalar` in the dense decoder
+  (init-1 whole-layer gain). Loop indices past `n_loops - 1` reuse the last entry, so an
+  inference-time loop-count override doesn't fall off the table. **Excluded from weight decay** by
+  `build_param_groups` — decaying it is decaying the loop toward "off".
+- **Routing is conditioned on the loop index** so consecutive loops don't all pick the same
+  experts: `route()` adds `loop_router_bias(loop_enc[loop])` to the router logits. The encoding is
+  *sinusoidal in the absolute loop index* (a `[max_enc_loops, loop_enc_dim]` non-persistent buffer),
+  deliberately not a learned `[n_loops, num_experts]` table — the loop count stays a runtime choice,
+  so `LoopMixtureOfExperts.forward(..., n_loops=N)` / `TinyMoETransformer.forward(..., n_loops=N)`
+  can run a trained checkpoint at any depth without reshaping a weight. `loop_router_bias` is
+  zero-init, so routing at step 0 is identical to the unconditioned router.
 - **Halt head** (PLAN.md Step 3a, replaces the deleted identity expert): `self.halt_proj` is a
   `Linear(hidden_size, 1)`, zero-init weight / bias `-2.0` (`p_halt ~ 0.12` at init), applied to
   the *incoming* hidden state each loop before the update above. `p_halt -> 1` means "don't modify
@@ -173,11 +196,17 @@ No identity expert (removed in PLAN.md Step 3c — see "Halt head" below for its
   fresh each loop, so a token can halt at loop 1 and un-halt at loop 2. `LoopMixtureOfExperts.forward`
   stacks per-loop `p_halt` into `[n_loops, B, S]` and returns it alongside `hidden_states` — never
   reduced with `.item()` inside the model.
+- **Anything reducing `p_halt` must divide by the loop axis too.** `p_halt` is `[n_loops, B, S]`
+  while `pad_mask`/`valid_mask` are `[B, S]`, so `sum() / valid_mask.sum()` is `n_loops` times too
+  large. Both the ponder term and the logged `p_halt` had this bug; `train_step` now normalizes by
+  `valid_mask.sum() * p_halt.size(0)`. Symptom if it regresses: logged `p_halt` can never read
+  below `n_loops * sigmoid(halt_bias)` (~0.36 at init instead of ~0.12), and `lambda_ponder` is
+  silently `n_loops` × its configured value.
 - **Ponder loss requires its warmup to actually be wired up** (`TrainingConfig.ponder_warmup_tokens`
   / `ponder_ramp_tokens`, applied in `scripts/pretrain.py`'s `train_step`) — this is a correctness
-  requirement, not tuning. At `loop_scale ~ 0.1`, CE loss has near-zero gradient wrt `p_halt`, so an
+  requirement, not tuning. At small `loop_scale`, CE loss has near-zero gradient wrt `p_halt`, so an
   un-warmed ponder term is briefly the halt head's only (constant-sign) signal; AdamW climbs the
-  halt bias regardless of `lambda_ponder`'s magnitude, `p_halt` saturates before `loop_scale` grows,
+  halt bias regardless of `lambda_ponder`'s magnitude, `p_halt` saturates before `loop_scale` moves,
   and the loop goes silently dead while the dense decoder keeps the loss descending. See
   `tests/test_ponder_deadlock.py` for a reproduction of both the failure mode and the fix.
 - Selection is applied with a **mask multiply**, not `mask.sum()`/boolean indexing, deliberately:
@@ -188,7 +217,17 @@ No identity expert (removed in PLAN.md Step 3c — see "Halt head" below for its
 - `torch.argsort(..., stable=True)` in the same function is required for determinism between the
   checkpoint forward and the recompute pass.
 - The aux (load-balancing) loss is computed directly on the router's softmax probabilities — no
-  skew/bias step anymore (that was the deleted identity mechanism).
+  skew/bias step anymore (that was the deleted identity mechanism). One `torch.topk` feeds both it
+  and the selection (score renormalization doesn't change indices).
+- The non-MLP experts' routing weights are folded into a single `[B, S, first_mlp_index]` gate via
+  `scatter_add_` before being applied, rather than a `top_k × first_mlp_index` nested loop of
+  `[B, S, H]` masked multiplies — same mask-multiply semantics (still no `mask.sum()`/boolean
+  indexing, which would sync per expert), a fraction of the retained activations.
+- **Router exploration noise is scaled by `router.noise_scale`** (`ROUTER_NOISE_SCALE = 0.3` in
+  [router.py](modules/model/router.py)). The learned `softplus(noise_proj(h))` lands near ~0.7 at
+  init while the clean logits' std is ~0.33 — un-scaled, early routing/expert weights/aux loss all
+  measure noise rather than the router. This is a ceiling on the *initial* level; `noise_factor`
+  still anneals it to 0 over `noise_anneal_tokens`.
 - `_ExpertTracking` guards against activation-checkpoint recompute double counting
   (`begin_forward(expected_updates)`) and only samples every 8th forward. Its stats are per-token
   EMAs in [0, 1], plotted to `ckpts/training/expert_selection_*.png`.
@@ -361,7 +400,27 @@ requirement here, not an afterthought.
   0 -> `lambda_ponder` over `ponder_warmup_tokens` -> `ponder_warmup_tokens + ponder_ramp_tokens`,
   also driven from the live token count — see the ponder-deadlock invariant above.
 - Main CE is now a weighted sum over `n_loops` per-loop CE terms (`TrainingConfig.loop_ce_weights`,
-  PLAN.md Step 4a) rather than just the final loop's — see the per-loop CE invariant above.
+  PLAN.md Step 4a) rather than just the final loop's — see the per-loop CE invariant above. The
+  **non-final** loops are token-subsampled by `TrainingConfig.loop_ce_subsample` (default `0.25`);
+  the final loop is always supervised in full. A CE mean over a uniform subsample is an unbiased
+  estimate of the full mean, so `loop_ce_weights` semantics are unchanged — only the variance on
+  the low-weight intermediate readouts goes up, in exchange for not running the model's largest
+  GEMM `n_loops` times at full width. `1.0` disables it.
+- **Optimizer uses two param groups** (`build_param_groups`): weight decay applies only to tensors
+  with `ndim >= 2`. Norms/biases/gates are excluded because their zero is a *degenerate state*, not
+  just a regularization preference — `moe.loop_scale` decayed toward 0 is the loop decayed toward
+  "off", and `layer_scalar` is a gain on the whole residual stream so its decay compounds across
+  depth (~0.5x over 8 layers at `lr=4e-4`/`wd=0.02` over a 5B-token run, before any gradient).
+- **A checkpoint that exists but fails to load is fatal, not a fresh start.** The resume path
+  distinguishes "no file in `ckpts/training`" (warn, start from scratch) from "found a file,
+  `load_checkpoint` raised" (log + re-raise). Collapsing both into one warning is how a preempted
+  box silently restarts from token 0 with a plausible-looking loss curve.
+- **`collect_metrics` is gated on the log cadence.** `train_step(..., collect_metrics=step %
+  LOG_INTERVAL == 0)`; `metrics` is `None` otherwise. The `p_max`/`p_correct` reductions run over
+  every CE chunk's live logits *and* again on the checkpoint recompute, so gathering them on the
+  other 9 steps in 10 is pure waste. `p_max` itself is computed as
+  `1 / sum_j exp(l_j - l_max)` rather than `logits.float().softmax(-1).max(-1)` — mathematically
+  identical, but avoids two ~537MB fp32 transients per chunk at `chunk=2048`/`vocab=65536`.
 - The correctness head's BCE loss (`TrainingConfig.lambda_conf`, PLAN.md Step 4b) is added
   unconditionally, no warmup ramp — see the correctness-head invariant above.
 - Everything that needs the host (loss `.item()`, token sync, tokens/sec, peak mem) is throttled

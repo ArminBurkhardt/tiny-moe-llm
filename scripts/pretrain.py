@@ -68,7 +68,16 @@ def train_step(
     accelerator: Accelerator = None,
     optimizer: optim.Optimizer = None,
     scheduler: optim.lr_scheduler._LRScheduler = None,
+    collect_metrics: bool = False,
 ):
+    """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
+
+    Args:
+        collect_metrics: whether to gather the PLAN.md Step 7 instrumentation dict. The trainer
+            only reads it inside its LOG_INTERVAL block, and the p_max/p_correct reductions run
+            over every chunk's live logits (and again on the checkpoint recompute), so gathering
+            them on the other 9 steps out of 10 is pure waste. ``metrics`` is None when False.
+    """
     # attribute access (has_mtp, lm heads) must go through the unwrapped module so this works
     # under DDP, where ``model`` is a wrapper without those attributes. The forward call still
     # goes through ``model`` so accelerate handles gradient sync.
@@ -95,7 +104,7 @@ def train_step(
                 )
                 extra_token_outputs = None
 
-            loss, loss_ce, metrics = compute_mtp_loss(
+            out = compute_mtp_loss(
                 logits,
                 labels,
                 mtp_outputs=extra_token_outputs,
@@ -104,10 +113,12 @@ def train_step(
                 main_lm_head=unwrapped.lm_head,
                 pad_mask=pad_mask,
                 loop_ce_weights=TrainingConfig.loop_ce_weights,
+                loop_ce_subsample=TrainingConfig.loop_ce_subsample,
                 correct_proj=unwrapped.correct_proj,
                 lambda_conf=TrainingConfig.lambda_conf,
-                return_metrics=True,
+                return_metrics=collect_metrics,
             )
+            loss, loss_ce, metrics = out if collect_metrics else (out[0], out[1], None)
 
             loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 
@@ -116,15 +127,22 @@ def train_step(
             tokens = unwrapped.token_count
             warm, ramp = TrainingConfig.ponder_warmup_tokens, TrainingConfig.ponder_ramp_tokens
             lambda_ponder_now = TrainingConfig.lambda_ponder * min(1.0, max(0.0, (tokens - warm) / ramp))
+            # p_halt is [n_loops, B, S] but valid_mask is [B, S], so the denominator has to carry
+            # the loop axis too -- normalizing by valid_mask.sum() alone made both the ponder term
+            # and the logged p_halt exactly n_loops times too large (p_halt could never read below
+            # n_loops * sigmoid(halt_bias), and lambda_ponder was silently n_loops x its config
+            # value).
             valid_mask = (~pad_mask).to(p_halt.dtype)
-            ponder = ((1.0 - p_halt) * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            valid_count = valid_mask.sum().clamp(min=1) * p_halt.size(0)
+            ponder = ((1.0 - p_halt) * valid_mask).sum() / valid_count
             loss = loss + lambda_ponder_now * ponder
 
             # instrumentation (PLAN.md Step 7): all tensors, no host sync here -- the caller only
             # pulls these to the host inside its own LOG_INTERVAL-throttled block.
-            metrics["p_halt_mean"] = ((p_halt * valid_mask).sum() / valid_mask.sum().clamp(min=1)).detach()
-            metrics["ponder"] = ponder.detach()
-            metrics["lambda_ponder_now"] = lambda_ponder_now
+            if collect_metrics:
+                metrics["p_halt_mean"] = ((p_halt * valid_mask).sum() / valid_count).detach()
+                metrics["ponder"] = ponder.detach()
+                metrics["lambda_ponder_now"] = lambda_ponder_now
 
             accelerator.backward(loss)
             # clip on the real update step only (matters once gradient accumulation > 1).
@@ -138,6 +156,37 @@ def train_step(
         scheduler.step()
 
     return loss, loss_ce, aux_loss.detach(), metrics
+
+def build_param_groups(model: TinyMoETransformer, weight_decay: float):
+    """Split parameters into decayed / non-decayed groups.
+
+    Decaying every parameter uniformly is actively harmful here, not just untidy: the architecture
+    leans on several learned scalars whose *zero* is a degenerate state.
+      * ``moe.loop_scale`` gates how much each loop contributes -- decaying it toward 0 decays the
+        whole MoE block toward "off", which is the exact failure mode the ponder warmup exists to
+        avoid.
+      * ``Gemma4TextDecoderLayer.layer_scalar`` is a gain on the *whole* residual stream, so its
+        decay compounds across depth: at lr=4e-4/wd=0.02 over ~9.5k steps it is a ~0.93x pull per
+        layer, i.e. ~0.5x across 8 layers, before any gradient signal.
+      * RMSNorm gains and biases (incl. ``halt_proj.bias``, which sets the p_halt operating point)
+        have the same problem in milder form.
+    The usual convention -- decay only tensors with ndim >= 2 -- covers all of these, since every
+    one of them is a scalar or a vector.
+    """
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        (no_decay if param.ndim <= 1 else decay).append(param)
+    logger.info(
+        f"Optimizer param groups: {len(decay)} decayed tensors (wd={weight_decay}), "
+        f"{len(no_decay)} undecayed (norms/biases/gates)"
+    )
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
 
 def build_scheduler(optimizer: optim.Optimizer):
     # linear warmup -> cosine decay, adjusted for the current total steps
@@ -206,6 +255,7 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
             main_lm_head=model.lm_head,
             pad_mask=pad_mask,
             loop_ce_weights=TrainingConfig.loop_ce_weights,
+            loop_ce_subsample=TrainingConfig.loop_ce_subsample,
             correct_proj=model.correct_proj,
             lambda_conf=TrainingConfig.lambda_conf,
         )
@@ -304,7 +354,9 @@ def pretrain():
     # model = torch.compile(model)
     # from bitsandbytes.optim import AdamW8bit
     
-    optimizer = optim.AdamW(model.parameters(), lr=TrainingConfig.lr, weight_decay=TrainingConfig.weight_decay)
+    optimizer = optim.AdamW(
+        build_param_groups(model, TrainingConfig.weight_decay), lr=TrainingConfig.lr,
+    )
     scheduler = build_scheduler(optimizer)
 
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -314,9 +366,24 @@ def pretrain():
     resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
     losses = []
-    try:
-        checkpoint_path = os.path.join(checkpoint_dir, get_latest_checkpoint_epoch(checkpoint_dir))
-        start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+    # "no checkpoint exists" and "a checkpoint exists but would not load" are NOT the same event.
+    # Swallowing both into one warning is how an unattended, interruptible run silently restarts
+    # from token 0 after e.g. a torch.save truncated by a preemption or a config change that
+    # reshapes a weight -- the loss curve looks plausible and days of compute are already gone.
+    # Only the first case is recoverable; the second re-raises.
+    latest = get_latest_checkpoint_epoch(checkpoint_dir) if os.path.isdir(checkpoint_dir) else None
+    if latest is None:
+        logger.warning("No checkpoint found in ckpts/training. Starting training from scratch")
+    else:
+        checkpoint_path = os.path.join(checkpoint_dir, latest)
+        try:
+            start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+        except Exception as e:
+            logger.error(
+                f"Found checkpoint {checkpoint_path} but failed to load it: {type(e).__name__}: {e}. "
+                f"Refusing to silently restart from scratch -- move or delete the file to start over."
+            )
+            raise
         model._token_tracker.num_tokens = resume_token_count
         resumed = True
 
@@ -333,8 +400,6 @@ def pretrain():
             f"Reanchored LR scheduler to step {resumed_sched_step:,}/{TrainingConfig.total_steps:,} "
             f"({resume_token_count / 1e9:.3f}B tokens trained, current LR {scheduler.get_last_lr()[0]:.3e})"
         )
-    except Exception as e:
-        logger.warning(f"No checkpoint found. Starting training from scratch")
 
     logger.info(f"Starting training from epoch {start_epoch}, document index {start_doc_idx}")
     
@@ -356,9 +421,22 @@ def pretrain():
     last_token_count = unwrapped_model._token_tracker.sync()
     last_log_time = timer
 
+    # MFU accounting (PLAN.md Step 11's budget number). Two accumulators rather than reusing the
+    # token counter:
+    #   * positions -- FLOPs are spent on padding too, and the token counter deliberately excludes
+    #     pads. A plain python int from .numel(), so no sync.
+    #   * sum(segment_len^2) -- attention cost scales with this, not with token count, and under
+    #     document packing it is far below B*S^2. Accumulated on device and drained once per log
+    #     interval alongside the existing syncs.
+    positions_since_log = 0
+    seg_sq_since_log = torch.zeros((), dtype=torch.long, device=device)
+    # lm_head runs once per supervised loop; the non-final loops are token-subsampled (Step 4a +
+    # loop_ce_subsample), so they cost a fraction of a full pass each.
+    lm_head_passes = 1.0 + (ModelConfig.Params["n_loops"] - 1) * TrainingConfig.loop_ce_subsample
+
     # log/sync cadence: pulling loss/aux/token-count to the host forces CPU/GPU syncs, so do it
     # every LOG_INTERVAL steps instead of every step (the model is small -> per-step syncs dominate)
-    LOG_INTERVAL = 10
+    LOG_INTERVAL = 20
 
     # per worker, last doc_idx that worker had reached, kept on device; -1 = nothing seen yet
     worker_state = torch.full((max(NUM_DATA_WORKERS, 1),), -1, dtype=torch.long, device=device)
@@ -398,8 +476,14 @@ def pretrain():
                 document_ids = batch["document_ids"].to(device) if batch["document_ids"] is not None else None
                 if document_ids is not None:
                     cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
+                    # attention FLOPs scale with sum(segment_len^2); accumulate on device (no sync)
+                    seg = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+                    seg_sq_since_log += (seg * seg).sum()
                 else:
                     cu_seqlens, max_seqlen = None, None
+                    # unpacked path: one full-length causal segment per sample
+                    seg_sq_since_log += input_ids.size(0) * input_ids.size(1) ** 2
+                positions_since_log += input_ids.numel()
 
                 if (device == "cuda") and (step % 20 == 0):
                     torch.cuda.reset_peak_memory_stats()
@@ -421,6 +505,8 @@ def pretrain():
                     accelerator=accelerator,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    # gathered only on the steps the log block below actually reads them
+                    collect_metrics=(step % LOG_INTERVAL == 0),
                 )
 
 
@@ -434,22 +520,42 @@ def pretrain():
                     losses.append(val_loss)
                     n_tokens = unwrapped_model._token_tracker.sync()
                     now = time.time()
-                    tokens_per_sec = (n_tokens - last_token_count) / max(now - last_log_time, 1e-6)
+                    interval_s = max(now - last_log_time, 1e-6)
+                    tokens_per_sec = (n_tokens - last_token_count) / interval_s
                     last_token_count = n_tokens
                     last_log_time = now
 
-                    # MFU estimate: training FLOPs/token ~= 3x the forward estimate printed at
-                    # construction (fwd+bwd+recompute, PLAN.md's convention -- see Step 11's budget
-                    # decision). n/a on an unrecognized GPU rather than a silently wrong number.
-                    if gpu_peak_flops is not None:
-                        training_flops_per_token = 3 * unwrapped_model.flops_per_token_fwd
-                        mfu_str = f"{100 * tokens_per_sec * training_flops_per_token / gpu_peak_flops:.1f}%"
+                    # MFU over the interval just elapsed. Built from three separately-scaled
+                    # pieces (see TinyMoETransformer's FLOP block) rather than one per-token
+                    # constant:
+                    #   * body matmuls: 3x (fwd + bwd; activation checkpointing is off)
+                    #   * heads: 4x -- compute_mtp_loss chunk-checkpoints every LM-head projection,
+                    #     so each also pays a recompute, and lm_head runs once per supervised loop
+                    #   * attention: keyed to the sum(segment_len^2) actually seen, since document
+                    #     packing puts real attention cost well below the dense B*S^2
+                    # n/a on an unrecognized GPU rather than a silently wrong number.
+                    seg_sq = int(seg_sq_since_log.item())
+                    seg_sq_since_log.zero_()
+                    if gpu_peak_flops is not None and positions_since_log > 0:
+                        body_flops = (
+                            unwrapped_model.body_flops_per_token * positions_since_log
+                            + unwrapped_model.attn_flops_per_seqsq * seg_sq
+                        )
+                        head_flops = (
+                            unwrapped_model.lm_head_flops_per_token * lm_head_passes
+                            + unwrapped_model.mtp_flops_per_token
+                        ) * positions_since_log
+                        interval_flops = 3 * body_flops + 4 * head_flops
+                        mfu_str = f"{100 * interval_flops / interval_s / gpu_peak_flops:.1f}%"
                     else:
                         mfu_str = "n/a"
+                    positions_since_log = 0
 
                     # PLAN.md Step 7 instrumentation: loop_scale, halt/correctness/confidence
                     # signals, and per-loop CE, all through unwrap_model per the training-loop rule.
-                    loop_scale = unwrapped_model.moe.loop_scale.item()
+                    # loop_scale is per-loop now (one gate per loop), so log the whole vector --
+                    # "loop 3 grew, loops 1-2 collapsed" is exactly the failure a single mean hides
+                    loop_scale_str = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
                     per_loop_ce_str = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                     p_halt_mean = metrics["p_halt_mean"].item()
                     ponder_val = metrics["ponder"].item()
@@ -461,7 +567,7 @@ def pretrain():
                     logger.info(
                         f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
                         f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} (lambda={metrics['lambda_ponder_now']:.2e}) | "
-                        f"Conf Loss: {conf_loss_val:.4f} | loop_scale: {loop_scale:.4f} | p_halt: {p_halt_mean:.4f} | "
+                        f"Conf Loss: {conf_loss_val:.4f} | loop_scale: [{loop_scale_str}] | p_halt: {p_halt_mean:.4f} | "
                         f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
                         f"per-loop CE: [{per_loop_ce_str}] | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
                         f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min"

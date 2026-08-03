@@ -36,15 +36,29 @@ training:
   num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient
-  target_tokens: 5000000000 # 5b tokens
-  warmup_steps: 1000 # linear LR warmup before cosine decay
-  noise_anneal_tokens: 1000000000 # decay router exploration noise 1->0 over the first 1b tokens
+  target_tokens: 45000000 # GATE4 TEST -- real value: 5000000000 (see config.yaml.real_backup). Scaled to the
+                          # ~50M-token local phase1 slice from prepare_data.py's smoke run, leaving ~5M tokens
+                          # margin so the mmap dataset's single epoch doesn't run out mid-run.
+  warmup_steps: 30 # GATE4 TEST -- real value: 1000. At grad_accumulation_steps=4 this is ~3.9M tokens (~9% of
+                   # the 45M target); the real 1000 steps would be ~524M tokens, more than this whole test run.
+  noise_anneal_tokens: 10000000 # GATE4 TEST -- real value: 1000000000, scaled proportionally down
   lambda_ponder: 3e-3 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens
-  ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 until loop_scale has had room to grow (deadlock avoidance)
-  ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
+  ponder_warmup_tokens: 8000000 # GATE4 TEST -- real value: 1000000000. Ponder turns on at ~18% into the run so
+                                # there's still runway afterward to check loop_scale doesn't collapse once it does.
+  ponder_ramp_tokens: 8000000 # GATE4 TEST -- real value: 1000000000. Full lambda_ponder weight by ~36% into the
+                              # run, leaving ~64% of the run (~29M tokens) at steady state to watch for deadlock.
   loop_ce_weights: [0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
+  loop_ce_subsample: 0.25 # fraction of token positions supervised on the NON-final loops (final
+                          # loop is always supervised in full). the LM head is the largest GEMM in
+                          # the model and per-loop CE runs it once per loop; a CE mean over a
+                          # uniform subsample is an unbiased estimate of the full mean, so this
+                          # trades variance on the low-weight intermediate readouts for throughput.
+                          # 1.0 disables it.
   lambda_conf: 0.05 # weight on the correctness head's BCE loss (final loop only)
-  grad_accumulation_steps: 16
+  grad_accumulation_steps: 4 # GATE4 TEST -- real value: 16. Tokens/step drops from 524,288 to 131,072, giving
+                             # ~343 optimizer steps (vs ~95) over the 45M budget -- more LOG_INTERVAL=10 points
+                             # to actually see loss/loop_scale/p_halt curves move, at the cost of noisier gradients
+                             # and a (slightly) different tokens/sec profile than the real grad_accum=16 config.
   seed: 42
   data_dir: "data/prepared" # dir holding {phase}.bin/.idx from scripts/prepare_data.py (Step 11)
   phase: "phase1" # which {phase}.bin/.idx pair to train on 
