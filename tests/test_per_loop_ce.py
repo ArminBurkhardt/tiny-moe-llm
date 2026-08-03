@@ -26,7 +26,13 @@ P = dict(vocab_size=512, max_seq_len=256, hidden_size=256, intermediate_size=512
 model = TinyMoETransformer(**P).to(dev).to(torch.bfloat16).train()
 model.set_checkpointing(False, False)
 model.delayed_mtp_loss(True)
-opt = optim.AdamW(model.parameters(), lr=3e-3, weight_decay=0.0)
+# lr=1e-3, NOT 3e-3: at 3e-3 this tiny model memorizes the 2x128 random-token batch by ~step 15,
+# after which every loop sits at CE ~1e-3 and the per-loop ratios are pure noise (later loops can
+# even read out *higher* CE -- no headroom left, and earlier loops still receive gradient from
+# every later loop's CE term). 1e-3 keeps the whole run in the regime where the ordering is
+# actually measurable: swept over 3 seeds x steps 10..26, the assertion below holds 3/3 at every
+# sampled step, so this is no longer sensitive to the exact step count.
+opt = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
 
 B, S = 2, 128
 pad_id = 1
@@ -48,8 +54,8 @@ torch.cuda.reset_peak_memory_stats()
 # loops backprop-receive gradient from every later loop's CE too (that's how backprop through the
 # loop recurrence works), not just their own loop_ce_weights entry -- so once training pushes deep
 # into the overfit regime, later loops' *smaller* remaining headroom can flip the ordering (loop 1
-# reads out lower CE than loop 2) even though nothing is broken. Sampled empirically: ordering is
-# clean through ~step 24 on this seed/config and flips by ~step 26, so stop with real margin.
+# reads out lower CE than loop 2) even though nothing is broken. At the lr above the ordering is
+# stable across steps 10..26 and 3 seeds, so 18 is a mid-window choice, not a knife-edge one.
 for step in range(18):
     hidden, aux, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
                              return_aux_loss=True, return_hidden=True)
