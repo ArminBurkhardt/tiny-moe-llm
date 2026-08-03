@@ -627,7 +627,7 @@ clone. Before renting:
    container has the environment already).
 3. Fix `tests/run_tests.sh` — it hardcodes `cd /mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm` and
    `source env_init`. Make repo root and init script overridable by env var.
-4. Commit `manifest.json` (Step 11) and `scripts/prepare_data.py`.
+4. Commit `manifest.json` (Step 11) and `scripts/prepare_data.py`. (Note: why tho? The script will be run on the box, so manifest.json wont be correct if its being pushed from local.)
 
 ---
 
