@@ -73,6 +73,15 @@ class TrainingConfig:
         f"loop_ce_subsample ({loop_ce_subsample}) must be in (0, 1]"
     )
 
+    # stochastic loop depth: probability a step runs a reduced loop count (uniform 1..n_loops-1).
+    # per-loop CE already supervises every prefix depth; this additionally makes the *model* see
+    # shallow depths as real inputs to the rest of training, so an inference-time loop-count
+    # override lands on a depth the model was actually trained at. 0.0 = always full depth.
+    loop_count_sampling = float(Config["training"].get("loop_count_sampling", 0.0))
+    assert 0.0 <= loop_count_sampling <= 1.0, (
+        f"loop_count_sampling ({loop_count_sampling}) must be in [0, 1]"
+    )
+
     # correctness head (PLAN.md Step 4b): weight on the correct_proj BCE loss, final loop only.
     # same yaml-block deviation as the ponder/loop_ce knobs above -- consumed directly in
     # compute_mtp_loss's call sites, not passed into the model.

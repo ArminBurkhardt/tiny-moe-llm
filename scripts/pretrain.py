@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import math
+import random
 import warnings
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
@@ -69,6 +70,7 @@ def train_step(
     optimizer: optim.Optimizer = None,
     scheduler: optim.lr_scheduler._LRScheduler = None,
     collect_metrics: bool = False,
+    n_loops: int = None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -77,7 +79,13 @@ def train_step(
             only reads it inside its LOG_INTERVAL block, and the p_max/p_correct reductions run
             over every chunk's live logits (and again on the checkpoint recompute), so gathering
             them on the other 9 steps out of 10 is pure waste. ``metrics`` is None when False.
+        n_loops: loop depth for this step (see sample_n_loops). None runs the configured depth.
+            loop_ce_weights is truncated/rescaled to match, so the deepest loop actually run is
+            always the one carrying weight 1.0 and holding the correctness head.
     """
+    loop_ce_weights = (
+        TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
+    )
     # attribute access (has_mtp, lm heads) must go through the unwrapped module so this works
     # under DDP, where ``model`` is a wrapper without those attributes. The forward call still
     # goes through ``model`` so accelerate handles gradient sync.
@@ -92,6 +100,7 @@ def train_step(
                 **ModelConfig.Forward,
                 return_aux_loss=True,
                 return_hidden=True,
+                n_loops=n_loops,
             )
             else:
                 logits, aux_loss, p_halt = model(
@@ -101,6 +110,7 @@ def train_step(
                     **ModelConfig.Forward,
                     return_aux_loss=True,
                     return_hidden=True,
+                    n_loops=n_loops,
                 )
                 extra_token_outputs = None
 
@@ -112,7 +122,7 @@ def train_step(
                 lambda_mtp=TrainingConfig.lambda_mtp,
                 main_lm_head=unwrapped.lm_head,
                 pad_mask=pad_mask,
-                loop_ce_weights=TrainingConfig.loop_ce_weights,
+                loop_ce_weights=loop_ce_weights,
                 loop_ce_subsample=TrainingConfig.loop_ce_subsample,
                 correct_proj=unwrapped.correct_proj,
                 lambda_conf=TrainingConfig.lambda_conf,
@@ -157,6 +167,36 @@ def train_step(
 
     return loss, loss_ce, aux_loss.detach(), metrics
 
+def sample_n_loops(rng: random.Random, full_n_loops: int, prob: float) -> int:
+    """Pick this step's loop depth (PLAN.md Step 3's "loops refine, bounded" goal).
+
+    With probability ``prob`` the step runs a uniformly random *reduced* depth in
+    ``1..full_n_loops-1``; otherwise the full depth. Keeping most steps at full depth matters --
+    that's the primary operating point, and a plain uniform draw would give it only
+    ``1/full_n_loops`` of the training signal.
+
+    Why this rather than a ponder/halt penalty: p_halt gates the loop's *output* while every expert
+    still runs, so penalizing it buys no compute back and only pushes the loop toward being a no-op.
+    Sampling the depth instead makes each depth a genuine operating point, which is what an
+    inference-time loop-count override actually needs, and it *reduces* mean training compute.
+    """
+    if prob <= 0.0 or full_n_loops <= 1 or rng.random() >= prob:
+        return full_n_loops
+    return rng.randint(1, full_n_loops - 1)
+
+
+def loop_ce_weights_for(n_loops: int):
+    """``loop_ce_weights`` truncated to ``n_loops``, rescaled so the deepest loop run carries 1.0.
+
+    Truncating alone would shrink the CE term (running 1 of 3 loops would weight the whole main
+    loss by 0.2), which is an unintended per-step learning-rate change on shallow steps. Rescaling
+    keeps the deepest readout at full weight and preserves the relative ordering of the rest.
+    """
+    weights = TrainingConfig.loop_ce_weights[:n_loops]
+    last = weights[-1]
+    return [w / last for w in weights] if last > 0 else weights
+
+
 def build_param_groups(model: TinyMoETransformer, weight_decay: float):
     """Split parameters into decayed / non-decayed groups.
 
@@ -174,7 +214,7 @@ def build_param_groups(model: TinyMoETransformer, weight_decay: float):
     one of them is a scalar or a vector.
     """
     decay, no_decay = [], []
-    for name, param in model.named_parameters():
+    for param in model.parameters():
         if not param.requires_grad:
             continue
         (no_decay if param.ndim <= 1 else decay).append(param)
@@ -421,18 +461,30 @@ def pretrain():
     last_token_count = unwrapped_model._token_tracker.sync()
     last_log_time = timer
 
-    # MFU accounting (PLAN.md Step 11's budget number). Two accumulators rather than reusing the
-    # token counter:
+    # MFU accounting (PLAN.md Step 11's budget number). Separate accumulators because the pieces
+    # scale differently, and none of them is just "tokens":
     #   * positions -- FLOPs are spent on padding too, and the token counter deliberately excludes
     #     pads. A plain python int from .numel(), so no sync.
     #   * sum(segment_len^2) -- attention cost scales with this, not with token count, and under
-    #     document packing it is far below B*S^2. Accumulated on device and drained once per log
+    #     document packing it is far below B*S^2. Accumulated on device, drained once per log
     #     interval alongside the existing syncs.
+    #   * the *_loops variants weight each step by the depth it actually ran, since loop-count
+    #     sampling means that is no longer the constant n_loops.
     positions_since_log = 0
+    loop_positions_since_log = 0
+    lm_head_passes_since_log = 0.0
     seg_sq_since_log = torch.zeros((), dtype=torch.long, device=device)
-    # lm_head runs once per supervised loop; the non-final loops are token-subsampled (Step 4a +
-    # loop_ce_subsample), so they cost a fraction of a full pass each.
-    lm_head_passes = 1.0 + (ModelConfig.Params["n_loops"] - 1) * TrainingConfig.loop_ce_subsample
+    loop_seg_sq_since_log = torch.zeros((), dtype=torch.long, device=device)
+
+    # stochastic loop depth (see sample_n_loops). Its own RNG so it can't perturb the model's
+    # init/dropout/router-noise stream, and so a config change here doesn't reshuffle those.
+    full_n_loops = ModelConfig.Params["n_loops"]
+    loop_rng = random.Random(TrainingConfig.seed)
+    if TrainingConfig.loop_count_sampling > 0:
+        logger.info(
+            f"Loop-count sampling on: p={TrainingConfig.loop_count_sampling} of steps run a random "
+            f"depth in 1..{full_n_loops - 1}, the rest run the full {full_n_loops}"
+        )
 
     # log/sync cadence: pulling loss/aux/token-count to the host forces CPU/GPU syncs, so do it
     # every LOG_INTERVAL steps instead of every step (the model is small -> per-step syncs dominate)
@@ -474,16 +526,35 @@ def pretrain():
                 # cu_seqlens (dim0 = num_segments+1) gets truncated to the batch size by accelerates
                 # split_batches, which silently corrupts the attention segmentation.
                 document_ids = batch["document_ids"].to(device) if batch["document_ids"] is not None else None
+                # this step's loop depth. Log steps are pinned to the full depth so the recorded
+                # loss curve, per-loop CE and p_halt are always read at the same operating point --
+                # otherwise `losses` (plotted and checkpointed) would jump whenever a logged step
+                # happened to draw a shallower depth. Costs ~1/LOG_INTERVAL of the sampling rate.
+                is_log_step = step % LOG_INTERVAL == 0
+                step_n_loops = full_n_loops if is_log_step else sample_n_loops(
+                    loop_rng, full_n_loops, TrainingConfig.loop_count_sampling
+                )
+
                 if document_ids is not None:
                     cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
                     # attention FLOPs scale with sum(segment_len^2); accumulate on device (no sync)
                     seg = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
-                    seg_sq_since_log += (seg * seg).sum()
+                    step_seg_sq = (seg * seg).sum()
                 else:
                     cu_seqlens, max_seqlen = None, None
                     # unpacked path: one full-length causal segment per sample
-                    seg_sq_since_log += input_ids.size(0) * input_ids.size(1) ** 2
+                    step_seg_sq = torch.as_tensor(
+                        input_ids.size(0) * input_ids.size(1) ** 2, dtype=torch.long, device=device
+                    )
+                seg_sq_since_log += step_seg_sq
+                loop_seg_sq_since_log += step_seg_sq * step_n_loops
                 positions_since_log += input_ids.numel()
+                loop_positions_since_log += input_ids.numel() * step_n_loops
+                # lm_head runs once per supervised loop; non-final loops are token-subsampled
+                # (Step 4a + loop_ce_subsample), so they cost a fraction of a full pass each
+                lm_head_passes_since_log += input_ids.numel() * (
+                    1.0 + (step_n_loops - 1) * TrainingConfig.loop_ce_subsample
+                )
 
                 if (device == "cuda") and (step % 20 == 0):
                     torch.cuda.reset_peak_memory_stats()
@@ -506,7 +577,8 @@ def pretrain():
                     optimizer=optimizer,
                     scheduler=scheduler,
                     # gathered only on the steps the log block below actually reads them
-                    collect_metrics=(step % LOG_INTERVAL == 0),
+                    collect_metrics=is_log_step,
+                    n_loops=step_n_loops,
                 )
 
 
@@ -534,22 +606,32 @@ def pretrain():
                     #   * attention: keyed to the sum(segment_len^2) actually seen, since document
                     #     packing puts real attention cost well below the dense B*S^2
                     # n/a on an unrecognized GPU rather than a silently wrong number.
-                    seg_sq = int(seg_sq_since_log.item())
+                    # one sync for both depth-weighted attention accumulators
+                    seg_sq, loop_seg_sq = torch.stack(
+                        [seg_sq_since_log, loop_seg_sq_since_log]
+                    ).tolist()
                     seg_sq_since_log.zero_()
+                    loop_seg_sq_since_log.zero_()
                     if gpu_peak_flops is not None and positions_since_log > 0:
+                        m = unwrapped_model
                         body_flops = (
-                            unwrapped_model.body_flops_per_token * positions_since_log
-                            + unwrapped_model.attn_flops_per_seqsq * seg_sq
+                            m.dense_flops_per_token * positions_since_log
+                            + m.loop_flops_per_token * loop_positions_since_log
+                            + m.dense_attn_flops_per_seqsq * seg_sq
+                            + m.loop_attn_flops_per_seqsq * loop_seg_sq
                         )
                         head_flops = (
-                            unwrapped_model.lm_head_flops_per_token * lm_head_passes
-                            + unwrapped_model.mtp_flops_per_token
-                        ) * positions_since_log
+                            m.lm_head_flops_per_token * lm_head_passes_since_log
+                            + m.mtp_flops_per_token * positions_since_log
+                        )
                         interval_flops = 3 * body_flops + 4 * head_flops
                         mfu_str = f"{100 * interval_flops / interval_s / gpu_peak_flops:.1f}%"
+                        mean_loops = loop_positions_since_log / positions_since_log
                     else:
-                        mfu_str = "n/a"
+                        mfu_str, mean_loops = "n/a", float("nan")
                     positions_since_log = 0
+                    loop_positions_since_log = 0
+                    lm_head_passes_since_log = 0.0
 
                     # PLAN.md Step 7 instrumentation: loop_scale, halt/correctness/confidence
                     # signals, and per-loop CE, all through unwrap_model per the training-loop rule.
@@ -569,7 +651,8 @@ def pretrain():
                         f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} (lambda={metrics['lambda_ponder_now']:.2e}) | "
                         f"Conf Loss: {conf_loss_val:.4f} | loop_scale: [{loop_scale_str}] | p_halt: {p_halt_mean:.4f} | "
                         f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
-                        f"per-loop CE: [{per_loop_ce_str}] | Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
+                        f"per-loop CE: [{per_loop_ce_str}] | mean loops: {mean_loops:.2f} | "
+                        f"Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
                         f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min"
                     )
 

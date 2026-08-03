@@ -222,10 +222,19 @@ class TinyMoETransformer(nn.Module):
         moe_attn_per_loop = 1 + 2 * num_attn_experts + num_ir_experts
         n_attn_layers = num_layers + n_loops * moe_attn_per_loop
 
-        self.body_flops_per_token = 2 * (body_params + n_loops * moe_active_params)
-        self.lm_head_flops_per_token = 2 * lm_head_params           # per application (once per loop)
+        # split per-loop from run-once so the trainer can bill the loop count it ACTUALLY ran --
+        # loop-count sampling (a step may run fewer than n_loops) would otherwise silently inflate
+        # the reported MFU by charging every step for the full depth.
+        self.dense_flops_per_token = 2 * body_params                 # decoder + heads' trunk, once
+        self.loop_flops_per_token = 2 * moe_active_params            # per MoE loop
+        self.dense_attn_flops_per_seqsq = 2 * hidden_size * num_layers
+        self.loop_attn_flops_per_seqsq = 2 * hidden_size * moe_attn_per_loop
+        self.lm_head_flops_per_token = 2 * lm_head_params            # per application (once per loop)
         self.mtp_flops_per_token = 2 * (mtp_body_params + mtp_num_extra_tokens * mtp_lm_head_params)
-        self.attn_flops_per_seqsq = 2 * hidden_size * n_attn_layers  # multiply by sum(segment_len^2)
+
+        # aggregates at the configured loop count, for the log line / anything not tracking depth
+        self.body_flops_per_token = self.dense_flops_per_token + n_loops * self.loop_flops_per_token
+        self.attn_flops_per_seqsq = self.dense_attn_flops_per_seqsq + n_loops * self.loop_attn_flops_per_seqsq
 
         # single representative number for the log line: one forward, every loop's lm_head, and
         # attention at a fully-packed max_seq_len (a single max_seq_len document per row, the

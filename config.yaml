@@ -54,6 +54,12 @@ training:
                           # uniform subsample is an unbiased estimate of the full mean, so this
                           # trades variance on the low-weight intermediate readouts for throughput.
                           # 1.0 disables it.
+  loop_count_sampling: 0.3 # probability that a training step runs a RANDOMLY REDUCED number of
+                           # loops (uniform over 1..n_loops-1) instead of the full n_loops. Trains
+                           # every depth as a real operating point rather than an incidental one,
+                           # so the loop count stays a runtime choice at inference; also cuts mean
+                           # training compute. loop_ce_weights is truncated and rescaled so the
+                           # deepest loop actually run always carries weight 1.0. 0.0 disables it.
   lambda_conf: 0.05 # weight on the correctness head's BCE loss (final loop only)
   grad_accumulation_steps: 4 # GATE4 TEST -- real value: 16. Tokens/step drops from 524,288 to 131,072, giving
                              # ~343 optimizer steps (vs ~95) over the 45M budget -- more LOG_INTERVAL=10 points

@@ -35,7 +35,8 @@ cu, ms = cu_seqlens_from_doc_ids(doc_ids)
 # --- per-loop loop_scale, init 1/sqrt(n_loops) ---
 ls = model.moe.loop_scale
 assert ls.shape == (N_LOOPS,), ls.shape
-assert all(abs(v - 1 / math.sqrt(N_LOOPS)) < 1e-6 for v in ls.tolist()), ls.tolist()
+# tolerance is bf16-sized, not fp32: the model is cast to bf16, so 1/sqrt(3)=0.57735 stores as 0.578125
+assert all(abs(v - 1 / math.sqrt(N_LOOPS)) < 1e-2 for v in ls.tolist()), ls.tolist()
 print(f"[ok] loop_scale shape {tuple(ls.shape)}, init {ls.tolist()[0]:.4f} == 1/sqrt({N_LOOPS})")
 
 # --- loop-index router bias: zero-init no-op, distinct per loop, clamps past the table ---
@@ -102,6 +103,44 @@ subs[0][0].backward(retain_graph=True)
 assert model.lm_head.projection.weight.grad is not None
 assert torch.count_nonzero(model.moe.loop_scale.grad).item() == N_LOOPS, model.moe.loop_scale.grad
 print(f"[ok] backward through subsampled CE; per-loop loop_scale grads {model.moe.loop_scale.grad.tolist()}")
+
+# --- stochastic loop depth ---
+import random
+from scripts.pretrain import sample_n_loops, loop_ce_weights_for
+
+rng = random.Random(0)
+assert all(sample_n_loops(rng, N_LOOPS, 0.0) == N_LOOPS for _ in range(50)), "p=0 must never reduce"
+assert all(sample_n_loops(rng, 1, 1.0) == 1 for _ in range(20)), "n_loops=1 has nothing to reduce to"
+draws = [sample_n_loops(rng, N_LOOPS, 0.3) for _ in range(4000)]
+assert set(draws) == set(range(1, N_LOOPS + 1)), sorted(set(draws))
+frac_full = draws.count(N_LOOPS) / len(draws)
+assert 0.65 < frac_full < 0.75, frac_full
+print(f"[ok] sample_n_loops: depths {sorted(set(draws))}, full-depth fraction {frac_full:.3f} (~0.70)")
+
+# truncated weights must keep the deepest loop actually run at weight 1.0
+import config as _cfg
+_cfg.TrainingConfig.loop_ce_weights = [0.2, 0.3, 1.0]
+assert loop_ce_weights_for(3) == [0.2, 0.3, 1.0]
+assert loop_ce_weights_for(2) == [0.2 / 0.3, 1.0]
+assert loop_ce_weights_for(1) == [1.0]
+print(f"[ok] loop_ce_weights_for: 3->{loop_ce_weights_for(3)} 2->{[round(w,3) for w in loop_ce_weights_for(2)]} 1->{loop_ce_weights_for(1)}")
+
+# a reduced-depth step must produce a finite loss and real gradients end to end
+for n in (1, 2, 3):
+    model.zero_grad(set_to_none=True)
+    h_n, aux_n, ph_n, mtp_n = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
+                                    return_aux_loss=True, return_hidden=True, n_loops=n)
+    loss_n, _ = compute_mtp_loss(h_n, labels, mtp_outputs=mtp_n, lm_head=model.mtp_head.lm_head,
+                                 main_lm_head=model.lm_head, pad_mask=pad_mask,
+                                 loop_ce_weights=loop_ce_weights_for(n),
+                                 loop_ce_subsample=0.25, correct_proj=model.correct_proj,
+                                 lambda_conf=0.05)
+    (loss_n + aux_n).backward()
+    assert torch.isfinite(loss_n), (n, loss_n)
+    g = model.moe.loop_scale.grad
+    assert torch.count_nonzero(g[:n]).item() == n, (n, g)
+    assert torch.count_nonzero(g[n:]).item() == 0, f"loops beyond {n} must get no gradient: {g}"
+    print(f"[ok] depth {n}: loss={loss_n.item():.4f}, loop_scale grad touches exactly loops 0..{n-1}")
 
 # --- weight decay param grouping ---
 from scripts.pretrain import build_param_groups

@@ -94,7 +94,8 @@ land in normal commits like any other source file.
 - `TrainingConfig` — class attributes; `total_steps` is *derived* as
   `target_tokens // (batch_size * seq_length * grad_accumulation_steps)`. Also holds the ponder
   loss knobs (`lambda_ponder`, `ponder_warmup_tokens`, `ponder_ramp_tokens`), `loop_ce_weights` +
-  `loop_ce_subsample` (PLAN.md Step 4a), and `lambda_conf` (PLAN.md Step 4b) even though they read from
+  `loop_ce_subsample` (PLAN.md Step 4a), `loop_count_sampling`, and `lambda_conf` (PLAN.md Step 4b)
+  even though they read from
   `config.yaml`'s `training:` block rather than `model:` — they're consumed directly in
   `scripts/pretrain.py`'s / `compute_mtp_loss`'s loss calc, not passed into the model.
   `loop_ce_weights`' length is asserted against `n_loops` at config-load time (import-time
@@ -406,6 +407,17 @@ requirement here, not an afterthought.
   estimate of the full mean, so `loop_ce_weights` semantics are unchanged — only the variance on
   the low-weight intermediate readouts goes up, in exchange for not running the model's largest
   GEMM `n_loops` times at full width. `1.0` disables it.
+- **Stochastic loop depth** (`TrainingConfig.loop_count_sampling`, default `0.3`): that fraction of
+  steps runs a uniformly random depth in `1..n_loops-1` via `sample_n_loops`, the rest run full
+  depth. `loop_ce_weights` is truncated and rescaled by `loop_ce_weights_for(n)` so the deepest loop
+  actually run always carries weight `1.0` (and holds the correctness head) — truncating alone
+  would shrink the whole CE term on shallow steps, i.e. a per-step LR change. Purpose: make every
+  depth a real operating point so an inference-time `n_loops` override lands on something the model
+  trained at; it also cuts mean body compute (~85% of always-full at `p=0.3`, `n_loops=3`).
+  **Log steps are pinned to full depth** so `losses`/per-loop CE/`p_halt` are always read at the
+  same operating point. This replaces the ponder loss as the "bounded refinement" mechanism —
+  `p_halt` gates the loop's *output* while every expert still runs, so penalizing it buys back no
+  compute and only pushes the loop toward a no-op.
 - **Optimizer uses two param groups** (`build_param_groups`): weight decay applies only to tensors
   with `ndim >= 2`. Norms/biases/gates are excluded because their zero is a *degenerate state*, not
   just a regularization preference — `moe.loop_scale` decayed toward 0 is the loop decayed toward
