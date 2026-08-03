@@ -137,7 +137,7 @@ def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
         # engine forced to pyarrow: fastparquet cannot decode list<struct<role,content>> columns
         # and silently returns None for every row instead of raising, which would make a chat
         # source like smoltalk2 contribute zero documents with no error at all (found via a real
-        # smoke run -- see TODO.md history).
+        # smoke run).
         df = pd.read_parquet(local_path, columns=[spec.messages_field], engine="pyarrow")
         texts = []
         for msgs in df[spec.messages_field]:
