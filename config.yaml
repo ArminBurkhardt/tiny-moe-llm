@@ -36,21 +36,28 @@ training:
   num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient
-  target_tokens: 45000000 # GATE4 TEST -- real value: 5000000000 (see config.yaml.real_backup). Scaled to the
-                          # ~50M-token local phase1 slice from prepare_data.py's smoke run, leaving ~5M tokens
-                          # margin so the mmap dataset's single epoch doesn't run out mid-run.
+  target_tokens: 45000000 # GATE4 TEST -- real value: 29900000000 (see config.yaml.real_backup -- Budget decision,
+                          # PLAN.md: data-limited at the 30B prepared-data cap, not MFU/budget-limited, given Gate
+                          # 4's 31.8% local MFU already clears the ~18% data-limited threshold under worse-than-real
+                          # conditions). Scaled to the ~50M-token local phase1 slice from prepare_data.py's smoke
+                          # run, leaving ~5M tokens margin so the mmap dataset's single epoch doesn't run out mid-run.
   warmup_steps: 30 # GATE4 TEST -- real value: 1000. At grad_accumulation_steps=4 this is ~3.9M tokens (~9% of
                    # the 45M target); the real 1000 steps would be ~524M tokens, more than this whole test run.
   noise_anneal_tokens: 10000000 # GATE4 TEST -- real value: 1000000000, scaled proportionally down
-  lambda_ponder: 0.05 # GATE4 TEST -- was 3e-3, then 0.5. Two measured points now bracket the band:
+  lambda_ponder: 0.15 # GATE4 TEST -- was 3e-3, then 0.5, then 0.05. Three measured points now:
                      # 3e-3 -> p_halt plateaus ~0.003-0.006 (CE gradient dominates, never enters
-                     # band); 0.5 -> p_halt plateaus ~0.73-0.75 (ponder dominates, loop's (1-p_halt)
-                     # update gets ~75% muted, which is why the idx1380 loss curve goes flat right
-                     # as p_halt climbs -- ponder was strangling the mechanism it's meant to just
-                     # discourage). Treating p_halt as sigmoid(a + b*ln(lambda)) and fitting those
-                     # two points targets p_halt~0.15 (mid-band) at lambda~0.05 -- extrapolated, not
-                     # independently measured. Read off the real Gate 4 run's own logs rather than
-                     # spending another dedicated test-config run on it.
+                     # band); 0.05 -> p_halt still only ~0.01-0.02 once fully ramped (the idx740
+                     # run: p_halt collapses from init ~0.12 to ~0.01 during the zero-lambda warmup,
+                     # purely from CE pressure, before ponder ever engages -- recovering out of that
+                     # saturated sigmoid region turned out to need much more than the log-linear
+                     # sigmoid(a + b*ln(lambda)) fit (through the 3e-3/0.5 points) predicted for
+                     # 0.05, which was ~0.15); 0.5 -> p_halt plateaus ~0.73-0.75 (ponder dominates,
+                     # loop's (1-p_halt) update gets ~75% muted, which is why the idx1380 loss curve
+                     # goes flat right as p_halt climbs -- ponder was strangling the mechanism it's
+                     # meant to just discourage). 0.15 is a re-guess given the fit undershot once
+                     # actually measured -- still extrapolated, not independently measured. Read off
+                     # the real Gate 4 run's own logs rather than spending another dedicated
+                     # test-config run on it.
   ponder_warmup_tokens: 8000000 # GATE4 TEST -- real value: 1000000000. Ponder turns on at ~18% into the run so
                                 # there's still runway afterward to check loop_scale doesn't collapse once it does.
   ponder_ramp_tokens: 8000000 # GATE4 TEST -- real value: 1000000000. Full lambda_ponder weight by ~36% into the

@@ -1,0 +1,76 @@
+model:
+  vocab_size: 65536 # gemma: 262144 -- pruned to fit uint16 train.bin (Step 8), was 129280
+  max_seq_length: 4096
+  hidden_size: 768 # was 512 -- 512 kept every GEMM skinny and MFU low
+  intermediate_size: 2304 # dense decoder MLP only
+  moe_intermediate_size: 2304 # routed + shared MoE experts only, defaults to intermediate_size if absent
+  num_layers: 8 # was 5
+  num_attention_heads: 12 # was 8
+  head_dim: 64
+  dropout: 0.00 # for pretraining only
+  per_layer_embeddings_size: 32
+
+  # num experts
+  num_mlp_experts: 32 # was 36 -- end of the free-lunch total-params-at-zero-active-compute range, see PLAN.md Step 5
+  num_attn_experts: 1
+
+  # routing
+  top_k: 2
+  n_loops: 3 # was 4 -- non-MLP experts run densely every loop, so fewer loops means fewer dense attention passes
+
+  # information retrieval
+  num_ir_experts: 1
+  num_ir_entries: 8192 # was 16384 -- dense every loop, ~11% of forward FLOPs, halving frees throughput + ~2GB peak mem
+  ir_dim: 128
+
+  # mtp
+  mtp_num_extra_tokens: 2
+  lm_head_factor: 4
+
+training:
+  batch_size: 8
+  seq_length: 4096
+  lr: 4e-4
+  weight_decay: 0.02
+  grad_clip: 1.0
+  num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
+  lambda_mtp: 0.1
+  aux_loss_weight: 0.01 # load balancing loss coefficient
+  target_tokens: 29900000000 # Budget decision (PLAN.md): prepared data caps phase1+phase2 combined at 30B tokens,
+                             # and Gate 4's local 5090 measurement (31.8% MFU, BF16-only, grad_accum=4, still under
+                             # the ~18% MFU threshold PLAN.md calls data- vs budget-limited) makes it very likely
+                             # the real H100+FP8 run (larger grad_accum, FP8 on the dense/head GEMMs, nothing that
+                             # should regress below that threshold) lands in the data-limited regime, so the EUR
+                             # 100/47h budget-hours table doesn't bind -- rounded down from the 30B data cap scaled
+                             # by Step 8's measured fertility regression (manifest.json fertility_regression._overall
+                             # = 0.15439%, i.e. 30B * (1 - 0.0015439) ~= 29.954B). Combined phase1+phase2, not either
+                             # phase alone. Correct via the Vast.ai runbook's Step 4 FP8 smoke test if real tokens/sec
+                             # differs from the Gate 4 extrapolation by >20% -- the last cheap moment to fix this.
+  warmup_steps: 1000 # linear LR warmup before cosine decay
+  noise_anneal_tokens: 1000000000 # decay router exploration noise 1->0 over the first 1b tokens
+  lambda_ponder: 0.05 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens.
+                      # was 3e-3, revised after GATE4 TEST runs (config.yaml) showed 3e-3 leaves
+                      # p_halt pinned ~0.003-0.006 (CE gradient dominates) and 0.5 oversaturates it
+                      # to ~0.75 (stalls the loss -- see config.yaml's comment for the full readout).
+                      # 0.05 is a log-linear interpolation between those two measured points, not
+                      # itself independently verified -- confirm against the real Gate 4 run's logs.
+  ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 until loop_scale has had room to grow (deadlock avoidance)
+  ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
+  loop_ce_weights: [0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
+  loop_ce_subsample: 0.25 # fraction of token positions supervised on the NON-final loops (final
+                          # loop is always supervised in full). the LM head is the largest GEMM in
+                          # the model and per-loop CE runs it once per loop; a CE mean over a
+                          # uniform subsample is an unbiased estimate of the full mean, so this
+                          # trades variance on the low-weight intermediate readouts for throughput.
+                          # 1.0 disables it.
+  loop_count_sampling: 0.3 # probability that a training step runs a RANDOMLY REDUCED number of
+                           # loops (uniform over 1..n_loops-1) instead of the full n_loops. Trains
+                           # every depth as a real operating point rather than an incidental one,
+                           # so the loop count stays a runtime choice at inference; also cuts mean
+                           # training compute. loop_ce_weights is truncated and rescaled so the
+                           # deepest loop actually run always carries weight 1.0. 0.0 disables it.
+  lambda_conf: 0.05 # weight on the correctness head's BCE loss (final loop only)
+  grad_accumulation_steps: 16
+  seed: 42
+  data_dir: "data/prepared" # dir holding {phase}.bin/.idx from scripts/prepare_data.py (Step 11)
+  phase: "phase1" # which {phase}.bin/.idx pair to train on 
