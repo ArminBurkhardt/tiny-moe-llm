@@ -143,17 +143,45 @@ for n in (1, 2, 3):
     print(f"[ok] depth {n}: loss={loss_n.item():.4f}, loop_scale grad touches exactly loops 0..{n-1}")
 
 # --- weight decay param grouping ---
-from scripts.pretrain import build_param_groups
-groups = build_param_groups(model, 0.02)
+from scripts.pretrain import build_param_groups, sync_master_grads_, sync_master_values_
+groups, no_decay_master_pairs = build_param_groups(model, 0.02)
 assert groups[0]["weight_decay"] == 0.02 and groups[1]["weight_decay"] == 0.0
-no_decay = {id(p) for p in groups[1]["params"]}
+# the no_decay group's optimizer entries are fp32 masters, not the bf16 model params directly
+# (see build_param_groups' docstring) -- membership is checked via the pairing, not group identity
+no_decay_ids = {id(bf16_p) for bf16_p, _ in no_decay_master_pairs}
 for name, p in [("moe.loop_scale", model.moe.loop_scale),
                 ("layer_scalar", model.gemma_decoder.layers[0].layer_scalar),
                 ("halt_proj.bias", model.moe.halt_proj.bias)]:
-    assert id(p) in no_decay, f"{name} must not be weight-decayed"
+    assert id(p) in no_decay_ids, f"{name} must not be weight-decayed"
 assert id(model.gemma_decoder.embed_tokens.weight) in {id(p) for p in groups[0]["params"]}
 assert sum(len(g["params"]) for g in groups) == len([p for p in model.parameters() if p.requires_grad])
+for bf16_p, master in no_decay_master_pairs:
+    assert master.dtype == torch.float32 and bf16_p.dtype == torch.bfloat16
+    assert master.data_ptr() != bf16_p.data_ptr(), "master must be a separate tensor, not an alias"
+    assert torch.allclose(master.float(), bf16_p.float(), atol=1e-3), "master must start at the bf16 value"
 print(f"[ok] param groups: {len(groups[0]['params'])} decayed / {len(groups[1]['params'])} undecayed, all covered")
+
+# --- bf16-native AdamW on a no_decay tensor silently discards a steady-state-sized step; the
+# fp32-master mechanism must not (this is the Gate-4 loop_scale/p_halt-frozen bug) ---
+ls = model.moe.loop_scale
+ls_master = dict(no_decay_master_pairs)[ls]
+before = ls.detach().clone()
+lr_like_step = 2e-4  # this run's peak lr; ls sits at 1/sqrt(3)=0.578, bf16 ulp there is 0.0039
+naive = before.clone()
+naive -= lr_like_step
+assert torch.equal(naive, before), "sanity check: a naive bf16 in-place step should round away to nothing"
+opt = torch.optim.AdamW([ls_master], lr=lr_like_step)
+for _ in range(50):
+    ls.grad = torch.full_like(ls, -1.0)  # consistent-sign synthetic gradient, like a real steady state
+    sync_master_grads_(no_decay_master_pairs)
+    opt.step()
+    sync_master_values_(no_decay_master_pairs)
+    ls.grad = None
+assert not torch.equal(ls, before), (
+    f"loop_scale must move via the fp32 master after 50 steps at lr={lr_like_step}, "
+    f"still exactly {ls.tolist()} == init -- the bf16-freeze bug is back"
+)
+print(f"[ok] fp32-master step: loop_scale moved {before.tolist()} -> {ls.tolist()} (naive bf16 step would not have)")
 
 # --- router exploration noise is scaled down ---
 from modules.model.router import ROUTER_NOISE_SCALE

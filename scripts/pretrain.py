@@ -69,6 +69,7 @@ def train_step(
     accelerator: Accelerator = None,
     optimizer: optim.Optimizer = None,
     scheduler: optim.lr_scheduler._LRScheduler = None,
+    no_decay_master_pairs: list = None,
     collect_metrics: bool = False,
     n_loops: int = None,
 ):
@@ -159,7 +160,13 @@ def train_step(
             # accelerator.clip_grad_norm_ unscales/handles the wrapped params correctly.
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), TrainingConfig.grad_clip)
+                # see build_param_groups: the no_decay group is optimized via fp32 masters
+                # because bf16-native AdamW steps on these silently round to zero otherwise.
+                if no_decay_master_pairs is not None:
+                    sync_master_grads_(no_decay_master_pairs)
             optimizer.step()
+            if accelerator.sync_gradients and no_decay_master_pairs is not None:
+                sync_master_values_(no_decay_master_pairs)
             optimizer.zero_grad(set_to_none=True)
 
     if scheduler is not None and accelerator.sync_gradients:
@@ -212,20 +219,69 @@ def build_param_groups(model: TinyMoETransformer, weight_decay: float):
         have the same problem in milder form.
     The usual convention -- decay only tensors with ndim >= 2 -- covers all of these, since every
     one of them is a scalar or a vector.
+
+    The no_decay group additionally needs fp32 shadow "master" weights, for a reason unrelated to
+    weight decay: the model trains in native bf16 (``model.to(BF16)``, no fp32 master copy), and a
+    steady-state AdamW step has magnitude ~lr (~1e-4-1e-3 here). Every no_decay tensor sits at O(0.1-2)
+    magnitude (loop_scale ~1/sqrt(n_loops), layer_scalar/RMSNorm gains ~1, halt_proj.bias -2.0), where
+    bf16's ulp (~0.4% of magnitude) is 10-40x bigger than that step -- so `param -= lr * update`
+    rounds to EXACTLY the original bf16 value, every single step, forever, regardless of how much
+    Adam momentum accumulates. Confirmed on a real checkpoint: after 344 optimizer steps loop_scale's
+    exp_avg was large and nonzero while the bf16 value hadn't moved a single representable increment
+    (matches Gate 4 failing -- p_halt pinned, loop_scale stuck at init). decay tensors don't have this
+    problem in practice: their values and needed steps both scale with their own (much smaller) init
+    std, so they stay inside bf16's relative resolution.
+    The fix: AdamW steps the fp32 masters (never sub-ulp at fp32 precision), and the bf16 model
+    parameter actually read by the forward pass is refreshed from its master after every real step
+    (see sync_master_grads_/sync_master_values_ below). Returns the master pairs so the caller can
+    drive that sync and re-seed the masters from a resumed checkpoint's bf16 weights.
     """
     decay, no_decay = [], []
     for param in model.parameters():
         if not param.requires_grad:
             continue
         (no_decay if param.ndim <= 1 else decay).append(param)
+    no_decay_masters = [p.detach().clone().float().requires_grad_(False) for p in no_decay]
     logger.info(
         f"Optimizer param groups: {len(decay)} decayed tensors (wd={weight_decay}), "
-        f"{len(no_decay)} undecayed (norms/biases/gates)"
+        f"{len(no_decay)} undecayed (norms/biases/gates) stepped via fp32 masters"
     )
-    return [
+    param_groups = [
         {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
+        {"params": no_decay_masters, "weight_decay": 0.0},
     ]
+    return param_groups, list(zip(no_decay, no_decay_masters))
+
+
+def sync_master_grads_(master_pairs):
+    """Copy each bf16 model param's (post-clip) .grad into its fp32 master's .grad, in place.
+
+    Call once, right before the real ``optimizer.step()`` (i.e. gated on
+    ``accelerator.sync_gradients``, matching where grad clipping already runs) -- the bf16 param's
+    .grad is the fully accumulated, clipped gradient at that point; the master needs exactly that,
+    not a running sum of its own, so this overwrites rather than accumulates.
+    """
+    with torch.no_grad():
+        for bf16_param, master in master_pairs:
+            if bf16_param.grad is None:
+                continue
+            if master.grad is None:
+                master.grad = bf16_param.grad.detach().float()
+            else:
+                master.grad.copy_(bf16_param.grad.detach())
+
+
+def sync_master_values_(master_pairs):
+    """Refresh each bf16 model param from its just-stepped fp32 master, in place.
+
+    Call once, right after the real ``optimizer.step()`` (same gating as sync_master_grads_) --
+    this is what makes the fp32 update actually visible to the forward pass, at bf16 precision
+    (an ordinary, correctly-rounded fp32->bf16 cast, not the sub-ulp-discarding in-place bf16 add
+    this whole mechanism exists to avoid).
+    """
+    with torch.no_grad():
+        for bf16_param, master in master_pairs:
+            bf16_param.data.copy_(master.data.to(bf16_param.dtype))
 
 
 def build_scheduler(optimizer: optim.Optimizer):
@@ -394,8 +450,9 @@ def pretrain():
     # model = torch.compile(model)
     # from bitsandbytes.optim import AdamW8bit
     
+    param_groups, no_decay_master_pairs = build_param_groups(model, TrainingConfig.weight_decay)
     optimizer = optim.AdamW(
-        build_param_groups(model, TrainingConfig.weight_decay), lr=TrainingConfig.lr,
+        param_groups, lr=TrainingConfig.lr,
     )
     scheduler = build_scheduler(optimizer)
 
@@ -426,6 +483,16 @@ def pretrain():
             raise
         model._token_tracker.num_tokens = resume_token_count
         resumed = True
+
+        # the fp32 masters aren't part of model_state_dict (they're optimizer-only shadows built
+        # at optimizer-construction time, before this resume) -- reseed them from the just-loaded
+        # bf16 weights so the no_decay group keeps moving from where this checkpoint left off,
+        # rather than from the pre-resume random init they were cloned from. Adam's exp_avg/
+        # exp_avg_sq for the masters already came back correctly via optimizer.load_state_dict
+        # above (restored by param-group position, not by identity, so unaffected by this copy).
+        with torch.no_grad():
+            for bf16_param, master in no_decay_master_pairs:
+                master.data.copy_(bf16_param.data.float())
 
         # total_steps moves with batch size / grad accum, so reanchor the LR schedule by tokens
         tokens_per_step = TrainingConfig.Batch_size * TrainingConfig.Seq_length * TrainingConfig.grad_accumulation_steps
@@ -576,6 +643,7 @@ def pretrain():
                     accelerator=accelerator,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    no_decay_master_pairs=no_decay_master_pairs,
                     # gathered only on the steps the log block below actually reads them
                     collect_metrics=is_log_step,
                     n_loops=step_n_loops,
