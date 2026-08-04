@@ -313,8 +313,22 @@ error. `pretrain.py` also logs the ETA on each log line, since that is where you
    (`prepare_data.py` forces the pyarrow engine). Torch-dependent installs get `--no-deps`.
 2. `--hf-token` → `huggingface.key` (0600) + `export HF_TOKEN`.
 3. `python scripts/fetch_tokenizer.py`.
-4. `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
-5. `bash tests/run_env_check.sh` (now pointing at the correct tokenizer dir).
+4. **Upload preflight.** Push a tiny `preflight.txt` to `ikeafisch4/temp-train` and delete it
+   again. This proves token *scope* — not just connectivity — before a 40 h run commits to it. A
+   read-only or wrongly-scoped fine-grained token is far likelier than a network problem, and
+   under §3.4 its failure mode is a disk that fills up 40 hours in rather than an error at minute
+   one. Fails loudly with the token-permission hint.
+   Also probes the one gated source (`nvidia/Nemotron-CC-Math-v1`) with a metadata-only call, for
+   the same reason: it fails on permissions, not on code, and only `prepare_data.py` would
+   otherwise find out.
+5. `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+6. `bash tests/run_env_check.sh` (now pointing at the correct tokenizer dir).
+
+Firewalls need no handling: HF traffic is client-initiated outbound HTTPS on 443, nothing listens,
+and if step 1's `pip install` and step 3's download succeed the path is already proven. Large-file
+uploads route via Xet (`cas-*.xethub.hf.co`) or the LFS CDN (`cdn-lfs*.hf.co`) rather than
+`huggingface.co` directly; `HF_HUB_DISABLE_XET=1` forces the plain LFS path if that ever matters.
+Total egress over the run is ~150 GB (~9 Mbps sustained average).
 
 ### 7.2 `scripts/onstart.sh`
 
