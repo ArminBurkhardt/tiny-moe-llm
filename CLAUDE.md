@@ -18,19 +18,30 @@ scripts under [scripts/](scripts/).
 
 ```
 config.py / config.yaml     all hyperparameters (yaml -> ModelConfig / TrainingConfig)
-utils.py                    logger, BASE_DIR, dtype aliases, save/load_checkpoint
+utils.py                    logger, BASE_DIR, dtype aliases, TOKENIZER_REPO/TOKENIZER_DIR/
+                             HF_UPLOAD_REPO, get_hf_token, save/load_checkpoint
 data_config.json            local parquet source roots + column names per mode (gitignored) --
                              no longer read by any script since the Step 9 mmap dataset rewrite
                              (`prune_vocab.py` hardcodes its own mix instead); kept around as a
                              record of the pre-Step-9 local shard layout
 memory-benchmark.py         standalone peak-VRAM probes (not used by training)
-env_init                    WSL/CUDA env + venv activation (gitignored, `source env_init`)
+env_init                    WSL/CUDA env + venv activation (gitignored, `source env_init`).
+                             The rented box has no counterpart -- `scripts/setup.sh` installs into
+                             the NGC image's system python, and the test runners take
+                             `TINY_LLM_ENV_INIT=/dev/null` there (`vast_init` is deleted)
 scripts/
-  pretrain.py               THE training loop
+  run_training.py           THE unattended entry point: supervises phase1 -> phase2, relaunches
+                             through preemptions, honours the exit-code contract
+  pretrain.py               THE training loop; `pretrain(phase=None) -> exit code`, `--phase`
+  setup.sh                  box setup: deps, huggingface.key, tokenizer, upload/gated preflight
+  onstart.sh                vast.ai onstart hook: clone, setup.sh, nohup run_training.py
+  fetch_tokenizer.py        pulls TOKENIZER_REPO into TOKENIZER_DIR (ckpts/ is gitignored)
   inference.py              greedy/top-k sampling CLI
   prune_vocab.py            one-shot 129280 -> 65536 vocab prune (Step 8), not part of training
   prepare_data.py           builds phase1/phase2.bin/.idx from the Hub source mix (Step 11), runs
                              on the rented box, not locally -- see "Data prep" below
+  eval_calibration.py       Gate 5: ECE / abstention AUROC for the correctness head
+  __init__.py               empty; exists only so tests can `from scripts.run_training import ...`
 modules/model/
   transformer.py            TinyMoETransformer (top level) + TokenTracker
   gemma4.py                 dense decoder: GQA, RoPE, RMSNorm(te), per-layer embeddings
@@ -44,9 +55,18 @@ modules/model/
   embeddings.py             RoPE cache + apply_rotary_pos_emb
   utils.py                  EncoderOutput dataclass
 modules/data/dataset.py     mmap flat-file IterableDataset (bin/idx) with document packing (Step 9)
+modules/runtime/            unattended-run machinery. MUST NOT import torch.nn, transformer_engine
+                             or anything under modules/model/ -- every test here runs GPU-free
+  checkpoints.py            naming, stale cleanup, latest-VALID resume, retention, phase scoping,
+                             run_state sidecar, verify_resume
+  hf_sync.py                HFSync: background upload thread, retries, droppable jobs, drain
+  control.py                RunControl: STOP sentinel + SIGTERM/SIGUSR1, EXIT_* contract
+  status.py                 write_status (atomic), eta_seconds, format_duration
 tests/                      tracked sanity scripts (see "Tests")
-ckpts/                      gitignored: pretrained/<tokenizer dirs>, training/<*.pt, *.png>
+ckpts/                      gitignored: pretrained/<tokenizer dirs>, training/<*.pt, *.png,
+                             run_state.json, status.json, STOP>
 data/datasets/              gitignored parquet/jsonl shards
+docs/runbook.md             what to run on the box, how to stop it, what is normal, what is not
 ```
 
 `modules/util/` is an empty leftover. `modules/*/__init__.py` are empty — imports are always
@@ -73,16 +93,26 @@ fully qualified (`from modules.model.moe import ...`).
 ## Commands
 
 ```bash
-source env_init                      # WSL: CUDA paths + venv
-python scripts/pretrain.py           # resumes from the newest ckpts/training/*.pt if any
+source env_init                      # WSL: CUDA paths + venv (local box only)
+bash scripts/setup.sh --hf-token X   # rented box only: deps, token, tokenizer, preflight
+python scripts/run_training.py       # the real run: phase1 -> phase2, restarts on preemption
+python scripts/pretrain.py --phase phase1   # one phase; resumes from the newest LOADABLE ckpt
 python scripts/inference.py          # interactive; -c CKPT -p PROMPT -n 200 --temperature 0.8
 bash tests/run_env_check.sh          # torch/flash/TE/tokenizer smoke check
 bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
+touch ckpts/training/STOP            # stop the run cleanly (exit 10, supervisor does not restart)
+kill -USR1 <pid>                     # checkpoint now, keep training
 ```
 
 Tests are plain scripts (no pytest): each `sys.path.insert`s the repo root, asserts, and prints.
-Most require a GPU. `tests/` is tracked (the `.gitignore` line for it is commented out) — edits
-land in normal commits like any other source file.
+Most require a GPU — the exceptions are the `modules/runtime/` tests (`test_checkpoint_lifecycle`,
+`test_hf_sync`, `test_control`, `test_supervisor`, `test_phase_targets`, `test_hf_token`,
+`test_checkpoint_atomic`) and `test_prepare_data`, which run anywhere. `tests/` is tracked (the
+`.gitignore` line for it is commented out) — edits land in normal commits like any other source
+file.
+
+Operational detail (what to run on the box, how to stop it, what is normal, what to do when it is
+not) lives in [docs/runbook.md](docs/runbook.md), not here.
 
 ## Config
 
@@ -272,9 +302,12 @@ the LM logits, on top of `correct_proj`'s own gradient — the exact leak `tests
 checks for by comparing `lm_head`'s gradient with the conf term on vs. off. `lambda_conf` (`TrainingConfig.lambda_conf`,
 default `0.05`) is not warmup-gated like `lambda_ponder` — no deadlock precondition applies here,
 `correct_proj` doesn't gate anything else's gradient. This head is provisional: Gate 5
-(`scripts/eval_calibration.py`, not written yet) compares its ECE/abstention-AUROC against the
+(`scripts/eval_calibration.py`) compares its ECE/abstention-AUROC against the
 free `p_max = softmax(logits).max()` baseline, and Step 4b reverts (head, loss term, `lambda_conf`)
-if `p_correct` doesn't beat `p_max` on both.
+if `p_correct` doesn't beat `p_max` on both. Gate 5 has been *run* once, on the 45M-token Gate 4
+checkpoint: `p_max` won on both metrics, but the revert was **deferred** rather than taken -- only
+one real cloud run remains and `correct_proj` is proven gradient-isolated and compute-free, so the
+call gets re-made against the real final checkpoint.
 
 **Document packing**: the dataset emits batch-aligned `document_ids [B, S]`; the trainer converts
 them to `cu_seqlens` **in-thread** via `cu_seqlens_from_doc_ids`. Never put `cu_seqlens` in the
@@ -296,9 +329,15 @@ lands on new id 0 again and the single pad/eos id keeps whatever new id it's rem
 
 **Vocab prune** (`scripts/prune_vocab.py`, PLAN.md Step 8): `ckpts/pretrained/DeepSeek-V4-Pro-tokenizer`
 (129280 tokens) is pruned to exactly 65536 so `scripts/prepare_data.py`'s `train.bin` (Step 11) can
-be uint16 instead of uint32 — a disk constraint, not a param-count one. `scripts/pretrain.py` and
-`scripts/inference.py` both point at the pruned `ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536`
-by default. The prune script:
+be uint16 instead of uint32 — a disk constraint, not a param-count one. **Every entry point now
+reads one constant**, `utils.TOKENIZER_DIR` (default `ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536`,
+overridable with `$TINY_LLM_TOKENIZER`), instead of six independent hardcoded paths — `ckpts/` is
+gitignored, so a fresh clone on the box used to fail in six places with six different messages.
+`scripts/fetch_tokenizer.py` downloads it from `utils.TOKENIZER_REPO`
+(`ikeafisch4/DeepSeek-V4-Pro-tokenizer-65536`, public, no token needed).
+`prune_vocab.py`'s own `SRC_TOKENIZER_DIR` is deliberately *not* that constant — it points at the
+unpruned 129280-token source, which is the prune's input, not the trained model's tokenizer.
+The prune script:
 - Samples ~2GB of text from a **local stand-in** for Step 11's phase-1 mix (`data_config.json`'s
   `pretrain` sources: `fineweb`=web -- absorbing the DCLM/FinePDFs weight that has no local shard,
   `nemotron-pre-specialized-v1.1`=code, `nemotron-pre-math-v1/4plus_MIND`=math, `wikipedia/en`=wiki;
@@ -423,10 +462,12 @@ requirement here, not an afterthought.
   just a regularization preference — `moe.loop_scale` decayed toward 0 is the loop decayed toward
   "off", and `layer_scalar` is a gain on the whole residual stream so its decay compounds across
   depth (~0.5x over 8 layers at `lr=4e-4`/`wd=0.02` over a 5B-token run, before any gradient).
-- **A checkpoint that exists but fails to load is fatal, not a fresh start.** The resume path
-  distinguishes "no file in `ckpts/training`" (warn, start from scratch) from "found a file,
-  `load_checkpoint` raised" (log + re-raise). Collapsing both into one warning is how a preempted
-  box silently restarts from token 0 with a plausible-looking loss curve.
+- **A checkpoint that exists but fails to load is never a fresh start.** The resume path
+  distinguishes "no file in `ckpts/training`" (warn, start from scratch) from "files exist but
+  none loads" (raise). Collapsing both into one warning is how a preempted box silently restarts
+  from token 0 with a plausible-looking loss curve. `find_resume_checkpoint` softens only the
+  middle case -- one corrupt newest file falls back to the next oldest -- which is why
+  `verify_resume` exists to bound how far back that fallback may silently go.
 - **`collect_metrics` is gated on the log cadence.** `train_step(..., collect_metrics=step %
   LOG_INTERVAL == 0)`; `metrics` is `None` otherwise. The `p_max`/`p_correct` reductions run over
   every CE chunk's live logits *and* again on the checkpoint recompute, so gathering them on the
@@ -439,15 +480,18 @@ requirement here, not an afterthought.
   to `LOG_INTERVAL`. Keep it that way — the model is small enough that per-step syncs dominate.
 - Anything touching `has_mtp`, `lm_head`, `mtp_head`, `_token_tracker`, or `moe` must go through
   `accelerator.unwrap_model(model)`; the DDP wrapper has none of those attributes.
-- `KeyboardInterrupt` prompts on stdin before saving an `*_interrupted.pt`.
-- **Training stops at `target_tokens`, not a fixed epoch count** (PLAN.md Step 6): `num_epochs: 1`
-  in `config.yaml` now just bounds the outer loop as a safety net; the real stop condition is
-  `n_tokens >= TrainingConfig.target_tokens`, checked inside the existing `LOG_INTERVAL` block (the
-  sync-free counter is already being drained there for logging, so this adds no extra sync). On
-  hitting it, a final checkpoint is saved (same `save_checkpoint` call as the periodic one) before
-  breaking both loops via a `stop_training` flag. Without this, a dataset bigger than `target_tokens`
-  would keep training past the point the cosine LR schedule was anchored to, wasting the phase-2
-  anneal (see PLAN.md's "Budget decision").
+- **`KeyboardInterrupt`'s `input()` prompt is gated on `sys.stdin.isatty()`.** On a box with no tty
+  it raises `EOFError`, which the old bare `except Exception` swallowed -- so the interrupt path
+  saved nothing. Worse, vast preemption sends SIGTERM, which never raised `KeyboardInterrupt` at
+  all, so that path never ran on the one machine it was written for.
+- **Training stops at the PHASE's token target, not `target_tokens` and not an epoch count**
+  (PLAN.md Step 6): `num_epochs: 1` in `config.yaml` now just bounds the outer loop as a safety
+  net. The real stop condition is `n_tokens >= phase_target`
+  (`TrainingConfig.phase_target_tokens(phase)`), checked inside the existing `LOG_INTERVAL` block
+  (the sync-free counter is already being drained there for logging, so this adds no extra sync).
+  `target_tokens` stays the **combined** budget and still anchors `total_steps` and the cosine, so
+  phase 2 continues the decay instead of restarting it. Without a stop, a dataset bigger than the
+  target would train past the point the schedule was anchored to, wasting the anneal.
 - **`compute_mtp_loss(..., return_metrics=True)`** (PLAN.md Step 7) returns a 3rd value, a dict of
   still-on-device tensors: `per_loop_ce` (list, one per loop), `conf_loss`, `p_correct`, `p_max`,
   `top1_acc` (the last three `None` if `correct_proj` wasn't passed). `train_step` adds `p_halt_mean`,
@@ -461,9 +505,17 @@ requirement here, not an afterthought.
 
 ## Checkpoints & resume
 
-`ckpts/training/checkpoint_epoch{E}_idx{STEP}_loss{L}[_interrupted].pt`; "latest" means newest
-mtime, not highest step. Payload (see [utils.py](utils.py)): model/optimizer/scheduler states,
-`token_count`, `losses`, and a single **`global_offset`** (PLAN.md Step 9) -- a doc index into the
+`ckpts/training/checkpoint_{phase}_tok{N}M_loss{L}.pt` for rolling saves, plus exactly one
+`checkpoint_{phase}_final.pt` per phase (`modules/runtime/checkpoints.rolling_name`/`final_name`).
+Epoch/step are deliberately gone from the name: `num_epochs` is a safety net now and `dataset_idx`
+stopped being the resume key when `global_offset` landed, so the token count is the only figure
+that says where a checkpoint sits in the run.
+
+**"Latest" means newest mtime that actually LOADS**, not simply newest mtime --
+`find_resume_checkpoint` walks the candidates newest-first, logs and skips one that raises, and
+only raises itself when *every* candidate fails. Payload (see [utils.py](utils.py)):
+model/optimizer/scheduler states, `token_count`, `losses`, `phase`, and a single
+**`global_offset`** (PLAN.md Step 9) -- a doc index into the
 flat, unshuffled document stream. There is no per-file or per-worker state anymore: doc sharding
 across `DataLoader` workers is pure `doc_idx % num_workers` arithmetic (see "Dataset" below), so
 one conservative (min-across-workers) scalar is enough to resume from without skipping any
@@ -484,6 +536,19 @@ design already accepted when the worker count changed.
   there's no sound mapping from the old per-file position into the new flat corpus.
 - All `load_checkpoint` extras use `.get(..., default)` so old checkpoints still load. Keep that
   when adding fields, and add them to `save_checkpoint`'s signature with a default too.
+  `load_checkpoint` returns a **6-tuple** now (`phase` last, `None` for legacy files).
+- **Writes are atomic**: `save_checkpoint` writes `path + ".tmp"`, `fsync`s, then `os.replace`s.
+  Without this a preemption mid-write leaves a truncated `.pt` that is *also* the newest by mtime,
+  i.e. exactly the file the resume would pick. Leftover `.pt.tmp` files are swept at startup by
+  `cleanup_stale_files`.
+- **Retention deletes a checkpoint only when it is BOTH outside `keep_local_checkpoints` AND
+  confirmed uploaded** (`prune_checkpoints`, `HFSync.is_uploaded`). Never relax the second
+  condition: a locally-deleted, never-uploaded checkpoint is gone for good, whereas one held past
+  the window only costs disk. Sustained upload failure is therefore meant to fill the disk.
+  `checkpoint_{phase}_final.pt` is exempt entirely.
+- **Cadence is in TOKENS** (`TrainingConfig.checkpoint_every_tokens`), checked inside the existing
+  `LOG_INTERVAL` block so it adds no host sync. The old `step % 1500` counted *micro* steps, so at
+  `grad_accum 16` it fired every ~49M tokens -- ~608 checkpoints, ~1.2TB, against a 120GB disk.
 
 ## Dataset ([modules/data/dataset.py](modules/data/dataset.py))
 
@@ -515,6 +580,50 @@ prepended if the document's first stored token isn't already BOS -- idempotent r
 Batches carry `doc_idx / worker_id` as `[B]`-shaped tensors purely so accelerate's batch splitting
 treats them like `input_ids`; `doc_idx` is the last global document index this worker had reached
 when the batch was assembled, read by the trainer for checkpointing (see "Checkpoints & resume").
+
+## Run lifecycle (`modules/runtime/`, `scripts/run_training.py`)
+
+Everything needed to leave a 40 hour run unattended on a preemptible box. Operational instructions
+are in [docs/runbook.md](docs/runbook.md); these are the invariants.
+
+- **`modules/runtime/` must stay GPU-free.** No `torch.nn`, no `transformer_engine`, nothing under
+  `modules/model/`. It imports `utils` (which imports torch) only for `logger`. Every one of its
+  tests runs on a machine with no GPU, which is the whole reason the phase-reset logic lives in
+  `resolve_resume_scope` rather than inline in `pretrain.py`.
+- **The exit-code contract is shared, not local**: `0` phase complete, `10` user stop, `20`
+  preempted, `30` resume verification failed (`modules/runtime/control.py`). `pretrain()` returns
+  one; `run_training.py` restarts on anything except `TERMINAL_CODES = (10, 30)`. Changing a number
+  means changing both sides plus the runbook's table.
+- **Signal handlers set a flag and nothing else.** No I/O, no allocation, no logging (the logging
+  lock can deadlock inside a signal context). `RunControl.poll()` reads the flag and stats the
+  `STOP` sentinel at the `LOG_INTERVAL` cadence -- ~3s granularity, inside vast's SIGTERM grace,
+  and no GPU sync.
+- **A stale `STOP` sentinel is cleared at startup** (`clear_sentinel()` before `install()`).
+  Otherwise the previous run's stop file kills every relaunch before it trains a step.
+- **Upload failures never propagate into the training loop.** `HFSync` retries 3x with tripling
+  backoff, then logs and gives up on that file. Crashing a 40 hour run over a transient 503 is the
+  worse outcome. The failed file stays *unmarked*, which is what makes retention refuse to delete
+  it -- see the retention invariant under "Checkpoints & resume".
+- **`HFSync.drain()` waits for the in-flight job too, not just an empty queue** (hence `_busy`).
+  It is called in `pretrain()`'s `finally`, so a stop or a phase transition cannot race the
+  uploader.
+- **Crossing a phase boundary resets `global_offset`/epoch/step to 0 but PRESERVES `token_count`**
+  (`resolve_resume_scope`). Both halves matter: phase 1's ~23M-document offset in phase 2's ~4M
+  document corpus makes every worker's `range()` empty, so the dataloader yields zero batches and
+  the run exits *looking successful having trained nothing*; and the token count must carry over
+  because the cosine is anchored to the combined budget.
+- **`verify_resume` is the backstop against silent restart-from-zero.** `run_state.json`
+  (`{phase, token_count, checkpoint}`, rewritten atomically at every save) records where the last
+  process got to; resuming more than `2 * checkpoint_every_tokens` behind that aborts with exit 30
+  rather than burning 40 GPU-hours retraining covered ground. The slack exists to permit
+  `find_resume_checkpoint`'s one-file fallback. A different recorded phase means no comparison.
+- **`config.yaml`'s `hf_upload_repo: ""` really does disable uploads.** `None` (key absent) is a
+  distinct state meaning "use `utils.HF_UPLOAD_REPO`", resolved by `TrainingConfig.upload_repo()`.
+  The obvious-looking `hf_upload_repo or HF_UPLOAD_REPO` collapses the two and uploads anyway --
+  it was caught by a local smoke run pushing a 2GB checkpoint to the real repo, not by a test.
+- **Graphs are fixed filenames, overwritten** (`loss_graph.png`, `expert_selection.png`), written
+  inside `save_and_sync` at checkpoint cadence. The old per-step `*_epoch{E}_step{S}.png` naming
+  produced them by the thousand; `cleanup_stale_files` sweeps any left over.
 
 ## Conventions
 
