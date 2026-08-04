@@ -87,3 +87,39 @@ class TrainingConfig:
     # compute_mtp_loss's call sites, not passed into the model.
     lambda_conf = float(Config["training"].get("lambda_conf", 0.05))
 
+    # checkpoint lifecycle for the unattended run
+    checkpoint_every_tokens = int(Config["training"].get("checkpoint_every_tokens", 400_000_000))
+    keep_local_checkpoints = int(Config["training"].get("keep_local_checkpoints", 2))
+    # None means "key absent, fall back to utils.HF_UPLOAD_REPO"; an explicit "" means "uploads
+    # off". Collapsing the two (defaulting to "" and then `value or HF_UPLOAD_REPO` at the call
+    # site) makes `hf_upload_repo: ""` silently upload anyway, which is the opposite of what the
+    # yaml comment promises -- and it is only noticed once a 2GB checkpoint is already on the Hub.
+    _raw_upload_repo = Config["training"].get("hf_upload_repo", None)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+    @classmethod
+    def upload_repo(cls, default: str) -> str:
+        """Resolve which repo to upload to.
+
+        Args:
+            default: utils.HF_UPLOAD_REPO, used only when config.yaml has no key at all.
+
+        Returns:
+            The repo id, or "" when uploads are explicitly disabled.
+        """
+        return default if cls.hf_upload_repo is None else cls.hf_upload_repo
+
+    # phase 1 gets this fraction of target_tokens, phase 2 the rest. target_tokens itself stays
+    # the COMBINED budget so total_steps and the cosine LR anchor are unchanged -- phase 2 must
+    # continue the decay from where phase 1 left it, not restart it.
+    phase1_fraction = float(Config["training"].get("phase1_fraction", 0.85))
+
+    @classmethod
+    def phase_target_tokens(cls, phase: str) -> int:
+        """Token count at which the given phase stops training."""
+        if phase == "phase1":
+            return int(cls.target_tokens * cls.phase1_fraction)
+        if phase == "phase2":
+            return cls.target_tokens
+        raise ValueError(f"unknown phase {phase!r}; expected 'phase1' or 'phase2'")
+

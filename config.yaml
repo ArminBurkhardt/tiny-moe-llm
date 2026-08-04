@@ -79,4 +79,15 @@ training:
   grad_accumulation_steps: 16
   seed: 42
   data_dir: "data/prepared" # dir holding {phase}.bin/.idx from scripts/prepare_data.py (Step 11)
-  phase: "phase1" # which {phase}.bin/.idx pair to train on 
+  phase: "phase1" # which {phase}.bin/.idx pair to train on
+  checkpoint_every_tokens: 400000000 # ~30 min at 200K tok/s. expressed in TOKENS, not steps: the
+                                     # old `step % 1500` counted MICRO steps, so at grad_accum 16
+                                     # it fired every ~49M tokens (~4 min, ~608 checkpoints,
+                                     # ~1.2TB against a 120GB disk). tokens also make the cadence
+                                     # invariant to batch size / grad accum changes.
+  keep_local_checkpoints: 2 # rolling checkpoints kept on disk. a checkpoint is only deleted once
+                            # it is BOTH outside this window AND confirmed uploaded -- see
+                            # modules/runtime/checkpoints.prune_checkpoints for why.
+  phase1_fraction: 0.85 # PLAN.md's 85/15 split. phase 1 stops here; phase 2 runs to target_tokens.
+  hf_upload_repo: "ikeafisch4/temp-train" # "" disables uploads (local runs); delete the key
+                                          # entirely to fall back to utils.HF_UPLOAD_REPO 

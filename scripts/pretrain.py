@@ -18,7 +18,11 @@ from modules.data.dataset import Dataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.mtp import compute_mtp_loss
 from config import ModelConfig, TrainingConfig
-from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16, TOKENIZER_DIR
+from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16, TOKENIZER_DIR, get_hf_token, HF_UPLOAD_REPO
+from modules.runtime import checkpoints as ckpt_lib
+from modules.runtime.control import EXIT_OK, EXIT_PREEMPTED, EXIT_RESUME_FAILED, EXIT_USER_STOP, RunControl
+from modules.runtime.hf_sync import HFSync
+from modules.runtime.status import eta_seconds, format_duration, write_status
 
 
 from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling, NVFP4BlockScaling
@@ -299,23 +303,6 @@ def build_scheduler(optimizer: optim.Optimizer):
         optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
     )
 
-def get_latest_checkpoint_epoch(checkpoint_dir: str):
-    last_timestamp = 0
-    cur_file = None
-    for filename in os.listdir(checkpoint_dir):
-        if filename.startswith("checkpoint") and filename.endswith(".pt"):
-            os_timestamp = os.path.getmtime(os.path.join(checkpoint_dir, filename))
-            if os_timestamp > last_timestamp:
-                last_timestamp = os_timestamp
-                cur_file = filename
-    return cur_file
-
-def checkpoint_name(epoch: int, dataset_idx: int, loss: float, interrupted=False):
-    if interrupted:
-        return f"checkpoint_epoch{epoch}_idx{dataset_idx}_loss{loss:.4f}_interrupted.pt"
-    return f"checkpoint_epoch{epoch}_idx{dataset_idx}_loss{loss:.4f}.pt"
-
-
 def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelConfig):
     model.train().to(device).to(dtype)
     # the dry run must not pollute the (possibly checkpoint-restored) token counter
@@ -412,7 +399,10 @@ def save_loss_graph(losses, path):
     plt.savefig(path)
     plt.close()
 
-def pretrain():
+def pretrain(phase=None):
+    phase = phase or TrainingConfig.phase
+    phase_target = TrainingConfig.phase_target_tokens(phase)
+
     # TOKENIZER_DIR is the pruned 65536 tokenizer (PLAN.md Step 8) -- fits uint16, matches
     # config.yaml's vocab_size. shared with every other entry point via utils, and fetched onto a
     # fresh box by scripts/fetch_tokenizer.py since ckpts/ is gitignored.
@@ -425,7 +415,7 @@ def pretrain():
         tokenizer=tokenizer,
         batch_size=TrainingConfig.Batch_size,
         max_length=TrainingConfig.Seq_length,
-        split=TrainingConfig.phase,
+        split=phase,
         num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
     )
     # must stay the same across checkpoints
@@ -465,24 +455,35 @@ def pretrain():
     resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
     losses = []
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    ckpt_lib.cleanup_stale_files(checkpoint_dir)
+    run_state_path = os.path.join(checkpoint_dir, "run_state.json")
+    run_state = ckpt_lib.read_run_state(run_state_path)
+
+    def _try_load(path):
+        return load_checkpoint(model, optimizer, scheduler, path)
+
     # "no checkpoint exists" and "a checkpoint exists but would not load" are NOT the same event.
     # Swallowing both into one warning is how an unattended, interruptible run silently restarts
     # from token 0 after e.g. a torch.save truncated by a preemption or a config change that
     # reshapes a weight -- the loss curve looks plausible and days of compute are already gone.
-    # Only the first case is recoverable; the second re-raises.
-    latest = get_latest_checkpoint_epoch(checkpoint_dir) if os.path.isdir(checkpoint_dir) else None
-    if latest is None:
+    # find_resume_checkpoint walks newest-first and only raises when NOTHING loads, which keeps
+    # that distinction while surviving one corrupt file.
+    found = ckpt_lib.find_resume_checkpoint(checkpoint_dir, _try_load)
+    resume_token_count = 0
+    if found is None:
         logger.warning("No checkpoint found in ckpts/training. Starting training from scratch")
     else:
-        checkpoint_path = os.path.join(checkpoint_dir, latest)
-        try:
-            start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
-        except Exception as e:
-            logger.error(
-                f"Found checkpoint {checkpoint_path} but failed to load it: {type(e).__name__}: {e}. "
-                f"Refusing to silently restart from scratch -- move or delete the file to start over."
-            )
-            raise
+        checkpoint_path, loaded = found
+        start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase = loaded
+
+        # a checkpoint from the OTHER phase indexes a different corpus -- see resolve_resume_scope
+        # for why that silently trains zero batches if left alone. The token count is deliberately
+        # NOT part of what it resets.
+        start_epoch, dataset_idx, start_doc_idx = ckpt_lib.resolve_resume_scope(
+            ckpt_phase, phase, start_epoch, dataset_idx, start_doc_idx
+        )
+
         model._token_tracker.num_tokens = resume_token_count
         resumed = True
 
@@ -510,8 +511,29 @@ def pretrain():
             f"({resume_token_count / 1e9:.3f}B tokens trained, current LR {scheduler.get_last_lr()[0]:.3e})"
         )
 
-    logger.info(f"Starting training from epoch {start_epoch}, document index {start_doc_idx}")
-    
+    # the check this whole file exists to make possible: if the last process reached 12.4B tokens
+    # and this one thinks it is at 0, something ate the checkpoint and continuing burns 40
+    # GPU-hours retraining ground already covered.
+    try:
+        ckpt_lib.verify_resume(run_state, phase, resume_token_count, 2 * TrainingConfig.checkpoint_every_tokens)
+    except ckpt_lib.ResumeVerificationError as e:
+        logger.error(str(e))
+        return EXIT_RESUME_FAILED
+
+    logger.info(f"Starting {phase} from epoch {start_epoch}, document index {start_doc_idx}; "
+                f"phase target {phase_target:,} tokens (combined run target {TrainingConfig.target_tokens:,})")
+
+    control = RunControl(checkpoint_dir)
+    control.clear_sentinel()
+    control.install()
+
+    hf = HFSync(TrainingConfig.upload_repo(HF_UPLOAD_REPO), token=get_hf_token())
+    log_path = os.path.join(checkpoint_dir, "train.log")
+    loss_png = os.path.join(checkpoint_dir, "loss_graph.png")
+    experts_png = os.path.join(checkpoint_dir, "expert_selection.png")
+    status_path = os.path.join(checkpoint_dir, "status.json")
+    manifest_path = os.path.join(BASE_DIR, "manifest.json")
+
     dry_run(model, device=device, dtype=BF16, config=ModelConfig)
     logger.info("Dry run successful. Starting training loop...")
     
@@ -572,6 +594,46 @@ def pretrain():
         if not seen:
             return start_doc_idx
         return min(seen) + NUM_DATA_WORKERS
+
+    def save_and_sync(epoch, dataset_idx, loss_value, token_count, final=False):
+        """Write a checkpoint, refresh the graphs, upload everything, then prune.
+
+        Order matters: prune runs last and only deletes what hf.is_uploaded confirms, so a
+        checkpoint can never be removed before its replacement is safely off-box.
+        """
+        name = ckpt_lib.final_name(phase) if final else ckpt_lib.rolling_name(phase, token_count, loss_value)
+        path = os.path.join(checkpoint_dir, name)
+        save_checkpoint(
+            unwrapped_model, optimizer, scheduler, epoch, dataset_idx, path=path,
+            token_count=token_count, global_offset=snapshot_global_offset(), losses=losses,
+            phase=phase,
+        )
+        ckpt_lib.write_run_state(run_state_path, phase, token_count, name)
+
+        try:
+            save_loss_graph(losses, loss_png)
+            save_expert_selection_graph(unwrapped_model.moe.expert_tracker.get_stats(), experts_png)
+        except Exception as e:
+            # plotting must never take the run down
+            logger.error(f"Error occurred while saving graphs: {e}")
+
+        repo_dir = "checkpoints/final" if final else "checkpoints"
+        hf.upload(path, f"{repo_dir}/{name}", droppable=not final)
+        for local, remote in (
+            (log_path, "logs/train.log"),
+            (loss_png, "graphs/loss_graph.png"),
+            (experts_png, "graphs/expert_selection.png"),
+            (status_path, "status.json"),
+            (manifest_path, "manifest.json"),
+        ):
+            if os.path.isfile(local):
+                hf.upload(local, remote)
+
+        ckpt_lib.prune_checkpoints(checkpoint_dir, TrainingConfig.keep_local_checkpoints, hf.is_uploaded)
+
+    # first periodic checkpoint one interval after wherever this process picked up
+    next_checkpoint_tokens = last_token_count + TrainingConfig.checkpoint_every_tokens
+    exit_code = EXIT_OK
 
     stop_training = False
     try:
@@ -716,6 +778,8 @@ def pretrain():
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
                     top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
 
+                    eta_phase = eta_seconds(n_tokens, phase_target, tokens_per_sec)
+
                     logger.info(
                         f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
                         f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} (lambda={metrics['lambda_ponder_now']:.2e}) | "
@@ -723,79 +787,91 @@ def pretrain():
                         f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
                         f"per-loop CE: [{per_loop_ce_str}] | mean loops: {mean_loops:.2f} | "
                         f"Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
-                        f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min"
+                        f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min | "
+                        f"ETA: {format_duration(eta_phase)}"
                     )
 
-                    # stop at the token budget the LR schedule is anchored to (PLAN.md Step 6) --
-                    # checked at this same sync-free-until-now cadence, not per step. Without this,
-                    # a run with more data than target_tokens keeps training past the schedule at
-                    # eta_min instead of stopping where the cosine decay was anchored.
-                    if n_tokens >= TrainingConfig.target_tokens:
-                        logger.info(f"Reached target_tokens ({TrainingConfig.target_tokens:,}); saving final checkpoint and stopping.")
-                        save_checkpoint(
-                            unwrapped_model,
-                            optimizer,
-                            scheduler,
-                            epoch,
-                            dataset_idx,
-                            path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
-                            token_count=n_tokens,
-                            global_offset=snapshot_global_offset(),
-                            losses=losses,
-                        )
+                    write_status(
+                        status_path, phase=phase, tokens=n_tokens, phase_target=phase_target,
+                        run_target=TrainingConfig.target_tokens, tokens_per_sec=tokens_per_sec,
+                        loss=val_loss, eta_phase=format_duration(eta_phase),
+                        eta_run=format_duration(eta_seconds(n_tokens, TrainingConfig.target_tokens, tokens_per_sec)),
+                        step=step, epoch=epoch,
+                    )
+
+                    control.poll()
+
+                    # stop at the PHASE's token budget. phase 1 stops at 85% of target_tokens so
+                    # phase 2 still has the anneal; the LR schedule stays anchored to the combined
+                    # figure either way.
+                    if n_tokens >= phase_target:
+                        logger.info(f"Reached {phase} target ({phase_target:,} tokens); saving final checkpoint.")
+                        save_and_sync(epoch, dataset_idx, val_loss, n_tokens, final=True)
                         stop_training = True
                         break
 
-                if step % unwrapped_model.moe.expert_tracker.sliding_window_size == 0:
-                    stats = unwrapped_model.moe.expert_tracker.get_stats()
-                    try:
-                        save_expert_selection_graph(stats, os.path.join(BASE_DIR, "ckpts", "training", f"expert_selection_epoch{epoch}_step{step}.png"))
-                    except Exception as e:
-                        logger.error(f"Error occurred while saving expert selection graph: {e}")
-                    try:
-                        save_loss_graph(losses, os.path.join(BASE_DIR, "ckpts", "training", f"loss_graph_epoch{epoch}_step{step}.png"))
-                    except Exception as e:
-                        logger.error(f"Error occurred while saving loss graph: {e}")
+                    if control.stop_requested:
+                        logger.info(f"Stopping: {control.reason}. Saving checkpoint...")
+                        save_and_sync(epoch, dataset_idx, val_loss, n_tokens)
+                        exit_code = control.exit_code
+                        stop_training = True
+                        break
 
-                # save checkpoint every 1500 steps (was 5000, PLAN.md Step 6 -- makes the run
-                # interruptible at a granularity that matches the vast.ai preemptible-instance flow)
-                if (step % 1500 == 0) and (local_step > 0):
-                    save_checkpoint(
-                        unwrapped_model,
-                        optimizer,
-                        scheduler,
-                        epoch,
-                        dataset_idx,
-                        path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss)),
-                        token_count=unwrapped_model._token_tracker.sync(),
-                        global_offset=snapshot_global_offset(),
-                        losses=losses,
-                    )
+                    # checkpoint cadence in TOKENS, checked here because the counter is already
+                    # drained for logging -- no extra host sync. SIGUSR1 forces one immediately.
+                    if n_tokens >= next_checkpoint_tokens or control.take_checkpoint_request():
+                        save_and_sync(epoch, dataset_idx, val_loss, n_tokens)
+                        next_checkpoint_tokens = n_tokens + TrainingConfig.checkpoint_every_tokens
+
+            # the dataloader ran dry -- a legitimate end of a phase, not an error. nominally the
+            # phase token target fires first (25.415B vs a phase1.bin built for 25.5B), but that
+            # margin is 0.33% against a data prep tolerance of 2%, so a slightly short corpus
+            # lands here instead. same outcome either way: final checkpoint, exit 0. previously
+            # this fell out of the loop saving nothing, losing everything since the last save.
+            if not stop_training:
+                final_tokens = unwrapped_model._token_tracker.sync()
+                logger.info(f"{phase} data exhausted at {final_tokens:,} tokens; saving final checkpoint.")
+                save_and_sync(epoch, dataset_idx, losses[-1] if losses else float("nan"), final_tokens, final=True)
+                stop_training = True
+
             dataset_idx = 0
             if stop_training:
                 break
     except KeyboardInterrupt:
+        # a tty gets the old confirm-then-save prompt; an unattended box must never block on
+        # stdin -- input() there raises EOFError, which the old bare except swallowed, saving
+        # nothing.
+        if sys.stdin is not None and sys.stdin.isatty():
+            try:
+                input("Training interrupted. Press Enter to save checkpoint and exit...")
+            except EOFError:
+                pass
+        logger.info("Training interrupted. Saving checkpoint...")
+        exit_code = EXIT_USER_STOP
         try:
-            input("Training interrupted. Press Enter to save checkpoint and exit...")
-            logger.info("Training interrupted. Saving checkpoint...")
-            save_checkpoint(
-                unwrapped_model,
-                optimizer,
-                scheduler,
-                epoch,
-                dataset_idx,
-                path=os.path.join(checkpoint_dir, checkpoint_name(epoch, dataset_idx, loss, interrupted=True)),
-                token_count=unwrapped_model._token_tracker.sync(),
-                global_offset=snapshot_global_offset(),
-                losses=losses,
-            )
+            save_and_sync(epoch, dataset_idx, losses[-1] if losses else float("nan"),
+                          unwrapped_model._token_tracker.sync())
         except Exception as e:
-            logger.error(f"Exiting with: {e}")
+            logger.error(f"Failed to save the interrupt checkpoint: {e}")
+    finally:
+        # never let a stop race the uploader: drain before the process goes away
+        hf.drain(timeout=900)
+        hf.close()
+
+    return exit_code
 
 
 
 if __name__ == "__main__":
-    pretrain()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="pretrain tiny-moe-llm")
+    parser.add_argument(
+        "--phase", choices=("phase1", "phase2"), default=TrainingConfig.phase,
+        help="which {phase}.bin/.idx corpus to train on (default: config.yaml's training.phase)",
+    )
+    args = parser.parse_args()
+    raise SystemExit(pretrain(phase=args.phase))
 
 
 
