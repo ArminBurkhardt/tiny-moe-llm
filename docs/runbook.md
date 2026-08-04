@@ -140,8 +140,9 @@ is cleaned up.
 | Stop from an attached terminal | Ctrl-C | 10 | no |
 
 The STOP sentinel is the one to use remotely — it needs no ssh session and no process lookup, just
-a file. Both the sentinel and the signal flags are read at the log cadence (~3s), so expect up to a
-few seconds plus however long a 2GB `torch.save` takes.
+a file. Both the sentinel and the signal flags are read at the log cadence (~3s), then a 2GB
+`torch.save` has to finish. **Measured end to end on a 5090: 23 seconds** from `touch` to the
+supervisor exiting 10. Budget for that, not for instant.
 
 A stale `STOP` file is deleted at startup, so a relaunch is never stopped by the previous run's
 sentinel. To stop the supervisor *and* the current phase, create the sentinel and let it exit —
