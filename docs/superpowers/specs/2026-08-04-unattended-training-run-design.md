@@ -226,9 +226,24 @@ grace, and it costs no GPU sync. Best-effort by nature: a 2 GB `torch.save` stil
 a short enough grace period can cut it off. §3.1's atomicity means a cut-off save loses that one
 checkpoint, not the previous one.
 
-The dataset-exhaustion case is a real current bug: phase 1's data runs out at ~25.5B, below
-`target_tokens` 29.9B, and today the epoch loop just ends with no final save — losing up to a full
-checkpoint interval.
+Both stop conditions have to produce the same outcome — final checkpoint, then exit 0 — because
+which one fires first is not knowable in advance. `phase1_fraction: 0.85` puts phase 1's own target
+at 25.415B against a `phase1.bin` built for 25.5B (`prepare_data.py`'s `--phase1-tokens` default),
+so *nominally* the token target fires first and the exhaustion path never runs. That margin is
+0.33%, while `run_phase` has an explicit "all sources exhausted or at target before reaching N
+tokens" path ([prepare_data.py:292](../../../scripts/prepare_data.py#L292)) and the acceptance bar
+for data prep is realized counts within 2% of target — a `phase1.bin` that lands even 1% short
+flips which condition fires. Phase 2 carries the identical 0.33% margin (4.485B target against
+4.5B of data). Trained-token accounting adds a little slack in the safe direction: `TokenTracker`
+excludes pads, and `pad_token_id == eos_token_id`, so each packed document counts its content plus
+the prepended BOS and *not* its EOS/pad separator — the trainer counts marginally more tokens than
+the bin holds, reaching the target marginally sooner.
+
+A short phase is self-correcting and needs nothing beyond the save: `token_count` carries across
+the phase boundary (§6) and the cosine schedule is anchored to the combined 29.9B, so a phase 1
+that exhausts at 25.0B simply hands phase 2 a 4.9B anneal instead of 4.5B. What is not acceptable
+is today's behaviour — with `num_epochs: 1` an exhausted epoch loop just ends, saving nothing and
+losing up to a full checkpoint interval.
 
 ### 5.1 Resume verification
 

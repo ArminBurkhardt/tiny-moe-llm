@@ -1822,9 +1822,11 @@ After the inner `for local_step, batch in enumerate(dataloader):` loop ends (whe
 `dataset_idx = 0` currently sits), add:
 
 ```python
-            # the dataloader ran dry. phase 1's corpus ends at ~25.5B, below the combined
-            # target_tokens, so this is the NORMAL end of a phase -- previously it fell out of the
-            # loop with no final checkpoint, losing everything since the last periodic save.
+            # the dataloader ran dry -- a legitimate end of a phase, not an error. nominally the
+            # phase token target fires first (25.415B vs a phase1.bin built for 25.5B), but that
+            # margin is 0.33% against a data prep tolerance of 2%, so a slightly short corpus
+            # lands here instead. same outcome either way: final checkpoint, exit 0. previously
+            # this fell out of the loop saving nothing, losing everything since the last save.
             if not stop_training:
                 final_tokens = unwrapped_model._token_tracker.sync()
                 logger.info(f"{phase} data exhausted at {final_tokens:,} tokens; saving final checkpoint.")
