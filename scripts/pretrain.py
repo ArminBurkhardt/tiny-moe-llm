@@ -476,7 +476,7 @@ def pretrain():
     else:
         checkpoint_path = os.path.join(checkpoint_dir, latest)
         try:
-            start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
+            start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase = load_checkpoint(model, optimizer, scheduler, checkpoint_path)
         except Exception as e:
             logger.error(
                 f"Found checkpoint {checkpoint_path} but failed to load it: {type(e).__name__}: {e}. "

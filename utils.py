@@ -62,7 +62,8 @@ def get_hf_token():
     return token or None
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token_count=0, global_offset=0, losses=None):
+def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token_count=0,
+                    global_offset=0, losses=None, phase=None):
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -74,9 +75,20 @@ def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token
         # doc sharding across workers is pure doc_idx % num_workers arithmetic, so one
         # conservative (min-across-workers) scalar is enough -- no per-worker/file bookkeeping
         "global_offset": global_offset,
+        # which {phase}.bin/.idx corpus that offset indexes into. without this, resuming a
+        # phase-1 checkpoint under phase 2 feeds a ~23M doc offset into a ~4M doc corpus and the
+        # dataloader silently yields zero batches
+        "phase": phase,
         "losses": losses
     }
-    torch.save(checkpoint, path)
+    # write-then-rename: a preemption mid-write must not be able to leave a truncated .pt that is
+    # also the newest file by mtime. os.replace is atomic on POSIX and on Windows.
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        torch.save(checkpoint, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
     logger.info(f"Checkpoint saved at {path}")
 
 
@@ -93,5 +105,8 @@ def load_checkpoint(model, optimizer, scheduler, path):
     # stream from 0
     global_offset = checkpoint.get("global_offset", 0)
     losses = checkpoint.get("losses", None)
+    # legacy (pre phase scoping) checkpoints have no phase -- the caller treats None as "same
+    # phase as the one being launched", matching the old behaviour
+    phase = checkpoint.get("phase", None)
     logger.info(f"Checkpoint loaded from {path}")
-    return epoch, dataset_idx, token_count, global_offset, losses
+    return epoch, dataset_idx, token_count, global_offset, losses, phase
