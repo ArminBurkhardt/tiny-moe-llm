@@ -166,7 +166,8 @@ def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
     return texts
 
 
-def make_hf_generator_factory(spec: SourceSpec, files: list, scratch_dir: str, hf_token: Optional[str], seed: int) -> Callable:
+def make_hf_generator_factory(spec: SourceSpec, files: list, scratch_dir: str, hf_token: Optional[str],
+                              seed: int, revision: Optional[str]) -> Callable:
     """returns factory(start_file_idx, start_row_idx) -> generator of (file_idx, row_idx, text).
 
     downloads one shard file at a time, reads it fully into memory as a shuffled text list, then
@@ -177,8 +178,11 @@ def make_hf_generator_factory(spec: SourceSpec, files: list, scratch_dir: str, h
         for file_idx in range(start_file_idx, len(files)):
             filename = files[file_idx]
             try:
+                # pin the revision the file list was taken from. without this, a source repo that
+                # updates mid-run reshuffles the sorted file list and the resume state's file_idx
+                # silently points at a different file.
                 local_path = hf_hub_download(repo_id=spec.repo_id, filename=filename, repo_type="dataset",
-                                              local_dir=scratch_dir, token=hf_token)
+                                              local_dir=scratch_dir, token=hf_token, revision=revision)
             except Exception as e:
                 gate_hint = (
                     f" -- this dataset is Hub-gated: set HF_TOKEN and accept the access request at "
@@ -382,7 +386,9 @@ def main():
             continue
         try:
             info = hf_api.dataset_info(spec.repo_id)
-            all_files = hf_api.list_repo_files(spec.repo_id, repo_type="dataset")
+            # list at the same revision the downloads will pin to, so the file list and the files
+            # actually fetched can never come from two different snapshots of the repo
+            all_files = hf_api.list_repo_files(spec.repo_id, repo_type="dataset", revision=info.sha)
         except Exception as e:
             gate_hint = f" (gated: accept access at https://huggingface.co/datasets/{spec.repo_id})" if spec.gated else ""
             raise RuntimeError(f"could not list files for {spec.repo_id}{gate_hint} -- check HF_TOKEN/connectivity: {e}") from e
@@ -414,7 +420,10 @@ def main():
             {
                 "key": spec.key,
                 "weight": getattr(spec, weight_attr) / total_w,
-                "generator_factory": make_hf_generator_factory(spec, files_by_source[spec.key], scratch_dir, args.hf_token, args.seed),
+                "generator_factory": make_hf_generator_factory(
+                    spec, files_by_source[spec.key], scratch_dir, args.hf_token, args.seed,
+                    revision_by_source[spec.key],
+                ),
             }
             for spec in phase_sources
         ]
