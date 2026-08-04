@@ -18,6 +18,48 @@ FP32 = torch.float32
 FP16 = torch.float16
 BF16 = torch.bfloat16
 
+# one place for the tokenizer location. every script used to hardcode this path independently,
+# which meant a fresh clone on the rented box (ckpts/ is gitignored) failed in four different
+# places with four different messages. TINY_LLM_TOKENIZER overrides it for one-off runs.
+TOKENIZER_REPO = "ikeafisch4/DeepSeek-V4-Pro-tokenizer-65536"
+TOKENIZER_DIR = os.environ.get(
+    "TINY_LLM_TOKENIZER",
+    os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536"),
+)
+# checkpoints/logs/graphs are pushed here so a reclaimed instance doesn't take the run with it
+HF_UPLOAD_REPO = "ikeafisch4/temp-train"
+
+
+def get_hf_token():
+    """Resolve the Hugging Face token from the one place it is allowed to live.
+
+    Order: ``$HF_TOKEN`` -> ``<repo root>/huggingface.key`` (gitignored via ``*.key``, and already
+    the local convention) -> the ``huggingface_hub`` login cache. Returns ``None`` rather than
+    raising, so read-only callers that don't need a token (the tokenizer repo is public) work
+    without one; upload callers raise their own error naming ``scripts/setup.sh --hf-token``.
+
+    Returns:
+        The token string, or None if no source provided one.
+    """
+    token = os.environ.get("HF_TOKEN", "").strip()
+    if token:
+        return token
+
+    key_path = os.path.join(BASE_DIR, "huggingface.key")
+    if os.path.isfile(key_path):
+        with open(key_path, "r", encoding="utf-8") as f:
+            token = f.read().strip()
+        if token:
+            return token
+
+    # last resort: whatever `huggingface-cli login` left behind. wrapped because huggingface_hub
+    # is not a hard dependency of every entry point that imports utils.
+    try:
+        from huggingface_hub import get_token as _cached_token
+        token = (_cached_token() or "").strip()
+    except Exception:
+        token = ""
+    return token or None
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token_count=0, global_offset=0, losses=None):

@@ -19,7 +19,12 @@ try:
 except Exception as e:
     print("TE MISSING:", e)
 from transformers import AutoTokenizer
-tok = AutoTokenizer.from_pretrained("ckpts/pretrained/DeepSeek-V4-Pro-tokenizer")
+# read the shared constant instead of a literal path, so this check cannot drift away from what
+# the trainer actually loads (it used to point at the *unpruned* tokenizer, which never gets
+# downloaded onto the box at all)
+import sys; sys.path.insert(0, ".")
+from utils import TOKENIZER_DIR
+tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
 print("tokenizer vocab_size:", tok.vocab_size, "len:", len(tok))
 print("pad:", tok.pad_token, tok.pad_token_id, "bos:", tok.bos_token, tok.bos_token_id, "eos:", tok.eos_token_id)
 EOF

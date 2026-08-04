@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 
 from modules.model.transformer import TinyMoETransformer
 from config import ModelConfig
-from utils import BASE_DIR, BF16
+from utils import BASE_DIR, BF16, TOKENIZER_DIR
 
 
 def load_model(checkpoint_path: str, device: str):
@@ -101,8 +101,8 @@ def main():
     )
     parser.add_argument(
         "--tokenizer", "-t",
-        default=os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536"),
-        help="Path to the tokenizer directory (default: DeepSeek-V4-Pro-tokenizer-65536)",
+        default=TOKENIZER_DIR,
+        help="Path to the tokenizer directory (default: utils.TOKENIZER_DIR)",
     )
     parser.add_argument(
         "--prompt", "-p",

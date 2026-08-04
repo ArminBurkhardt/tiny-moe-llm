@@ -49,10 +49,10 @@ import pandas as pd
 from transformers import AutoTokenizer
 from huggingface_hub import HfApi, hf_hub_download
 
-from utils import BASE_DIR, logger
+from utils import BASE_DIR, logger, TOKENIZER_DIR
 
 MANIFEST_PATH = os.path.join(BASE_DIR, "manifest.json")
-DEFAULT_TOKENIZER_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536")
+DEFAULT_TOKENIZER_DIR = TOKENIZER_DIR
 
 
 @dataclass

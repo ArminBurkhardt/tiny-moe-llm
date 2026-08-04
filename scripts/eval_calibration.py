@@ -39,7 +39,7 @@ from modules.model.transformer import TinyMoETransformer
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.data.dataset import Dataset
 from config import ModelConfig, TrainingConfig
-from utils import BASE_DIR, BF16, logger
+from utils import BASE_DIR, BF16, logger, TOKENIZER_DIR
 
 CE_CHUNK_SIZE = 2048
 
@@ -220,7 +220,7 @@ def collect_stats(model: TinyMoETransformer, dataset: Dataset, tokenizer, device
 def main():
     parser = argparse.ArgumentParser(description="PLAN.md Gate 5 -- calibration sanity check")
     parser.add_argument("--checkpoint", "-c", default=find_latest_checkpoint(os.path.join(BASE_DIR, "ckpts", "training")))
-    parser.add_argument("--tokenizer", "-t", default=os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536"))
+    parser.add_argument("--tokenizer", "-t", default=TOKENIZER_DIR)
     parser.add_argument("--data-dir", default=os.path.join(BASE_DIR, TrainingConfig.data_dir))
     parser.add_argument("--phase", default=TrainingConfig.phase)
     parser.add_argument("--start-doc-idx", type=int, default=None, help="override the checkpoint's own global_offset (held-out start point)")

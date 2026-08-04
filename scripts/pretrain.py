@@ -18,7 +18,7 @@ from modules.data.dataset import Dataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.mtp import compute_mtp_loss
 from config import ModelConfig, TrainingConfig
-from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16
+from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16, TOKENIZER_DIR
 
 
 from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling, NVFP4BlockScaling
@@ -413,10 +413,12 @@ def save_loss_graph(losses, path):
     plt.close()
 
 def pretrain():
-    GEMMA4_TOKENIZER_PATH = os.path.join(BASE_DIR, "ckpts", "pretrained", "DeepSeek-V4-Pro-tokenizer-65536") # pruned to fit uint16 (PLAN.md Step 8), matches config.yaml's vocab_size: 65536
-    tokenizer = AutoTokenizer.from_pretrained(GEMMA4_TOKENIZER_PATH)
-    
-    logger.info(f"Tokenizer loaded from {GEMMA4_TOKENIZER_PATH} with vocab size {tokenizer.vocab_size}")
+    # TOKENIZER_DIR is the pruned 65536 tokenizer (PLAN.md Step 8) -- fits uint16, matches
+    # config.yaml's vocab_size. shared with every other entry point via utils, and fetched onto a
+    # fresh box by scripts/fetch_tokenizer.py since ckpts/ is gitignored.
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+
+    logger.info(f"Tokenizer loaded from {TOKENIZER_DIR} with vocab size {tokenizer.vocab_size}")
     
     dataset = Dataset(
         data_dir=os.path.join(BASE_DIR, TrainingConfig.data_dir),

@@ -20,12 +20,13 @@ from modules.model.transformer import TinyMoETransformer
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.mtp import compute_mtp_loss
 from modules.data.dataset import Dataset
+from utils import TOKENIZER_DIR
 
 assert torch.cuda.is_available(), "GPU required"
 torch.manual_seed(0)
 dev = "cuda"
 
-tok = AutoTokenizer.from_pretrained("ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536")
+tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
 
 # synthetic corpus: varying-length documents of random ids, bounded by the tokenizer's vocab
 rng = np.random.default_rng(0)

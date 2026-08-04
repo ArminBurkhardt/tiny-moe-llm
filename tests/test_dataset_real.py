@@ -15,9 +15,9 @@ import numpy as np
 from transformers import AutoTokenizer
 
 from modules.data.dataset import Dataset
+from utils import TOKENIZER_DIR
 
-TOK = "ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536"
-tok = AutoTokenizer.from_pretrained(TOK)
+tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
 print(f"pad_token_id={tok.pad_token_id} eos_token_id={tok.eos_token_id} bos_token_id={tok.bos_token_id}")
 
 # does the tokenizer add BOS itself? (it doesn't -> dataset must prepend it)
