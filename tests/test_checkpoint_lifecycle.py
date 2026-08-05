@@ -6,8 +6,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.runtime.checkpoints import (
     ResumeVerificationError, cleanup_stale_files, final_name, find_resume_checkpoint, is_final,
-    prune_checkpoints, read_run_state, resolve_resume_scope, rolling_name, verify_resume,
-    write_run_state,
+    prune_checkpoints, read_run_state, resolve_resume_scope, resume_phase_index, rolling_name,
+    verify_resume, write_run_state,
 )
 
 
@@ -122,5 +122,41 @@ for bad in (0, 11_000_000_000):
     except ResumeVerificationError:
         pass
 print("[ok] a resume materially behind the recorded token count aborts")
+
+# --- resume_phase_index (the phase-rewind bug: a reclaimed instance restarts run_training.py,
+# whose old unconditional loop re-entered phase 1 even though phase-2 checkpoints already existed
+# on the surviving disk) ------------------------------------------------------------------------
+assert resume_phase_index(tempfile.mkdtemp()) == 0
+print("[ok] a cold start (no checkpoints) begins at phase 1")
+
+d = tempfile.mkdtemp()
+touch(d, "checkpoint_phase1_tok100M_loss3.0000.pt")
+assert resume_phase_index(d) == 0
+print("[ok] a rolling phase-1 checkpoint alone stays at phase 1")
+
+d = tempfile.mkdtemp()
+touch(d, "checkpoint_phase1_tok25000M_loss2.0000.pt")
+touch(d, "checkpoint_phase1_final.pt")
+assert resume_phase_index(d) == 1
+print("[ok] a phase-1 final checkpoint advances to phase 2")
+
+d = tempfile.mkdtemp()
+touch(d, "checkpoint_phase1_final.pt")
+touch(d, "checkpoint_phase2_tok27000M_loss1.8000.pt")
+assert resume_phase_index(d) == 1
+print("[ok] a rolling phase-2 checkpoint stays at phase 2, not zero")
+
+# the bug's exact trace: only a phase-2 rolling checkpoint is on disk (e.g. recovery restored just
+# the newest rolling file, per the runbook, and phase 1's never-pruned final.pt was not restored)
+d = tempfile.mkdtemp()
+touch(d, "checkpoint_phase2_tok27000M_loss1.8000.pt")
+assert resume_phase_index(d) == 1, "a phase-2 checkpoint with no phase-1 final must still skip phase 1"
+print("[ok] a phase-2 checkpoint alone still skips phase 1, even without a phase-1 final on disk")
+
+d = tempfile.mkdtemp()
+touch(d, "checkpoint_phase1_final.pt")
+touch(d, "checkpoint_phase2_final.pt")
+assert resume_phase_index(d) == 1, "both phases done: nothing left in PHASE_ORDER past the last index"
+print("[ok] both phases complete clamps to the last phase index, not out of range")
 
 print("\nCHECKPOINT LIFECYCLE CHECKS PASSED")

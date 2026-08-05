@@ -11,6 +11,8 @@ from utils import logger
 
 FINAL_SUFFIX = "_final.pt"
 CKPT_PREFIX = "checkpoint_"
+# order the supervisor trains phases in -- see resume_phase_index
+PHASE_ORDER = ("phase1", "phase2")
 
 
 class ResumeVerificationError(RuntimeError):
@@ -165,6 +167,41 @@ def prune_checkpoints(checkpoint_dir: str, keep: int, is_uploaded) -> list:
     if deleted:
         logger.info(f"pruned {len(deleted)} uploaded checkpoint(s) past the newest {keep}")
     return deleted
+
+
+def resume_phase_index(checkpoint_dir: str) -> int:
+    """Which index into PHASE_ORDER the supervisor should (re)start at, given what's on disk.
+
+    scripts/run_training.py used to always iterate PHASE_ORDER from the start on every process
+    launch. That is fine mid-process (run_phase relaunches pretrain.py for the SAME phase through
+    a preemption), but vast.ai reclaiming the whole instance kills the supervisor too; onstart.sh
+    then starts a brand new run_training.py, whose old unconditional loop re-entered phase 1 even
+    though the disk (which survives a reclaim) already held a phase-2 checkpoint. Consequences
+    traced in full: pretrain.py resumes the phase-2 checkpoint under --phase phase1,
+    resolve_resume_scope resets the doc offset, the token count is already past phase 1's target,
+    so it immediately overwrites checkpoint_phase1_final.pt with phase-2 weights and phase 2 then
+    restarts its own document offset from 0.
+
+    A phase is skipped once its own final checkpoint is on disk, OR once any checkpoint for a
+    LATER phase is found -- the latter covers a recovery that only restored the phase-2 rolling
+    checkpoint (final checkpoints are never pruned locally, but a fresh disk after `git clone` plus
+    a manual snapshot_download of just the latest rolling file, per the runbook's recovery section,
+    would otherwise still trip the same bug this function exists to prevent).
+
+    Args:
+        checkpoint_dir: ckpts/training.
+
+    Returns:
+        An index into PHASE_ORDER; PHASE_ORDER[index:] is what main() should actually run.
+    """
+    reached = 0
+    for path in _checkpoint_files(checkpoint_dir):
+        name = os.path.basename(path)
+        for i, phase in enumerate(PHASE_ORDER):
+            if not name.startswith(f"{CKPT_PREFIX}{phase}_"):
+                continue
+            reached = max(reached, i + 1 if name == final_name(phase) else i)
+    return min(reached, len(PHASE_ORDER) - 1)
 
 
 def resolve_resume_scope(ckpt_phase, phase: str, start_epoch: int, dataset_idx: int,

@@ -56,6 +56,20 @@ class TrainingConfig:
     ponder_warmup_tokens = int(Config["training"].get("ponder_warmup_tokens", 1_000_000_000))
     ponder_ramp_tokens = int(Config["training"].get("ponder_ramp_tokens", 1_000_000_000))
 
+    # runtime auto-adjustment of lambda_ponder (modules/runtime/ponder.PonderController) -- see
+    # the config.yaml comment on lambda_ponder for why a static value tuned at a different
+    # schedule needs a runtime corrective. lambda_ponder above is only the STARTING point once
+    # auto-adjust is on; the live value is checkpointed, not re-read from here on every resume.
+    ponder_auto_adjust = bool(Config["training"].get("ponder_auto_adjust", True))
+    ponder_target_p_halt = float(Config["training"].get("ponder_target_p_halt", 0.30))
+    ponder_p_halt_band = float(Config["training"].get("ponder_p_halt_band", 0.12))
+    ponder_adjust_factor = float(Config["training"].get("ponder_adjust_factor", 1.20))
+    ponder_adjust_cooldown_tokens = int(
+        Config["training"].get("ponder_adjust_cooldown_tokens", 500_000_000)
+    )
+    ponder_lambda_min = float(Config["training"].get("ponder_lambda_min", 0.01))
+    ponder_lambda_max = float(Config["training"].get("ponder_lambda_max", 1.0))
+
     # per-loop CE supervision (PLAN.md Step 4a): ascending weights, one per loop, so lm_head has
     # *some* incentive to make intermediate loops' hidden states legible without competing with
     # the final loop's dominant supervision. Same yaml-block deviation as the ponder knobs above --

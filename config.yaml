@@ -62,6 +62,23 @@ training:
                      # run's own p_halt curve; it has much more steady-state runway to drift higher.
   ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 while loop_scale has room to grow (deadlock avoidance)
   ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
+  ponder_auto_adjust: true # nudge lambda_ponder at runtime if p_halt drifts out of the healthy
+                           # band below, once the warmup+ramp above has finished. Exists because
+                           # lambda_ponder above was tuned at the Gate 4 test's much longer
+                           # (proportionally) warmup/ramp -- the real run's p_halt has far more
+                           # steady-state runway to drift before anyone is watching. The adjusted
+                           # value is checkpointed (modules/runtime/ponder.py) so it survives
+                           # every preemption restart instead of resetting to the value below.
+  ponder_target_p_halt: 0.30 # center of the healthy band -- the plateau lambda_ponder=0.15 found
+                             # in the Gate 4 test (see the comment above)
+  ponder_p_halt_band: 0.12 # healthy range is target +/- this, i.e. [0.18, 0.42] at the defaults
+  ponder_adjust_factor: 1.20 # multiplicative nudge per adjustment (up if p_halt too low, i.e. not
+                             # halting enough; down if too high, i.e. the loop is collapsing to a
+                             # no-op -- see PonderController's docstring for the direction)
+  ponder_adjust_cooldown_tokens: 500000000 # min tokens between adjustments, so each nudge's
+                                           # effect is visible in the EMA before reacting again
+  ponder_lambda_min: 0.01 # clamp bounds so a runaway EMA can't push lambda_ponder to 0 or infinity
+  ponder_lambda_max: 1.0
   loop_ce_weights: [0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
   loop_ce_subsample: 0.25 # fraction of token positions supervised on the NON-final loops (final
                           # loop is always supervised in full). the LM head is the largest GEMM in

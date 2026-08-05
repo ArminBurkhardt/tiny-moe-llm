@@ -40,8 +40,26 @@ if [ -f huggingface.key ]; then
   export HF_TOKEN
 fi
 if [ -z "${HF_TOKEN:-}" ]; then
-  echo "setup: no HF token. Uploads and the gated Nemotron-Math source will fail." \
-       "Re-run with --hf-token hf_xxx." >&2
+  # a missing token only truly doesn't matter if config.yaml has uploads disabled -- otherwise
+  # HFSync stays "enabled" (repo id is non-empty), every upload 401s, and retention correctly
+  # refuses to delete the un-uploaded files, so the failure mode is a silently full disk found
+  # hours into an unattended run rather than an error now, at minute two.
+  UPLOAD_REPO="$(python - <<'EOF'
+import sys
+sys.path.insert(0, ".")
+from config import TrainingConfig
+from utils import HF_UPLOAD_REPO
+print(TrainingConfig.upload_repo(HF_UPLOAD_REPO))
+EOF
+)"
+  if [ -n "$UPLOAD_REPO" ]; then
+    echo "setup: FATAL: no HF token, but config.yaml's hf_upload_repo resolves to '$UPLOAD_REPO'." \
+         "Every checkpoint upload would fail for the whole run. Set \$HF_TOKEN (e.g. as a vast.ai" \
+         "instance env var) or pass --hf-token hf_xxx, or set hf_upload_repo: \"\" to run local-only." >&2
+    exit 1
+  fi
+  echo "setup: no HF token. Uploads are disabled by config.yaml, so this is fine; the gated" \
+       "Nemotron-Math source will still fail without one." >&2
 fi
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -89,5 +107,16 @@ EOF
 
 # 5. environment sanity
 TINY_LLM_ROOT="$(pwd)" TINY_LLM_ENV_INIT=/dev/null bash tests/run_env_check.sh
+
+# run_env_check.sh only does `import transformer_engine.pytorch`, which is too shallow: pretrain.py
+# also constructs `transformer_engine.common.recipe.DelayedScaling` and every modules/model/ file
+# does its own `import transformer_engine.pytorch as te` at module scope, so a TE build whose API
+# doesn't match this repo's pin (e.g. an older/newer NGC image tag) can still pass run_env_check.sh
+# and then fail here -- catch that now, not after prepare_data.py has spent hours of rental.
+python -c "import sys; sys.path.insert(0, '.'); import scripts.pretrain" \
+  || { echo "setup: FATAL: 'import scripts.pretrain' failed -- almost certainly a" \
+            "transformer_engine/flash-attn version mismatch in this NGC image. Fix before running" \
+            "prepare_data.py; see CLAUDE.md's 'Environment' section." >&2; exit 1; }
+echo "setup: scripts.pretrain imports cleanly (transformer_engine/flash-attn API check)"
 
 echo "setup: done. Next: python scripts/prepare_data.py, then python scripts/run_training.py"

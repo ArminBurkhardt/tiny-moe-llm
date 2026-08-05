@@ -12,11 +12,12 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
 
 from config import TrainingConfig
+from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_PREEMPTED, EXIT_RESUME_FAILED, EXIT_USER_STOP
 from modules.runtime.status import format_duration
 from utils import BASE_DIR, logger
 
-PHASES = ("phase1", "phase2")
+PHASES = ckpt_lib.PHASE_ORDER
 # codes that mean "a human or a verification check decided this run stops" -- restarting would
 # either ignore an explicit instruction or retrain ground already covered
 TERMINAL_CODES = (EXIT_USER_STOP, EXIT_RESUME_FAILED)
@@ -73,7 +74,15 @@ def run_phase(phase, launch=launch_pretrain, max_restarts=5, restart_window=600.
 
 def main() -> int:
     started = time.time()
-    for phase in PHASES:
+    checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
+    start_index = ckpt_lib.resume_phase_index(checkpoint_dir)
+    if start_index > 0:
+        skipped = ", ".join(PHASES[:start_index])
+        logger.info(
+            f"skipping already-complete phase(s) on disk: {skipped} -- see "
+            f"checkpoints.resume_phase_index if this looks wrong"
+        )
+    for phase in PHASES[start_index:]:
         target = TrainingConfig.phase_target_tokens(phase)
         logger.info(f"=== {phase}: training to {target:,} tokens ===")
         code = run_phase(phase)

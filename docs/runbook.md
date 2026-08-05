@@ -19,10 +19,12 @@ Four commands, in this order. Only the last one is long-lived.
 | 3 | `USE_FP8=1 python scripts/pretrain.py --phase phase1` (smoke, then Ctrl-C) | ~5 min | yes |
 | 4 | `python scripts/run_training.py` | ~40 h | yes, restarts itself |
 
-On vast.ai you can skip straight to step 4 by pasting `scripts/onstart.sh` as the instance's
-onstart command — it clones, runs setup, and launches the supervisor under `nohup`. It deliberately
-does **not** run `prepare_data.py`; that has its own multi-hour lifecycle and its own resume state,
-and tangling the two makes both harder to diagnose.
+On vast.ai you can paste `scripts/onstart.sh` as the instance's onstart command to survive
+reclaims — it clones, runs setup, and launches the supervisor under `nohup`. It deliberately does
+**not** run `prepare_data.py`; that has its own multi-hour lifecycle and its own resume state, and
+tangling the two makes both harder to diagnose. Run step 2 by hand first: the hook exits
+immediately (without launching training) if `data/prepared/phase1.idx` is missing, so pasting it
+in before data prep just means it does nothing on the first boot — set it after step 2 completes.
 
 ### 1.1 `scripts/setup.sh`
 
@@ -48,14 +50,24 @@ documents into `_prepare_state_{phase}.json`; if it dies, re-run the identical c
 truncates back to the last confirmed state and continues. Peak disk stays bounded — it holds one
 shard file per source at a time and deletes each after tokenizing.
 
+Peak *RAM* is a separate concern: `load_document_texts` reads a whole shard into a Python
+`list[str]` and the generator holds it for that file's duration, and up to 6 sources are live at
+once in phase 1. Only ever exercised at 50M-token smoke scale — pick an instance with **>=64GB
+RAM** for the real run.
+
 ### 1.3 The smoke test
 
 Run phase 1 by hand for ~200 steps and check the log line before committing to the real run:
 
 - `MFU:` should be in the region of the Gate 4 extrapolation. **More than ~20% off and you should
   redo the budget math before starting** — this is the last cheap moment to change `target_tokens`.
-- `Peak Mem:` should leave headroom on an 80GB card.
-- FP8 should actually be active. TE warns when it silently falls back.
+- `Peak Mem:` should leave headroom on an 80GB card. Gate 4 peaked at 25.45GB on a 32GB card; on an
+  80GB H100 try `batch_size: 16` / `grad_accumulation_steps: 8` in `config.yaml` (keeps
+  tokens-per-optimizer-step, and therefore `total_steps`/warmup/the cosine, identical while roughly
+  doubling GEMM sizes) — the cheapest available MFU win. Revert if peak mem passes ~65GB.
+- FP8 should actually be active. **`te.autocast(enabled=True)` raises if the device rejects the
+  recipe — it does not silently fall back.** `log_precision_mode()`'s log line at startup states
+  the resolved recipe either way, so check that instead of assuming a missing warning means BF16.
 
 Then **delete `ckpts/training/` and start clean**, so the real run does not resume from a
 200-step smoke checkpoint.
@@ -107,6 +119,16 @@ logs/train.log
 status.json
 manifest.json
 ```
+
+**Remote retention mirrors local retention.** Every rolling checkpoint `prune_checkpoints` deletes
+locally (§3) is also deleted from `checkpoints/` on the Hub, and `HFSync` squashes the repo's git
+history afterward (throttled to at most once per 30 minutes) so the deleted 2GB blob's storage is
+actually reclaimed rather than just hidden from the current tree — a plain Hub file delete alone
+leaves it referenced by history and still billed. Both the delete and the squash go through the
+same non-fatal retry-and-log path as uploads; a failure never touches the training loop, and a
+failed delete just leaves stale clutter on the Hub rather than a local retention problem. Because
+history gets rewritten, do not expect old commits on `ikeafisch4/temp-train` to stay browsable —
+this repo is a scratch mirror of local checkpoints, not something meant to be read commit-by-commit.
 
 ---
 
@@ -169,8 +191,10 @@ killing the supervisor alone leaves `pretrain.py` running.
 | `pruned N uploaded checkpoint(s) past the newest 2` | Retention doing its job. |
 | `phase1 data exhausted at ... saving final checkpoint` | Legitimate end of a phase. Phase 1's corpus is only ~0.3% larger than its token target, so either this or "reached target" can fire first; both save a final checkpoint and exit 0. |
 | `checkpoint was written during phase1, now training phase2: resetting the document offset` | The phase handoff. The token count is deliberately preserved so the LR schedule continues rather than restarting. |
+| `skipping already-complete phase(s) on disk: phase1` | A reclaimed instance came back and `onstart.sh` started a brand new `run_training.py`. `resume_phase_index` (`modules/runtime/checkpoints.py`) checked `ckpts/training` before looping and found phase 1 already finished, so it starts straight at phase 2 instead of re-entering phase 1 and overwriting `checkpoint_phase1_final.pt` with phase-2 weights. |
 | ETA swinging wildly in the first few minutes after a restart | It extrapolates from one log interval. It settles. |
 | `mean loops` below `n_loops` | `loop_count_sampling` runs 30% of steps at a reduced depth on purpose. Log steps are pinned to full depth. |
+| `ponder auto-adjust: p_halt too low/high ... lambda_ponder X -> Y` | `PonderController` (`modules/runtime/ponder.py`) nudging the ponder weight to keep `p_halt`'s steady state in the healthy band (`ponder_target_p_halt` +/- `ponder_p_halt_band` in `config.yaml`). Only fires after the warmup+ramp finishes, at most once per `ponder_adjust_cooldown_tokens`. The adjusted value is checkpointed, so it survives every preemption restart; disable with `ponder_auto_adjust: false`. |
 
 ---
 
@@ -185,7 +209,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 | Training "succeeded" in minutes having done nothing | A phase-2 run whose document offset was not reset. | This is the bug `resolve_resume_scope` exists to prevent — check the checkpoint's `phase` field. |
 | `upload queue full; dropping ...` | Uploads are slower than checkpointing. | Only rolling checkpoints are ever dropped, and a dropped one stays on disk un-pruned. If it persists, the box's uplink cannot keep up with a 2GB/30min cadence — raise `checkpoint_every_tokens`. |
 | Supervisor gave up: `restarted N times in 600s` | A crash loop, not a preemption. | Read the last child traceback in the log. The flap limit exists so a crash loop does not silently bill you for hours. |
-| `no HF token` at setup | `huggingface.key` missing or empty. | `bash scripts/setup.sh --hf-token hf_xxx`. |
+| `setup: FATAL: no HF token, but config.yaml's hf_upload_repo resolves to ...` | `huggingface.key`/`$HF_TOKEN` missing or empty, and `config.yaml` has uploads enabled. `setup.sh` now exits non-zero here rather than only warning, so `onstart.sh` (which runs under `set -euo pipefail`) never launches training with a token that would 401 every upload for 40 hours. | Set `$HF_TOKEN` (a vast.ai **instance env var** survives a reclaim; `huggingface.key` alone does not, since it's gitignored and a fresh clone won't have it) or pass `--hf-token hf_xxx`. Or set `hf_upload_repo: ""` to run local-only on purpose. |
 
 ---
 

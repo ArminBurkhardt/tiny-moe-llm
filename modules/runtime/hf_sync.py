@@ -14,35 +14,40 @@ from utils import logger
 
 
 class _Job:
-    __slots__ = ("local_path", "repo_path", "droppable")
+    __slots__ = ("op", "local_path", "repo_path", "droppable")
 
-    def __init__(self, local_path, repo_path, droppable):
+    def __init__(self, op, local_path, repo_path, droppable):
+        self.op = op
         self.local_path = local_path
         self.repo_path = repo_path
         self.droppable = droppable
 
 
 class HFSync:
-    """Queue-backed uploader to a Hugging Face repo.
+    """Queue-backed uploader (and pruner) for a Hugging Face repo.
 
     Args:
         repo_id: e.g. "ikeafisch4/temp-train". An empty string disables uploading entirely, so a
             local run needs no special casing at the call sites.
         token: HF token with write access to repo_id.
-        api: an object exposing ``upload_file(path_or_fileobj, path_in_repo, repo_id, token)``.
-            Defaults to a real ``huggingface_hub.HfApi``; injectable for tests.
+        api: an object exposing ``upload_file``/``delete_file``/``super_squash_history`` with the
+            real ``huggingface_hub.HfApi`` signatures. Defaults to a real ``HfApi``; injectable
+            for tests.
         max_queue: soft cap on pending jobs before droppable ones start being discarded.
         retries: attempts per file before giving up.
         backoff: seconds before the first retry, tripled each attempt.
+        squash_min_interval: minimum seconds between history squashes (see delete()'s docstring).
     """
 
-    def __init__(self, repo_id, token=None, api=None, max_queue=8, retries=3, backoff=5.0):
+    def __init__(self, repo_id, token=None, api=None, max_queue=8, retries=3, backoff=5.0,
+                 squash_min_interval=1800.0):
         self.repo_id = repo_id or ""
         self.enabled = bool(self.repo_id)
         self._token = token
         self._retries = retries
         self._backoff = backoff
         self._max_queue = max_queue
+        self._squash_min_interval = squash_min_interval
 
         self._queue = deque()
         self._cv = threading.Condition()
@@ -52,6 +57,9 @@ class HFSync:
         # true while the worker holds a job it has taken off the queue -- drain() must wait for
         # that job too, not just for the queue to empty
         self._busy = False
+        # squash_min_interval below covers repeated bursts; -inf so the first delete after
+        # startup can always trigger one
+        self._last_squash = float("-inf")
 
         if not self.enabled:
             logger.warning("HF upload disabled (no repo id) -- checkpoints stay local only")
@@ -66,6 +74,22 @@ class HFSync:
         self._thread.start()
         logger.info(f"HF upload thread started -> {self.repo_id}")
 
+    def _enqueue(self, job: _Job) -> None:
+        with self._cv:
+            if len(self._queue) >= self._max_queue:
+                for i, queued in enumerate(self._queue):
+                    if queued.droppable:
+                        del self._queue[i]
+                        logger.warning(
+                            f"upload queue full ({self._max_queue}); dropping "
+                            f"{queued.op} {queued.repo_path}. A dropped upload stays on disk and "
+                            f"un-pruned; a dropped delete just leaves stale clutter on the Hub -- "
+                            f"uploads are falling behind either way."
+                        )
+                        break
+            self._queue.append(job)
+            self._cv.notify()
+
     def upload(self, local_path: str, repo_path: str, droppable: bool = False) -> None:
         """Queue a file for upload and return immediately.
 
@@ -79,18 +103,25 @@ class HFSync:
         """
         if not self.enabled:
             return
-        with self._cv:
-            if len(self._queue) >= self._max_queue:
-                for i, job in enumerate(self._queue):
-                    if job.droppable:
-                        del self._queue[i]
-                        logger.warning(
-                            f"upload queue full ({self._max_queue}); dropping {job.repo_path}. "
-                            f"It stays on disk and un-pruned -- uploads are falling behind."
-                        )
-                        break
-            self._queue.append(_Job(local_path, repo_path, droppable))
-            self._cv.notify()
+        self._enqueue(_Job("upload", local_path, repo_path, droppable))
+
+    def delete(self, repo_path: str) -> None:
+        """Queue removal of a file already confirmed uploaded, and reclaim its storage.
+
+        Only meant for checkpoints modules.runtime.checkpoints.prune_checkpoints has already
+        deleted locally -- never for `checkpoints/final/*`, which is never pruned. A plain
+        ``delete_file`` only removes the blob from the repo's current tree; the git history still
+        references it, so the Hub keeps charging storage for a 2GB checkpoint until the history
+        itself is rewritten. So every successful delete also (throttled) triggers
+        ``super_squash_history``, which squashes the whole branch into one commit and actually
+        frees the space -- fine for this repo since it exists only as a scratch mirror of local
+        checkpoints, not something anyone reads commit-by-commit. Throttled to at most once per
+        ``squash_min_interval`` so a burst of deletes (several prunes back to back) costs one
+        squash, not one per file.
+        """
+        if not self.enabled:
+            return
+        self._enqueue(_Job("delete", None, repo_path, droppable=True))
 
     def is_uploaded(self, local_path: str) -> bool:
         """Whether this exact path completed an upload in this process."""
@@ -138,7 +169,10 @@ class HFSync:
                 job = self._queue.popleft()
                 self._busy = True
             try:
-                self._upload_with_retries(job)
+                if job.op == "upload":
+                    self._upload_with_retries(job)
+                else:
+                    self._delete_with_retries(job)
             finally:
                 with self._cv:
                     self._busy = False
@@ -173,3 +207,45 @@ class HFSync:
                 )
                 time.sleep(delay)
                 delay *= 3
+
+    def _delete_with_retries(self, job):
+        delay = self._backoff
+        for attempt in range(1, self._retries + 1):
+            try:
+                self._api.delete_file(
+                    path_in_repo=job.repo_path, repo_id=self.repo_id, token=self._token,
+                )
+                logger.info(f"deleted {job.repo_path} from {self.repo_id}")
+                self._maybe_squash_history()
+                return
+            except Exception as e:
+                if attempt == self._retries:
+                    # same swallow-and-log policy as upload: a stale file left on the Hub is
+                    # clutter, not a correctness problem, and must not take the run down with it.
+                    logger.error(
+                        f"delete of {job.repo_path} failed after {self._retries} attempts "
+                        f"({type(e).__name__}: {e}); leaving it on the Hub"
+                    )
+                    return
+                logger.warning(
+                    f"delete of {job.repo_path} attempt {attempt}/{self._retries} failed "
+                    f"({type(e).__name__}: {e}); retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
+                delay *= 3
+
+    def _maybe_squash_history(self):
+        now = time.time()
+        if now - self._last_squash < self._squash_min_interval:
+            return
+        try:
+            self._api.super_squash_history(repo_id=self.repo_id, token=self._token)
+            self._last_squash = now
+            logger.info(f"squashed {self.repo_id} history to reclaim deleted-checkpoint storage")
+        except Exception as e:
+            # non-fatal: the file is still gone from the tree, it just keeps costing storage in
+            # history until a future delete's squash succeeds
+            logger.warning(
+                f"history squash on {self.repo_id} failed ({type(e).__name__}: {e}); deleted "
+                f"checkpoints stay in git history (and billed storage) until the next attempt"
+            )

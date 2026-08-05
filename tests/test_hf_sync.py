@@ -13,6 +13,8 @@ class StubApi:
 
     def __init__(self, flaky=(), fail_times=0, always_fail=()):
         self.calls = []
+        self.deleted = []
+        self.squash_calls = 0
         self.flaky = set(flaky)
         self.always_fail = set(always_fail)
         self.fail_times = fail_times
@@ -28,6 +30,23 @@ class StubApi:
             raise RuntimeError("permanent failure")
         if path_in_repo in self.flaky and n <= self.fail_times:
             raise RuntimeError("transient failure")
+        return "ok"
+
+    def delete_file(self, path_in_repo=None, repo_id=None, token=None, **kw):
+        with self.lock:
+            self.attempts[path_in_repo] = self.attempts.get(path_in_repo, 0) + 1
+            n = self.attempts[path_in_repo]
+        if path_in_repo in self.always_fail:
+            raise RuntimeError("permanent failure")
+        if path_in_repo in self.flaky and n <= self.fail_times:
+            raise RuntimeError("transient failure")
+        with self.lock:
+            self.deleted.append(path_in_repo)
+        return "ok"
+
+    def super_squash_history(self, repo_id=None, token=None, **kw):
+        with self.lock:
+            self.squash_calls += 1
         return "ok"
 
 
@@ -71,15 +90,60 @@ assert not sync.is_uploaded(p), "a failed upload must NOT be marked uploaded -- 
 sync.close()
 print("[ok] a permanently failing upload never raises into the caller and stays unmarked")
 
+# --- delete queues a remote removal and triggers a (throttled) history squash ---------------
+api = StubApi()
+sync = HFSync("owner/repo", token="t", api=api, squash_min_interval=1800.0)
+sync.delete("checkpoints/old_a.pt")
+assert sync.drain(timeout=10)
+assert api.deleted == ["checkpoints/old_a.pt"], api.deleted
+assert api.squash_calls == 1, "the first delete after startup must trigger a squash"
+sync.close()
+print("[ok] delete() removes the remote file and squashes history")
+
+# a burst of deletes inside the throttle window squashes only once
+api = StubApi()
+sync = HFSync("owner/repo", token="t", api=api, squash_min_interval=1800.0)
+sync.delete("checkpoints/old_b.pt")
+sync.delete("checkpoints/old_c.pt")
+sync.delete("checkpoints/old_d.pt")
+assert sync.drain(timeout=10)
+assert set(api.deleted) == {"checkpoints/old_b.pt", "checkpoints/old_c.pt", "checkpoints/old_d.pt"}
+assert api.squash_calls == 1, f"a burst of deletes must squash once, not {api.squash_calls} times"
+sync.close()
+print("[ok] a burst of deletes squashes history only once, throttled")
+
+# a squash failure must not raise into the caller or block further deletes
+class FailingSquashApi(StubApi):
+    def super_squash_history(self, repo_id=None, token=None, **kw):
+        raise RuntimeError("squash failed")
+
+api = FailingSquashApi()
+sync = HFSync("owner/repo", token="t", api=api)
+sync.delete("checkpoints/old_e.pt")   # must not raise
+assert sync.drain(timeout=10)
+assert api.deleted == ["checkpoints/old_e.pt"], "the delete itself must still succeed"
+sync.close()
+print("[ok] a failing history squash is swallowed; the delete itself still lands")
+
+# a permanently failing delete is swallowed like a permanently failing upload
+api = StubApi(always_fail={"checkpoints/old_f.pt"})
+sync = HFSync("owner/repo", token="t", api=api, backoff=0.01)
+sync.delete("checkpoints/old_f.pt")   # must not raise
+assert sync.drain(timeout=10)
+assert api.deleted == [], "a permanently failing delete must not be recorded as deleted"
+sync.close()
+print("[ok] a permanently failing delete never raises into the caller")
+
 # --- disabled sync is a no-op that reports nothing uploaded ---------------
 sync = HFSync("", token=None, api=StubApi())
 assert not sync.enabled
 p = mkfile("d.pt")
 sync.upload(p, "checkpoints/d.pt")
+sync.delete("checkpoints/d.pt")
 assert not sync.is_uploaded(p)
 assert sync.drain(timeout=1)
 sync.close()
-print("[ok] an empty repo id disables uploads without breaking callers")
+print("[ok] an empty repo id disables uploads and deletes without breaking callers")
 
 # --- status helpers -------------------------------------------------------
 assert eta_seconds(0, 100, 0) is None

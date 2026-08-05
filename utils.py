@@ -63,7 +63,7 @@ def get_hf_token():
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token_count=0,
-                    global_offset=0, losses=None, phase=None):
+                    global_offset=0, losses=None, phase=None, ponder_state=None):
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -79,7 +79,11 @@ def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token
         # phase-1 checkpoint under phase 2 feeds a ~23M doc offset into a ~4M doc corpus and the
         # dataloader silently yields zero batches
         "phase": phase,
-        "losses": losses
+        "losses": losses,
+        # modules.runtime.ponder.PonderController.state_dict() -- the auto-adjusted lambda_ponder
+        # (plus its EMA/cooldown state) must survive a resume, or every preemption restart would
+        # silently reset it back to config.yaml's static starting value
+        "ponder_state": ponder_state,
     }
     # write-then-rename: a preemption mid-write must not be able to leave a truncated .pt that is
     # also the newest file by mtime. os.replace is atomic on POSIX and on Windows.
@@ -108,5 +112,8 @@ def load_checkpoint(model, optimizer, scheduler, path):
     # legacy (pre phase scoping) checkpoints have no phase -- the caller treats None as "same
     # phase as the one being launched", matching the old behaviour
     phase = checkpoint.get("phase", None)
+    # legacy (pre ponder-auto-adjust) checkpoints have no ponder_state -- PonderController.
+    # load_state_dict(None) is a no-op, leaving the caller's config-seeded controller in place
+    ponder_state = checkpoint.get("ponder_state", None)
     logger.info(f"Checkpoint loaded from {path}")
-    return epoch, dataset_idx, token_count, global_offset, losses, phase
+    return epoch, dataset_idx, token_count, global_offset, losses, phase, ponder_state

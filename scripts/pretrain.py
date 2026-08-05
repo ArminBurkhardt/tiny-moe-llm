@@ -22,20 +22,21 @@ from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16, TOKE
 from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_PREEMPTED, EXIT_RESUME_FAILED, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
+from modules.runtime.ponder import PonderController
 from modules.runtime.status import eta_seconds, format_duration, write_status
 
 
-from transformer_engine.common.recipe import Format, DelayedScaling, MXFP8BlockScaling, NVFP4BlockScaling
+from transformer_engine.common.recipe import Format, DelayedScaling #, MXFP8BlockScaling, NVFP4BlockScaling
 import transformer_engine.pytorch as te
 
 fp8_format = Format.HYBRID  # E4M3 during forward pass, E5M2 during backward pass
 fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max")
-mxfp8_format = Format.E4M3  # E4M3 used everywhere
-mxfp8_recipe = MXFP8BlockScaling(fp8_format=mxfp8_format)
-nvfp4_recipe = NVFP4BlockScaling(
-    disable_rht=False,
-    disable_stochastic_rounding=False,
-)
+#mxfp8_format = Format.E4M3  # E4M3 used everywhere
+#mxfp8_recipe = MXFP8BlockScaling(fp8_format=mxfp8_format)
+#nvfp4_recipe = NVFP4BlockScaling(
+#    disable_rht=False,
+#    disable_stochastic_rounding=False,
+#)
 
 # Note: using NVFP4 for the router and MTP heads leads to issues with the backward pass (mainly the requirement of divisability)
 
@@ -63,6 +64,45 @@ def detect_gpu_peak_flops():
             return peak
     return None
 
+
+def log_precision_mode():
+    """State once, up front, whether this run is really training in FP8.
+
+    "USE_FP8 was set in the environment" and "the GEMMs run in FP8" are not the same claim, and on
+    an unattended box nobody is watching the first few seconds: the env var can be missing from the
+    onstart script, or the recipe can be rejected by the device. So log the resolved recipe next to
+    what TE says about the hardware, rather than the env var alone.
+    """
+    if not USE_LOW_PRECISION:
+        logger.info("Precision: BF16 (USE_FP8 not set -- export USE_FP8=1 to train in FP8)")
+        return
+
+    fmt = getattr(chosen_recipe, "fp8_format", None)
+    detail = (
+        f"{type(chosen_recipe).__name__}(format={getattr(fmt, 'name', fmt)}, "
+        f"amax_history_len={getattr(chosen_recipe, 'amax_history_len', '?')})"
+    )
+    # check_fp8_support moved from transformer_engine.pytorch.fp8 to .quantization in TE 2.x; try
+    # both so this stays informational rather than becoming its own import failure
+    supported, reason = None, ""
+    for module in ("transformer_engine.pytorch.quantization", "transformer_engine.pytorch.fp8"):
+        try:
+            supported, reason = __import__(module, fromlist=["check_fp8_support"]).check_fp8_support()
+            break
+        except Exception:
+            continue
+
+    if supported is False:
+        # te.autocast(enabled=True) calls check_recipe_support and RAISES on an unsupported
+        # device, so this is a preview of a hard failure a few lines later, not a silent fallback
+        logger.error(f"Precision: USE_FP8=1 requested {detail} but this device rejects it: {reason}")
+    else:
+        logger.info(
+            f"Precision: FP8 ENABLED -- te.autocast wraps the forward with {detail}"
+            + ("" if supported else " (TE support probe unavailable)")
+            + ". Note the routed MoE grouped GEMM stays BF16 by design (see moe.py)."
+        )
+
 def train_step(
     model: TinyMoETransformer,
     input_ids: torch.Tensor,
@@ -76,6 +116,7 @@ def train_step(
     no_decay_master_pairs: list = None,
     collect_metrics: bool = False,
     n_loops: int = None,
+    lambda_ponder: float = None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -87,6 +128,11 @@ def train_step(
         n_loops: loop depth for this step (see sample_n_loops). None runs the configured depth.
             loop_ce_weights is truncated/rescaled to match, so the deepest loop actually run is
             always the one carrying weight 1.0 and holding the correctness head.
+        lambda_ponder: the ponder loss's target weight (pre-ramp), read from a live
+            modules.runtime.ponder.PonderController rather than TrainingConfig directly -- the
+            controller may have moved it away from config.yaml's starting value. None falls back
+            to TrainingConfig.lambda_ponder (config's static value, no auto-adjust) for callers
+            that construct no controller.
     """
     loop_ce_weights = (
         TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
@@ -141,7 +187,8 @@ def train_step(
             # loop_scale before the loop has learned to do anything (see loop_scale's docstring).
             tokens = unwrapped.token_count
             warm, ramp = TrainingConfig.ponder_warmup_tokens, TrainingConfig.ponder_ramp_tokens
-            lambda_ponder_now = TrainingConfig.lambda_ponder * min(1.0, max(0.0, (tokens - warm) / ramp))
+            target_lambda = TrainingConfig.lambda_ponder if lambda_ponder is None else lambda_ponder
+            lambda_ponder_now = target_lambda * min(1.0, max(0.0, (tokens - warm) / ramp))
             # p_halt is [n_loops, B, S] but valid_mask is [B, S], so the denominator has to carry
             # the loop axis too -- normalizing by valid_mask.sum() alone made both the ponder term
             # and the logged p_halt exactly n_loops times too large (p_halt could never read below
@@ -432,6 +479,7 @@ def pretrain(phase=None):
             logger.info(f"GPU: {gpu_name} | assumed BF16 dense peak: {gpu_peak_flops / 1e12:.1f} TFLOPS (MFU will be logged)")
         else:
             logger.warning(f"GPU: {gpu_name} not in GPU_BF16_PEAK_TFLOPS -- MFU will be logged as n/a, add an entry to enable it")
+    log_precision_mode()
 
     model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
@@ -455,6 +503,19 @@ def pretrain(phase=None):
     resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
     losses = []
+    # cold-start seed; overwritten by the checkpoint's ponder_state below on a resume, so a
+    # relaunch after preemption doesn't silently reset an already-adjusted lambda_ponder back to
+    # config.yaml's starting value
+    ponder_controller = PonderController(
+        TrainingConfig.lambda_ponder,
+        target=TrainingConfig.ponder_target_p_halt,
+        band=TrainingConfig.ponder_p_halt_band,
+        factor=TrainingConfig.ponder_adjust_factor,
+        cooldown_tokens=TrainingConfig.ponder_adjust_cooldown_tokens,
+        lambda_min=TrainingConfig.ponder_lambda_min,
+        lambda_max=TrainingConfig.ponder_lambda_max,
+        enabled=TrainingConfig.ponder_auto_adjust,
+    )
     os.makedirs(checkpoint_dir, exist_ok=True)
     ckpt_lib.cleanup_stale_files(checkpoint_dir)
     run_state_path = os.path.join(checkpoint_dir, "run_state.json")
@@ -475,7 +536,12 @@ def pretrain(phase=None):
         logger.warning("No checkpoint found in ckpts/training. Starting training from scratch")
     else:
         checkpoint_path, loaded = found
-        start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase = loaded
+        (start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase,
+         ponder_state) = loaded
+        # legacy checkpoints (pre Step 9 phase scoping, or plain pre-any-of-this) can carry
+        # losses=None; appending to that later crashes the first log step of the resumed run
+        losses = losses or []
+        ponder_controller.load_state_dict(ponder_state)
 
         # a checkpoint from the OTHER phase indexes a different corpus -- see resolve_resume_scope
         # for why that silently trains zero batches if left alone. The token count is deliberately
@@ -606,7 +672,7 @@ def pretrain(phase=None):
         save_checkpoint(
             unwrapped_model, optimizer, scheduler, epoch, dataset_idx, path=path,
             token_count=token_count, global_offset=snapshot_global_offset(), losses=losses,
-            phase=phase,
+            phase=phase, ponder_state=ponder_controller.state_dict(),
         )
         ckpt_lib.write_run_state(run_state_path, phase, token_count, name)
 
@@ -629,7 +695,13 @@ def pretrain(phase=None):
             if os.path.isfile(local):
                 hf.upload(local, remote)
 
-        ckpt_lib.prune_checkpoints(checkpoint_dir, TrainingConfig.keep_local_checkpoints, hf.is_uploaded)
+        deleted = ckpt_lib.prune_checkpoints(
+            checkpoint_dir, TrainingConfig.keep_local_checkpoints, hf.is_uploaded
+        )
+        # mirror local retention on the Hub -- otherwise every uploaded rolling checkpoint (2GB
+        # each, one every checkpoint_every_tokens) accumulates on temp-train forever
+        for deleted_path in deleted:
+            hf.delete(f"checkpoints/{os.path.basename(deleted_path)}")
 
     # first periodic checkpoint one interval after wherever this process picked up
     next_checkpoint_tokens = last_token_count + TrainingConfig.checkpoint_every_tokens
@@ -711,6 +783,7 @@ def pretrain(phase=None):
                     # gathered only on the steps the log block below actually reads them
                     collect_metrics=is_log_step,
                     n_loops=step_n_loops,
+                    lambda_ponder=ponder_controller.lambda_ponder,
                 )
 
 
@@ -778,11 +851,19 @@ def pretrain(phase=None):
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
                     top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
 
+                    # may move ponder_controller.lambda_ponder in place -- feeds next step's
+                    # train_step call, and the current value is what save_and_sync checkpoints
+                    ramp_complete = n_tokens >= (
+                        TrainingConfig.ponder_warmup_tokens + TrainingConfig.ponder_ramp_tokens
+                    )
+                    ponder_controller.observe(p_halt_mean, n_tokens, ramp_complete=ramp_complete)
+
                     eta_phase = eta_seconds(n_tokens, phase_target, tokens_per_sec)
 
                     logger.info(
                         f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
-                        f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} (lambda={metrics['lambda_ponder_now']:.2e}) | "
+                        f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} "
+                        f"(lambda={metrics['lambda_ponder_now']:.2e}, target={ponder_controller.lambda_ponder:.4g}) | "
                         f"Conf Loss: {conf_loss_val:.4f} | loop_scale: [{loop_scale_str}] | p_halt: {p_halt_mean:.4f} | "
                         f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
                         f"per-loop CE: [{per_loop_ce_str}] | mean loops: {mean_loops:.2f} | "

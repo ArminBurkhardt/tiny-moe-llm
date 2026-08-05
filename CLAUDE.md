@@ -58,8 +58,11 @@ modules/data/dataset.py     mmap flat-file IterableDataset (bin/idx) with docume
 modules/runtime/            unattended-run machinery. MUST NOT import torch.nn, transformer_engine
                              or anything under modules/model/ -- every test here runs GPU-free
   checkpoints.py            naming, stale cleanup, latest-VALID resume, retention, phase scoping,
-                             run_state sidecar, verify_resume
-  hf_sync.py                HFSync: background upload thread, retries, droppable jobs, drain
+                             run_state sidecar, verify_resume, resume_phase_index (which phase the
+                             supervisor should (re)start at)
+  hf_sync.py                HFSync: background upload thread, retries, droppable jobs, drain,
+                             remote delete + throttled history squash (mirrors local retention)
+  ponder.py                 PonderController: runtime lambda_ponder auto-adjust, checkpointed
   control.py                RunControl: STOP sentinel + SIGTERM/SIGUSR1, EXIT_* contract
   status.py                 write_status (atomic), eta_seconds, format_duration
 tests/                      tracked sanity scripts (see "Tests")
@@ -107,7 +110,8 @@ kill -USR1 <pid>                     # checkpoint now, keep training
 Tests are plain scripts (no pytest): each `sys.path.insert`s the repo root, asserts, and prints.
 Most require a GPU — the exceptions are the `modules/runtime/` tests (`test_checkpoint_lifecycle`,
 `test_hf_sync`, `test_control`, `test_supervisor`, `test_phase_targets`, `test_hf_token`,
-`test_checkpoint_atomic`) and `test_prepare_data`, which run anywhere. `tests/` is tracked (the
+`test_checkpoint_atomic`, `test_ponder_autoadjust`) and `test_prepare_data`, which run anywhere.
+`tests/` is tracked (the
 `.gitignore` line for it is commented out) — edits land in normal commits like any other source
 file.
 
@@ -439,6 +443,20 @@ requirement here, not an afterthought.
 - Ponder loss (`TrainingConfig.lambda_ponder`, applied to `(1 - p_halt)` on real tokens) ramps
   0 -> `lambda_ponder` over `ponder_warmup_tokens` -> `ponder_warmup_tokens + ponder_ramp_tokens`,
   also driven from the live token count — see the ponder-deadlock invariant above.
+- **`TrainingConfig.lambda_ponder` is only the ramp's target at a cold start.** `pretrain()`
+  constructs a `modules.runtime.ponder.PonderController` seeded from it, and `train_step` reads
+  the controller's live `.lambda_ponder` (a `lambda_ponder=` param, not `TrainingConfig` directly)
+  every step. After the warmup+ramp finishes, `train_step` feeds the controller each log
+  interval's `p_halt_mean`; the controller keeps an EMA and, once every `ponder_adjust_cooldown_
+  tokens`, nudges its value by `ponder_adjust_factor` if the EMA sits outside
+  `ponder_target_p_halt +/- ponder_p_halt_band` (up if `p_halt` reads too low, down if too high —
+  see the controller's docstring for why that's the correct direction), clamped to `[ponder_
+  lambda_min, ponder_lambda_max]`. `PonderController.state_dict()` is checkpointed
+  (`save_checkpoint`'s `ponder_state`) and restored on resume via `load_state_dict` — **without
+  this the adjustment would evaporate on every preemption restart**, since `config.yaml` is
+  re-read unmoved at every relaunch and only the controller's own persisted state remembers that
+  it moved away from that starting value. `ponder_auto_adjust: false` disables the whole
+  mechanism and pins `lambda_ponder` at the config value, matching the pre-auto-adjust behaviour.
 - Main CE is now a weighted sum over `n_loops` per-loop CE terms (`TrainingConfig.loop_ce_weights`,
   PLAN.md Step 4a) rather than just the final loop's — see the per-loop CE invariant above. The
   **non-final** loops are token-subsampled by `TrainingConfig.loop_ce_subsample` (default `0.25`);
@@ -536,7 +554,9 @@ design already accepted when the worker count changed.
   there's no sound mapping from the old per-file position into the new flat corpus.
 - All `load_checkpoint` extras use `.get(..., default)` so old checkpoints still load. Keep that
   when adding fields, and add them to `save_checkpoint`'s signature with a default too.
-  `load_checkpoint` returns a **6-tuple** now (`phase` last, `None` for legacy files).
+  `load_checkpoint` returns a **7-tuple** now (`phase`, then `ponder_state` last, both `None` for
+  legacy files -- `ponder_state` is `PonderController.state_dict()`, see "Ponder auto-adjust"
+  below).
 - **Writes are atomic**: `save_checkpoint` writes `path + ".tmp"`, `fsync`s, then `os.replace`s.
   Without this a preemption mid-write leaves a truncated `.pt` that is *also* the newest by mtime,
   i.e. exactly the file the resume would pick. Leftover `.pt.tmp` files are swept at startup by
@@ -603,10 +623,36 @@ are in [docs/runbook.md](docs/runbook.md); these are the invariants.
 - **Upload failures never propagate into the training loop.** `HFSync` retries 3x with tripling
   backoff, then logs and gives up on that file. Crashing a 40 hour run over a transient 503 is the
   worse outcome. The failed file stays *unmarked*, which is what makes retention refuse to delete
-  it -- see the retention invariant under "Checkpoints & resume".
+  it -- see the retention invariant under "Checkpoints & resume". `HFSync.delete()` (queued by
+  `pretrain.py`'s `save_and_sync` for whatever `prune_checkpoints` just removed locally) follows
+  the identical swallow-and-log policy -- a failed remote delete just leaves stale clutter on the
+  Hub, never takes the run down.
+- **A Hub file delete alone does not free storage; `HFSync` also squashes history.** `delete_file`
+  only removes the blob from the repo's current tree -- git history still references it, so a 2GB
+  checkpoint keeps costing storage until the history itself is rewritten. Every successful delete
+  calls `super_squash_history` too, throttled to at most once per `squash_min_interval` (default
+  1800s) so a burst of same-cycle deletes (one `prune_checkpoints` call can remove several files)
+  costs one squash, not one per file. Acceptable only because `temp-train` is a disposable scratch
+  mirror -- don't reuse this pattern against a repo anyone reads commit-by-commit.
 - **`HFSync.drain()` waits for the in-flight job too, not just an empty queue** (hence `_busy`).
   It is called in `pretrain()`'s `finally`, so a stop or a phase transition cannot race the
   uploader.
+- **`run_training.py`'s `main()` does not blindly start at `PHASE_ORDER[0]`.** It calls
+  `checkpoints.resume_phase_index(checkpoint_dir)` first and starts there. This exists because a
+  vast.ai reclaim kills the whole supervisor, not just the `pretrain.py` child -- `onstart.sh`
+  then launches a brand new `run_training.py` process, and the disk (which survives a reclaim)
+  can already hold a phase-2 checkpoint. The old unconditional loop re-entered phase 1 regardless,
+  which resumed the phase-2 checkpoint under `--phase phase1`, tripped `resolve_resume_scope`'s
+  cross-phase reset, immediately hit phase 1's (already-exceeded) token target, and overwrote
+  `checkpoint_phase1_final.pt` with phase-2 weights -- destroying it -- before phase 2 restarted
+  its own document offset from 0 on top. `resume_phase_index` treats a phase as already complete
+  once its final checkpoint is on disk, or once any checkpoint for a *later* phase is found (the
+  latter covers a recovery that only restored the phase-2 rolling file, per the runbook).
+- **`scripts/setup.sh` fails hard, not just a warning, when no HF token is found AND
+  `config.yaml`'s resolved upload repo is non-empty.** `set -euo pipefail` in `onstart.sh` means
+  this stops the box before training ever launches, rather than 40 hours of every checkpoint
+  upload 401ing silently while retention (correctly) refuses to delete the un-uploaded files and
+  the disk fills. `hf_upload_repo: ""` is still a legitimate way to opt out and run local-only.
 - **Crossing a phase boundary resets `global_offset`/epoch/step to 0 but PRESERVES `token_count`**
   (`resolve_resume_scope`). Both halves matter: phase 1's ~23M-document offset in phase 2's ~4M
   document corpus makes every worker's `range()` empty, so the dataloader yields zero batches and

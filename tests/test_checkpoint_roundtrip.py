@@ -30,7 +30,7 @@ save_checkpoint(m1, opt1, scheduler, epoch=3, dataset_idx=1234, path=path, token
 
 m2 = TinyMoETransformer(**P).to(dev).to(torch.bfloat16)
 opt2 = optim.AdamW(m2.parameters(), lr=1e-4)
-epoch, idx, tokens, global_offset, _, _ = load_checkpoint(m2, opt2, scheduler, path)
+epoch, idx, tokens, global_offset, _, _, _ = load_checkpoint(m2, opt2, scheduler, path)
 assert (epoch, idx, tokens) == (3, 1234, 987654), (epoch, idx, tokens, global_offset)
 
 sd1, sd2 = m1.state_dict(), m2.state_dict()
