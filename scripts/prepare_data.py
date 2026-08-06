@@ -74,6 +74,25 @@ def _no_think_split(path: str) -> bool:
     return "_no_think" in path
 
 
+def render_pretrain_chat(msgs) -> str:
+    """Render chat turns as plain "role: content" lines -- NOT a chat template, deliberately.
+
+    That's Step 12 SFT's job (``modules/data/chat.py``); here the point is only that the text reads
+    like natural dialogue prose during pretraining.
+
+    Kept as its own function because ``doc_hash`` of exactly this string is what lands in
+    ``manifest.json``'s ``smoltalk2_holdout_hashes``, and ``scripts/prepare_sft_data.py`` has to
+    reproduce it byte-for-byte to exclude conversations phase-2 pretraining already saw. Inlining
+    it in two places would make that a silent, untestable coupling.
+    """
+    return "\n".join(f"{m['role']}: {m['content']}" for m in msgs if m.get("content"))
+
+
+def doc_hash(text: str) -> str:
+    """Short content hash used for the smoltalk2 pretrain/SFT holdout bookkeeping."""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
 # PLAN.md Step 11 mix table. phase1 weights sum to 0.90 as written (see module docstring) --
 # renormalized to 1.0 at run time, ratios among sources preserved.
 SOURCES = [
@@ -143,7 +162,7 @@ def load_document_texts(spec: SourceSpec, local_path: str, seed: int) -> list:
         for msgs in df[spec.messages_field]:
             if msgs is None or len(msgs) == 0:
                 continue
-            rendered = "\n".join(f"{m['role']}: {m['content']}" for m in msgs if m.get("content"))
+            rendered = render_pretrain_chat(msgs)
             if rendered:
                 texts.append(rendered)
     elif spec.format == "parquet":
@@ -335,7 +354,7 @@ def run_phase(
             active[pick]["state"]["row_idx"] = row_idx + 1
             since_checkpoint += 1
             if pick == holdout_source_key:
-                state["holdout_hashes"].append(hashlib.sha1(text.encode("utf-8")).hexdigest()[:16])
+                state["holdout_hashes"].append(doc_hash(text))
             if tokens_written >= overall_target_tokens:
                 break
 

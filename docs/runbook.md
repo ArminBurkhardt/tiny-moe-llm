@@ -271,3 +271,71 @@ huggingface.key                           your token, mode 600, gitignored
 
 All of `ckpts/` and `data/prepared/` are gitignored, as is every `*.json` — `run_state.json` and
 `status.json` are runtime state, not tracked files.
+
+---
+
+## 10. Running SFT (PLAN.md Step 12) on a rented box
+
+SFT is written for the local dev GPU, but it runs unattended on vast.ai. It is a *different shape*
+of job from pretraining: ~300M tokens x 2 epochs, so **1-3 hours, not 40**, and there is no
+supervisor because there are no phases — only epochs, and the epoch is in the checkpoint.
+
+**Rent on-demand, not interruptible.** The interruptible discount is worth ~EUR 1-3 on a run this
+short, against a real chance of babysitting restarts. `sft.py` does honour the same stop contract
+as pretraining (SIGTERM → checkpoint + exit 20, `ckpts/sft/STOP` → exit 10, SIGUSR1 → checkpoint and
+keep going), so if you do take an interruptible box, wrap it: `until python scripts/sft.py
+--upload-repo ikeafisch4/temp-train; do sleep 10; done` — exit 10 and 0 both stop the loop, exit 20
+relaunches and resumes from the newest loadable checkpoint in `ckpts/sft`.
+
+### 10.1 On the same instance that just finished pretraining (preferred)
+
+The tokenizer, `manifest.json` and the final checkpoint are all already on disk, and
+`checkpoint_phase2_final.pt` is right there — no downloads.
+
+```bash
+# stop the onstart hook from relaunching the supervisor on the next boot (clear it in the vast
+# console). It is harmless if it does run -- resume_phase_index sees checkpoint_phase2_final.pt
+# and phase 2 exits immediately -- but it churns a final checkpoint save for nothing.
+unset USE_FP8                      # see 10.3
+python scripts/prepare_sft_data.py --target-tokens 300000000
+python scripts/sft.py -c ckpts/training/checkpoint_phase2_final.pt \
+                      --upload-repo ikeafisch4/temp-train
+```
+
+Disk: the SFT corpus is ~1GB (bin + mask) plus a few GB of shard scratch, against ~60GB already
+used by `phase{1,2}.bin`. Fits in 120GB with room; delete the phase bins only if you need to.
+
+### 10.2 On a fresh instance
+
+```bash
+bash scripts/setup.sh --hf-token X          # deps, token, tokenizer, preflight
+bash tests/run_env_check.sh
+python scripts/prepare_sft_data.py --pull-manifest   # 20-40 min, download-bound
+python scripts/sft.py --from-hub --upload-repo ikeafisch4/temp-train
+```
+
+`--pull-manifest` is **not optional here.** `manifest.json` is gitignored (`*.json`), so a fresh
+clone has no `smoltalk2_holdout_hashes`, and without them the SFT corpus would re-train on the
+smoltalk2 conversations phase-2 pretraining already saw. The script refuses to run with an empty
+holdout list rather than doing that silently; `--ignore-holdout` overrides, but do not.
+
+### 10.3 What to change from the local defaults
+
+| | why |
+|---|---|
+| **`--upload-repo <repo>`** | `sft.hf_upload_repo` is `""` (uploads off) because SFT is a local run. On a rented box that means the checkpoints die with the instance. This is the one you must not forget. |
+| **`unset USE_FP8`** | `onstart.sh` exports `USE_FP8=1`, and `sft.py` imports the same recipe resolution from `pretrain.py`, so it would inherit FP8. At `lr=3e-5` the FP8 GEMM noise is large relative to the update — the same margin argument that forces fp32 masters for every parameter (see `build_sft_param_groups`). The run is short enough that the throughput does not matter. |
+| **`sft.batch_size: 16`, `grad_accumulation_steps: 2`** | 4 x 8 is sized for a 32GB 5090. On an 80GB H100 this keeps tokens/step at 131k and is far faster. Both are in `config.yaml`'s `sft:` block. |
+| `--target-tokens` | 300M is the default corpus size. Raising it costs prep time and disk, not much else. |
+
+Everything else carries over unchanged. `ckpts/sft/` is a separate directory from `ckpts/training/`
+on purpose, so `resume_phase_index` can never mistake an SFT checkpoint for a pretraining phase.
+
+### 10.4 Watching it
+
+`ckpts/sft/status.json` and the log line are the same shape as pretraining's, plus an `[eval]` line
+every `sft.eval_every_tokens` (25M) reporting val CE, `p_correct`, `p_max` and top-1 on `sft_val`.
+The one to watch: **`p_correct` tracking `p_max` exactly** means the correctness head learned
+nothing beyond the free baseline — that is the Gate 5 / Step 4b re-decision showing up early, not a
+crash. Loss should start near where pretraining ended and drop quickly in the first few hundred
+steps as the model learns the chat format, then flatten.

@@ -137,3 +137,57 @@ class TrainingConfig:
             return cls.target_tokens
         raise ValueError(f"unknown phase {phase!r}; expected 'phase1' or 'phase2'")
 
+
+class SFTConfig:
+    """Supervised fine-tuning knobs (PLAN.md Step 12), read from config.yaml's ``sft:`` block.
+
+    Only the things SFT genuinely does differently live here. Every loss weight -- lambda_mtp,
+    aux_loss_weight, loop_ce_weights/loop_ce_subsample, loop_count_sampling, lambda_conf and the
+    whole ponder family -- is read from ``TrainingConfig`` by ``scripts/pretrain.train_step``,
+    which ``scripts/sft.py`` reuses unchanged. That reuse is the point: PLAN.md Step 12 wants
+    ``p_halt``/``p_correct`` supervision to stay active during SFT, and the cheapest way to
+    guarantee it stays *identical* is to not have a second copy of it.
+    """
+    _Block = Config.get("sft", {}) or {}
+
+    data_dir = str(_Block.get("data_dir", "data/prepared"))
+    train_split = str(_Block.get("train_split", "sft_train"))
+    val_split = str(_Block.get("val_split", "sft_val"))
+
+    Batch_size = int(_Block.get("batch_size", 4))
+    Seq_length = int(_Block.get("seq_length", 4096))
+    grad_accumulation_steps = int(_Block.get("grad_accumulation_steps", 8))
+    lr = float(_Block.get("lr", 3e-5))
+    weight_decay = float(_Block.get("weight_decay", 0.01))
+    num_epochs = int(_Block.get("num_epochs", 2))
+    warmup_fraction = float(_Block.get("warmup_fraction", 0.03))
+    lr_min_factor = float(_Block.get("lr_min_factor", 0.05))
+    dropout = float(_Block.get("dropout", 0.05))
+    # seeds the SFTDataset per-epoch document permutation. Changing it mid-run repoints every
+    # checkpointed resume position into a different order, so it is checkpointed alongside them.
+    seed = int(_Block.get("seed", 1234))
+
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 25_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", 3))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 25_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", 40))
+
+    # same None-vs-"" distinction as TrainingConfig.hf_upload_repo: absent means "fall back to
+    # utils.HF_UPLOAD_REPO", explicit "" means uploads off (the default for a local run).
+    _raw_upload_repo = _Block.get("hf_upload_repo", "")
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+    @classmethod
+    def upload_repo(cls, default: str) -> str:
+        """Resolve which repo to upload SFT checkpoints to ("" disables uploads)."""
+        return default if cls.hf_upload_repo is None else cls.hf_upload_repo
+
+    @classmethod
+    def model_params(cls) -> dict:
+        """``ModelConfig.Params`` with the SFT dropout override applied.
+
+        Dropout is not a parameter, so this changes nothing about checkpoint compatibility -- the
+        pretrained state dict loads into the overridden model unchanged.
+        """
+        return {**ModelConfig.Params, "dropout": cls.dropout}
+

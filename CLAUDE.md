@@ -40,6 +40,10 @@ scripts/
   prune_vocab.py            one-shot 129280 -> 65536 vocab prune (Step 8), not part of training
   prepare_data.py           builds phase1/phase2.bin/.idx from the Hub source mix (Step 11), runs
                              on the rented box, not locally -- see "Data prep" below
+  prepare_sft_data.py       builds sft_train/sft_val .bin/.idx/.mask from the Step 12 source mix,
+                             runs LOCALLY -- see "SFT" below
+  sft.py                    THE post-training entry point (Step 12): local, single GPU, reuses
+                             pretrain.train_step verbatim
   eval_calibration.py       Gate 5: ECE / abstention AUROC for the correctness head
   __init__.py               empty; exists only so tests can `from scripts.run_training import ...`
 modules/model/
@@ -55,6 +59,10 @@ modules/model/
   embeddings.py             RoPE cache + apply_rotary_pos_emb
   utils.py                  EncoderOutput dataclass
 modules/data/dataset.py     mmap flat-file IterableDataset (bin/idx) with document packing (Step 9)
+modules/data/sft_dataset.py mmap SFT dataset (bin/idx/mask): explicit loss mask, per-epoch shuffle,
+                             never splits a conversation across rows (Step 12)
+modules/data/chat.py        chat template + token-level loss masking (Step 12)
+modules/data/abstention.py  the fixed abstention/hedge phrasings (Steps 12 and 13)
 modules/runtime/            unattended-run machinery. MUST NOT import torch.nn, transformer_engine
                              or anything under modules/model/ -- every test here runs GPU-free
   checkpoints.py            naming, stale cleanup, latest-VALID resume, retention, phase scoping,
@@ -100,6 +108,8 @@ source env_init                      # WSL: CUDA paths + venv (local box only)
 bash scripts/setup.sh --hf-token X   # rented box only: deps, token, tokenizer, preflight
 python scripts/run_training.py       # the real run: phase1 -> phase2, restarts on preemption
 python scripts/pretrain.py --phase phase1   # one phase; resumes from the newest LOADABLE ckpt
+python scripts/prepare_sft_data.py   # Step 12 corpus; needs manifest.json's holdout hashes first
+python scripts/sft.py --from-hub     # Step 12 SFT: pull the pretrained ckpt + manifest, then train
 python scripts/inference.py          # interactive; -c CKPT -p PROMPT -n 200 --temperature 0.8
 bash tests/run_env_check.sh          # torch/flash/TE/tokenizer smoke check
 bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
@@ -110,7 +120,8 @@ kill -USR1 <pid>                     # checkpoint now, keep training
 Tests are plain scripts (no pytest): each `sys.path.insert`s the repo root, asserts, and prints.
 Most require a GPU — the exceptions are the `modules/runtime/` tests (`test_checkpoint_lifecycle`,
 `test_hf_sync`, `test_control`, `test_supervisor`, `test_phase_targets`, `test_hf_token`,
-`test_checkpoint_atomic`, `test_ponder_autoadjust`) and `test_prepare_data`, which run anywhere.
+`test_checkpoint_atomic`, `test_ponder_autoadjust`), `test_prepare_data` and `test_sft_dataset`,
+which run anywhere.
 `tests/` is tracked (the
 `.gitignore` line for it is commented out) — edits land in normal commits like any other source
 file.
@@ -120,7 +131,7 @@ not) lives in [docs/runbook.md](docs/runbook.md), not here.
 
 ## Config
 
-`config.yaml` -> `config.py` exposes three surfaces:
+`config.yaml` -> `config.py` exposes four surfaces:
 
 - `ModelConfig.Params` — kwargs splatted straight into `TinyMoETransformer(**...)`.
 - `ModelConfig.Forward` — kwargs splatted into `model(...)`; currently empty (`identity_skew` was
@@ -138,6 +149,13 @@ not) lives in [docs/runbook.md](docs/runbook.md), not here.
   reads (PLAN.md Step 9) -- both are gitignored artifacts produced by `scripts/prepare_data.py`
   (Step 11, see "Data prep" below); a real `pretrain()` run has nothing to read until that's
   been run once, normally on the rented box.
+- `SFTConfig` — the `sft:` block (PLAN.md Step 12). Only what SFT genuinely does differently: its
+  own lr/epochs/batch/seq, the `{train,val}_split` stems, the per-epoch shuffle `seed`, the eval and
+  checkpoint cadences, and a `dropout` override applied via `SFTConfig.model_params()` (dropout is
+  not a parameter, so the pretrained state dict still loads unchanged). **Every loss weight is
+  absent on purpose** — `scripts/sft.py` reuses `pretrain.train_step`, which reads them from
+  `TrainingConfig`. Same `None`-vs-`""` `hf_upload_repo` distinction as `TrainingConfig`, but it
+  defaults to `""` (uploads off) because SFT is a local run.
 
 Constraints worth remembering:
 - `moe_intermediate_size` (optional) sizes the routed MLP experts and the always-on shared
@@ -480,6 +498,17 @@ requirement here, not an afterthought.
   just a regularization preference — `moe.loop_scale` decayed toward 0 is the loop decayed toward
   "off", and `layer_scalar` is a gain on the whole residual stream so its decay compounds across
   depth (~0.5x over 8 layers at `lr=4e-4`/`wd=0.02` over a 5B-token run, before any gradient).
+- **A parameter stepped through an fp32 master is NOT in any optimizer param group, so
+  `optimizer.zero_grad()` never clears its `.grad` — `train_step` has to, by hand, gated on
+  `accelerator.sync_gradients` exactly like the step itself** (clearing every micro step would
+  throw away grad accumulation for those tensors). That loop is load-bearing, not tidiness:
+  without it the bf16 `.grad` accumulates across every
+  optimizer step for the entire run, and (a) `accelerator.clip_grad_norm_(model.parameters(), ...)`
+  reads those tensors, so the total norm grows without bound and the clip coefficient throttles
+  *every other* parameter's gradient — a silent run-wide LR collapse behind a loss curve that still
+  descends, just far too slowly — and (b) `sync_master_grads_` copies a run-length sum instead of
+  the step's gradient, giving the shadowed params a permanent non-decaying momentum. This bites
+  proportionally harder in `scripts/sft.py`, where *every* parameter is shadowed.
 - **A checkpoint that exists but fails to load is never a fresh start.** The resume path
   distinguishes "no file in `ckpts/training`" (warn, start from scratch) from "files exist but
   none loads" (raise). Collapsing both into one warning is how a preempted box silently restarts
@@ -600,6 +629,81 @@ prepended if the document's first stored token isn't already BOS -- idempotent r
 Batches carry `doc_idx / worker_id` as `[B]`-shaped tensors purely so accelerate's batch splitting
 treats them like `input_ids`; `doc_idx` is the last global document index this worker had reached
 when the batch was assembled, read by the trainer for checkpointing (see "Checkpoints & resume").
+
+## SFT / post-training (PLAN.md Step 12)
+
+`scripts/sft.py` + `scripts/prepare_sft_data.py` + `modules/data/{chat,abstention,sft_dataset}.py`.
+**Written for a local run** — the pretrained checkpoint and `manifest.json` come down from the Hub
+once pretraining finishes (`sft.py --from-hub`, `prepare_sft_data.py --pull-manifest`; the manifest
+is gitignored so a fresh clone never has the holdout hashes). It does run unattended on a rented
+box: same `modules/runtime/control` contract as pretraining (SIGTERM → save + exit 20, STOP → exit
+10, SIGUSR1 → save and continue) and it returns those codes, so a `while ! python scripts/sft.py;
+do :; done`-style wrapper covers an interruptible instance. There is deliberately **no phase
+supervisor** — there are no phases here, only epochs, and epoch position is in the checkpoint.
+What to actually run on a rented box, and what to change from the local defaults, lives in
+[docs/runbook.md](docs/runbook.md) §10, not here.
+
+- **`sft.py` reuses `pretrain.train_step` verbatim**, deliberately. PLAN.md Step 12 wants
+  `p_halt`/`p_correct` supervision to stay active during SFT, and the only way to guarantee it stays
+  *identical* (per-loop CE weights, aux loss, ponder ramp, correctness BCE, loop-count sampling) is
+  to have one copy. Prompt masking needs nothing there: the dataset emits `-100` labels and every
+  loss term — including the MTP heads, which read the same `labels` tensor — already honours
+  `ignore_index=-100`. Consequence: every loss weight lives in `TrainingConfig`, not `SFTConfig`.
+- **The model's global token counter is CONTINUED, not reset.** The ponder ramp and the router
+  noise anneal are both driven from it and both have long finished at ~30B tokens; resetting to 0
+  would restart the ponder warmup, i.e. silently switch the ponder loss off for all of SFT. SFT
+  progress is `token_count - start_token_count`, and `start_token_count` is why `sft.py` writes its
+  own checkpoint payload (a strict *superset* of `utils.save_checkpoint`'s, so `inference.py` /
+  `eval_calibration.py` read an SFT checkpoint unchanged) instead of extending `utils.py` —
+  changing `load_checkpoint`'s tuple arity would break the *live* pretraining run on its next
+  preemption relaunch, since `onstart.sh` does `git pull --ff-only` on `train-build`.
+- **Every parameter gets an fp32 master, not just the undecayed ones** (`build_sft_param_groups`).
+  Pretraining shadows only `ndim <= 1` on the argument that 2D weights' values and steps both scale
+  with their init std. That argument does not survive SFT's LR: at `lr=3e-5` a weight near its init
+  std ~0.02-0.03 has a bf16 ulp of ~1e-4, three times *larger* than the ~`lr`-sized AdamW step, so
+  `param -= lr * update` rounds to exactly the old value forever. At `4e-4` the same step is ~4x
+  above the ulp, which is why the narrower fix was right there and wrong here. See also the
+  `sync_master_values_` grad-clearing invariant under "Training loop notes".
+- **`SFTDataset` differs from the pretraining `Dataset` in exactly three ways**, each forced:
+  a third file `{split}.mask` (uint8/token, 1 = supervised) because prompt and completion interleave
+  inside a multi-turn conversation and labels can't be derived from position; **conversations are
+  never split across rows** (a split tail is supervised with its prompt missing, and loses the
+  supervised EOS that teaches the model to stop — over-long ones are dropped, never truncated, at
+  ~5-10% trailing-padding cost); and **documents are shuffled per epoch** via a
+  `(seed, epoch)`-seeded permutation every worker regenerates independently. `global_offset` is
+  therefore a *position in that permutation*, not a raw doc id — which is why `sft.seed` is
+  checkpointed and a mid-run change of it is a hard error rather than a silent reshuffle.
+- **Separator slots after each conversation are all pads**, unlike the pretraining dataset's
+  `EOS + pads`: an SFT document already ends with its own *supervised* EOS.
+- **The chat template's control tokens are resolved from the tokenizer and asserted**
+  (`ChatTemplate._control_id`). They are DeepSeek's `<｜User｜>` / `<｜Assistant｜>` /
+  `<｜begin▁sys｜>` / `<｜end▁sys｜>`, which survived the Step 8 prune because `prune_vocab.py` keeps
+  every special/added token unconditionally. They are spelled with explicit `｜`/`▁`
+  escapes in `chat.py` — those are FULLWIDTH VERTICAL LINE and LOWER ONE EIGHTH BLOCK, visually
+  identical to `|` and `_`, and a mistyped one resolves to a different or missing id. Only the
+  assistant's own text and its terminating EOS are ever supervised; markers belong to the prompt
+  (inference appends `<｜Assistant｜>` itself, so the model never has to predict it).
+- **Conversations with roles outside {system, user, assistant} are dropped whole**, not mangled
+  into user turns — smoltalk2's `hermes_function_calling`/`xlam_traces` splits carry `tool` turns,
+  which are noise for a calibrated-abstention target and would teach tool syntax the model can
+  never complete.
+- **`prepare_sft_data.py` honours the smoltalk2 holdout** from `manifest.json`'s
+  `data_prep.smoltalk2_holdout_hashes` (phase-2 pretraining already trained on those). Those hashes
+  are of `prepare_data.render_pretrain_chat`'s output, so the exclusion **imports that exact
+  function** rather than reimplementing the rendering, and hashes the *raw* parquet rows — a
+  reimplementation that drifted by one character would silently exclude nothing. It refuses to run
+  with an empty holdout list unless `--ignore-holdout` is passed.
+- **Only train splits are consumed.** `squad_v2`'s validation split and `gsm8k`'s test split are
+  the acceptance-metric eval sets (abstention precision/recall on the unanswerable half); pulling
+  them into SFT would make that number meaningless.
+- **Abstention phrasings are a small fixed closed set** (`modules/data/abstention.py`), shared with
+  Step 13. SQuAD v2's unanswerable rows have a literally empty reference answer, so a phrasing has
+  to be supplied; keeping the set closed is what makes `is_abstention` an exact check rather than a
+  classification problem, and means Step 13 measures a shift in *when* the model abstains rather
+  than in how it words it.
+- `estimate_packed_rows` replays the packing rule over `{split}.idx` to anchor the LR schedule.
+  "corpus tokens / (batch * seq)" is not a usable estimate here — no-split packing plus separator
+  slots easily costs 10%, which would end the cosine well before the data does.
 
 ## Run lifecycle (`modules/runtime/`, `scripts/run_training.py`)
 
