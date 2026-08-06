@@ -45,6 +45,8 @@ scripts/
   sft.py                    THE post-training entry point (Step 12): local, single GPU, reuses
                              pretrain.train_step verbatim
   eval_calibration.py       Gate 5: ECE / abstention AUROC for the correctness head
+  eval_abstention.py        Step 12 acceptance: SQuAD v2 abstention precision/recall + ECE,
+                             LOCAL, needs an SFT checkpoint -- see "SFT" below
   __init__.py               empty; exists only so tests can `from scripts.run_training import ...`
 modules/model/
   transformer.py            TinyMoETransformer (top level) + TokenTracker
@@ -110,6 +112,7 @@ python scripts/run_training.py       # the real run: phase1 -> phase2, restarts 
 python scripts/pretrain.py --phase phase1   # one phase; resumes from the newest LOADABLE ckpt
 python scripts/prepare_sft_data.py   # Step 12 corpus; needs manifest.json's holdout hashes first
 python scripts/sft.py --from-hub     # Step 12 SFT: pull the pretrained ckpt + manifest, then train
+python scripts/eval_abstention.py    # Step 12 acceptance; -c CKPT --baseline-checkpoint PRETRAINED
 python scripts/inference.py          # interactive; -c CKPT -p PROMPT -n 200 --temperature 0.8
 bash tests/run_env_check.sh          # torch/flash/TE/tokenizer smoke check
 bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
@@ -696,6 +699,38 @@ What to actually run on a rented box, and what to change from the local defaults
 - **Only train splits are consumed.** `squad_v2`'s validation split and `gsm8k`'s test split are
   the acceptance-metric eval sets (abstention precision/recall on the unanswerable half); pulling
   them into SFT would make that number meaningless.
+- **`scripts/eval_abstention.py` is the acceptance metric**, and it *generates* — `sft.py`'s
+  `sft_val` pass reports `p_correct`/`p_max`/top-1 at checkpoint cadence, which is an early warning,
+  not the number. It decodes an answer for every `squad_v2` validation question and classifies it
+  with `abstention.is_abstention`, so it reuses `SQUAD_INSTRUCTION` and `ChatTemplate.encode_prompt`
+  by **import** rather than restating them: the instruction is what licenses abstention at all
+  ("If the passage does not contain the answer, say so"), and a prompt that drifted by a word would
+  score the model on something it never saw. Three things worth knowing before touching it:
+  - **Batched decode is left-padded, with the pad run given its own `document_ids` segment.** Left
+    padding puts every row's last real token at the same index so one append extends all rows; the
+    separate segment is what stops real tokens attending to pads, the same block-diagonal mask that
+    keeps packed documents apart in training. RoPE positions shift by the pad length, which is
+    harmless because the score depends only on the relative offset inside a segment. There is still
+    no KV cache (same as `inference.py`), so cost is quadratic in answer length — hence
+    `--max-new-tokens 32` and length-sorted batches.
+  - **The isolation is exact through attention and only through attention.** Change what is in the
+    pad region and the dense decoder's output for the real tokens is *bit-identical* — that is the
+    property worth asserting, and `tests/test_pad_isolation.py` asserts exactly it (with an
+    unsegmented control, so the test can't pass vacuously). It is deliberately not asserted on the
+    full model or on a decoded string: `ParallelSparseMoELayer` tiles its grouped GEMM by
+    `m_splits`, the per-expert row counts over *every* token in the batch, pads included, so batch
+    composition changes the bf16 accumulation order for the real tokens' rows too (~0.5–1% of
+    hidden-state magnitude). Same input twice is bit-identical, so this is reduction order, not RNG
+    — but it means eval numbers are only comparable at a fixed `--batch-size`, and it is why an
+    equality assert on greedy output flaps on an untrained model.
+  - **Two calibration numbers, deliberately.** Answer-level (confidence over the generated tokens vs.
+    whether the answer was right) is the user-facing claim; token-level teacher-forced is the only
+    one that can also be read off the *pretrained* checkpoint (`--baseline-checkpoint`), which is
+    what makes "ECE doesn't degrade" a delta instead of a comparison between two different
+    quantities. The pretrained model is out of distribution on the chat control tokens, so that
+    baseline is conservative — the script prints the caveat with the result.
+  - `expected_calibration_error`/`roc_auc` are imported from `scripts/eval_calibration.py`, so Gate 5
+    and Step 12's acceptance are computed by the same code. Don't fork them.
 - **Abstention phrasings are a small fixed closed set** (`modules/data/abstention.py`), shared with
   Step 13. SQuAD v2's unanswerable rows have a literally empty reference answer, so a phrasing has
   to be supplied; keeping the set closed is what makes `is_abstention` an exact check rather than a

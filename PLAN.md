@@ -147,7 +147,8 @@ the mix for representation quality, not benchmark score (SmolLM2-1.7B scored 3.2
 
 ### Step 12 — SFT — **built, not yet run**
 
-`scripts/sft.py` (+ `scripts/prepare_sft_data.py`, `modules/data/{chat,abstention,sft_dataset}.py`,
+`scripts/sft.py` (+ `scripts/prepare_sft_data.py`, `scripts/eval_abstention.py`,
+`modules/data/{chat,abstention,sft_dataset}.py`,
 `tests/test_sft_dataset.py`, config.yaml's `sft:` block). Reuses the model/packing path — in fact it
 reuses `pretrain.train_step` verbatim, which is what keeps `p_halt`/`p_correct` supervision
 *identical* rather than merely similar; swaps data source, adds loss masking over prompt tokens.
@@ -176,14 +177,20 @@ yet, and the data prep has not been run against the live Hub.
 **Acceptance:** SQuAD v2 abstention precision/recall on the unanswerable split both reported; ECE
 of the abstention signal doesn't degrade relative to the pretrained checkpoint.
 
-**Still to write for the acceptance criterion:** `scripts/eval_abstention.py` — run the SFT
-checkpoint over `squad_v2`'s *validation* split (deliberately never consumed by
-`prepare_sft_data.py`, precisely so it can serve here), classify each completion with
-`modules.data.abstention.is_abstention`, and report abstention precision/recall on the unanswerable
-half plus ECE of the abstention signal against the same number from
-`scripts/eval_calibration.py` on the pretrained checkpoint. `sft.py`'s validation pass already logs
-`p_correct`/`p_max`/top-1 on `sft_val` at checkpoint cadence, which catches "the head learned
-nothing beyond `p_max`" early, but it is not the acceptance number.
+**Measured by `scripts/eval_abstention.py`** — it generates an answer for every question in
+`squad_v2`'s *validation* split (deliberately never consumed by `prepare_sft_data.py`, precisely so
+it can serve here), classifies each completion with `modules.data.abstention.is_abstention`, and
+reports abstention precision/recall/F1 plus the false-abstention rate on the answerable half (the
+"refuse everything" tell that precision alone hides). Calibration is reported twice: answer-level
+(confidence averaged over the generated tokens, scored against whether the answer was right) and
+token-level teacher-forced, the latter runnable against the pretrained checkpoint too via
+`--baseline-checkpoint` so the "doesn't degrade" half is an actual delta rather than a comparison
+between two differently-defined numbers. ECE/AUROC are imported from `scripts/eval_calibration.py`,
+so Gate 5's numbers and these come out of the same code. The caveat is printed with the result: the
+pretrained checkpoint is out of distribution on the chat control tokens, so a PASS there is weak
+evidence and a FAIL is strong. `sft.py`'s validation pass already logs `p_correct`/`p_max`/top-1 on
+`sft_val` at checkpoint cadence, which catches "the head learned nothing beyond `p_max`" early, but
+it is not the acceptance number.
 
 ### Step 13 — Self-labelled calibration set
 

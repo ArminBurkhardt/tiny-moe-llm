@@ -339,3 +339,46 @@ The one to watch: **`p_correct` tracking `p_max` exactly** means the correctness
 nothing beyond the free baseline — that is the Gate 5 / Step 4b re-decision showing up early, not a
 crash. Loss should start near where pretraining ended and drop quickly in the first few hundred
 steps as the model learns the chat format, then flatten.
+
+### 10.5 The acceptance metric (PLAN.md Step 12)
+
+`sft_val`'s `[eval]` line is an early warning, not the acceptance number. That comes from
+`scripts/eval_abstention.py`, which runs **after** SFT finishes, on the SQuAD v2 *validation* split
+that `prepare_sft_data.py` deliberately never consumed:
+
+```bash
+python scripts/eval_abstention.py \
+    -c ckpts/sft/checkpoint_sft_final.pt \
+    --baseline-checkpoint ckpts/training/checkpoint_phase2_final.pt \
+    --json-out ckpts/sft/abstention_eval.json
+```
+
+It downloads the validation shards itself (`--squad-dir` reads local parquet instead, for a box with
+no network), generates an answer for every question, and prints three blocks:
+
+| block | the number that matters |
+|---|---|
+| generated answers | **abstention precision and recall** — PLAN.md's acceptance pair. Read `false abstention rate` next to them: a model that refuses everything scores recall 1.0 and looks fine on precision alone. |
+| answer quality | EM/token-F1 on the answerable half. Low here with a high abstention rate is the degenerate solution. |
+| calibration | answer-level ECE/AUROC for `p_correct` and `p_max`, then the teacher-forced token-level pair with the pretrained checkpoint beside it and an explicit PASS/FAIL on **`ECE(p_correct)` change vs pretrained**. |
+
+Three things to expect rather than panic about. First, **the run is slow**: there is no KV cache, so
+every decode step re-runs the whole prefix. The full ~11.9k-question split at `--batch-size 16` is
+tens of minutes on the dev GPU — use `--max-examples 2000` for a first look (it is a seeded
+subsample, so two capped runs are comparable to each other). Raise `--batch-size` on a bigger card.
+
+Second, **hold `--batch-size` and `--max-examples` fixed across any two runs you compare.** The
+padding is genuinely invisible to the model (`tests/test_pad_isolation.py` asserts the decoder is
+bit-identical under a changed pad region), but the MoE's grouped GEMM tiles by the batch's
+per-expert row counts, so batch composition shifts bf16 accumulation order by ~0.5–1% of
+hidden-state magnitude. Deterministic, not random — the same command twice gives the same answer —
+but a different `--batch-size` is a different measurement.
+
+Third, **the baseline comparison is asymmetric on purpose**: the pretrained checkpoint never saw
+the chat control tokens, so it is out of distribution on these inputs and its ECE is a conservative
+bar. The script prints this with the verdict — a PASS is weak evidence, a FAIL is strong.
+
+This is also where the deferred **Gate 5 / Step 4b re-decision** gets made against the real final
+checkpoint: if `p_max` beats `p_correct` on ECE *and* AUROC here as it did on the 45M-token smoke
+checkpoint, drop the correctness head, its loss term and `lambda_conf`, and substitute `p_max`
+everywhere Step 13 uses an abstention signal.

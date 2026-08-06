@@ -88,6 +88,9 @@ scripts/
   inference.py                 greedy/top-k sampling CLI
   prune_vocab.py               one-shot 129280 -> 65536 vocab prune
   eval_calibration.py          ECE / abstention AUROC for the correctness head
+  prepare_sft_data.py          builds sft_train/sft_val .bin/.idx/.mask from the SFT source mix
+  sft.py                       supervised fine-tuning; reuses pretrain.train_step unchanged
+  eval_abstention.py           SQuAD v2 abstention precision/recall + calibration
 modules/model/
   transformer.py               TinyMoETransformer (top-level model)
   gemma4.py                    dense Gemma4-style decoder
@@ -100,6 +103,9 @@ modules/model/
   modules.py                   factored LM head
   embeddings.py                rotary position embeddings
 modules/data/dataset.py        mmap flat-file dataset with document packing
+modules/data/sft_dataset.py    mmap SFT dataset: explicit loss mask, per-epoch shuffle
+modules/data/chat.py           chat template + token-level loss masking
+modules/data/abstention.py     the fixed abstention/hedge phrasings
 modules/runtime/               unattended-run machinery (no GPU/TE dependency)
   checkpoints.py               naming, retention, latest-VALID resume, resume verification
   hf_sync.py                   background uploader to the Hugging Face Hub
