@@ -218,6 +218,17 @@ def train_step(
             optimizer.step()
             if accelerator.sync_gradients and no_decay_master_pairs is not None:
                 sync_master_values_(no_decay_master_pairs)
+                # the bf16 no_decay params sit in NO optimizer param group (only their fp32 masters
+                # do), so optimizer.zero_grad() below never reaches them -- they have to be cleared
+                # by hand, here, gated on sync_gradients exactly like the step (clearing every micro
+                # step would throw away grad accumulation for these tensors). Without it .grad is a
+                # running sum over the whole run: it pads clip_grad_norm_'s total until the run is
+                # permanently pinned at the clip threshold, and sync_master_grads_ then hands AdamW
+                # an integral of past gradients instead of this step's -- on precisely the tensors
+                # (loop_scale, layer_scalar, halt_proj.bias, norm gains) the master mechanism exists
+                # to keep moving correctly.
+                for bf16_param, _ in no_decay_master_pairs:
+                    bf16_param.grad = None
             optimizer.zero_grad(set_to_none=True)
 
     if scheduler is not None and accelerator.sync_gradients:
