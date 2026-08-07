@@ -25,6 +25,14 @@ MAX_ATTEMPTS="${SFT_MAX_ATTEMPTS:-10}"
 
 log() { echo "[chain $(date -u '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# sft.py imports USE_LOW_PRECISION/chosen_recipe straight from pretrain.py, so it inherits USE_FP8
+# from whatever shell launched this -- and onstart.sh exports USE_FP8=1. At lr=3e-5 the FP8 GEMM
+# noise is large relative to the update (the same margin argument that forces fp32 masters for
+# every parameter, see build_sft_param_groups); a 2-3h run does not need the throughput. Unset it
+# here rather than trusting the launching environment -- see runbook 10.3.
+unset USE_FP8
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # --- 0. preconditions ------------------------------------------------------------------------
 for f in scripts/sft.py scripts/eval_abstention.py; do
   [ -f "$f" ] || { log "FATAL: $f missing -- the box is on a commit older than 'feat: add sft script'"; exit 1; }
