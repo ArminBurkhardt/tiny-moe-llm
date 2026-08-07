@@ -88,9 +88,24 @@ def _no_think_sft_split(path: str) -> bool:
 # count would earn in a proportional mix. gsm8k and no_robots are tiny (~7.5k and ~9.5k examples)
 # and will exhaust well before their share -- the interleave redistributes to whatever is still
 # live and logs the realized split, which is the honest outcome for a source that small.
+#
+# Note what that redistribution means for --target-tokens: squad_v2 (~130k QA pairs, ~30-35M tokens
+# once rendered) exhausts at any target above ~175M, so its ABSOLUTE contribution is fixed and only
+# its SHARE moves -- ~11% of a 300M corpus, ~6-7% of a 500M one. Growing the corpus therefore
+# dilutes abstention supervision even though the weight below is unchanged. If eval_abstention.py's
+# recall comes out weak, a smaller --target-tokens is the knob, not a bigger squad_v2 weight.
 SOURCES = [
     SFTSource("smoltalk2", "HuggingFaceTB/smoltalk2", "SFT/", (".parquet",),
-              render="messages", weight=0.55, file_filter=_no_think_sft_split, holdout=True),
+              render="messages", weight=0.35, file_filter=_no_think_sft_split, holdout=True),
+    # general multi-turn chat. Exists so the corpus can be grown past ~300M tokens without the
+    # entire increase landing on smoltalk2: it and smoltalk2 are the only two sources here with
+    # enough data to absorb a redistribution, and a corpus that is 80% one source is a narrower
+    # instruction distribution than the same token count split across two. NOT part of
+    # prepare_data.py's pretraining mix, so unlike smoltalk2 it needs no holdout check. train_sft
+    # only -- train_gen is the raw generation-prompt half, and the test_* splits stay untouched for
+    # the same reason squad_v2's validation split does.
+    SFTSource("ultrachat", "HuggingFaceH4/ultrachat_200k", "data/train_sft", (".parquet",),
+              render="messages", weight=0.20),
     SFTSource("squad_v2", "rajpurkar/squad_v2", "squad_v2/train", (".parquet",),
               render="squad_v2", weight=0.20),
     SFTSource("tulu_math", "allenai/tulu-3-sft-personas-math", "data/train", (".parquet",),
