@@ -19,13 +19,14 @@ class SelfAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
         x_norm = self.norm(x)
         attn_output = self.attn(
             hidden_states=x_norm,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
+            kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
 
@@ -44,7 +45,7 @@ class CrossAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
         x_norm = self.norm(x)
         attn_output = self.attn(
             hidden_states=x_norm,
@@ -52,6 +53,7 @@ class CrossAttention(nn.Module):
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
             other_states=other,
+            kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
 
@@ -90,7 +92,7 @@ class InformationRetrievalExpert(nn.Module):
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
         x_norm = self.norm(x)
 
         down = self.down_proj(x_norm)
@@ -103,6 +105,7 @@ class InformationRetrievalExpert(nn.Module):
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
             other_states=information,
+            kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
 

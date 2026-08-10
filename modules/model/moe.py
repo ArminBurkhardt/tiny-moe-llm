@@ -378,7 +378,7 @@ class LoopMixtureOfExperts(nn.Module):
 
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0):
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None):
         topk_scores, topk_indices, load_balancing_loss = self.route(
             hidden_states, temperature=self.temperature, loop_idx=loop_idx
         )
@@ -387,17 +387,19 @@ class LoopMixtureOfExperts(nn.Module):
         # [attn_experts..., num_ir_experts..., ff_experts...]
 
         # seed with the always-on shared experts (Step 2) before accumulating routed outputs
-        output = self.shared_mlp(hidden_states) + self.shared_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
+        shared_attn_cache = kv_cache.shared_attn if kv_cache is not None else None
+        output = self.shared_mlp(hidden_states) + self.shared_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
         _other = other if other is not None else hidden_states
 
         # compute each non-MLP expert exactly once per forward_step, then cache across k slots
         # (attention runs over the full sequence regardless of routing, so recomputing per k-slot wastes compute)
         expert_cache = []
         for i in range(self.first_mlp_index):
+            slot_cache = kv_cache.slots[i] if kv_cache is not None else None
             if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
-                expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings))
+                expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
             elif isinstance(self.experts[i], CrossAttention):
-                expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings))
+                expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
 
         # accumulate the non-MLP experts' weighted outputs. still a mask multiply (never
         # mask.sum()/boolean indexing -- that's a per-expert device sync), but the per-(slot, expert)
@@ -455,6 +457,8 @@ class LoopMixtureOfExperts(nn.Module):
         max_seqlen: int = None,
         use_checkpointing: bool = False,
         n_loops: int = None,
+        kv_cache: list = None,
+        position_offset: int = 0,
     ):
         """
         Args:
@@ -463,8 +467,18 @@ class LoopMixtureOfExperts(nn.Module):
                 out-of-range indices reusing the last trained entry), so a checkpoint trained at
                 ``n_loops=3`` can be run with more or fewer loops without reshaping any weight.
                 Defaults to None (use the configured ``self.n_loops``).
+            kv_cache (list, optional): one ``_MoELoopCache`` per loop (``KVCache.moe``, see
+                ``modules/model/kv_cache.py``), for incremental decoding. Its length must equal
+                ``n_loops``. ``hidden_states`` covers only the newly-appended tokens in this mode.
+                Defaults to None (the normal packed/varlen training and full-recompute path).
+            position_offset (int, optional): absolute position of ``hidden_states[:, 0]``, only
+                used to slice RoPE when ``kv_cache`` is given. Defaults to 0.
         """
         n_loops = self.n_loops if n_loops is None else int(n_loops)
+        if kv_cache is not None:
+            assert len(kv_cache) == n_loops, (
+                f"kv_cache has {len(kv_cache)} loop slots but n_loops={n_loops}"
+            )
         total_load_balancing_loss = 0.0
         p_halt_all = []
         hidden_states_all = []
@@ -472,13 +486,17 @@ class LoopMixtureOfExperts(nn.Module):
         self.expert_tracker.begin_forward(n_loops)
 
         # rotary cos/sin for the expert attention, computed once and reused across loops/experts
-        position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
+        if kv_cache is not None:
+            position_embeddings = self.rotary_emb.slice(position_offset, hidden_states.shape[1], hidden_states.dtype)
+        else:
+            position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
 
         for loop in range(n_loops):
+            loop_cache = kv_cache[loop] if kv_cache is not None else None
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss, p_halt = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, use_reentrant=False)
+                hidden_states, load_balancing_loss, p_halt = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop)
+                hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache)
             total_load_balancing_loss += load_balancing_loss
             p_halt_all.append(p_halt)
             hidden_states_all.append(hidden_states)

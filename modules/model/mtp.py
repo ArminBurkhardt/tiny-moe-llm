@@ -10,7 +10,7 @@ import transformer_engine.pytorch as te
 from transformer_engine.pytorch import checkpoint
 
 # token chunk size for the chunked LM head cross entropy (see _chunked_linear_ce)
-CE_CHUNK_SIZE = 2048
+CE_CHUNK_SIZE = 8192 # 2048
 
 
 class MTPHead(nn.Module):

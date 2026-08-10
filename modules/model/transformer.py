@@ -282,11 +282,14 @@ class TinyMoETransformer(nn.Module):
         return_aux_loss=False,
         return_hidden=False,
         n_loops: int = None,
+        kv_cache=None,
     ):
         """forward pass of the model
 
         Args:
-            input_ids (torch.Tensor): input token ids, shape [batch_size, seq_len]
+            input_ids (torch.Tensor): input token ids, shape [batch_size, seq_len]. When
+                ``kv_cache`` is given, this must be only the newly-appended tokens, not the full
+                sequence -- everything before them is already reflected in the cache.
             cu_seqlens (torch.Tensor, optional): int32 cumulative segment boundaries over the
                 flattened [B*S] token axis for document-packed varlen attention. Defaults to None (normal causal attention).
             max_seqlen (int, optional): longest packed segment length. Defaults to None.
@@ -296,6 +299,11 @@ class TinyMoETransformer(nn.Module):
                 absolute loop index, so this needs no weight reshaping -- see
                 LoopMixtureOfExperts.forward. Training should leave this None (loop_ce_weights is
                 length-checked against the configured n_loops). Defaults to None.
+            kv_cache (modules.model.kv_cache.KVCache, optional): incremental decode cache built by
+                ``KVCache.for_model(model, n_loops=n_loops)``. When given, ``cu_seqlens`` must be
+                None (single unpacked sequence) and ``n_loops`` must match the value the cache was
+                built with. Inference/generation only -- never set during training. Defaults to
+                None.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -325,8 +333,12 @@ class TinyMoETransformer(nn.Module):
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
             x = x_all if return_hidden else self.lm_head(x)
         else:
-            x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen).last_hidden_state
-            _, aux_loss, p_halt, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops)
+            assert kv_cache is None or cu_seqlens is None, "kv_cache decoding is single-sequence only, cu_seqlens must be None"
+            position_offset = kv_cache.length if kv_cache is not None else 0
+            decoder_cache = kv_cache.decoder if kv_cache is not None else None
+            moe_cache = kv_cache.moe if kv_cache is not None else None
+            x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
+            _, aux_loss, p_halt, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)

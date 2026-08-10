@@ -6,7 +6,7 @@ import transformer_engine.pytorch as te
 
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency, apply_rotary_pos_emb
 from modules.model.utils import EncoderOutput
-from modules.model.attention import varlen_attention
+from modules.model.attention import varlen_attention, cached_attention
 
 # adapted from https://github.com/huggingface/transformers/tree/main/src/transformers/models/gemma4
 # https://github.com/huggingface/blog/blob/main/gemma4.md#overview-of-capabilities-and-architecture 
@@ -60,36 +60,51 @@ class Gemma4TextAttention(nn.Module):
         max_seqlen: int | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         other_states: torch.Tensor | None = None,
+        kv_cache=None,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
         if other_states is None:
             other_states = hidden_states
+        o_len = other_states.shape[1]
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(other_states)
         value_states = self.v_proj(other_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, o_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, o_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # block-diagonal causal attention over the packed documents (flash varlen handles GQA,
-        # so KV heads are not pre-repeated). Returns [B, S, Hq, D].
-        attn_output = varlen_attention(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens,
-            max_seqlen,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            softmax_scale=self.scaling,
-            causal=True,
-        )
+        if kv_cache is not None:
+            # KV-cached incremental decoding (modules/model/kv_cache.py): hidden_states/other_states
+            # cover only the newly-appended tokens, cu_seqlens/max_seqlen are unused (single
+            # unpacked sequence). Returns [B, S, Hq, D], same layout as varlen_attention.
+            attn_output = cached_attention(
+                query_states,
+                key_states,
+                value_states,
+                kv_cache,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=self.scaling,
+            )
+        else:
+            # block-diagonal causal attention over the packed documents (flash varlen handles GQA,
+            # so KV heads are not pre-repeated). Returns [B, S, Hq, D].
+            attn_output = varlen_attention(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens,
+                max_seqlen,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=self.scaling,
+                causal=True,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
@@ -142,12 +157,13 @@ class Gemma4TextDecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        per_layer_embeddings: torch.Tensor | None = None
+        per_layer_embeddings: torch.Tensor | None = None,
+        kv_cache=None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=kv_cache)
         hidden_states = self.dropout(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -216,15 +232,27 @@ class Gemma4TextModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.hidden_size = hidden_size
 
-    def forward(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor | None = None, max_seqlen: int | None = None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+        kv_cache: list | None = None,
+        position_offset: int = 0,
+    ):
         hidden_states = self.embed_tokens(input_ids)
 
         # scale embeddings by sqrt(hidden_size)
         hidden_states = hidden_states * (self.hidden_size**0.5)
         hidden_states = self.dropout(hidden_states)
-        
-        position_embeddings = self.rotary_emb(hidden_states, seq_len=input_ids.shape[1])
-        
+
+        if kv_cache is not None:
+            # KV-cached decoding: input_ids covers only the newly-appended tokens, which sit at
+            # absolute positions [position_offset, position_offset + seq_len) -- not [0, seq_len).
+            position_embeddings = self.rotary_emb.slice(position_offset, input_ids.shape[1], hidden_states.dtype)
+        else:
+            position_embeddings = self.rotary_emb(hidden_states, seq_len=input_ids.shape[1])
+
         if self.ple is not None:
             ple_emb = self.ple(input_ids)
             ple_emb = ple_emb.view(
@@ -243,7 +271,8 @@ class Gemma4TextModel(nn.Module):
                 cu_seqlens,
                 max_seqlen,
                 position_embeddings,
-                per_layer_embeddings=ple_emb[:, i] if ple_emb is not None else None
+                per_layer_embeddings=ple_emb[:, i] if ple_emb is not None else None,
+                kv_cache=kv_cache[i] if kv_cache is not None else None,
             )
             layers_outputs.append(hidden_states)
 

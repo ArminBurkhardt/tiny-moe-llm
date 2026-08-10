@@ -8,6 +8,9 @@ zstandard>=0.23.0
 matplotlib>=3.10.0
 accelerate>=1.13.0
 flash-attn>=2.8.0
+gradio>=6.0.0 # scripts/gradio_app.py inference UI only, not used by training -- ChatInterface's
+              # messages format is unconditional as of 6.x (no `type=` kwarg), which is what
+              # scripts/gradio_app.py's run_chat() assumes
 #transformer-engine[pytorch]>=2.15.0 # refer to https://github.com/NVIDIA/TransformerEngine#installation TODO: make te optional
 # deliberately absent: sentence-transformers (unused, and it drags in a torch that can clobber the
 # NGC image's prebuilt one, taking TE and flash-attn with it), fastparquet (prepare_data.py forces
