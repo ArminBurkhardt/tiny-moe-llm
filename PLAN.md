@@ -187,6 +187,39 @@ answerable-half false-abstention rate specifically, not just precision/recall in
 (precision at the current 0.512 is barely above the 0.501 base rate — a metric that can pass while
 the behavior is still degenerate).
 
+**Ordering matters more than usual here.** 12b-iii (the data fix) is *upstream* of both head
+redesigns: a confidence probe fitted on a model that refuses 78% of answerable questions is fitting
+a broken policy, and a halting criterion tuned against it inherits the same distribution. The
+recommended sequence is 12b-0 (measure) → 12b-iii (repair finetune) → re-measure → then decide
+whether 12b-i/ii are worth building at all. 12b-iv and 12b-v are cross-cutting notes that apply to
+whichever finetune gets run.
+
+#### 12b-0. Measure before building anything
+
+Every route below is gated on numbers that don't exist yet and that the **existing checkpoint** can
+produce in minutes. Do this first; 12b-ii and 12b-iv may close outright on the results.
+
+1. **Is loop 3 idle or churning?** Per loop, log `‖Δh‖ / ‖h‖`, `cos(Δ_k, Δ_{k-1})`, and the **top-1
+   flip rate between loop 2's and loop 3's readouts** (the per-loop hidden stack is already returned
+   — `hidden_states_all`, `modules/model/moe.py`). Note the run's effective per-loop gate is
+   `(1 - p_halt) * loop_scale` ≈ `[0.38, 0.40, 0.29]`, *not* `loop_scale`'s `[1.73, 1.81, 1.32]`:
+   loop 3 writes a ~0.3-RMS-relative update while per-loop CE doesn't move (3.109 / 2.969 / 2.969).
+   Flip rate ≈ 0 → loop 3 is a genuine no-op, ship `n_loops=2`, and 12b-ii item 1 is settled. Flip
+   rate high with CE flat → loop 3 is churning between equally-good predictions, which is a
+   different problem and rules *out* the noise/dropout route in 12b-iv.
+2. **Oracle minimum sufficient depth.** On held-out data run `n_loops = 1, 2, 3` (the runtime
+   override already exists) and per token record the smallest depth whose argmax matches the label,
+   bucketing "never correct" separately. This histogram *is* the answer to "do complex tokens need
+   more loops" — and given loop 3 contributes ~0 nats, expect the "3 helps where 2 doesn't" bucket
+   to be small and roughly cancelled by tokens where 3 *hurts*. If so, adaptive depth has no
+   headroom at this scale and 12b-ii items 3-6 close for a few GPU-minutes. If there is headroom,
+   the same labels are the training signal (see 12b-ii).
+3. **Does any confidence signal carry answerability information at all?** On the real checkpoint,
+   AUROC of `(1 - p_max)` for flagging an unanswerable SQuAD v2 question was **0.457 — below
+   chance**, and `(1 - p_correct)` was 0.457 too. Whatever replaces the correctness head has to beat
+   0.5 on that task before anything is built on top of it. Measure the candidate features
+   (entropy, top1-top2 margin, cross-loop KL — see 12b-i) against that bar directly.
+
 #### 12b-i. Correctness head: revert (spec says to; redesign only if retried)
 
 **What it does, architecturally**: `self.correct_proj` (`TinyMoETransformer`, zero-init weight/
@@ -235,7 +268,33 @@ Any redesign attempt is gated behind actually beating `p_max` on both ECE and AU
 set before it's wired back into `eval_abstention.py`'s reported numbers — same bar as the original
 Gate 5, applied honestly this time.
 
-#### 12b-ii. Halt head: give it real compute authority, or replace the control loop
+**Preferred replacement: a frozen-backbone probe over cross-loop disagreement.** Of the "give it
+features `lm_head` doesn't imply" options above, entropy and top-2 margin are the weak ones — they
+are functions of the same logits `p_max` comes from, i.e. the same family that already lost (ECE
+0.371 vs. 0.378). The signal this architecture provides **for free and that `p_max` provably cannot
+contain** is disagreement across *depth*: `KL(p_loop2 ‖ p_loop3)`, top-1 agreement between
+consecutive loops, optionally across a few `n_loops` overrides. The recurrence is a free
+depth-ensemble and its spread is a genuine epistemic-uncertainty signal, computed from hidden states
+`p_max` never sees. It also shares its entire computation with 12b-ii's convergence-exit criterion —
+one measurement, two consumers.
+
+Shape of the probe (this is CONCLUSION.md's "decouple abstention from generation", made concrete):
+- **Backbone frozen, fitted offline.** Minutes of compute, no training-loop change, no new loss term
+  in `pretrain.train_step`, and it yields a *tunable* precision/recall operating point instead of one
+  policy baked into the weights.
+- **Features**: `[final hidden state, p_max, entropy, top1-top2 margin, cross-loop KL, cross-loop
+  top-1 agreement]`.
+- **Targets from the model's own sampled generations vs. ground truth, sequence-level.** Not
+  teacher-forced argmax — that specific choice is the leak that sank Step 4b, and reproducing it
+  behind a fancier classifier reproduces the failure.
+- **Held-out fit and eval**, and the same Gate 5 bar (beat `p_max` on ECE *and* AUROC) before it
+  enters `eval_abstention.py`'s reported numbers. Per 12b-0 item 3, its *first* job is beating 0.5
+  AUROC on answerability at all.
+
+Fit the probe **after** 12b-iii's repair finetune, not before: on the current checkpoint it would be
+fitting a model whose policy is "refuse", and the operating points would not survive the data fix.
+
+#### 12b-ii. Halt head: give it real compute authority, replace the control loop, or drop it
 
 **What it does, architecturally**: `moe.py`'s `forward_step` computes `p_halt` from the *incoming*
 hidden state every loop (`halt_proj`, zero-init weight, bias `-2.0`), then applies it as an output
@@ -274,7 +333,26 @@ sigmoid saturation), nothing pulls it back. This is a structural gap, not a hype
    halt mechanism was meant to buy adaptively, for free (no halt head needed at all). Run this
    ablation before investing in a harder fix; it sets the bar any dynamic-halting redesign has to
    clear to be worth the complexity.
-2. **Make halting actually skip compute.** Currently `p_halt` can only ever be a soft signal because
+2. **Drop the head entirely and exit on convergence instead** (recommended; strictly cheaper than
+   items 3-6 and evaluable on the *existing* checkpoint). "Was the last loop a no-op? then stop" is
+   a criterion, not a learned policy: zero parameters, zero loss terms, no `lambda_ponder`
+   controller, no sigmoid that can saturate, and a single tunable threshold instead of a
+   hyperparameter that has to be found by training. Three details decide whether it works:
+   - **Measure convergence in the readout, not the hidden state.** `loop_scale[2] = 1.32` means the
+     loop-3 hidden delta is large while the *prediction* is stationary, so a `‖Δh‖` criterion would
+     never fire. Use `KL(p_k ‖ p_{k-1})` or top-1 agreement between consecutive loops' `lm_head`
+     outputs.
+   - **The "that's a vocab projection per loop" objection does not apply at generation time**, because
+     only the *last* position needs a readout: 1 token x 65536, i.e. free. Under teacher forcing the
+     per-loop readouts already exist for per-loop CE. It only becomes expensive if applied per-token
+     across a full packed batch, which is not what an exit criterion needs.
+   - **Trap when removing the head**: `(1 - p_halt)` is pinned at ~0.22 and `loop_scale` grew to
+     absorb it. Deleting the gate multiplies every loop's delta by ~4.5x and the checkpoint stops
+     working — fold the constant into `loop_scale` rather than dropping the term.
+   Real compute is only saved if the remaining loops are actually skipped. For batch-1 generation a
+   whole-sequence exit decision at the last position is trivial; per-token skipping inside a batch is
+   item 3's problem.
+3. **Make halting actually skip compute.** Currently `p_halt` can only ever be a soft signal because
    masking output post-hoc changes nothing about cost. Gathering/masking so halted tokens' experts
    genuinely don't run in a later loop turns `p_halt` into a real compute/quality trade-off with a
    live CE gradient (a token that halts and then would have benefited from another loop actually
@@ -282,22 +360,38 @@ sigmoid saturation), nothing pulls it back. This is a structural gap, not a hype
    rather than the symptom. It's also the most invasive: it interacts with the mask-multiply /
    grouped-GEMM machinery `moe.py` already uses for expert sparsity, and needs a per-token variable
    loop count within a single batch, not just across batches (`loop_count_sampling` already varies
-   depth *per step*, this would need it *per token*).
-3. **Replace the λ-nudge controller with a Lagrangian on an explicit compute/halt budget** (dual
+   depth *per step*, this would need it *per token*). Concretely, where the difficulty actually is:
+   the routed MLP path is fine (the grouped GEMM is already ragged over sorted assignments, so a
+   shorter active-row list is just smaller `m_splits`), but the **non-MLP experts are the dense
+   per-loop cost** and they need full K/V with queries only for still-active tokens. varlen supports
+   differing q/kv lengths, but combined with document packing (`cu_seqlens` would need separate q and
+   kv offset arrays) and `shared_attn` on the same path, that's the real work. It's also where the
+   savings are, so it can't be skipped by doing the easy half.
+4. **Replace the λ-nudge controller with a Lagrangian on an explicit compute/halt budget** (dual
    ascent: increase the multiplier when the constraint is violated, decrease when it's slack) —
    still an output-gate, but a properly constrained optimization instead of a heuristic EMA nudge
    that has no way to recover once the primal variable (`p_halt`) saturates.
-4. **Switch to cumulative ACT** (Graves-style: halting probabilities that accumulate across loops
+5. **Switch to cumulative ACT** (Graves-style: halting probabilities that accumulate across loops
    and must sum to ≤1, with a ponder cost on the number of loops actually taken) instead of the
    current greedy-per-loop formulation (`p_halt` recomputed fresh each loop, so a token can halt at
    loop 1 and un-halt at loop 2 — CLAUDE.md flags this explicitly). ACT's cross-loop normalization
    is what gives the halting decision a coherent "when do I stop" semantics; the current design
    doesn't actually ask that question per loop, so it's unsurprising the answer collapsed to a
    constant.
+6. **Supervise depth directly instead of inducing it through a penalty.** 12b-0 item 2's oracle
+   histogram is already a per-token label ("smallest depth whose argmax matches the label"), so the
+   halting decision can be trained as plain classification against it rather than coaxed out of a
+   hand-tuned `lambda_ponder`. This removes every failure mode documented above at once: no `λ`, no
+   ramp, no saturating sigmoid, no coupling to the main loss, and it fails safe — an uninformative
+   classifier degrades to fixed depth rather than collapsing the loop. It answers "which tokens need
+   more refinement" the way the question was actually meant, and pairs naturally with item 3 (labels
+   say *when* to stop; item 3 makes stopping *cheap*). It does need a label-generation pass over
+   held-out data at each depth, which is the same pass 12b-0 item 2 already runs.
 
 Item 1 is a half-day ablation with the existing checkpoint architecture (just force `n_loops=2` at
-inference and re-run eval). Items 2-4 are real training-loop changes and should only be attempted
-if item 1's ablation shows a real quality gap between 2 and 3 loops worth recovering adaptively.
+inference and re-run eval); item 2 is the same order of effort and is the recommended landing spot
+if 12b-0 shows the recurrence converges. Items 3-6 are real training-loop changes and should only be
+attempted if 12b-0's oracle histogram shows a real per-token depth gap worth recovering adaptively.
 
 #### 12b-iii. SFT data: stop rewarding refusal
 
@@ -325,11 +419,87 @@ answered this" signal for QA-shaped prompts.
 full 708.9M-token SFT rerun — the model is already chat-formatted, so this is hours on a rented
 box, not days, and reuses the Vast.ai runbook's shorter-run template.
 
-**Acceptance for 12b overall**: re-run `scripts/eval_abstention.py`; answerable-half false-abstention
+#### 12b-iv. Loop refinement: latent noise / dropout (rejected), input injection (open)
+
+The question this answers: *should a further finetune inject a noise vector or extra dropout into
+the latent between loops, to force each loop into "actual refinement"?*
+
+**Rejected as specified — it treats a failure mode this run doesn't have.** The diagnostics say the
+loop isn't idle: effective per-loop gate `(1 - p_halt) * loop_scale` ≈ `[0.38, 0.40, 0.29]`, so loop
+3 writes a ~0.3-RMS-relative update into the residual stream and per-loop CE doesn't move. The
+failure is "the loop does work `lm_head` is blind to", not "the loop declines to do work". Noise
+injection adds a *denoising* task that exists only at train time (nothing is injected at eval), so
+it spends loop capacity repairing damage that isn't there at inference — a train/test mismatch, not
+a refinement pressure. The random-`h₀`-plus-randomized-depth variant that does have a track record
+(latent-recurrent-depth models, where it buys path-independence / fixed-point behaviour) is a
+*pretraining-time* property; it cannot be installed by a 20-50M-token finetune at `lr=1e-5`.
+
+Related facts worth not re-deriving:
+- **Dropout on the delta already exists** — `moe.py`'s `forward_step` is
+  `self.dropout(self.post_norm(output))`, at `dropout: 0.00` in pretraining and `0.05` in SFT.
+  Raising it is a one-line config change if the hypothesis is worth a cheap test; expect nothing.
+- **Input injection already exists, but conditionally.** The cross-attention expert receives
+  `other=self._moe_ple(input_ids)` (`transformer.py`), i.e. a fresh view of the input on every loop —
+  structurally the same trick as "inject `e` at every recurrent step". But cross-attn is one routed
+  expert out of 35 at `top_k=2`, so its contribution is gated toward 0 much of the time. **If one
+  architectural change in this family is made, make the injection unconditional** (alongside
+  `shared_mlp` / `shared_attn`, which already seed the accumulator every loop) rather than adding
+  noise. That gives every loop a stable anchor to refine *against*, which is the mechanism the noise
+  idea was reaching for.
+- **The tension that can't be dodged**: `loop_ce_weights: [0.2, 0.3, 1.0]` trains loop 1 to already
+  be a usable readout. Making later loops matter more means making *early* readouts worse (lower
+  those weights) — which is exactly what makes 12b-ii item 2's early exit less viable. "Loop 1 reads
+  out well" and "later loops do a lot" are the same knob pointed in opposite directions; the next run
+  has to pick one.
+
+Gate: 12b-0 item 1. Flip rate ≈ 0 → the recurrence has converged, ship `n_loops=2`, nothing here
+applies. Flip rate high with CE flat → loop 3 is churning between equally-good predictions, which
+noise would make worse, not better.
+
+#### 12b-v. MTP: already inference-only as an output, but not free
+
+MTP was only ever a training-time objective for richer latents, and it *is* already unused as an
+output at inference — `TinyMoETransformer.forward` returns `lm_head(x)` from the final loop and
+nothing reads `extra_token_outputs` outside `compute_mtp_loss`. Two things are still worth changing:
+
+1. **`_mtp_forward` runs unconditionally** (`transformer.py`, both the checkpointed and plain
+   branches) and `scripts/inference.py` discards the result. With `late_token_loss=True` that's only
+   the gate/up/down MLP (no vocab projection), but `inference.py` has no KV cache and re-runs the
+   full prefix per generated token, so the waste is paid over the whole prefix every step — and
+   `eval_abstention.py`'s batched decode inherits it. Guard the call on `self.training` (or an
+   explicit caller flag) — a small, self-contained inference win.
+2. **`lambda_mtp: 0.0` does NOT skip the compute.** `compute_mtp_loss` gates on
+   `mtp_outputs is not None`, so a zero weight still pays the full head plus its `num_extra_tokens`
+   chunked vocab projections — which per CLAUDE.md's accounting cost 4x (fwd + recompute + bwd).
+   To actually turn MTP off for a finetune, pass `mtp_outputs=None` / skip `_mtp_forward`; keep the
+   weights on disk so the checkpoint stays loadable and MTP can be switched back on.
+
+**Recommendation**: drop MTP for a *behavioral* repair finetune (12b-iii). It was a regularizer
+present through all 16B pretraining tokens, so removing it does shift the objective the trunk sits
+in — but at 20-50M tokens and `lr=1e-5` that drift is negligible against a real throughput win. Keep
+it if any further *general* pretraining is done. Not worth touching the data pipeline over: the SFT
+dataset's `num_mtp_tokens` separator slots become plain padding when MTP is off, at a cost too small
+to justify a rebuild.
+
+#### Acceptance
+
+**For 12b overall**: re-run `scripts/eval_abstention.py`; answerable-half false-abstention
 rate materially below the current 78.4% (Step 13's own bar is <10%, which is the real target to aim
 for even though 12b's job is just to get off the degenerate floor); abstention precision clearly
 above the ~0.50 base rate; if the correctness head is kept rather than reverted, `p_correct` must
 beat `p_max` on both ECE and AUROC on this checkpoint too.
+
+That gate belongs to 12b-iii, which is the only sub-item that can move it. The others carry their
+own, narrower gates and none of them substitutes for it:
+
+| sub-item | gate |
+|---|---|
+| 12b-0 | none — it's the measurement pass everything else is conditioned on |
+| 12b-i (probe) | beats 0.5 AUROC on answerability, then beats `p_max` on ECE *and* AUROC, held out |
+| 12b-ii (exit / depth) | a real quality gap between `n_loops=2` and `3` in 12b-0's oracle histogram |
+| 12b-iii (data) | the 12b acceptance above |
+| 12b-iv (injection) | 12b-0 item 1 shows the recurrence has *not* converged |
+| 12b-v (MTP) | none — a correctness/throughput cleanup, measured by tokens/sec and unchanged eval |
 
 ### Step 13 — Self-labelled calibration set
 
