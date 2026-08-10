@@ -36,7 +36,7 @@ training:
   num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient
-  target_tokens: 29900000000 # Budget decision (PLAN.md): prepared data caps phase1+phase2 combined at 30B
+  target_tokens: 16000000000 # Budget decision (PLAN.md): prepared data caps phase1+phase2 combined at 30B
                              # tokens, and Gate 4's local 5090 measurement (31.8% MFU, BF16-only, grad_accum=4,
                              # already clears the ~18% MFU threshold PLAN.md calls data- vs budget-limited) makes
                              # it very likely the real H100+FP8 run lands in the data-limited regime, so the EUR
@@ -72,10 +72,10 @@ training:
   ponder_target_p_halt: 0.30 # center of the healthy band -- the plateau lambda_ponder=0.15 found
                              # in the Gate 4 test (see the comment above)
   ponder_p_halt_band: 0.12 # healthy range is target +/- this, i.e. [0.18, 0.42] at the defaults
-  ponder_adjust_factor: 1.20 # multiplicative nudge per adjustment (up if p_halt too low, i.e. not
+  ponder_adjust_factor: 1.30 # multiplicative nudge per adjustment (up if p_halt too low, i.e. not
                              # halting enough; down if too high, i.e. the loop is collapsing to a
                              # no-op -- see PonderController's docstring for the direction)
-  ponder_adjust_cooldown_tokens: 500000000 # min tokens between adjustments, so each nudge's
+  ponder_adjust_cooldown_tokens: 150000000 # min tokens between adjustments, so each nudge's
                                            # effect is visible in the EMA before reacting again
   ponder_lambda_min: 0.01 # clamp bounds so a runaway EMA can't push lambda_ponder to 0 or infinity
   ponder_lambda_max: 1.0
@@ -117,11 +117,11 @@ sft: # PLAN.md Step 12. Runs LOCALLY on the dev GPU, not on vast.ai -- the pretr
   data_dir: "data/prepared"
   train_split: "sft_train"
   val_split: "sft_val"
-  batch_size: 4 # pretraining ran B=8 at 25.45GB peak; halving it leaves headroom for the fp32
+  batch_size: 8 # pretraining ran B=8 at 25.45GB peak; halving it leaves headroom for the fp32
                 # master weights below on a 32GB card
   seq_length: 4096 # same as pretraining: packing means a shorter row wouldn't save anything, and a
                    # longer max_doc_tokens keeps more of smoltalk2's conversations
-  grad_accumulation_steps: 8 # ~131k tokens per optimizer step
+  grad_accumulation_steps: 4 # ~131k tokens per optimizer step
   lr: 3.0e-5 # ~1/13 of pretraining's 4e-4. Standard SFT territory, and the reason
              # scripts/sft.py shadows EVERY parameter in fp32 rather than only the no_decay group:
              # at this LR an AdamW step on a bf16 2D weight is below its own ulp (see
