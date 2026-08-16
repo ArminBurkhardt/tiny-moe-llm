@@ -66,6 +66,14 @@ class RotaryPositionEmbeddingsFrequency(nn.Module):
             self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
         )
 
+    def slice(self, start: int, length: int, dtype: torch.dtype):
+        """cos/sin for absolute positions ``[start, start + length)`` -- for KV-cached decoding,
+        where the new tokens being processed do not start at position 0."""
+        return (
+            self.cos_cached[:, :, start:start + length, ...].to(dtype=dtype),
+            self.sin_cached[:, :, start:start + length, ...].to(dtype=dtype),
+        )
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]

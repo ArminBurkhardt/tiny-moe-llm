@@ -1,26 +1,26 @@
 model:
-  vocab_size: 129280 # gemma: 262144
+  vocab_size: 65536 # gemma: 262144 -- pruned to fit uint16 train.bin (Step 8), was 129280
   max_seq_length: 4096
-  hidden_size: 512
-  intermediate_size: 2048
-  num_layers: 5
-  num_attention_heads: 8
+  hidden_size: 768 # was 512 -- 512 kept every GEMM skinny and MFU low
+  intermediate_size: 2304 # dense decoder MLP only
+  moe_intermediate_size: 2304 # routed + shared MoE experts only, defaults to intermediate_size if absent
+  num_layers: 8 # was 5
+  num_attention_heads: 12 # was 8
   head_dim: 64
   dropout: 0.00 # for pretraining only
   per_layer_embeddings_size: 32
 
   # num experts
-  num_mlp_experts: 36 # due to fp8 requirement, this + other experts must be divisible by 8
+  num_mlp_experts: 32 # was 36 -- end of the free-lunch total-params-at-zero-active-compute range, see PLAN.md Step 5
   num_attn_experts: 1
 
   # routing
   top_k: 2
-  n_loops: 4
-  identity_skew: 0.8 # higher values encourage choosing the identity
+  n_loops: 3 # was 4 -- non-MLP experts run densely every loop, so fewer loops means fewer dense attention passes
 
   # information retrieval
   num_ir_experts: 1
-  num_ir_entries: 16384
+  num_ir_entries: 8192 # was 16384 -- dense every loop, ~11% of forward FLOPs, halving frees throughput + ~2GB peak mem
   ir_dim: 128
 
   # mtp
@@ -33,12 +33,116 @@ training:
   lr: 4e-4
   weight_decay: 0.02
   grad_clip: 1.0
-  num_epochs: 10
+  num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient
-  target_tokens: 5000000000 # 5b tokens
+  target_tokens: 16000000000 # Budget decision (PLAN.md): prepared data caps phase1+phase2 combined at 30B
+                             # tokens, and Gate 4's local 5090 measurement (31.8% MFU, BF16-only, grad_accum=4,
+                             # already clears the ~18% MFU threshold PLAN.md calls data- vs budget-limited) makes
+                             # it very likely the real H100+FP8 run lands in the data-limited regime, so the EUR
+                             # 100/47h budget-hours table doesn't bind -- rounded down from the 30B data cap
+                             # scaled by Step 8's measured fertility regression (manifest.json
+                             # fertility_regression._overall = 0.15439%, i.e. 30B * (1 - 0.0015439) ~= 29.954B).
+                             # Combined phase1+phase2, not either phase alone. Correct via the Vast.ai runbook's
+                             # Step 4 FP8 smoke test if real tokens/sec differs from the Gate 4 extrapolation by
+                             # >20% -- the last cheap moment to fix this.
   warmup_steps: 1000 # linear LR warmup before cosine decay
   noise_anneal_tokens: 1000000000 # decay router exploration noise 1->0 over the first 1b tokens
+  lambda_ponder: 0.15 # target weight on the ponder loss, ramped from 0 -- see ponder_warmup/ramp_tokens.
+                     # Two GATE4 TEST runs at this compressed-schedule scale: 0.05 left p_halt pinned
+                     # ~0.01-0.02 once fully ramped (collapses from init ~0.12 to ~0.01 during the
+                     # zero-lambda warmup, purely from CE pressure, before ponder ever engages --
+                     # recovering out of that saturated sigmoid region needs much more lambda than a
+                     # naive log-linear fit through 3e-3/0.5 predicted). 0.15 settled to a genuine
+                     # plateau at p_halt~0.28-0.30 (ponder~0.70-0.72) over the last ~9 log points of a
+                     # 45M-token run -- comfortably between the CE-collapse extreme (3e-3 -> ~0.003-0.006)
+                     # and the over-muted extreme (0.5 -> ~0.73-0.75, which visibly flattened the loss
+                     # curve). Not independently re-measured at the real schedule's proportionally much
+                     # shorter warmup/ramp (~6.7% of target_tokens vs this test's ~36%) -- watch the real
+                     # run's own p_halt curve; it has much more steady-state runway to drift higher.
+  ponder_warmup_tokens: 1000000000 # lambda_ponder stays 0 while loop_scale has room to grow (deadlock avoidance)
+  ponder_ramp_tokens: 1000000000 # linear ramp to lambda_ponder after warmup
+  ponder_auto_adjust: true # nudge lambda_ponder at runtime if p_halt drifts out of the healthy
+                           # band below, once the warmup+ramp above has finished. Exists because
+                           # lambda_ponder above was tuned at the Gate 4 test's much longer
+                           # (proportionally) warmup/ramp -- the real run's p_halt has far more
+                           # steady-state runway to drift before anyone is watching. The adjusted
+                           # value is checkpointed (modules/runtime/ponder.py) so it survives
+                           # every preemption restart instead of resetting to the value below.
+  ponder_target_p_halt: 0.30 # center of the healthy band -- the plateau lambda_ponder=0.15 found
+                             # in the Gate 4 test (see the comment above)
+  ponder_p_halt_band: 0.12 # healthy range is target +/- this, i.e. [0.18, 0.42] at the defaults
+  ponder_adjust_factor: 1.30 # multiplicative nudge per adjustment (up if p_halt too low, i.e. not
+                             # halting enough; down if too high, i.e. the loop is collapsing to a
+                             # no-op -- see PonderController's docstring for the direction)
+  ponder_adjust_cooldown_tokens: 150000000 # min tokens between adjustments, so each nudge's
+                                           # effect is visible in the EMA before reacting again
+  ponder_lambda_min: 0.01 # clamp bounds so a runaway EMA can't push lambda_ponder to 0 or infinity
+  ponder_lambda_max: 1.0
+  loop_ce_weights: [0.2, 0.3, 1.0] # per-loop CE weight, ascending; len must == model.n_loops
+  loop_ce_subsample: 0.25 # fraction of token positions supervised on the NON-final loops (final
+                          # loop is always supervised in full). the LM head is the largest GEMM in
+                          # the model and per-loop CE runs it once per loop; a CE mean over a
+                          # uniform subsample is an unbiased estimate of the full mean, so this
+                          # trades variance on the low-weight intermediate readouts for throughput.
+                          # 1.0 disables it.
+  loop_count_sampling: 0.3 # probability that a training step runs a RANDOMLY REDUCED number of
+                           # loops (uniform over 1..n_loops-1) instead of the full n_loops. Trains
+                           # every depth as a real operating point rather than an incidental one,
+                           # so the loop count stays a runtime choice at inference; also cuts mean
+                           # training compute. loop_ce_weights is truncated and rescaled so the
+                           # deepest loop actually run always carries weight 1.0. 0.0 disables it.
+  lambda_conf: 0.05 # weight on the correctness head's BCE loss (final loop only)
   grad_accumulation_steps: 16
   seed: 42
-  max_tokens_per_shard: 200000000 # 200m tokens per shard 
+  data_dir: "data/prepared" # dir holding {phase}.bin/.idx from scripts/prepare_data.py (Step 11)
+  phase: "phase1" # which {phase}.bin/.idx pair to train on
+  checkpoint_every_tokens: 400000000 # ~30 min at 200K tok/s. expressed in TOKENS, not steps: the
+                                     # old `step % 1500` counted MICRO steps, so at grad_accum 16
+                                     # it fired every ~49M tokens (~4 min, ~608 checkpoints,
+                                     # ~1.2TB against a 120GB disk). tokens also make the cadence
+                                     # invariant to batch size / grad accum changes.
+  keep_local_checkpoints: 2 # rolling checkpoints kept on disk. a checkpoint is only deleted once
+                            # it is BOTH outside this window AND confirmed uploaded -- see
+                            # modules/runtime/checkpoints.prune_checkpoints for why.
+  phase1_fraction: 0.85 # PLAN.md's 85/15 split. phase 1 stops here; phase 2 runs to target_tokens.
+  hf_upload_repo: "ikeafisch4/temp-train" # "" disables uploads (local runs); delete the key
+                                          # entirely to fall back to utils.HF_UPLOAD_REPO
+
+sft: # PLAN.md Step 12. Runs LOCALLY on the dev GPU, not on vast.ai -- the pretrained checkpoint and
+     # manifest.json come down from the Hub once pretraining finishes. Loss weights (lambda_mtp,
+     # aux_loss_weight, loop_ce_weights/subsample, loop_count_sampling, lambda_conf, ponder_*) are
+     # deliberately NOT duplicated here: SFT reuses pretrain.train_step unchanged, so p_halt and
+     # p_correct keep getting supervised exactly as they were (PLAN.md Step 12: "still free").
+  data_dir: "data/prepared"
+  train_split: "sft_train"
+  val_split: "sft_val"
+  batch_size: 8 # pretraining ran B=8 at 25.45GB peak; halving it leaves headroom for the fp32
+                # master weights below on a 32GB card
+  seq_length: 4096 # same as pretraining: packing means a shorter row wouldn't save anything, and a
+                   # longer max_doc_tokens keeps more of smoltalk2's conversations
+  grad_accumulation_steps: 4 # ~131k tokens per optimizer step
+  lr: 3.0e-5 # ~1/13 of pretraining's 4e-4. Standard SFT territory, and the reason
+             # scripts/sft.py shadows EVERY parameter in fp32 rather than only the no_decay group:
+             # at this LR an AdamW step on a bf16 2D weight is below its own ulp (see
+             # build_sft_param_groups' docstring for the arithmetic).
+  weight_decay: 0.01
+  # deliberately no grad_clip / lambda_* here: pretrain.train_step reads those from `training:`
+  # above, and a duplicate key that silently does nothing is worse than no key
+  num_epochs: 2
+  warmup_fraction: 0.03 # linear warmup as a fraction of total steps, then cosine to lr_min
+  lr_min_factor: 0.05 # cosine floor as a fraction of lr
+  dropout: 0.05 # pretraining ran 0.0; a small amount here since SFT repeats a much smaller corpus
+  seed: 1234 # seeds the per-epoch document permutation, so it must stay stable across resumes
+  checkpoint_every_tokens: 100000000 # ~6 saves over a 2-epoch/300M-token corpus. An SFT checkpoint
+                                     # is ~3.3GB, not pretraining's ~2GB: every parameter is
+                                     # stepped through an fp32 master, so AdamW's two moments are
+                                     # fp32 (2.7GB) instead of bf16. At 25M this was ~24 saves,
+                                     # ~79GB of uploads on a ~3h run.
+  keep_local_checkpoints: 3
+  eval_every_tokens: 25000000 # decoupled from (and 4x more frequent than) the checkpoint cadence:
+                              # the validation pass is seconds and its p_correct-vs-p_max reading
+                              # is the early warning for Step 12's acceptance criterion
+  eval_max_batches: 40 # cap on the validation pass, so it stays a couple of seconds
+  hf_upload_repo: "" # local run: uploads off by default. Set a repo id (or pass --upload) to mirror
+                     # SFT checkpoints to the Hub like the pretraining run does. 

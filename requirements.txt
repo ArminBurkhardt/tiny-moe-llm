@@ -1,11 +1,18 @@
 torch>=2.0.0
 transformers>=5.5.4
-sentence-transformers>=5.2.0
 numpy>=1.21.0
 pandas>=3.0.0
-fastparquet
+pyarrow>=14.0.0
+huggingface_hub>=0.27.0
+zstandard>=0.23.0
 matplotlib>=3.10.0
-bitsandbytes>=0.30.0
 accelerate>=1.13.0
 flash-attn>=2.8.0
-transformer-engine[pytorch]>=2.15.0 # refer to https://github.com/NVIDIA/TransformerEngine#installation TODO: make te optional
+gradio>=6.0.0 # scripts/gradio_app.py inference UI only, not used by training -- ChatInterface's
+              # messages format is unconditional as of 6.x (no `type=` kwarg), which is what
+              # scripts/gradio_app.py's run_chat() assumes
+#transformer-engine[pytorch]>=2.15.0 # refer to https://github.com/NVIDIA/TransformerEngine#installation TODO: make te optional
+# deliberately absent: sentence-transformers (unused, and it drags in a torch that can clobber the
+# NGC image's prebuilt one, taking TE and flash-attn with it), fastparquet (prepare_data.py forces
+# the pyarrow engine), bitsandbytes (only memory-benchmark.py's opt-in `--optimizer bnb` branch
+# imports it, lazily -- install it by hand if you want that path).

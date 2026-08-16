@@ -6,20 +6,32 @@ import transformer_engine.pytorch as te
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 
 
+# ceiling on the exploration noise, as a fraction of the router logits' own std.
+#
+# the learned `softplus(noise_proj(h))` scale lands around ~0.7 at init while the clean logits
+# (RMSNorm -> default-init Linear over hidden_size=768) have std ~0.33 -- i.e. un-scaled, the noise
+# is ~2x the signal, so early routing, the routing *weights* that scale expert outputs, and the
+# load-balance loss are all measuring noise rather than the router. 0.3 keeps exploration well
+# below the signal while still perturbing the argmax; it is a ceiling on the *initial* level, since
+# noise_factor anneals this to 0 over noise_anneal_tokens anyway.
+ROUTER_NOISE_SCALE = 0.3
+
+
 class Router(nn.Module):
-    def __init__(self, hidden_size: int, num_experts: int):
+    def __init__(self, hidden_size: int, num_experts: int, noise_scale: float = ROUTER_NOISE_SCALE):
         super().__init__()
         self.num_experts = num_experts
         self.router = nn.Sequential(
             RMSNorm(hidden_size),
             nn.Linear(hidden_size, num_experts, bias=False),
         )
-        
+
         self.noise_proj = nn.Linear(hidden_size, num_experts, bias=False)
         self.softmax = nn.Softmax(dim=-1)
+        self.noise_scale = noise_scale
 
-        # global multiplier on the exploration noise, annealed 1 -> 0 over training 
-        # high early noise encourages to explore experts 
+        # global multiplier on the exploration noise, annealed 1 -> 0 over training
+        # high early noise encourages to explore experts
         # once routing has specialized the noise only adds grad variance => decayed away
         self.noise_factor = 1.0
 
@@ -29,7 +41,7 @@ class Router(nn.Module):
         # add (annealed) noise for exploration
         if self.training and self.noise_factor > 0.0:
             noise = torch.randn_like(expert_scores)
-            noise_scale = F.softplus(self.noise_proj(hidden_states))
+            noise_scale = F.softplus(self.noise_proj(hidden_states)) * self.noise_scale
             expert_scores = expert_scores + self.noise_factor * noise_scale * noise
 
         # raw logits: the single softmax happens in LoopMixtureOfExperts.route()
