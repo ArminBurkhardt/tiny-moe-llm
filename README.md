@@ -6,6 +6,10 @@ mixture-of-experts** architecture on top of a dense Gemma4-style backbone.
 A dense decoder feeds a *single* MoE block that is applied `n_loops` times, so depth is recurrence
 rather than parameters. 332M total / 173M active per token.
 
+One 16B-token run exists, pretrained on a rented H100 and fine-tuned locally.
+[docs/CONCLUSION.md](docs/CONCLUSION.md) is the honest write-up of what it did and did not work —
+read it before believing anything in this list.
+
 The following techniques were used/implemented:
 
 - **Dense Gemma4-style blocks** — GQA, RoPE, RMSNorm, per-layer embeddings (PLE)
@@ -14,35 +18,53 @@ The following techniques were used/implemented:
   all pick the same experts
 - **Heterogeneous experts** — self-attention, cross-attention, information-retrieval and MLP
   experts share one router, plus always-on shared MLP/attention experts outside the router pool
-- **Halt head** — a per-loop `p_halt` gates how much each loop is allowed to change a token, a
-  compute-allocation signal rather than a correctness one
-- **Correctness head** — a separate `p_correct` asks "is this specific prediction right", which
-  comes apart from `p_halt` on confident hallucinations (provisional, see [PLAN.md](PLAN.md))
 - **Per-loop CE supervision** — every loop's readout is supervised, not just the last, so an
   early-exit policy has something to exit *to*
 - **Stochastic loop depth** — a fraction of steps train at a reduced depth, making the loop count a
   real runtime choice at inference
-- **Multi-token prediction (MTP)** — auxiliary heads predict several future tokens per step
+- **Parameter-free convergence exit** — inference stops looping once the last position's readout
+  stops moving. No learned gate, no loss term, nothing that can saturate
+- **Multi-token prediction (MTP)** — auxiliary heads predict several future tokens per step, reused
+  at inference as self-speculative drafting
+- **KV-cached decoding** — one cache slot per decoder layer and per (loop, attention expert) pair
 - **Document packing** — multiple documents per sequence with block-diagonal causal attention via
   flash-attn varlen
 - **Low-precision training** — optional FP8 / NVFP4 via NVIDIA Transformer Engine
 
-There is no identity expert; it was removed in favour of the halt head.
+There is no identity expert. There is also no longer a learned halt head or correctness head: both
+were tried, both failed structurally rather than by mistuning, and both were removed. See
+[docs/moe.md](docs/moe.md) for what replaced them and [docs/CONCLUSION.md](docs/CONCLUSION.md) for
+the measurements that decided it.
 
 ## Documentation
 
 | Doc | Contents |
 |-----|----------|
 | [docs/runbook.md](docs/runbook.md) | **Start here for a real run**: what to run, how to stop it, what is normal, what to do when it is not |
+| [docs/CONCLUSION.md](docs/CONCLUSION.md) | What the 16B-token run actually produced, including the failures |
 | [docs/architecture.md](docs/architecture.md) | End-to-end model architecture and data flow |
-| [docs/moe.md](docs/moe.md) | Looped MoE, routing, expert types, halt head |
+| [docs/moe.md](docs/moe.md) | Looped MoE, routing, expert types, depth policy |
 | [docs/training.md](docs/training.md) | Training pipeline, data packing, MTP loss, precision, checkpointing, resume |
 | [docs/configuration.md](docs/configuration.md) | Full `config.yaml` reference |
+| [docs/plans/NEXT.md](docs/plans/NEXT.md) | The current plan: turn the IR + cross-attention experts into a retriever/reader pair |
 | [CLAUDE.md](CLAUDE.md) | Operational map: invariants, gotchas, what lives where |
 
-## Quick start
+## Running anything
 
-Every command runs from the repo root — `config.py` opens `config.yaml` by relative path.
+**Everything runs under WSL, from the repo root, after `source env_init`.** The dev box is Windows;
+CUDA, flash-attn and Transformer Engine all live in the WSL Ubuntu install. `env_init` is
+gitignored — it sets `CUDA_HOME`, the library paths, `PYTORCH_CUDA_ALLOC_CONF`, and activates
+`venv/`. From PowerShell that is:
+
+```powershell
+wsl bash -lc "cd /mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm && source env_init && python scripts/inference.py --help"
+```
+
+Nothing works without it, and nothing works from a different working directory either — `config.py`
+opens `config.yaml` by relative path. The rented box is the one exception: `scripts/setup.sh`
+installs into the NGC image's system python and there is no `env_init` to source there.
+
+## Quick start
 
 ```bash
 # 1. environment, HF token, tokenizer, preflight checks
@@ -70,8 +92,23 @@ under `modules/model/` imports without it.
 Inference against a checkpoint:
 
 ```bash
-python scripts/inference.py -c ckpts/training/checkpoint_phase1_final.pt -p "Once upon a time" -n 200
+python scripts/inference.py -c ckpts/trained/checkpoint_sft_final_phase0.pt -p "Once upon a time" -n 200
+python scripts/gradio_app.py          # the same generation path behind a UI
 ```
+
+### Migrating an old checkpoint
+
+Checkpoints written before the halt and correctness heads were removed do not load: they carry two
+tensors the model no longer has, and a `loop_scale` that was learned underneath a per-token gate.
+Fold and strip them first — the script measures the gate on real data rather than assuming it:
+
+```bash
+python scripts/migrate_phase0.py -c ckpts/trained/checkpoint_sft_final.pt
+```
+
+The result is a finetune **seed** (its optimizer state is dropped on purpose), and it is
+behaviourally identical to the original: final-loop CE moved 3.7564 → 3.7604 and top-1 0.3644 →
+0.3628 on a fixed held-out slice.
 
 ## Repository layout
 
@@ -82,17 +119,20 @@ scripts/
   setup.sh                     one-shot box setup: deps, token, tokenizer, preflight
   onstart.sh                   vast.ai onstart hook: clone, setup, launch the supervisor
   run_training.py              supervisor: phase 1 -> phase 2, restarts through preemptions
+  run_sft_after_pretrain.sh    unattended pretrain -> SFT -> abstention eval chain
   pretrain.py                  the training loop
   prepare_data.py              builds phase1/phase2 .bin/.idx from the Hub source mix
   fetch_tokenizer.py           downloads the pruned 65536-token tokenizer
-  inference.py                 greedy/top-k sampling CLI
+  inference.py                 greedy/top-k sampling CLI, KV-cached, MTP drafting
+  gradio_app.py                browser UI over the same generation path
   prune_vocab.py               one-shot 129280 -> 65536 vocab prune
-  eval_calibration.py          ECE / abstention AUROC for the correctness head
+  migrate_phase0.py            folds the deleted halt gate into loop_scale, strips both old heads
+  eval_calibration.py          p_max calibration, early-exit curve, loop-convergence statistics
   prepare_sft_data.py          builds sft_train/sft_val .bin/.idx/.mask from the SFT source mix
   sft.py                       supervised fine-tuning; reuses pretrain.train_step unchanged
   eval_abstention.py           SQuAD v2 abstention precision/recall + calibration
 modules/model/
-  transformer.py               TinyMoETransformer (top-level model)
+  transformer.py               TinyMoETransformer (top-level model) + the convergence exit
   gemma4.py                    dense Gemma4-style decoder
   moe.py                       LoopMixtureOfExperts + sparse grouped-GEMM MLP experts
   router.py                    router + load-balancing aux loss
@@ -100,6 +140,7 @@ modules/model/
   information_retrieval.py     learned key/value retrieval module
   mtp.py                       multi-token-prediction head + chunked LM-head loss
   attention.py                 document-packed (varlen) causal attention
+  kv_cache.py                  incremental decode cache, one slot per layer and per (loop, expert)
   modules.py                   factored LM head
   embeddings.py                rotary position embeddings
 modules/data/dataset.py        mmap flat-file dataset with document packing
@@ -126,7 +167,7 @@ The default [config.yaml](config.yaml) produces a 332M-parameter model, 173M act
 | top-k / loops | 2 / 3 |
 | MTP extra tokens | 2 |
 | vocab / context length | 65536 / 4096 |
-| token budget | 29.9B (phase 1: 25.4B, phase 2: 4.5B anneal) |
+| token budget | 16B (phase 1: 85%, phase 2: the anneal) |
 
 ## Credit
 
@@ -155,3 +196,6 @@ Borrows heavily from [Gemma4](https://huggingface.co/google/gemma-4-31b-it).
   and `scripts/fetch_tokenizer.py` pulls it — `ckpts/` is gitignored, so a fresh clone has none.
 - `pad_token_id == eos_token_id` and id 0 is BOS, which is why the embedding table has no
   `padding_idx` (setting one froze BOS at zero).
+- The corpus under `data/prepared/` on the dev box is an outdated local stand-in, not the corpus the
+  16B-token run used. Absolute numbers measured against it are not comparable to
+  [docs/CONCLUSION.md](docs/CONCLUSION.md); before/after deltas on the same slice are.

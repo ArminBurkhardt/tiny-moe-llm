@@ -194,7 +194,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 | `skipping already-complete phase(s) on disk: phase1` | A reclaimed instance came back and `onstart.sh` started a brand new `run_training.py`. `resume_phase_index` (`modules/runtime/checkpoints.py`) checked `ckpts/training` before looping and found phase 1 already finished, so it starts straight at phase 2 instead of re-entering phase 1 and overwriting `checkpoint_phase1_final.pt` with phase-2 weights. |
 | ETA swinging wildly in the first few minutes after a restart | It extrapolates from one log interval. It settles. |
 | `mean loops` below `n_loops` | `loop_count_sampling` runs 30% of steps at a reduced depth on purpose. Log steps are pinned to full depth. |
-| `ponder auto-adjust: p_halt too low/high ... lambda_ponder X -> Y` | `PonderController` (`modules/runtime/ponder.py`) nudging the ponder weight to keep `p_halt`'s steady state in the healthy band (`ponder_target_p_halt` +/- `ponder_p_halt_band` in `config.yaml`). Only fires after the warmup+ramp finishes, at most once per `ponder_adjust_cooldown_tokens`. The adjusted value is checkpointed, so it survives every preemption restart; disable with `ponder_auto_adjust: false`. |
+| `loop_scale` far below `1/sqrt(n_loops)` at step 0 | Expected on a checkpoint from `scripts/migrate_phase0.py` — the deleted halt gate's measured per-loop mean was folded into it. Not a collapsed loop. |
 
 ---
 
@@ -334,13 +334,11 @@ on purpose, so `resume_phase_index` can never mistake an SFT checkpoint for a pr
 ### 10.4 Watching it
 
 `ckpts/sft/status.json` and the log line are the same shape as pretraining's, plus an `[eval]` line
-every `sft.eval_every_tokens` (25M) reporting val CE, `p_correct`, `p_max` and top-1 on `sft_val`.
-The one to watch: **`p_correct` tracking `p_max` exactly** means the correctness head learned
-nothing beyond the free baseline — that is the Gate 5 / Step 4b re-decision showing up early, not a
-crash. Loss should start near where pretraining ended and drop quickly in the first few hundred
-steps as the model learns the chat format, then flatten.
+every `sft.eval_every_tokens` (25M) reporting val CE, `p_max` and top-1 on `sft_val`.
+Loss should start near where pretraining ended and drop quickly in the first few hundred steps as
+the model learns the chat format, then flatten.
 
-### 10.5 The acceptance metric (PLAN.md Step 12)
+### 10.5 The acceptance metric
 
 `sft_val`'s `[eval]` line is an early warning, not the acceptance number. That comes from
 `scripts/eval_abstention.py`, which runs **after** SFT finishes, on the SQuAD v2 *validation* split
@@ -358,9 +356,9 @@ no network), generates an answer for every question, and prints three blocks:
 
 | block | the number that matters |
 |---|---|
-| generated answers | **abstention precision and recall** — PLAN.md's acceptance pair. Read `false abstention rate` next to them: a model that refuses everything scores recall 1.0 and looks fine on precision alone. |
+| generated answers | **abstention precision and recall** — the acceptance pair. Read `false abstention rate` next to them: a model that refuses everything scores recall 1.0 and looks fine on precision alone. That is not hypothetical: the 16B-token run refused **78.4% of answerable questions** (see [CONCLUSION.md](CONCLUSION.md)). |
 | answer quality | EM/token-F1 on the answerable half. Low here with a high abstention rate is the degenerate solution. |
-| calibration | answer-level ECE/AUROC for `p_correct` and `p_max`, then the teacher-forced token-level pair with the pretrained checkpoint beside it and an explicit PASS/FAIL on **`ECE(p_correct)` change vs pretrained**. |
+| calibration | answer-level ECE/AUROC for `p_max`, then the teacher-forced token-level pass with the pretrained checkpoint beside it and an explicit PASS/FAIL on **`ECE(p_max)` change vs pretrained**. |
 
 Three things to expect rather than panic about. First, **the run is slow**: there is no KV cache, so
 every decode step re-runs the whole prefix. The full ~11.9k-question split at `--batch-size 16` is
@@ -378,7 +376,8 @@ Third, **the baseline comparison is asymmetric on purpose**: the pretrained chec
 the chat control tokens, so it is out of distribution on these inputs and its ECE is a conservative
 bar. The script prints this with the verdict — a PASS is weak evidence, a FAIL is strong.
 
-This is also where the deferred **Gate 5 / Step 4b re-decision** gets made against the real final
-checkpoint: if `p_max` beats `p_correct` on ECE *and* AUROC here as it did on the 45M-token smoke
-checkpoint, drop the correctness head, its loss term and `lambda_conf`, and substitute `p_max`
-everywhere Step 13 uses an abstention signal.
+Note the token-level number can pass while the behavioural one fails, and that is exactly what
+happened on the real run: teacher-forced ECE read 0.026 against the pretrained baseline's 0.049 (a
+clean PASS) while the model was refusing 78% of answerable questions. Token-level calibration
+measures next-token confidence on a *given* reference string; it says nothing about whether the
+answer-level decision was right. Read the generated-answers block first.

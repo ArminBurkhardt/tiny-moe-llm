@@ -27,11 +27,12 @@ All hyperparameters live in [config.yaml](../config.yaml) and are surfaced as `M
 | `mtp_num_extra_tokens` | 2 | Extra future tokens predicted (`0` disables MTP) |
 | `lm_head_factor` | 4 | Factorization factor of the LM head (higher = cheaper, lower rank) |
 
-There is no identity expert / `identity_skew` anymore (removed, PLAN.md Step 3) — a halt head
-(`p_halt`, see [moe.md](moe.md)) replaces it as the early-exit signal. `ModelConfig.Forward` is
+There is no identity expert / `identity_skew`, and no halt head either — the depth policy is the
+parameter-free `converge_tol` on `TinyMoETransformer.forward`, which has no config key because it
+is an inference-time argument, not a trained one (see [moe.md](moe.md)). `ModelConfig.Forward` is
 currently empty.
 
-**Construction-time assertions** (`TinyMoETransformer.__init__`, PLAN.md Step 5): `vocab_size` and
+**Construction-time assertions** (`TinyMoETransformer.__init__`): `vocab_size` and
 `hidden_size` must each be divisible by `lm_head_factor`; if MTP is enabled, `vocab_size` and
 `hidden_size // 2` must each also be divisible by `lm_head_factor * 2` (the MTP head's own
 `SmallLMHead`); `vocab_size <= 65536`. These raise immediately on a bad config instead of silently
@@ -53,13 +54,9 @@ forward FLOP/token estimate at construction — see [moe.md](moe.md) for the met
 | `target_tokens` | 29.9e9 | **Combined** phase1+phase2 budget. Drives `total_steps` and the cosine length |
 | `warmup_steps` | 1000 | Linear LR warmup before cosine decay |
 | `noise_anneal_tokens` | 1e9 | Tokens over which router exploration noise decays 1 -> 0 |
-| `lambda_ponder` | 0.15 | Target weight on the ponder loss (`(1 - p_halt)` over real tokens) |
-| `ponder_warmup_tokens` | 1e9 | Tokens before `lambda_ponder` starts ramping up from 0 |
-| `ponder_ramp_tokens` | 1e9 | Tokens over which `lambda_ponder` ramps from 0 to its target after warmup |
 | `loop_ce_weights` | `[0.2, 0.3, 1.0]`, required | Per-loop CE weight, ascending. Length must equal `model.n_loops` (asserted at config-load time) |
 | `loop_ce_subsample` | 0.25 | Fraction of token positions supervised on the **non-final** loops. The final loop is always supervised in full. `1.0` disables it |
 | `loop_count_sampling` | 0.3 | Probability a step runs a random reduced depth in `1..n_loops-1`. `loop_ce_weights` is truncated and rescaled so the deepest loop run always carries weight 1.0. Log steps are pinned to full depth. `0.0` disables it |
-| `lambda_conf` | 0.05 | Weight on the correctness head's BCE loss (`correct_proj`, final loop only). Not warmup-ramped |
 | `grad_accumulation_steps` | 16 | Mini batches accumulated per optim step |
 | `seed` | 42 | Seeds the loop-depth RNG (kept separate from the model's init/dropout/router-noise stream) |
 | `data_dir` | `data/prepared` | Directory holding `{phase}.bin` / `{phase}.idx` from `scripts/prepare_data.py` |

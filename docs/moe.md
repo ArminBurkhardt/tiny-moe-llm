@@ -51,37 +51,57 @@ Experts other than MLP are applied by masked accumulation; MLP slots are remappe
 indices and dispatched to the sparse layer. All expert outputs (plus the always-on shared experts)
 are summed, then `RMSNorm` + dropout. The mean aux loss over loops is returned.
 
-## Halt head
+## Depth policy
 
-There is no identity expert anymore. In its place, `forward_step` computes a **halt probability**
-each loop from a small linear head on the *incoming* hidden state:
+There is no identity expert and, since Phase 0, no halt head either. `forward_step`'s update is
+now just the per-loop gain:
 
 ```
-p_halt = sigmoid(halt_proj(hidden_states))         # [B, S, 1], zero-init weight, bias -2.0
-hidden_states = hidden_states + (1 - p_halt) * loop_scale * delta
+hidden_states = hidden_states + loop_scale[loop] * delta
 ```
 
-`p_halt -> 1` means "this token doesn't need further refinement" and directly gates how much of
-the loop's update lands — a **compute-allocation signal**, not a correctness score. It's greedy
-and per-loop (recomputed from scratch each loop, not a cumulative ACT-style accumulator), so a
-token can halt at one loop and un-halt at the next. `LoopMixtureOfExperts.forward` stacks `p_halt`
-over loops into `[n_loops, B, S]` and returns it alongside the hidden states.
+**What used to be here.** A learned `p_halt = sigmoid(halt_proj(hidden_states))` gated that update
+as `(1 - p_halt) * loop_scale * delta`, trained by a "ponder" loss on `(1 - p_halt)` with a runtime
+controller nudging its weight. It failed structurally, not by mistuning: `p_halt` collapsed to
+~0.004 during the zero-λ warmup, overshot to ~0.78 when the ramp engaged, and pinned there for 14B
+tokens while the controller cut the weight 11 times with no measurable effect. A saturated sigmoid
+has no gradient, so λ was not a control knob. `loop_scale` grew to `[1.73, 1.81, 1.32]` to
+compensate for the pinned gate. Full post-mortem in [CONCLUSION.md](CONCLUSION.md).
 
-The trainer adds a **ponder loss** on `(1 - p_halt)` over real (non-pad) tokens, weighted by
-`TrainingConfig.lambda_ponder`, ramped from 0 over `ponder_warmup_tokens` / `ponder_ramp_tokens`.
-The warmup is load-bearing, not tunable: see the ponder-deadlock note in
-[CLAUDE.md](../CLAUDE.md) and `tests/test_ponder_deadlock.py`.
+Deleting the gate naively would have multiplied every loop's delta by ~1/(1 − p_halt) and broken
+the checkpoint, so `scripts/migrate_phase0.py` **folds the gate's measured per-loop mean into
+`loop_scale`**: `loop_scale_new[k] = loop_scale_old[k] * mean_k(1 - p_halt)`. A migrated
+checkpoint's `loop_scale` is therefore much smaller than a fresh `1/sqrt(n_loops)` init — that is
+correct, not a bug. The gate had to be *measured*: the training log only recorded `p_halt` averaged
+over all loops, hiding a strong decreasing trend (`[0.290, 0.134, 0.084]` on the SFT checkpoint).
+
+**What replaced it.** A parameter-free convergence criterion, `converge_tol` on
+`TinyMoETransformer.forward`. After each loop it reads out the **last position only** (one token ×
+vocab — free next to a loop of the MoE block) and stops when the top-1 token is unchanged *and* its
+log-probability moved less than `converge_tol`. Nothing is learned, so nothing can saturate.
+
+Two things about it are load-bearing:
+
+- It is measured in the **readout**, not in `‖Δh‖`. `loop_scale` still injects a sizeable hidden
+  delta on the last loop while the prediction is already stationary, so a hidden-state criterion
+  would never fire.
+- It is **mutually exclusive with the KV cache** (asserted in both `LoopMixtureOfExperts.forward`
+  and `TinyMoETransformer.forward`). An exited loop appends no K/V for that token, so a later
+  full-depth step would attend over a cache with a hole in it. `scripts/inference.py` resolves this
+  by turning the cache off when `--converge-tol` is set.
+
+`scripts/eval_calibration.py` prints per-transition top-1 agreement and mean `|Δ log p_top|`, which
+is how the threshold gets picked, alongside the early-exit CE curve that says what it costs.
 
 ## Per-loop CE supervision
 
-Using `p_halt` for early exit at inference means `lm_head` must be able to read *any* loop's
-hidden state, not just the last one -- otherwise thresholding `p_halt` and exiting early reads
-from an interface never trained (PLAN.md Step 4a). `LoopMixtureOfExperts.forward` returns a 4th
-value alongside `hidden_states`/`aux_loss`/`p_halt`: `hidden_states_all`, the stack of every
-loop's (pre-norm) hidden state, `[n_loops, B, S, H]`. `TinyMoETransformer.forward` applies the
-final `RMSNorm` to the whole stack (not just the last loop) before returning it as `x` when
-`return_hidden=True` -- `lm_head` never reads the raw residual stream, so skipping this makes
-per-loop losses meaningless.
+Exiting early at inference means `lm_head` must be able to read *any* loop's hidden state, not just
+the last one -- otherwise an early exit reads from an interface never trained.
+`LoopMixtureOfExperts.forward` returns a third value alongside `hidden_states`/`aux_loss`:
+`hidden_states_all`, the stack of every loop's (pre-norm) hidden state, `[loops_run, B, S, H]`.
+`TinyMoETransformer.forward` applies the final `RMSNorm` to the whole stack (not just the last
+loop) before returning it as `x` when `return_hidden=True` -- `lm_head` never reads the raw
+residual stream, so skipping this makes per-loop losses meaningless.
 
 `compute_mtp_loss` (`modules/model/mtp.py`) takes a `loop_ce_weights` list (one entry per loop,
 `TrainingConfig.loop_ce_weights`, ascending -- e.g. `[0.1, 0.2, 0.3, 1.0]`) and computes the
@@ -95,35 +115,29 @@ Missing or wrong-length `loop_ce_weights` is a hard error (`compute_mtp_loss` as
 `len(loop_ce_weights) == n_loops`); `config.py` also asserts this against `ModelConfig.Params`
 at import time so a config typo fails fast instead of at the first training step.
 
-## Correctness head
+## Confidence signal
 
-`p_halt` answers "is more compute useful here" (a compute-allocation signal); it is trained by LM
-loss + ponder cost, so it learns whether refinement *changes* the prediction, not whether the
-prediction is *right*. A confidently hallucinated fact is stable under refinement -- it halts early
-and reads as maximum certainty. `TinyMoETransformer.correct_proj` (PLAN.md Step 4b) is a second,
-independent `Linear(hidden_size, 1)` head (zero-init) that asks the right question directly: is
-this prediction correct.
+`p_max = softmax(logits).max()` is the confidence signal everywhere downstream — training logs,
+`sft.py`'s validation pass, `eval_calibration.py`, `eval_abstention.py`. It costs nothing and has
+no parameters.
 
-Like `lm_head`/`mtp_head`, `correct_proj` is applied externally rather than inside `forward()` --
-`compute_mtp_loss` calls it only on the **final loop's** hidden states (never per loop, unlike the
-CE terms above) when passed `correct_proj=` and `lambda_conf > 0`. Its target is free: inside the
-same chunked pass that already computes the final loop's CE, `is_correct = (logits.argmax(-1) ==
-labels)` under `torch.no_grad()` -- no extra forward pass, no labels beyond what CE already uses.
-The `no_grad` is load-bearing: without it, the "correct" target would itself carry gradient back
-through the shared CE logits, on top of `correct_proj`'s own gradient, quietly corrupting the LM
-loss. `tests/test_correctness_head.py` checks this directly by comparing `lm_head`'s gradient with
-the correctness term on vs. off -- it must be bit-identical.
+There used to be a learned alternative: `correct_proj`, a `Linear(hidden_size, 1)` head asking "is
+this specific prediction correct", supervised by BCE against `is_correct = (logits.argmax(-1) ==
+labels)`. It lost. The target was derived from `lm_head`'s own argmax on the same hidden state the
+head reads, so "reproduce `p_max`" was the reachable optimum by construction — and that is exactly
+what it did, tracking `p_max` to within 0.005 across the whole run. On the real checkpoint `p_max`
+beat it on ECE *and* AUROC, and `(1 - p_correct)` scored 0.457 AUROC — **below chance** — at
+flagging unanswerable questions, with mean `p_correct` *higher* on abstentions (0.835) than on real
+answers (0.739). It was deleted in Phase 0; `expected_calibration_error` / `roc_auc` in
+`eval_calibration.py` survive it as shared code.
 
-Unlike the ponder loss, `lambda_conf` (`TrainingConfig.lambda_conf`, default `0.05`) is **not**
-warmup-ramped -- there's no `loop_scale`-style deadlock precondition here, since `correct_proj`
-doesn't gate anything else's gradient the way `p_halt` gates the loop's residual update.
+Anything that replaces it has to *add* information over `p_max` rather than reproduce it: target
+sampled continuations rather than teacher-forced tokens, make the target sequence-level, and feed
+it the logit features explicitly. See [CONCLUSION.md](CONCLUSION.md).
 
-This head is provisional. `p_max = softmax(logits).max()` is already a strong, free per-token
-correctness predictor with no extra parameters. Gate 5 (`scripts/eval_calibration.py`, not written
-yet) compares `p_correct = sigmoid(correct_proj(hidden))`'s ECE and abstention AUROC against
-`p_max`'s on a held-out slice; if `p_correct` doesn't win on both, the plan is to revert this head
-entirely (see PLAN.md's Step 4b for the exact revert scope) and use `p_max` for abstention
-throughout post-training instead.
+`p_max` is computed as `1 / Σ_j exp(l_j - l_max)` rather than `logits.float().softmax(-1).max(-1)`
+— the identity is exact, and it avoids two ~2GB fp32 transients per chunk at `chunk=8192 /
+vocab=65536`, allocated on every step and again on the checkpoint recompute.
 
 ## Sparse MLP dispatch - `ParallelSparseMoELayer`
 

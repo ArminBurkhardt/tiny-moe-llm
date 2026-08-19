@@ -121,8 +121,8 @@ class SFTConfig:
     """Supervised fine-tuning knobs, read from config.yaml's ``sft:`` block.
 
     Only the things SFT genuinely does differently live here. Every loss weight -- lambda_mtp,
-    aux_loss_weight, loop_ce_weights/loop_ce_subsample, loop_count_sampling and the whole ponder
-    family -- is read from ``TrainingConfig`` by ``scripts/pretrain.train_step``, which
+    aux_loss_weight, loop_ce_weights/loop_ce_subsample and loop_count_sampling -- is read from
+    ``TrainingConfig`` by ``scripts/pretrain.train_step``, which
     ``scripts/sft.py`` reuses unchanged. That reuse is the point: the cheapest way to guarantee
     the objective stays *identical* across the two runs is to not have a second copy of it.
     """

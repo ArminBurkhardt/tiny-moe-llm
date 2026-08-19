@@ -326,7 +326,7 @@ class TinyMoETransformer(nn.Module):
             cu_seqlens (torch.Tensor, optional): int32 cumulative segment boundaries over the
                 flattened [B*S] token axis for document-packed varlen attention. Defaults to None (normal causal attention).
             max_seqlen (int, optional): longest packed segment length. Defaults to None.
-            return_aux_loss (bool, optional): whether to return auxiliary loss (and p_halt). Defaults to False.
+            return_aux_loss (bool, optional): whether to return the MoE routing auxiliary loss. Defaults to False.
             n_loops (int, optional): run the MoE block a different number of times than it was
                 configured with. Both the per-loop router bias and loop_scale are indexed by
                 absolute loop index, so this needs no weight reshaping -- see

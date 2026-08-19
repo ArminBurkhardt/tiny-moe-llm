@@ -1,4 +1,4 @@
-"""Supervised fine-tuning (PLAN.md Step 12).
+"""Supervised fine-tuning.
 
 Written for a **local** run -- the pretrained checkpoint and ``manifest.json`` come down from the
 Hub once pretraining finishes (``--from-hub`` does that), and the fine-tune itself is a couple of
@@ -17,7 +17,7 @@ What it deliberately *reuses* rather than reimplements:
     the dataset emits ``-100`` labels over prompt tokens and every loss term already routes through
     ``ignore_index=-100``, including the MTP heads (they read the same ``labels`` tensor).
   * The model's **global token counter**, continued rather than reset. The router-noise anneal is
-    driven from it, and it has long since finished at ~30B tokens. SFT progress is tracked
+    driven from it, and it has long since finished at ~16B tokens. SFT progress is tracked
     separately as ``token_count - start_token_count``.
 
 What is genuinely different:
@@ -91,8 +91,8 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float):
     """Split parameters into decayed / undecayed groups, **all** shadowed by fp32 masters.
 
     The decay split is the same one ``pretrain.build_param_groups`` makes and for the same reasons
-    (``moe.loop_scale``, ``layer_scalar``, RMSNorm gains and ``halt_proj.bias`` all have a
-    degenerate zero, and every one of them is ndim <= 1).
+    (``moe.loop_scale``, ``layer_scalar`` and the RMSNorm gains all have a degenerate zero, and
+    every one of them is ndim <= 1).
 
     The difference is which tensors get an fp32 master. Pretraining shadows only the undecayed
     group, on the argument that ordinary 2D weights are safe because "their values and needed steps
@@ -740,7 +740,7 @@ def sft(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="supervised fine-tuning (PLAN.md Step 12)")
+    parser = argparse.ArgumentParser(description="supervised fine-tuning")
     parser.add_argument("--checkpoint", "-c", default=None,
                         help="pretrained checkpoint to initialize from (ignored when resuming an "
                              "SFT run from ckpts/sft)")
