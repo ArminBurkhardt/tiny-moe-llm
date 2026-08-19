@@ -32,6 +32,27 @@ pad_mask = torch.zeros(B, S, dtype=torch.bool, device=dev)
 doc_ids = torch.tensor([[0] * (S // 2) + [1] * (S // 2)] * B, device=dev)
 cu, ms = cu_seqlens_from_doc_ids(doc_ids)
 
+# --- expert pool shape and routing: exactly one softmax decides selection, no identity slot ---
+moe = model.moe
+A, I, M = moe._num_attn_experts, moe._num_ir_experts, moe._num_mlp_experts
+assert moe.num_experts == A + I + M, (moe.num_experts, A, I, M)
+assert moe.first_mlp_index == A + I, (moe.first_mlp_index, A, I)
+model.eval()   # eval: no router noise, deterministic
+with torch.no_grad():
+    x = torch.randn(B, S, P["hidden_size"], device=dev, dtype=torch.bfloat16)
+    router_logits = moe.router(x)
+    assert (router_logits.float().sum(-1) - 1.0).abs().mean() > 0.1, \
+        "router output looks softmaxed; it must be raw logits"
+    tk_scores, tk_idx, aux_only = moe.route(x)
+assert tk_idx.max().item() < moe.num_experts, "topk index out of range"
+assert torch.allclose(tk_scores.sum(-1), torch.ones_like(tk_scores.sum(-1)), atol=1e-2), \
+    "topk scores must renormalize to sum to 1"
+# aux loss is probability-based, so its floor is 1.0 at perfect balance, not 0
+assert 0.9 < float(aux_only) < 5.0, f"aux loss out of expected scale: {float(aux_only)}"
+model.train()
+print(f"[ok] routing: num_experts={moe.num_experts} (A={A} I={I} M={M}), first_mlp_index="
+      f"{moe.first_mlp_index}, raw logits, scores renormalize, aux={float(aux_only):.3f}")
+
 # --- per-loop loop_scale, init 1/sqrt(n_loops) ---
 ls = model.moe.loop_scale
 assert ls.shape == (N_LOOPS,), ls.shape
@@ -227,4 +248,4 @@ assert all(isinstance(head, te.Linear) for head in model.lm_head.lm_heads)
 assert all(isinstance(head, te.Linear) for head in model.mtp_head.lm_head.lm_heads)
 print("[ok] SmallLMHead sub-heads are te.Linear")
 
-print("\nREVIEW FIX CHECKS PASSED")
+print("\nLOOP MACHINERY CHECKS PASSED")

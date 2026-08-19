@@ -1,6 +1,6 @@
 """Network-free checks for scripts/prepare_data.py's resumable interleave/write/checkpoint core
 (PLAN.md Step 11). Synthetic in-memory sources stand in for real Hub shard files -- no HF Hub
-calls, no GPU/TE dependency, runs on CPU like test_review.py / test_dataset_resume.py.
+calls, no GPU/TE dependency, runs on CPU like test_dataset_packing.py / test_dataset_resume.py.
 """
 import os
 import sys

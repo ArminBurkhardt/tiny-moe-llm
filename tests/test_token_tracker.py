@@ -35,4 +35,4 @@ tr2.count_tokens(torch.zeros(2, 8))
 assert tr2.get_count() == 16 and tr2._device_count is None, "pad-less counting stays on the host"
 print("[ok] TokenTracker: exact non-pad count, sync-free reads, idempotent drain, setter resets")
 
-print("\nSYNC-OPTIMIZATION CHECKS PASSED")
+print("\nTOKEN TRACKER CHECKS PASSED")

@@ -101,6 +101,16 @@ def load_checkpoint(model, optimizer, scheduler, path):
     through ``scripts/migrate_phase0.py`` first -- that is what folds the gate in.
     """
     checkpoint = torch.load(path)
+    if "optimizer_state_dict" not in checkpoint:
+        # scripts/migrate_phase0.py drops the optimizer state on purpose (its moments are indexed
+        # by param-group position and two tensors left the model). Say that, rather than letting a
+        # bare KeyError surface as "this checkpoint would not load" during a resume scan.
+        raise ValueError(
+            f"{os.path.basename(path)} carries no optimizer state"
+            + (" -- it is a Phase 0 migration output, which is a finetune SEED, not a resume "
+               "point. Pass it with -c to initialize from it."
+               if "phase0_migration" in checkpoint else "")
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
