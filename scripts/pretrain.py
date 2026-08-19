@@ -22,7 +22,6 @@ from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16, TOKE
 from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_PREEMPTED, EXIT_RESUME_FAILED, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
-from modules.runtime.ponder import PonderController
 from modules.runtime.status import eta_seconds, format_duration, write_status
 
 
@@ -116,7 +115,6 @@ def train_step(
     no_decay_master_pairs: list = None,
     collect_metrics: bool = False,
     n_loops: int = None,
-    lambda_ponder: float = None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -127,12 +125,7 @@ def train_step(
             steps out of 10 is pure waste. ``metrics`` is None when False.
         n_loops: loop depth for this step (see sample_n_loops). None runs the configured depth.
             loop_ce_weights is truncated/rescaled to match, so the deepest loop actually run is
-            always the one carrying weight 1.0 and holding the correctness head.
-        lambda_ponder: the ponder loss's target weight (pre-ramp), read from a live
-            modules.runtime.ponder.PonderController rather than TrainingConfig directly -- the
-            controller may have moved it away from config.yaml's starting value. None falls back
-            to TrainingConfig.lambda_ponder (config's static value, no auto-adjust) for callers
-            that construct no controller.
+            always the one carrying weight 1.0.
     """
     loop_ce_weights = (
         TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
@@ -144,7 +137,7 @@ def train_step(
     with accelerator.accumulate(model):
         with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
             if unwrapped.has_mtp:
-                logits, aux_loss, p_halt, extra_token_outputs = model(
+                logits, aux_loss, extra_token_outputs = model(
                 input_ids=input_ids,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
@@ -154,7 +147,7 @@ def train_step(
                 n_loops=n_loops,
             )
             else:
-                logits, aux_loss, p_halt = model(
+                logits, aux_loss = model(
                     input_ids=input_ids,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
@@ -181,29 +174,6 @@ def train_step(
 
             loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 
-            # ponder loss: penalize not-halting on real tokens, ramped from 0 so it can't deadlock
-            # loop_scale before the loop has learned to do anything (see loop_scale's docstring).
-            tokens = unwrapped.token_count
-            warm, ramp = TrainingConfig.ponder_warmup_tokens, TrainingConfig.ponder_ramp_tokens
-            target_lambda = TrainingConfig.lambda_ponder if lambda_ponder is None else lambda_ponder
-            lambda_ponder_now = target_lambda * min(1.0, max(0.0, (tokens - warm) / ramp))
-            # p_halt is [n_loops, B, S] but valid_mask is [B, S], so the denominator has to carry
-            # the loop axis too -- normalizing by valid_mask.sum() alone made both the ponder term
-            # and the logged p_halt exactly n_loops times too large (p_halt could never read below
-            # n_loops * sigmoid(halt_bias), and lambda_ponder was silently n_loops x its config
-            # value).
-            valid_mask = (~pad_mask).to(p_halt.dtype)
-            valid_count = valid_mask.sum().clamp(min=1) * p_halt.size(0)
-            ponder = ((1.0 - p_halt) * valid_mask).sum() / valid_count
-            loss = loss + lambda_ponder_now * ponder
-
-            # instrumentation (PLAN.md Step 7): all tensors, no host sync here -- the caller only
-            # pulls these to the host inside its own LOG_INTERVAL-throttled block.
-            if collect_metrics:
-                metrics["p_halt_mean"] = ((p_halt * valid_mask).sum() / valid_count).detach()
-                metrics["ponder"] = ponder.detach()
-                metrics["lambda_ponder_now"] = lambda_ponder_now
-
             accelerator.backward(loss)
             # clip on the real update step only (matters once gradient accumulation > 1).
             # accelerator.clip_grad_norm_ unscales/handles the wrapped params correctly.
@@ -223,8 +193,8 @@ def train_step(
                 # running sum over the whole run: it pads clip_grad_norm_'s total until the run is
                 # permanently pinned at the clip threshold, and sync_master_grads_ then hands AdamW
                 # an integral of past gradients instead of this step's -- on precisely the tensors
-                # (loop_scale, layer_scalar, halt_proj.bias, norm gains) the master mechanism exists
-                # to keep moving correctly.
+                # (loop_scale, layer_scalar, norm gains) the master mechanism exists to keep moving
+                # correctly.
                 for bf16_param, _ in no_decay_master_pairs:
                     bf16_param.grad = None
             optimizer.zero_grad(set_to_none=True)
@@ -242,10 +212,11 @@ def sample_n_loops(rng: random.Random, full_n_loops: int, prob: float) -> int:
     that's the primary operating point, and a plain uniform draw would give it only
     ``1/full_n_loops`` of the training signal.
 
-    Why this rather than a ponder/halt penalty: p_halt gates the loop's *output* while every expert
-    still runs, so penalizing it buys no compute back and only pushes the loop toward being a no-op.
-    Sampling the depth instead makes each depth a genuine operating point, which is what an
-    inference-time loop-count override actually needs, and it *reduces* mean training compute.
+    Why this rather than a learned halt gate: the deleted p_halt gated the loop's *output* while
+    every expert still ran, so penalizing it bought no compute back and only pushed the loop toward
+    being a no-op. Sampling the depth instead makes each depth a genuine operating point, which is
+    what an inference-time loop-count override actually needs, and it *reduces* mean training
+    compute.
     """
     if prob <= 0.0 or full_n_loops <= 1 or rng.random() >= prob:
         return full_n_loops
@@ -270,25 +241,25 @@ def build_param_groups(model: TinyMoETransformer, weight_decay: float):
     Decaying every parameter uniformly is actively harmful here, not just untidy: the architecture
     leans on several learned scalars whose *zero* is a degenerate state.
       * ``moe.loop_scale`` gates how much each loop contributes -- decaying it toward 0 decays the
-        whole MoE block toward "off", which is the exact failure mode the ponder warmup exists to
-        avoid.
+        whole MoE block toward "off". On a checkpoint migrated by ``scripts/migrate_phase0.py``
+        these values are already small (the deleted halt gate was folded into them), so there is
+        even less headroom than the init suggests.
       * ``Gemma4TextDecoderLayer.layer_scalar`` is a gain on the *whole* residual stream, so its
         decay compounds across depth: at lr=4e-4/wd=0.02 over ~9.5k steps it is a ~0.93x pull per
         layer, i.e. ~0.5x across 8 layers, before any gradient signal.
-      * RMSNorm gains and biases (incl. ``halt_proj.bias``, which sets the p_halt operating point)
-        have the same problem in milder form.
+      * RMSNorm gains and biases have the same problem in milder form.
     The usual convention -- decay only tensors with ndim >= 2 -- covers all of these, since every
     one of them is a scalar or a vector.
 
     The no_decay group additionally needs fp32 shadow "master" weights, for a reason unrelated to
     weight decay: the model trains in native bf16 (``model.to(BF16)``, no fp32 master copy), and a
     steady-state AdamW step has magnitude ~lr (~1e-4-1e-3 here). Every no_decay tensor sits at O(0.1-2)
-    magnitude (loop_scale ~1/sqrt(n_loops), layer_scalar/RMSNorm gains ~1, halt_proj.bias -2.0), where
+    magnitude (loop_scale ~1/sqrt(n_loops), layer_scalar/RMSNorm gains ~1), where
     bf16's ulp (~0.4% of magnitude) is 10-40x bigger than that step -- so `param -= lr * update`
     rounds to EXACTLY the original bf16 value, every single step, forever, regardless of how much
     Adam momentum accumulates. Confirmed on a real checkpoint: after 344 optimizer steps loop_scale's
     exp_avg was large and nonzero while the bf16 value hadn't moved a single representable increment
-    (matches Gate 4 failing -- p_halt pinned, loop_scale stuck at init). decay tensors don't have this
+    (which is why loop_scale sat pinned at its init on the first smoke run). decay tensors don't have this
     problem in practice: their values and needed steps both scale with their own (much smaller) init
     std, so they stay inside bf16's relative resolution.
     The fix: AdamW steps the fp32 masters (never sub-ulp at fp32 precision), and the bf16 model
@@ -377,7 +348,7 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
     pad_mask = (input_ids == pad_id)
 
     with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
-        logits, aux_loss, p_halt, extra_token_outputs = model(
+        logits, aux_loss, extra_token_outputs = model(
             input_ids=input_ids,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
@@ -510,19 +481,6 @@ def pretrain(phase=None):
     resumed = False
     checkpoint_dir = os.path.join(BASE_DIR, "ckpts", "training")
     losses = []
-    # cold-start seed; overwritten by the checkpoint's ponder_state below on a resume, so a
-    # relaunch after preemption doesn't silently reset an already-adjusted lambda_ponder back to
-    # config.yaml's starting value
-    ponder_controller = PonderController(
-        TrainingConfig.lambda_ponder,
-        target=TrainingConfig.ponder_target_p_halt,
-        band=TrainingConfig.ponder_p_halt_band,
-        factor=TrainingConfig.ponder_adjust_factor,
-        cooldown_tokens=TrainingConfig.ponder_adjust_cooldown_tokens,
-        lambda_min=TrainingConfig.ponder_lambda_min,
-        lambda_max=TrainingConfig.ponder_lambda_max,
-        enabled=TrainingConfig.ponder_auto_adjust,
-    )
     os.makedirs(checkpoint_dir, exist_ok=True)
     ckpt_lib.cleanup_stale_files(checkpoint_dir)
     run_state_path = os.path.join(checkpoint_dir, "run_state.json")
@@ -543,12 +501,10 @@ def pretrain(phase=None):
         logger.warning("No checkpoint found in ckpts/training. Starting training from scratch")
     else:
         checkpoint_path, loaded = found
-        (start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase,
-         ponder_state) = loaded
-        # legacy checkpoints (pre Step 9 phase scoping, or plain pre-any-of-this) can carry
-        # losses=None; appending to that later crashes the first log step of the resumed run
+        start_epoch, dataset_idx, resume_token_count, start_doc_idx, losses, ckpt_phase = loaded
+        # legacy checkpoints can carry losses=None; appending to that later crashes the first log
+        # step of the resumed run
         losses = losses or []
-        ponder_controller.load_state_dict(ponder_state)
 
         # a checkpoint from the OTHER phase indexes a different corpus -- see resolve_resume_scope
         # for why that silently trains zero batches if left alone. The token count is deliberately
@@ -679,7 +635,7 @@ def pretrain(phase=None):
         save_checkpoint(
             unwrapped_model, optimizer, scheduler, epoch, dataset_idx, path=path,
             token_count=token_count, global_offset=snapshot_global_offset(), losses=losses,
-            phase=phase, ponder_state=ponder_controller.state_dict(),
+            phase=phase,
         )
         ckpt_lib.write_run_state(run_state_path, phase, token_count, name)
 
@@ -737,7 +693,7 @@ def pretrain(phase=None):
                 # split_batches, which silently corrupts the attention segmentation.
                 document_ids = batch["document_ids"].to(device) if batch["document_ids"] is not None else None
                 # this step's loop depth. Log steps are pinned to the full depth so the recorded
-                # loss curve, per-loop CE and p_halt are always read at the same operating point --
+                # loss curve and per-loop CE are always read at the same operating point --
                 # otherwise `losses` (plotted and checkpointed) would jump whenever a logged step
                 # happened to draw a shallower depth. Costs ~1/LOG_INTERVAL of the sampling rate.
                 is_log_step = step % LOG_INTERVAL == 0
@@ -790,7 +746,6 @@ def pretrain(phase=None):
                     # gathered only on the steps the log block below actually reads them
                     collect_metrics=is_log_step,
                     n_loops=step_n_loops,
-                    lambda_ponder=ponder_controller.lambda_ponder,
                 )
 
 
@@ -845,31 +800,21 @@ def pretrain(phase=None):
                     loop_positions_since_log = 0
                     lm_head_passes_since_log = 0.0
 
-                    # PLAN.md Step 7 instrumentation: loop_scale, halt/correctness/confidence
-                    # signals, and per-loop CE, all through unwrap_model per the training-loop rule.
-                    # loop_scale is per-loop now (one gate per loop), so log the whole vector --
+                    # instrumentation: loop_scale, the p_max/top-1 confidence signals and per-loop
+                    # CE, all through unwrap_model per the training-loop rule.
+                    # loop_scale is per-loop (one gate per loop), so log the whole vector --
                     # "loop 3 grew, loops 1-2 collapsed" is exactly the failure a single mean hides
                     loop_scale_str = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
                     per_loop_ce_str = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
-                    p_halt_mean = metrics["p_halt_mean"].item()
-                    ponder_val = metrics["ponder"].item()
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
                     top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
-
-                    # may move ponder_controller.lambda_ponder in place -- feeds next step's
-                    # train_step call, and the current value is what save_and_sync checkpoints
-                    ramp_complete = n_tokens >= (
-                        TrainingConfig.ponder_warmup_tokens + TrainingConfig.ponder_ramp_tokens
-                    )
-                    ponder_controller.observe(p_halt_mean, n_tokens, ramp_complete=ramp_complete)
 
                     eta_phase = eta_seconds(n_tokens, phase_target, tokens_per_sec)
 
                     logger.info(
                         f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
-                        f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} "
-                        f"(lambda={metrics['lambda_ponder_now']:.2e}, target={ponder_controller.lambda_ponder:.4g}) | "
-                        f"loop_scale: [{loop_scale_str}] | p_halt: {p_halt_mean:.4f} | "
+                        f"Aux Loss: {aux_loss.item():.4f} | "
+                        f"loop_scale: [{loop_scale_str}] | "
                         f"p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
                         f"per-loop CE: [{per_loop_ce_str}] | mean loops: {mean_loops:.2f} | "
                         f"Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "

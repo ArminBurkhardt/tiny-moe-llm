@@ -1,11 +1,11 @@
-"""Regression checks for the code-review fixes.
+"""Regression checks for the loop machinery, in one GPU pass.
 
-Covers, in one pass: the p_halt/ponder loop-axis normalization, the weight-decay param grouping,
-per-loop loop_scale, the sinusoidal loop-index router bias (including running a trained model at a
-loop count it was not trained at), the cheap p_max identity, per-loop CE token subsampling being
-unbiased, the split FLOP components, and the te.Linear LM heads.
+Covers: per-loop ``loop_scale``, the sinusoidal loop-index router bias (including running a model
+at a loop count it was not trained at), the parameter-free convergence exit, the cheap ``p_max``
+identity, per-loop CE token subsampling being unbiased, stochastic loop depth, the weight-decay
+param grouping and its fp32-master mechanism, the split FLOP components, and the te.Linear LM heads.
 
-NOT YET RUN -- written alongside the fixes but never executed. GPU + TE required.
+GPU + TE required.
 """
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -56,23 +56,50 @@ print("[ok] loop router bias: zero-init no-op, distinct per loop, clamps past th
 model.eval()
 with torch.no_grad():
     for n in (1, 2, 3, 5, 8):
-        h, aux, ph, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
-                                return_aux_loss=True, return_hidden=True, n_loops=n)
+        h, aux, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
+                            return_aux_loss=True, return_hidden=True, n_loops=n)
         assert h.shape == (n, B, S, P["hidden_size"]), (n, h.shape)
-        assert ph.shape == (n, B, S), (n, ph.shape)
 print("[ok] n_loops override runs at 1/2/3/5/8 loops with correct shapes")
+
+# --- convergence exit: the parameter-free depth policy that replaced the halt head ---
+with torch.no_grad():
+    # tol=0 can never be satisfied (|dlogp| < 0 is false), so the full depth always runs
+    h_full, _, _ = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
+                         return_aux_loss=True, return_hidden=True, converge_tol=0.0)
+    assert h_full.shape[0] == N_LOOPS, h_full.shape
+    # a huge tol reduces it to "top-1 unchanged", and min_loops is a hard floor either way
+    h_min, _, _ = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
+                        return_aux_loss=True, return_hidden=True,
+                        converge_tol=1e9, min_loops=2)
+    assert 2 <= h_min.shape[0] <= N_LOOPS, h_min.shape
+    # the un-exited prefix must be bit-identical to the full run: exiting changes nothing about
+    # the loops that did run, it only stops adding more
+    assert torch.equal(h_min[0], h_full[0]), "early exit perturbed loop 0"
+print(f"[ok] convergence exit: tol=0 -> {h_full.shape[0]} loops, tol=inf/min_loops=2 -> "
+      f"{h_min.shape[0]} loops, prefix bit-identical")
+
+# an exit_check must never be combined with training or with a KV cache
+try:
+    model.train()
+    model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms, return_hidden=True, converge_tol=0.1)
+    raise SystemExit("converge_tol must be rejected in training mode")
+except AssertionError:
+    pass
+finally:
+    model.eval()
+from modules.model.kv_cache import KVCache
+try:
+    with torch.no_grad():
+        model(input_ids=input_ids[:1, :4], return_hidden=True, converge_tol=0.1,
+              kv_cache=KVCache.for_model(model))
+    raise SystemExit("converge_tol + kv_cache must be rejected")
+except AssertionError:
+    pass
+print("[ok] convergence exit refuses training mode and the KV cache")
 model.train()
 
-# --- p_halt / ponder normalization: the old form was exactly n_loops x too large ---
-h, aux, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
-                            return_aux_loss=True, return_hidden=True)
-valid = (~pad_mask).to(p_halt.dtype)
-old = ((p_halt * valid).sum() / valid.sum().clamp(min=1)).item()
-new = ((p_halt * valid).sum() / (valid.sum().clamp(min=1) * p_halt.size(0))).item()
-true_mean = p_halt.float().mean().item()
-assert abs(new - true_mean) < 2e-2, (new, true_mean)
-assert abs(old / max(new, 1e-9) - N_LOOPS) < 0.05, (old, new)
-print(f"[ok] p_halt mean: fixed={new:.4f} matches true {true_mean:.4f}; old form read {old:.4f} ({old/new:.2f}x)")
+h, aux, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
+                    return_aux_loss=True, return_hidden=True)
 
 # --- p_max via 1/sum(exp(l - l_max)) == fp32 softmax max, without the fp32 copy ---
 hid = torch.randn(300, P["hidden_size"], device=dev, dtype=torch.bfloat16)
@@ -127,8 +154,8 @@ print(f"[ok] loop_ce_weights_for: 3->{loop_ce_weights_for(3)} 2->{[round(w,3) fo
 # a reduced-depth step must produce a finite loss and real gradients end to end
 for n in (1, 2, 3):
     model.zero_grad(set_to_none=True)
-    h_n, aux_n, ph_n, mtp_n = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
-                                    return_aux_loss=True, return_hidden=True, n_loops=n)
+    h_n, aux_n, mtp_n = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms,
+                              return_aux_loss=True, return_hidden=True, n_loops=n)
     loss_n, _ = compute_mtp_loss(h_n, labels, mtp_outputs=mtp_n, lm_head=model.mtp_head.lm_head,
                                  main_lm_head=model.lm_head, pad_mask=pad_mask,
                                  loop_ce_weights=loop_ce_weights_for(n),
@@ -148,8 +175,7 @@ assert groups[0]["weight_decay"] == 0.02 and groups[1]["weight_decay"] == 0.0
 # (see build_param_groups' docstring) -- membership is checked via the pairing, not group identity
 no_decay_ids = {id(bf16_p) for bf16_p, _ in no_decay_master_pairs}
 for name, p in [("moe.loop_scale", model.moe.loop_scale),
-                ("layer_scalar", model.gemma_decoder.layers[0].layer_scalar),
-                ("halt_proj.bias", model.moe.halt_proj.bias)]:
+                ("layer_scalar", model.gemma_decoder.layers[0].layer_scalar)]:
     assert id(p) in no_decay_ids, f"{name} must not be weight-decayed"
 assert id(model.gemma_decoder.embed_tokens.weight) in {id(p) for p in groups[0]["params"]}
 assert sum(len(g["params"]) for g in groups) == len([p for p in model.parameters() if p.requires_grad])
@@ -160,7 +186,7 @@ for bf16_p, master in no_decay_master_pairs:
 print(f"[ok] param groups: {len(groups[0]['params'])} decayed / {len(groups[1]['params'])} undecayed, all covered")
 
 # --- bf16-native AdamW on a no_decay tensor silently discards a steady-state-sized step; the
-# fp32-master mechanism must not (this is the Gate-4 loop_scale/p_halt-frozen bug) ---
+# fp32-master mechanism must not (this is the bug that left loop_scale pinned at its init) ---
 ls = model.moe.loop_scale
 ls_master = dict(no_decay_master_pairs)[ls]
 before = ls.detach().clone()

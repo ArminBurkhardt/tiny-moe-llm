@@ -52,7 +52,7 @@ def main():
 
     tok_before = model.token_count
     with te.autocast(enabled=True, recipe=recipe):
-        logits, aux_loss, p_halt, mtp = model(
+        logits, aux_loss, mtp = model(
             input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
             return_aux_loss=True, return_hidden=True,
         )

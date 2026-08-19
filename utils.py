@@ -63,7 +63,7 @@ def get_hf_token():
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token_count=0,
-                    global_offset=0, losses=None, phase=None, ponder_state=None):
+                    global_offset=0, losses=None, phase=None):
     checkpoint = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -80,10 +80,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token
         # dataloader silently yields zero batches
         "phase": phase,
         "losses": losses,
-        # modules.runtime.ponder.PonderController.state_dict() -- the auto-adjusted lambda_ponder
-        # (plus its EMA/cooldown state) must survive a resume, or every preemption restart would
-        # silently reset it back to config.yaml's static starting value
-        "ponder_state": ponder_state,
     }
     # write-then-rename: a preemption mid-write must not be able to leave a truncated .pt that is
     # also the newest file by mtime. os.replace is atomic on POSIX and on Windows.
@@ -97,6 +93,13 @@ def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token
 
 
 def load_checkpoint(model, optimizer, scheduler, path):
+    """Restore a pretraining run. Returns a 6-tuple; pre-Phase-0 checkpoints returned 7.
+
+    ``strict=True`` is deliberate: a checkpoint written before the halt/correctness heads were
+    deleted still carries ``moe.halt_proj.*`` and ``correct_proj.*``, and silently dropping them
+    would also silently keep a ``loop_scale`` that is ~4x too large for an ungated loop. Run it
+    through ``scripts/migrate_phase0.py`` first -- that is what folds the gate in.
+    """
     checkpoint = torch.load(path)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -112,8 +115,5 @@ def load_checkpoint(model, optimizer, scheduler, path):
     # legacy (pre phase scoping) checkpoints have no phase -- the caller treats None as "same
     # phase as the one being launched", matching the old behaviour
     phase = checkpoint.get("phase", None)
-    # legacy (pre ponder-auto-adjust) checkpoints have no ponder_state -- PonderController.
-    # load_state_dict(None) is a no-op, leaving the caller's config-seeded controller in place
-    ponder_state = checkpoint.get("ponder_state", None)
     logger.info(f"Checkpoint loaded from {path}")
-    return epoch, dataset_idx, token_count, global_offset, losses, phase, ponder_state
+    return epoch, dataset_idx, token_count, global_offset, losses, phase

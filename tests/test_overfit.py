@@ -41,7 +41,7 @@ labels[:, 0] = -100; labels[:, half] = -100  # first token of each doc
 
 first = last = None
 for step in range(150):
-    hidden, aux, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
+    hidden, aux, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
                              return_aux_loss=True, return_hidden=True)
     loss, _ = compute_mtp_loss(hidden, labels, mtp_outputs=mtp, lm_head=model.mtp_head.lm_head,
                             lambda_mtp=0.1, main_lm_head=model.lm_head, pad_mask=pad_mask,

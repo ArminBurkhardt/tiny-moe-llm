@@ -275,16 +275,16 @@ class LoopMixtureOfExperts(nn.Module):
         # LayerScale/ReZero-style gate, ONE ENTRY PER LOOP: each loop learns independently how much
         # refinement it contributes, instead of all n_loops sharing a single scalar.
         #
-        # init 1/sqrt(n_loops), NOT 0 and not 0.1. Two constraints meet here:
-        #   * strictly > 0, because at loop_scale == 0 the CE loss has exactly zero gradient wrt
-        #     p_halt, so the ponder term becomes the halt head's only signal, saturates p_halt at 1,
-        #     and freezes loop_scale in turn -- the loop silently goes dead while the loss still
-        #     descends (tests/test_ponder_deadlock.py).
-        #   * large enough to matter. post_norm makes every delta unit-RMS, so with the old 0.1 the
-        #     n_loops deltas summed to ~sqrt(n_loops)*0.1 ~ 0.17 against a unit-RMS decoder output:
-        #     the entire MoE block (most of the model's parameters) was a ~1.5% perturbation, and a
-        #     lone scalar at lr=4e-4 cannot climb out of that inside a short run. 1/sqrt(n_loops)
-        #     puts the loop stack at ~1.0, i.e. on par with the decoder, from step 0.
+        # This is now the ONLY per-loop gain. It used to be multiplied by a learned per-token
+        # (1 - p_halt) as well; that head saturated and was deleted, with its measured per-loop mean
+        # folded into these values by scripts/migrate_phase0.py -- so a migrated checkpoint's
+        # loop_scale is much smaller than a freshly initialized one and that is correct, not a bug.
+        #
+        # init 1/sqrt(n_loops), NOT 0 and not 0.1: post_norm makes every delta unit-RMS, so with the
+        # old 0.1 the n_loops deltas summed to ~sqrt(n_loops)*0.1 ~ 0.17 against a unit-RMS decoder
+        # output -- the entire MoE block (most of the model's parameters) was a ~1.5% perturbation,
+        # and a lone scalar at lr=4e-4 cannot climb out of that inside a short run. 1/sqrt(n_loops)
+        # puts the loop stack at ~1.0, i.e. on par with the decoder, from step 0.
         # not the same mechanism as gemma4's layer_scalar (init-1 gain on a whole layer output) --
         # that precedent doesn't transfer to this init value.
         # excluded from weight decay by scripts/pretrain.py's param grouping (ndim <= 1): decaying
@@ -312,14 +312,6 @@ class LoopMixtureOfExperts(nn.Module):
         # the un-conditioned router and this cannot perturb the load-balance loss at init.
         self.loop_router_bias = nn.Linear(loop_enc_dim, self.num_experts, bias=False)
         nn.init.zeros_(self.loop_router_bias.weight)
-
-        # soft, differentiable halting gate (PLAN.md Step 3a): a compute-allocation signal
-        # ("is more refinement useful here"), not a correctness signal (see Step 4b's separate
-        # correct_proj). Greedy per-loop, recomputed from the current hidden state each loop --
-        # not cumulative ACT -- so a token can halt at one loop and un-halt at the next.
-        self.halt_proj = nn.Linear(hidden_size, 1, bias=True)
-        nn.init.zeros_(self.halt_proj.weight)
-        nn.init.constant_(self.halt_proj.bias, -2.0)   # p_halt ~ 0.12 at init
 
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
@@ -433,19 +425,15 @@ class LoopMixtureOfExperts(nn.Module):
         )
         output = output + parallel_output
 
-        # p_halt -> 1 means "don't modify me further"; gates how much of this loop's update
-        # actually lands. computed from the incoming hidden state, before the update below.
-        p_halt = torch.sigmoid(self.halt_proj(hidden_states))   # [B, S, 1]
-
         # residual update, not a replacement: a gradient path across loop boundaries that doesn't
         # depend on which expert got routed to. loop_scale is per-loop (see __init__); loop indices
         # past the trained count reuse the last entry so extra inference-time loops keep the final
         # loop's learned gain rather than falling off a table.
         loop_scale = self.loop_scale[min(int(loop_idx), self.loop_scale.numel() - 1)]
         delta = self.dropout(self.post_norm(output))
-        hidden_states = hidden_states + (1.0 - p_halt) * loop_scale * delta
+        hidden_states = hidden_states + loop_scale * delta
 
-        return hidden_states, load_balancing_loss, p_halt
+        return hidden_states, load_balancing_loss
 
 
     def forward(
@@ -459,6 +447,7 @@ class LoopMixtureOfExperts(nn.Module):
         n_loops: int = None,
         kv_cache: list = None,
         position_offset: int = 0,
+        exit_check=None,
     ):
         """
         Args:
@@ -473,14 +462,32 @@ class LoopMixtureOfExperts(nn.Module):
                 Defaults to None (the normal packed/varlen training and full-recompute path).
             position_offset (int, optional): absolute position of ``hidden_states[:, 0]``, only
                 used to slice RoPE when ``kv_cache`` is given. Defaults to 0.
+            exit_check (callable, optional): ``(loop_idx, hidden_states) -> bool``, consulted after
+                each loop; a True return stops the recurrence early. This is the parameter-free
+                depth policy that replaced the deleted halt head -- the caller owns the criterion
+                (``TinyMoETransformer.forward`` supplies a readout-convergence one), so nothing
+                here is learned and nothing can saturate. Never set during training: the returned
+                ``hidden_states_all`` would then be shorter than ``loop_ce_weights``. Defaults to
+                None (always run the full depth).
         """
         n_loops = self.n_loops if n_loops is None else int(n_loops)
         if kv_cache is not None:
             assert len(kv_cache) == n_loops, (
                 f"kv_cache has {len(kv_cache)} loop slots but n_loops={n_loops}"
             )
+        assert not (exit_check is not None and self.training), (
+            "exit_check is inference-only: a short hidden_states_all breaks per-loop CE"
+        )
+        # exiting early would leave loops L+1..n-1 with no K/V entry for this token, so the NEXT
+        # decode step -- which may well run to full depth -- would attend over a cache with a hole
+        # in it and silently produce garbage. Filling those caches cheaply (K/V projections only,
+        # skipping each skipped loop's experts) is real plumbing through every attention expert and
+        # is deliberately not part of this change; until then the two features are exclusive.
+        assert not (exit_check is not None and kv_cache is not None), (
+            "convergence exit and the KV cache are mutually exclusive: an exited loop appends no "
+            "K/V for this token, which corrupts every later step. Run with use_kv_cache=False."
+        )
         total_load_balancing_loss = 0.0
-        p_halt_all = []
         hidden_states_all = []
 
         self.expert_tracker.begin_forward(n_loops)
@@ -491,28 +498,27 @@ class LoopMixtureOfExperts(nn.Module):
         else:
             position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
 
+        loops_run = 0
         for loop in range(n_loops):
             loop_cache = kv_cache[loop] if kv_cache is not None else None
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss, p_halt = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss, p_halt = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache)
             total_load_balancing_loss += load_balancing_loss
-            p_halt_all.append(p_halt)
             hidden_states_all.append(hidden_states)
+            loops_run += 1
+            if exit_check is not None and exit_check(loop, hidden_states):
+                break
 
-        # [n_loops, B, S] -- per-loop, per-token halt probability. stacked, never reduced with
-        # .item() here; the trainer computes the ponder loss and logging means from this.
-        p_halt_all = torch.stack(p_halt_all, dim=0).squeeze(-1)
-
-        # [n_loops, B, S, H] -- per-loop hidden states, so lm_head can be applied at every loop
-        # (PLAN.md Step 4a) instead of only the last one. hidden_states_all[-1] is hidden_states.
+        # [loops_run, B, S, H] -- per-loop hidden states, so lm_head can be applied at every loop
+        # instead of only the last one. hidden_states_all[-1] is hidden_states.
         hidden_states_all = torch.stack(hidden_states_all, dim=0)
 
         if return_loss:
-            return hidden_states, total_load_balancing_loss / n_loops, p_halt_all, hidden_states_all
+            return hidden_states, total_load_balancing_loss / loops_run, hidden_states_all
         else:
-            return hidden_states, p_halt_all, hidden_states_all
+            return hidden_states, hidden_states_all
 
     def set_temperature(self, temperature: float):
         self.temperature = temperature

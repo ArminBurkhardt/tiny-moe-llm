@@ -86,6 +86,8 @@ def stream_generate(
     n_loops: int | None = None,
     num_mtp_tokens: int = 0,
     use_kv_cache: bool = True,
+    converge_tol: float | None = None,
+    min_loops: int = 1,
 ) -> Iterator[str]:
     """Generate tokens one step at a time, yielding the newly decoded text after each step.
 
@@ -101,6 +103,13 @@ def stream_generate(
     greedily accepted with no rejection sampling against the main path -- see CLAUDE.md's MTP
     invariant). 0 disables it; it is a no-op on a checkpoint with no MTP head.
 
+    ``converge_tol`` turns on the parameter-free depth policy: stop looping once the last position's
+    readout stops moving (see ``TinyMoETransformer._convergence_exit``). It **forces the KV cache
+    off** -- an exited loop appends no K/V for that token, so a later full-depth step would attend
+    over a cache with a hole in it. Whether that trade is worth it depends on the checkpoint;
+    ``scripts/eval_calibration.py`` prints the per-transition agreement/log-prob-gap numbers that
+    say what threshold to use and what stopping early costs.
+
     Text is streamed by re-decoding the full generated id sequence each step and yielding only the
     new suffix, rather than decoding each step's tokens in isolation -- a lone step's tokens can
     decode differently out of context (subword/space merges), so this avoids visible artifacts.
@@ -111,10 +120,17 @@ def stream_generate(
     all_ids = torch.tensor([prompt_ids], device=device)
 
     use_mtp = num_mtp_tokens > 0 and model.has_mtp
+    # the two are mutually exclusive at the model level; resolve it here rather than letting the
+    # assertion fire deep inside the loop
+    if converge_tol is not None and use_kv_cache:
+        use_kv_cache = False
     kv_cache = KVCache.for_model(model, n_loops=n_loops) if use_kv_cache else None
 
     def forward_logits(ids: torch.Tensor):
         kwargs = {"n_loops": n_loops}
+        if converge_tol is not None:
+            kwargs["converge_tol"] = converge_tol
+            kwargs["min_loops"] = min_loops
         if kv_cache is not None:
             kwargs["kv_cache"] = kv_cache
         if use_mtp:
@@ -228,7 +244,8 @@ def interactive_loop(model, tokenizer, args, device):
             model, tokenizer, prompt_ids, args.max_new_tokens, args.temperature, args.top_k, device,
             repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
             top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
-            use_kv_cache=not args.no_kv_cache,
+            use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
+            min_loops=args.min_loops,
         ):
             print(chunk, end="", flush=True)
         print("\n")
@@ -321,6 +338,21 @@ def main():
         help="Disable the KV cache and re-run the full prefix every step (slow reference path).",
     )
     parser.add_argument(
+        "--converge-tol",
+        type=float,
+        default=None,
+        help="Stop looping once the last position's readout stops moving: the top-1 token is "
+             "unchanged AND its log-probability moved less than this between consecutive loops. "
+             "Parameter-free, no loss term. Forces the KV cache off (an exited loop stores no K/V "
+             "for that token). Run scripts/eval_calibration.py to pick a value. Default: off.",
+    )
+    parser.add_argument(
+        "--min-loops",
+        type=int,
+        default=1,
+        help="Floor on the loop count when --converge-tol is set (default: 1).",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to run on (default: cuda if available, else cpu)",
@@ -351,7 +383,8 @@ def main():
             model, tokenizer, prompt_ids, args.max_new_tokens, args.temperature, args.top_k, args.device,
             repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
             top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
-            use_kv_cache=not args.no_kv_cache,
+            use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
+            min_loops=args.min_loops,
         ):
             print(chunk, end="", flush=True)
         print()

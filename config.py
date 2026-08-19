@@ -50,30 +50,11 @@ class TrainingConfig:
     seed = int(Config["training"].get("seed", 42))
     data_dir = str(Config["training"].get("data_dir", "data/prepared"))
     phase = str(Config["training"].get("phase", "phase1"))
-    # ponder loss (PLAN.md Step 3b): held at 0 while loop_scale grows, then ramped -- see the
-    # deadlock note on LoopMixtureOfExperts.loop_scale for why the warmup is load-bearing.
-    lambda_ponder = float(Config["training"].get("lambda_ponder", 3e-3))
-    ponder_warmup_tokens = int(Config["training"].get("ponder_warmup_tokens", 1_000_000_000))
-    ponder_ramp_tokens = int(Config["training"].get("ponder_ramp_tokens", 1_000_000_000))
 
-    # runtime auto-adjustment of lambda_ponder (modules/runtime/ponder.PonderController) -- see
-    # the config.yaml comment on lambda_ponder for why a static value tuned at a different
-    # schedule needs a runtime corrective. lambda_ponder above is only the STARTING point once
-    # auto-adjust is on; the live value is checkpointed, not re-read from here on every resume.
-    ponder_auto_adjust = bool(Config["training"].get("ponder_auto_adjust", True))
-    ponder_target_p_halt = float(Config["training"].get("ponder_target_p_halt", 0.30))
-    ponder_p_halt_band = float(Config["training"].get("ponder_p_halt_band", 0.12))
-    ponder_adjust_factor = float(Config["training"].get("ponder_adjust_factor", 1.20))
-    ponder_adjust_cooldown_tokens = int(
-        Config["training"].get("ponder_adjust_cooldown_tokens", 500_000_000)
-    )
-    ponder_lambda_min = float(Config["training"].get("ponder_lambda_min", 0.01))
-    ponder_lambda_max = float(Config["training"].get("ponder_lambda_max", 1.0))
-
-    # per-loop CE supervision (PLAN.md Step 4a): ascending weights, one per loop, so lm_head has
+    # per-loop CE supervision: ascending weights, one per loop, so lm_head has
     # *some* incentive to make intermediate loops' hidden states legible without competing with
-    # the final loop's dominant supervision. Same yaml-block deviation as the ponder knobs above --
-    # consumed directly in compute_mtp_loss's call sites, not passed into the model.
+    # the final loop's dominant supervision. Consumed directly in compute_mtp_loss's call sites,
+    # not passed into the model.
     loop_ce_weights = [float(w) for w in Config["training"]["loop_ce_weights"]]
     assert len(loop_ce_weights) == ModelConfig.Params["n_loops"], (
         f"loop_ce_weights ({loop_ce_weights}) must have exactly one weight per loop "
@@ -88,6 +69,9 @@ class TrainingConfig:
     )
 
     # stochastic loop depth: probability a step runs a reduced loop count (uniform 1..n_loops-1).
+    # this is the whole depth policy during training now that the halt head is gone -- the
+    # inference-time criterion (TinyMoETransformer's converge_tol) is parameter-free and needs
+    # every depth to be a real operating point, which is exactly what this trains.
     # per-loop CE already supervises every prefix depth; this additionally makes the *model* see
     # shallow depths as real inputs to the rest of training, so an inference-time loop-count
     # override lands on a depth the model was actually trained at. 0.0 = always full depth.

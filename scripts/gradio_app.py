@@ -91,7 +91,7 @@ def _seed(seed: int):
 def run_generate(
     prompt, checkpoint_path, tokenizer_dir, device,
     max_new_tokens, temperature, top_k, top_p, repetition_penalty, no_repeat_ngram_size,
-    n_loops, num_mtp_tokens, use_kv_cache, seed,
+    n_loops, num_mtp_tokens, use_kv_cache, converge_tol, min_loops, seed,
 ):
     if not prompt or not prompt.strip():
         yield ""
@@ -105,6 +105,8 @@ def run_generate(
         repetition_penalty=float(repetition_penalty), no_repeat_ngram_size=int(no_repeat_ngram_size),
         top_p=float(top_p), n_loops=(None if int(n_loops) == 0 else int(n_loops)),
         num_mtp_tokens=int(num_mtp_tokens), use_kv_cache=bool(use_kv_cache),
+        converge_tol=(None if float(converge_tol) <= 0 else float(converge_tol)),
+        min_loops=int(min_loops),
     ):
         text += chunk
         yield text
@@ -113,7 +115,7 @@ def run_generate(
 def run_chat(
     message, history, system_prompt, checkpoint_path, tokenizer_dir, device,
     max_new_tokens, temperature, top_k, top_p, repetition_penalty, no_repeat_ngram_size,
-    n_loops, num_mtp_tokens, use_kv_cache, seed,
+    n_loops, num_mtp_tokens, use_kv_cache, converge_tol, min_loops, seed,
 ):
     model, tokenizer = _ensure_loaded(checkpoint_path, tokenizer_dir, device)
     _seed(seed)
@@ -134,6 +136,8 @@ def run_chat(
         repetition_penalty=float(repetition_penalty), no_repeat_ngram_size=int(no_repeat_ngram_size),
         top_p=float(top_p), n_loops=(None if int(n_loops) == 0 else int(n_loops)),
         num_mtp_tokens=int(num_mtp_tokens), use_kv_cache=bool(use_kv_cache),
+        converge_tol=(None if float(converge_tol) <= 0 else float(converge_tol)),
+        min_loops=int(min_loops),
     ):
         partial += chunk
         yield partial
@@ -181,12 +185,20 @@ def build_demo() -> gr.Blocks:
                     label="Self-speculative MTP draft tokens/step (0 = off, greedy & unverified)",
                 )
             with gr.Row():
+                # the parameter-free depth policy that replaced the halt head. >0 forces the KV
+                # cache off, since an exited loop stores no K/V for that token.
+                converge_tol = gr.Slider(
+                    0.0, 2.0, value=0.0, step=0.01,
+                    label="Convergence exit tolerance (0 = off, forces KV cache off)",
+                )
+                min_loops = gr.Slider(1, 8, value=1, step=1, label="Minimum loops before exiting")
+            with gr.Row():
                 use_kv_cache = gr.Checkbox(value=True, label="Use KV cache")
                 seed = gr.Number(value=-1, precision=0, label="Random seed (-1 = random)")
 
         gen_inputs_tail = [
             max_new_tokens, temperature, top_k, top_p, repetition_penalty, no_repeat_ngram,
-            n_loops, num_mtp_tokens, use_kv_cache, seed,
+            n_loops, num_mtp_tokens, use_kv_cache, converge_tol, min_loops, seed,
         ]
 
         with gr.Tabs():

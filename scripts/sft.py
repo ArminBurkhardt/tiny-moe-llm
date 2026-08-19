@@ -12,15 +12,13 @@ part of the checkpoint.
 What it deliberately *reuses* rather than reimplements:
 
   * ``pretrain.train_step`` verbatim. The cheapest way to guarantee every loss term stays
-    *identical* between pretraining and SFT -- per-loop CE weights, aux loss, ponder ramp,
-    loop-count sampling -- is to have exactly one copy of it. Prompt masking needs no changes at all:
+    *identical* between pretraining and SFT -- per-loop CE weights, aux loss, loop-count sampling --
+    is to have exactly one copy of it. Prompt masking needs no changes at all:
     the dataset emits ``-100`` labels over prompt tokens and every loss term already routes through
     ``ignore_index=-100``, including the MTP heads (they read the same ``labels`` tensor).
-  * The model's **global token counter**, continued rather than reset. The ponder ramp and the
-    router-noise anneal are both driven from it, and both are functions that have long since
-    finished at ~30B tokens. Resetting it to zero would silently restart the ponder warmup, i.e.
-    turn the ponder loss off for the whole of SFT and let ``p_halt`` drift wherever CE pushes it.
-    SFT progress is tracked separately as ``token_count - start_token_count``.
+  * The model's **global token counter**, continued rather than reset. The router-noise anneal is
+    driven from it, and it has long since finished at ~30B tokens. SFT progress is tracked
+    separately as ``token_count - start_token_count``.
 
 What is genuinely different:
 
@@ -63,7 +61,6 @@ from modules.model.transformer import TinyMoETransformer
 from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
-from modules.runtime.ponder import PonderController
 from modules.runtime.status import eta_seconds, format_duration, write_status
 from config import ModelConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
@@ -216,7 +213,7 @@ def pull_from_hub(repo_id: str, filename: str, dest_dir: str, token: str = None)
 
 
 def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token_count,
-                        start_token_count, global_offset, losses, ponder_state, seed):
+                        start_token_count, global_offset, losses, seed):
     """Write an SFT checkpoint atomically.
 
     Deliberately its own function rather than an extension of ``utils.save_checkpoint``: SFT needs
@@ -239,7 +236,6 @@ def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token
         "global_offset": global_offset,
         "phase": SFT_PHASE,
         "losses": losses,
-        "ponder_state": ponder_state,
         # SFT-only extras, ignored by utils.load_checkpoint's .get()-based reader
         "sft": {"start_token_count": start_token_count, "seed": seed},
     }
@@ -283,7 +279,6 @@ def load_sft_checkpoint(model, optimizer, scheduler, path):
         "start_token_count": sft_extra.get("start_token_count", checkpoint.get("token_count", 0)),
         "global_offset": checkpoint.get("global_offset", 0),
         "losses": checkpoint.get("losses", None) or [],
-        "ponder_state": checkpoint.get("ponder_state", None),
         "seed": sft_extra.get("seed", SFTConfig.seed),
     }
 
@@ -296,18 +291,16 @@ def load_pretrained_weights(model, path: str):
     first few hundred steps unwinding momentum that no longer describes the loss surface.
 
     Returns:
-        ``(token_count, ponder_state)``. The token count is carried forward on purpose -- see this
-        module's docstring for why resetting it would silently disable the ponder loss.
+        The pretraining token count, carried forward on purpose -- see this module's docstring.
     """
     checkpoint = torch.load(path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
     token_count = checkpoint.get("token_count", 0)
-    ponder_state = checkpoint.get("ponder_state", None)
     logger.info(
         f"Initialized from pretrained checkpoint {os.path.basename(path)} "
         f"({token_count / 1e9:.3f}B pretraining tokens, phase={checkpoint.get('phase')})"
     )
-    return token_count, ponder_state
+    return token_count
 
 
 @torch.no_grad()
@@ -323,12 +316,13 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     """
     was_training = model.training
     model.eval()
-    # the eval forwards would otherwise inflate the trained-token counter, which drives the ponder
-    # ramp, the checkpoint cadence and the reported progress (same guard as pretrain.dry_run)
+    # the eval forwards would otherwise inflate the trained-token counter, which drives the
+    # router-noise anneal, the checkpoint cadence and the reported progress (same guard as
+    # pretrain.dry_run)
     token_count_before = model._token_tracker.num_tokens
 
     ce_sum, token_sum = 0.0, 0
-    signal_sums = {"p_max": 0.0, "top1_acc": 0.0, "p_halt": 0.0}
+    signal_sums = {"p_max": 0.0, "top1_acc": 0.0}
     n_batches = 0
 
     for batch in dataset:
@@ -345,8 +339,8 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 return_aux_loss=True, return_hidden=True,
             )
-            hidden, p_halt = out[0], out[2]
-            extra_token_outputs = out[3] if model.has_mtp else None
+            hidden = out[0]
+            extra_token_outputs = out[2] if model.has_mtp else None
             _, loss_ce, metrics = compute_mtp_loss(
                 hidden, labels,
                 mtp_outputs=extra_token_outputs,
@@ -369,11 +363,6 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
         for key in ("p_max", "top1_acc"):
             value = metrics.get(key)
             signal_sums[key] += (value.item() if value is not None else float("nan")) * n_supervised
-        valid = (~pad_mask).to(p_halt.dtype)
-        signal_sums["p_halt"] += (
-            ((p_halt * valid).sum() / (valid.sum().clamp(min=1) * p_halt.size(0))).item()
-            * n_supervised
-        )
         n_batches += 1
 
     model._token_tracker.num_tokens = token_count_before
@@ -442,17 +431,6 @@ def sft(args):
     optimizer = optim.AdamW(param_groups, lr=SFTConfig.lr)
     scheduler = build_sft_scheduler(optimizer, total_steps)
 
-    ponder_controller = PonderController(
-        TrainingConfig.lambda_ponder,
-        target=TrainingConfig.ponder_target_p_halt,
-        band=TrainingConfig.ponder_p_halt_band,
-        factor=TrainingConfig.ponder_adjust_factor,
-        cooldown_tokens=TrainingConfig.ponder_adjust_cooldown_tokens,
-        lambda_min=TrainingConfig.ponder_lambda_min,
-        lambda_max=TrainingConfig.ponder_lambda_max,
-        enabled=TrainingConfig.ponder_auto_adjust,
-    )
-
     os.makedirs(SFT_CHECKPOINT_DIR, exist_ok=True)
     ckpt_lib.cleanup_stale_files(SFT_CHECKPOINT_DIR)
     run_state_path = os.path.join(SFT_CHECKPOINT_DIR, "run_state.json")
@@ -472,7 +450,6 @@ def sft(args):
         start_token_count = state["start_token_count"]
         start_doc_idx = state["global_offset"]
         losses = state["losses"]
-        ponder_controller.load_state_dict(state["ponder_state"])
         if state["seed"] != SFTConfig.seed:
             # the resume position indexes into a permutation generated from the seed; reading it
             # back under a different seed silently reshuffles which conversations were "already
@@ -509,9 +486,8 @@ def sft(args):
                 "no SFT checkpoint to resume and no pretrained checkpoint given -- pass "
                 "--from-hub, or -c <path to checkpoint_phase2_final.pt>"
             )
-        start_token_count, ponder_state = load_pretrained_weights(model, init_path)
+        start_token_count = load_pretrained_weights(model, init_path)
         token_count = start_token_count
-        ponder_controller.load_state_dict(ponder_state)
         model._token_tracker.num_tokens = token_count
 
     # the masters were cloned from the random init at optimizer-construction time, before either
@@ -572,7 +548,7 @@ def sft(args):
             unwrapped_model, optimizer, scheduler, path,
             epoch=epoch, step=step, token_count=tokens, start_token_count=start_token_count,
             global_offset=snapshot_global_offset(start_doc_idx), losses=losses,
-            ponder_state=ponder_controller.state_dict(), seed=SFTConfig.seed,
+            seed=SFTConfig.seed,
         )
         ckpt_lib.write_run_state(run_state_path, SFT_PHASE, tokens, name)
         try:
@@ -605,7 +581,6 @@ def sft(args):
         logger.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
             f"p_max: {stats['p_max']:.4f} | top1_acc: {stats['top1_acc']:.4f} | "
-            f"p_halt: {stats['p_halt']:.4f} | "
             f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches"
         )
 
@@ -658,7 +633,6 @@ def sft(args):
                     no_decay_master_pairs=master_pairs,
                     collect_metrics=is_log_step,
                     n_loops=step_n_loops,
-                    lambda_ponder=ponder_controller.lambda_ponder,
                 )
 
                 if not is_log_step:
@@ -682,8 +656,6 @@ def sft(args):
 
                 per_loop_ce = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                 loop_scale = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
-                p_halt_mean = metrics["p_halt_mean"].item()
-                ponder_controller.observe(p_halt_mean, token_count, ramp_complete=True)
 
                 def _metric(key):
                     value = metrics.get(key)
@@ -692,9 +664,7 @@ def sft(args):
                 eta = eta_seconds(sft_tokens, target_tokens or 0, tokens_per_sec) if target_tokens else None
                 logger.info(
                     f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
-                    f"Aux: {aux_loss.item():.4f} | Ponder: {metrics['ponder'].item():.4f} "
-                    f"(lambda={metrics['lambda_ponder_now']:.2e}) | "
-                    f"loop_scale: [{loop_scale}] | p_halt: {p_halt_mean:.4f} | "
+                    f"Aux: {aux_loss.item():.4f} | loop_scale: [{loop_scale}] | "
                     f"p_max: {_metric('p_max'):.4f} | top1_acc: {_metric('top1_acc'):.4f} | "
                     f"per-loop CE: [{per_loop_ce}] | "
                     f"LR: {scheduler.get_last_lr()[0]:.3e} | SFT tokens: {sft_tokens / 1e6:.2f}M | "

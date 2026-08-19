@@ -57,7 +57,7 @@ torch.cuda.reset_peak_memory_stats()
 # reads out lower CE than loop 2) even though nothing is broken. At the lr above the ordering is
 # stable across steps 10..26 and 3 seeds, so 18 is a mid-window choice, not a knife-edge one.
 for step in range(18):
-    hidden, aux, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
+    hidden, aux, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
                              return_aux_loss=True, return_hidden=True)
     loss, loss_ce = compute_mtp_loss(hidden, labels, mtp_outputs=mtp, lm_head=model.mtp_head.lm_head,
                             lambda_mtp=0.1, main_lm_head=model.lm_head, pad_mask=pad_mask,
@@ -77,7 +77,7 @@ print(f"peak memory during training: {peak_gb:.3f} GB")
 # criterion cares about, not just the scalar training loss.
 model.eval()
 with torch.no_grad():
-    hidden, aux, p_halt, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
+    hidden, aux, mtp = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
                              return_aux_loss=True, return_hidden=True)
     main_labels = labels[:, 1:].contiguous().view(-1)
     per_loop_ce = []

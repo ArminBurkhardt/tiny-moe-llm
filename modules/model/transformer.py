@@ -266,6 +266,45 @@ class TinyMoETransformer(nn.Module):
         moe_embeds = self.moe_embed_proj(moe_embeds)
         return moe_embeds
     
+    def _convergence_exit(self, tol: float, min_loops: int):
+        """Build an ``exit_check`` that stops looping once the READOUT stops moving.
+
+        The parameter-free replacement for the deleted halt head. Two things make it work where a
+        learned gate did not: it has no parameters to saturate, and it is measured in the *readout*
+        rather than in ``||dh||``. That distinction is load-bearing -- a migrated checkpoint's
+        ``loop_scale`` still injects a sizeable hidden-state delta on the last loop while the
+        predicted distribution is already stationary, so a hidden-state criterion would never fire.
+
+        Evaluated at the **last position only**: one token x vocab, which is free next to a loop of
+        the MoE block, and the only position generation actually reads.
+
+        Args:
+            tol: stop when the top-1's log-probability moves less than this between consecutive
+                loops AND the top-1 token itself is unchanged. ``scripts/eval_calibration.py``
+                prints both quantities per transition, which is how this gets picked.
+            min_loops: never exit before this many loops have run (1-indexed count).
+
+        Returns:
+            A callable suitable for ``LoopMixtureOfExperts.forward``'s ``exit_check``.
+        """
+        state = {"token": None, "logprob": None}
+
+        def check(loop_idx: int, hidden_states: torch.Tensor) -> bool:
+            # [B, 1, H] -> [B, vocab]; self.norm because lm_head only ever reads normed states
+            logits = self.lm_head(self.norm(hidden_states[:, -1:, :])).squeeze(1).float()
+            logprobs = logits.log_softmax(-1)
+            token = logprobs.argmax(-1)
+            logprob = logprobs.gather(-1, token.unsqueeze(-1)).squeeze(-1)
+            prev_token, prev_logprob = state["token"], state["logprob"]
+            state["token"], state["logprob"] = token, logprob
+            if prev_token is None or (loop_idx + 1) < min_loops:
+                return False
+            same = bool((token == prev_token).all())
+            settled = bool(((logprob - prev_logprob).abs() < tol).all())
+            return same and settled
+
+        return check
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -275,6 +314,8 @@ class TinyMoETransformer(nn.Module):
         return_hidden=False,
         n_loops: int = None,
         kv_cache=None,
+        converge_tol: float = None,
+        min_loops: int = 1,
     ):
         """forward pass of the model
 
@@ -296,17 +337,19 @@ class TinyMoETransformer(nn.Module):
                 None (single unpacked sequence) and ``n_loops`` must match the value the cache was
                 built with. Inference/generation only -- never set during training. Defaults to
                 None.
+            converge_tol (float, optional): enable the parameter-free convergence exit at this
+                tolerance (see ``_convergence_exit``). Inference only, and mutually exclusive with
+                ``kv_cache``. Defaults to None (always run the full depth).
+            min_loops (int, optional): floor on the loop count when ``converge_tol`` is set.
+                Defaults to 1.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
                 is True, returns the post-norm hidden states for every loop instead, shape
-                [n_loops, batch_size, seq_len, hidden_size] (PLAN.md Step 4a) -- index [-1] is the
-                final loop, matching the pre-Step-4a single-loop shape.
+                [loops_run, batch_size, seq_len, hidden_size] -- index [-1] is the final loop, and
+                ``loops_run`` is below ``n_loops`` only when ``converge_tol`` fired.
 
             float (optional): auxiliary loss from MoE routing, returned if return_aux_loss is True
-
-            p_halt (optional): [n_loops, batch_size, seq_len] per-loop halt probability from the
-                MoE halt head, returned if return_aux_loss is True
 
             extra_token_outputs (optional): if MTP is enabled returns either the hidden states for the extra tokens (if delayed_mtp_loss is True) or the logits for the extra tokens (if delayed_mtp_loss is False)
 
@@ -316,10 +359,11 @@ class TinyMoETransformer(nn.Module):
         """
         self._token_tracker.count_tokens(input_ids)
         if self.training and self.use_checkpointing:
+            assert converge_tol is None, "converge_tol is inference-only"
             x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
-            _, aux_loss, p_halt, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, use_reentrant=False)
-            # final RMSNorm applied at every loop, not just the last (PLAN.md Step 4a) -- lm_head
-            # reads self.norm(x), never the raw residual stream, so per-loop CE needs this too.
+            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, use_reentrant=False)
+            # final RMSNorm applied at every loop, not just the last -- lm_head reads self.norm(x),
+            # never the raw residual stream, so per-loop CE needs this too.
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
@@ -329,16 +373,17 @@ class TinyMoETransformer(nn.Module):
             position_offset = kv_cache.length if kv_cache is not None else 0
             decoder_cache = kv_cache.decoder if kv_cache is not None else None
             moe_cache = kv_cache.moe if kv_cache is not None else None
+            exit_check = None if converge_tol is None else self._convergence_exit(converge_tol, min_loops)
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
-            _, aux_loss, p_halt, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset)
+            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)
             x = x_all if return_hidden else self.lm_head(x)
 
         if extra_token_outputs is not None:
-            return (x, aux_loss, p_halt, extra_token_outputs) if return_aux_loss else (x, extra_token_outputs)
-        return (x, aux_loss, p_halt) if return_aux_loss else x
+            return (x, aux_loss, extra_token_outputs) if return_aux_loss else (x, extra_token_outputs)
+        return (x, aux_loss) if return_aux_loss else x
 
 
     def set_checkpointing(self, use_checkpointing: bool, use_sub_checkpointing: bool = None):
