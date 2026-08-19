@@ -11,10 +11,9 @@ part of the checkpoint.
 
 What it deliberately *reuses* rather than reimplements:
 
-  * ``pretrain.train_step`` verbatim. PLAN.md Step 12 says to keep ``p_halt``/``p_correct``
-    supervision active during SFT ("still free"), and the cheapest way to guarantee it stays
-    *identical* -- per-loop CE weights, aux loss, ponder ramp, correctness-head BCE, loop-count
-    sampling -- is to have exactly one copy of it. Prompt masking needs no changes there at all:
+  * ``pretrain.train_step`` verbatim. The cheapest way to guarantee every loss term stays
+    *identical* between pretraining and SFT -- per-loop CE weights, aux loss, ponder ramp,
+    loop-count sampling -- is to have exactly one copy of it. Prompt masking needs no changes at all:
     the dataset emits ``-100`` labels over prompt tokens and every loss term already routes through
     ``ignore_index=-100``, including the MTP heads (they read the same ``labels`` tensor).
   * The model's **global token counter**, continued rather than reset. The ponder ramp and the
@@ -30,7 +29,7 @@ What is genuinely different:
     refinement.
   * **A masked, shuffled, non-splitting dataset** (``modules/data/sft_dataset.py``).
   * **A validation pass** on ``sft_val`` at checkpoint cadence, reporting the calibration signals
-    (``p_correct``/``p_max``/top-1) that Step 12's acceptance criterion is about.
+    (``p_max``/top-1) the abstention acceptance criterion is about.
 
 Run from the repo root:
 
@@ -315,10 +314,9 @@ def load_pretrained_weights(model, path: str):
 def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_batches: int):
     """Validation pass over ``sft_val``: CE on supervised tokens plus the calibration signals.
 
-    Reports ``p_correct``/``p_max``/top-1 accuracy because Step 12's acceptance criterion is about
-    the abstention signal's calibration, not about val loss -- and because ``p_correct`` tracking
-    ``p_max`` exactly is the "head learned nothing" symptom in PLAN.md's monitoring table, which is
-    much easier to catch on a fixed held-out slice than in the noisy training log.
+    Reports ``p_max``/top-1 accuracy because the acceptance criterion is about the abstention
+    signal's calibration, not about val loss, and a fixed held-out slice shows drift in it far
+    earlier than the noisy training log does.
 
     Runs at the full configured loop depth (no ``n_loops`` override, no loop-count sampling) and
     with subsampling off, so successive eval numbers are read at one fixed operating point.
@@ -330,7 +328,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     token_count_before = model._token_tracker.num_tokens
 
     ce_sum, token_sum = 0.0, 0
-    signal_sums = {"p_correct": 0.0, "p_max": 0.0, "top1_acc": 0.0, "p_halt": 0.0}
+    signal_sums = {"p_max": 0.0, "top1_acc": 0.0, "p_halt": 0.0}
     n_batches = 0
 
     for batch in dataset:
@@ -358,8 +356,6 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 pad_mask=pad_mask,
                 loop_ce_weights=TrainingConfig.loop_ce_weights,
                 loop_ce_subsample=1.0,
-                correct_proj=model.correct_proj,
-                lambda_conf=TrainingConfig.lambda_conf,
                 return_metrics=True,
             )
 
@@ -370,7 +366,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
             continue
         ce_sum += loss_ce.item() * n_supervised
         token_sum += n_supervised
-        for key in ("p_correct", "p_max", "top1_acc"):
+        for key in ("p_max", "top1_acc"):
             value = metrics.get(key)
             signal_sums[key] += (value.item() if value is not None else float("nan")) * n_supervised
         valid = (~pad_mask).to(p_halt.dtype)
@@ -608,8 +604,8 @@ def sft(args):
             return
         logger.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
-            f"p_correct: {stats['p_correct']:.4f} | p_max: {stats['p_max']:.4f} | "
-            f"top1_acc: {stats['top1_acc']:.4f} | p_halt: {stats['p_halt']:.4f} | "
+            f"p_max: {stats['p_max']:.4f} | top1_acc: {stats['top1_acc']:.4f} | "
+            f"p_halt: {stats['p_halt']:.4f} | "
             f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches"
         )
 
@@ -697,10 +693,10 @@ def sft(args):
                 logger.info(
                     f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
                     f"Aux: {aux_loss.item():.4f} | Ponder: {metrics['ponder'].item():.4f} "
-                    f"(lambda={metrics['lambda_ponder_now']:.2e}) | Conf: {_metric('conf_loss'):.4f} | "
+                    f"(lambda={metrics['lambda_ponder_now']:.2e}) | "
                     f"loop_scale: [{loop_scale}] | p_halt: {p_halt_mean:.4f} | "
-                    f"p_correct: {_metric('p_correct'):.4f} | p_max: {_metric('p_max'):.4f} | "
-                    f"top1_acc: {_metric('top1_acc'):.4f} | per-loop CE: [{per_loop_ce}] | "
+                    f"p_max: {_metric('p_max'):.4f} | top1_acc: {_metric('top1_acc'):.4f} | "
+                    f"per-loop CE: [{per_loop_ce}] | "
                     f"LR: {scheduler.get_last_lr()[0]:.3e} | SFT tokens: {sft_tokens / 1e6:.2f}M | "
                     f"Tokens/sec: {tokens_per_sec:.0f} | "
                     f"Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | "

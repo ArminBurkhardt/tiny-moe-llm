@@ -1,6 +1,6 @@
-"""Step 12's acceptance metric: SQuAD v2 abstention precision/recall + calibration (PLAN.md).
+"""The abstention acceptance metric: SQuAD v2 abstention precision/recall + calibration.
 
-PLAN.md Step 12 accepts on two numbers:
+Two numbers decide it:
 
   * **abstention precision and recall on the unanswerable split**, both reported. Measured by
     actually *generating* an answer for every held-out question and classifying it with
@@ -16,7 +16,7 @@ exclusion exists for this script.
 Two calibration passes, because "the abstention signal" means two different things depending on
 what you are willing to spend:
 
-  * **answer-level** (from the generation pass, free): confidence averaged over the tokens the
+  * **answer-level** (from the generation pass, free): ``p_max`` averaged over the tokens the
     model actually generated, scored against whether the generated answer was right. This is the
     number that matches the user-facing claim -- "when it says it knows, does it?"
   * **token-level, teacher-forced** (``--baseline-checkpoint``): the same per-token quantity
@@ -31,10 +31,12 @@ what you are willing to spend:
 Both ECE and AUROC come from ``scripts.eval_calibration`` by import, so Gate 5's numbers and these
 are computed by the same code.
 
-Generation has no KV cache (same limitation as ``scripts/inference.py``): every decode step re-runs
-the full prefix, so cost is quadratic in the answer length. It is tolerable here because SQuAD
-answers are short -- ``--max-new-tokens`` defaults to 32 -- and because prompts are length-sorted
-into batches so padding stays small. Use ``--max-examples`` to trade precision for time.
+Generation here has no KV cache, unlike ``scripts/inference.py``: ``modules/model/kv_cache.py`` is
+single-sequence, and this script's whole point is batched decoding over left-padded, varlen-segmented
+rows. So every decode step re-runs the full prefix and cost is quadratic in the answer length. It is
+tolerable because SQuAD answers are short -- ``--max-new-tokens`` defaults to 32 -- and because
+prompts are length-sorted into batches so padding stays small. Use ``--max-examples`` to trade
+precision for time.
 
 **Results are not bit-reproducible across a change of ``--batch-size``**, and that is the model, not
 this script. Left padding is genuinely invisible to the real tokens -- the dense decoder's output for
@@ -286,9 +288,9 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
     bit-exact through the MoE -- see this module's docstring on ``m_splits``.
 
     Returns:
-        ``(texts, p_correct_mean, p_max_mean, n_generated)`` -- the decoded completions plus, per
-        row, the confidence signals averaged over the tokens actually generated (the terminating EOS
-        included; padding after a finished row excluded).
+        ``(texts, p_max_mean, n_generated)`` -- the decoded completions plus, per row, ``p_max``
+        averaged over the tokens actually generated (the terminating EOS included; padding after a
+        finished row excluded).
     """
     batch = len(prompt_ids)
     width = max(len(p) for p in prompt_ids)
@@ -300,7 +302,6 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
 
     finished = torch.zeros(batch, dtype=torch.bool, device=device)
     generated = [[] for _ in range(batch)]
-    p_correct_sum = torch.zeros(batch, dtype=torch.float32, device=device)
     p_max_sum = torch.zeros(batch, dtype=torch.float32, device=device)
     counts = torch.zeros(batch, dtype=torch.float32, device=device)
 
@@ -312,7 +313,6 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
         logits = model.lm_head(h_last).float()          # [B, vocab] -- one position, not the row
 
         live = (~finished).float()
-        p_correct_sum += torch.sigmoid(model.correct_proj(h_last).float().squeeze(-1)) * live
         p_max_sum += logits.softmax(-1).max(-1).values * live
         counts += live
 
@@ -341,17 +341,12 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
         doc = torch.cat([doc, torch.ones_like(next_token)], dim=-1)
 
     denominator = counts.clamp(min=1.0)
-    return (
-        generated,
-        (p_correct_sum / denominator).cpu().numpy(),
-        (p_max_sum / denominator).cpu().numpy(),
-        counts.cpu().numpy(),
-    )
+    return generated, (p_max_sum / denominator).cpu().numpy(), counts.cpu().numpy()
 
 
 def run_generation(model, tokenizer, template: ChatTemplate, records: List[dict], *, batch_size: int,
                    max_new_tokens: int, temperature: float, top_k: int, device: str) -> None:
-    """Fill in ``completion``/``p_correct``/``p_max`` on every record, in place.
+    """Fill in ``completion``/``p_max`` on every record, in place.
 
     Records are length-sorted into batches (and restored to their original order by writing back
     through the record objects): padding is what a batched, cache-free decoder wastes most compute
@@ -362,15 +357,14 @@ def run_generation(model, tokenizer, template: ChatTemplate, records: List[dict]
     done = 0
     for start in range(0, len(order), batch_size):
         chunk = [records[i] for i in order[start:start + batch_size]]
-        texts, p_correct, p_max, counts = generate_batch(
+        texts, p_max, counts = generate_batch(
             model, [r["prompt_ids"] for r in chunk],
             max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k,
             eos_id=template.eos_id, pad_id=tokenizer.pad_token_id, device=device,
             max_seq_len=max_seq_len,
         )
-        for record, token_ids, pc, pm, n in zip(chunk, texts, p_correct, p_max, counts):
+        for record, token_ids, pm, n in zip(chunk, texts, p_max, counts):
             record["completion"] = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
-            record["p_correct"] = float(pc)
             record["p_max"] = float(pm)
             record["n_generated"] = int(n)
         done += len(chunk)
@@ -387,14 +381,13 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
                                n_bins: int = 15) -> dict:
     """Per-token CE and confidence over the reference answers, forced.
 
-    This is ``scripts/eval_calibration.py``'s measurement (same ECE/AUROC functions, same
-    ``p_correct`` vs ``p_max`` pairing) restricted to the supervised tokens of these SQuAD prompts,
-    which is what makes it comparable across two checkpoints that cannot both be *generated* from.
-    Unanswerable rows are forced onto the same fixed abstention phrasing the SFT corpus used, so
-    "was the model confident about the abstention" is part of the number rather than excluded from
-    it.
+    This is ``scripts/eval_calibration.py``'s measurement (same ECE/AUROC functions, same ``p_max``
+    signal) restricted to the supervised tokens of these SQuAD prompts, which is what makes it
+    comparable across two checkpoints that cannot both be *generated* from. Unanswerable rows are
+    forced onto the same fixed abstention phrasing the SFT corpus used, so "was the model confident
+    about the abstention" is part of the number rather than excluded from it.
     """
-    p_correct_parts, p_max_parts, is_correct_parts = [], [], []
+    p_max_parts, is_correct_parts = [], []
     ce_sum, n_tokens = 0.0, 0
 
     order = sorted(range(len(records)), key=lambda i: len(records[i]["forced_ids"]))
@@ -430,14 +423,11 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
             n_tokens += int(valid.sum().item())
             is_correct = (logits.argmax(-1) == t_part).float()
             p_max = logits.softmax(-1).max(-1).values
-            p_correct = torch.sigmoid(model.correct_proj(h_part).float().squeeze(-1))
-            p_correct_parts.append(p_correct[valid].cpu().numpy())
             p_max_parts.append(p_max[valid].cpu().numpy())
             is_correct_parts.append(is_correct[valid].cpu().numpy())
 
     if n_tokens == 0:
         return {}
-    p_correct_all = np.concatenate(p_correct_parts)
     p_max_all = np.concatenate(p_max_parts)
     is_correct_all = np.concatenate(is_correct_parts)
     return {
@@ -445,11 +435,8 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
         "ce": ce_sum / n_tokens,
         "ppl": math.exp(min(ce_sum / n_tokens, 20.0)),
         "top1_acc": float(is_correct_all.mean()),
-        "ece_p_correct": expected_calibration_error(p_correct_all, is_correct_all, n_bins),
         "ece_p_max": expected_calibration_error(p_max_all, is_correct_all, n_bins),
-        "auroc_p_correct": roc_auc(p_correct_all, is_correct_all),
         "auroc_p_max": roc_auc(p_max_all, is_correct_all),
-        "mean_p_correct": float(p_correct_all.mean()),
         "mean_p_max": float(p_max_all.mean()),
     }
 
@@ -525,13 +512,12 @@ def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: 
     em = np.array([r["em"] for r in records], dtype=np.float64)
     f1 = np.array([r["f1"] for r in records], dtype=np.float64)
     is_correct = np.array([r["is_correct"] for r in records], dtype=np.float64)
-    p_correct = np.array([r["p_correct"] for r in records], dtype=np.float64)
     p_max = np.array([r["p_max"] for r in records], dtype=np.float64)
 
     scores = abstention_scores(abstained, unanswerable)
     answerable = ~unanswerable
 
-    print("\n=== SQuAD v2 validation, generated answers (PLAN.md Step 12 acceptance) ===")
+    print("\n=== SQuAD v2 validation, generated answers ===")
     print(f"  questions: {len(records):,}  ({int(unanswerable.sum()):,} unanswerable, "
           f"{int(answerable.sum()):,} answerable)")
     print(f"  abstention precision: {scores['precision']:.4f}   "
@@ -550,32 +536,27 @@ def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: 
         print("  no answerable questions in this sample")
     print(f"  overall correctness (EM on answerable, abstention on unanswerable): {is_correct.mean():.4f}")
 
-    print("\n=== Answer-level calibration (confidence over generated tokens) ===")
+    print("\n=== Answer-level calibration (p_max over generated tokens) ===")
     print(f"  {'signal':<10} {'mean':>8} {'ECE':>8} {'AUROC':>8}")
-    for name, signal in (("p_correct", p_correct), ("p_max", p_max)):
-        ece = expected_calibration_error(signal, is_correct, n_bins)
-        auroc = roc_auc(signal, is_correct)
-        print(f"  {name:<10} {signal.mean():>8.4f} {ece:>8.4f} {auroc:>8.4f}")
+    ece = expected_calibration_error(p_max, is_correct, n_bins)
+    print(f"  {'p_max':<10} {p_max.mean():>8.4f} {ece:>8.4f} {roc_auc(p_max, is_correct):>8.4f}")
     # the literal "abstention signal": does low confidence predict that the question is unanswerable
-    print(f"  AUROC of (1 - p_correct) for detecting unanswerable: "
-          f"{roc_auc(-p_correct, unanswerable.astype(np.float64)):.4f}")
-    print(f"  AUROC of (1 - p_max)     for detecting unanswerable: "
+    print(f"  AUROC of (1 - p_max) for detecting unanswerable: "
           f"{roc_auc(-p_max, unanswerable.astype(np.float64)):.4f}")
 
     if not forced:
         return
     print("\n=== Token-level calibration, teacher-forced on the same prompts ===")
     print("  (the quantity scripts/eval_calibration.py reports, restricted to these supervised tokens)")
-    header = f"  {'checkpoint':<12} {'CE':>8} {'top-1':>8} {'ECE(pc)':>9} {'ECE(pmax)':>10} {'AUROC(pc)':>10}"
+    header = f"  {'checkpoint':<12} {'CE':>8} {'top-1':>8} {'ECE(pmax)':>10} {'AUROC(pmax)':>12}"
     print(header)
     print(f"  {'sft':<12} {forced['ce']:>8.4f} {forced['top1_acc']:>8.4f} "
-          f"{forced['ece_p_correct']:>9.4f} {forced['ece_p_max']:>10.4f} {forced['auroc_p_correct']:>10.4f}")
+          f"{forced['ece_p_max']:>10.4f} {forced['auroc_p_max']:>12.4f}")
     if baseline:
         print(f"  {'pretrained':<12} {baseline['ce']:>8.4f} {baseline['top1_acc']:>8.4f} "
-              f"{baseline['ece_p_correct']:>9.4f} {baseline['ece_p_max']:>10.4f} "
-              f"{baseline['auroc_p_correct']:>10.4f}")
-        delta = forced["ece_p_correct"] - baseline["ece_p_correct"]
-        print(f"\n  ECE(p_correct) change vs pretrained: {delta:+.4f} "
+              f"{baseline['ece_p_max']:>10.4f} {baseline['auroc_p_max']:>12.4f}")
+        delta = forced["ece_p_max"] - baseline["ece_p_max"]
+        print(f"\n  ECE(p_max) change vs pretrained: {delta:+.4f} "
               f"({'PASS -- no degradation' if delta <= 0 else 'FAIL -- calibration degraded'})")
         print("  Caveat: the pretrained checkpoint never saw the chat control tokens, so it is out of")
         print("  distribution on these inputs. Read a PASS here as weak evidence and a FAIL as strong.")
@@ -585,7 +566,7 @@ def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="PLAN.md Step 12 acceptance -- SQuAD v2 abstention precision/recall + calibration")
+        description="SQuAD v2 abstention precision/recall + calibration")
     parser.add_argument("--checkpoint", "-c", default=find_latest_checkpoint(SFT_CHECKPOINT_DIR),
                         help="SFT checkpoint to evaluate (default: newest in ckpts/sft)")
     parser.add_argument("--baseline-checkpoint", default=None,

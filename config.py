@@ -96,11 +96,6 @@ class TrainingConfig:
         f"loop_count_sampling ({loop_count_sampling}) must be in [0, 1]"
     )
 
-    # correctness head (PLAN.md Step 4b): weight on the correct_proj BCE loss, final loop only.
-    # same yaml-block deviation as the ponder/loop_ce knobs above -- consumed directly in
-    # compute_mtp_loss's call sites, not passed into the model.
-    lambda_conf = float(Config["training"].get("lambda_conf", 0.05))
-
     # checkpoint lifecycle for the unattended run
     checkpoint_every_tokens = int(Config["training"].get("checkpoint_every_tokens", 400_000_000))
     keep_local_checkpoints = int(Config["training"].get("keep_local_checkpoints", 2))
@@ -139,14 +134,13 @@ class TrainingConfig:
 
 
 class SFTConfig:
-    """Supervised fine-tuning knobs (PLAN.md Step 12), read from config.yaml's ``sft:`` block.
+    """Supervised fine-tuning knobs, read from config.yaml's ``sft:`` block.
 
     Only the things SFT genuinely does differently live here. Every loss weight -- lambda_mtp,
-    aux_loss_weight, loop_ce_weights/loop_ce_subsample, loop_count_sampling, lambda_conf and the
-    whole ponder family -- is read from ``TrainingConfig`` by ``scripts/pretrain.train_step``,
-    which ``scripts/sft.py`` reuses unchanged. That reuse is the point: PLAN.md Step 12 wants
-    ``p_halt``/``p_correct`` supervision to stay active during SFT, and the cheapest way to
-    guarantee it stays *identical* is to not have a second copy of it.
+    aux_loss_weight, loop_ce_weights/loop_ce_subsample, loop_count_sampling and the whole ponder
+    family -- is read from ``TrainingConfig`` by ``scripts/pretrain.train_step``, which
+    ``scripts/sft.py`` reuses unchanged. That reuse is the point: the cheapest way to guarantee
+    the objective stays *identical* across the two runs is to not have a second copy of it.
     """
     _Block = Config.get("sft", {}) or {}
 

@@ -121,10 +121,10 @@ def train_step(
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
     Args:
-        collect_metrics: whether to gather the PLAN.md Step 7 instrumentation dict. The trainer
-            only reads it inside its LOG_INTERVAL block, and the p_max/p_correct reductions run
-            over every chunk's live logits (and again on the checkpoint recompute), so gathering
-            them on the other 9 steps out of 10 is pure waste. ``metrics`` is None when False.
+        collect_metrics: whether to gather the instrumentation dict. The trainer only reads it
+            inside its LOG_INTERVAL block, and the p_max/top-1 reductions run over every chunk's
+            live logits (and again on the checkpoint recompute), so gathering them on the other 9
+            steps out of 10 is pure waste. ``metrics`` is None when False.
         n_loops: loop depth for this step (see sample_n_loops). None runs the configured depth.
             loop_ce_weights is truncated/rescaled to match, so the deepest loop actually run is
             always the one carrying weight 1.0 and holding the correctness head.
@@ -175,8 +175,6 @@ def train_step(
                 pad_mask=pad_mask,
                 loop_ce_weights=loop_ce_weights,
                 loop_ce_subsample=TrainingConfig.loop_ce_subsample,
-                correct_proj=unwrapped.correct_proj,
-                lambda_conf=TrainingConfig.lambda_conf,
                 return_metrics=collect_metrics,
             )
             loss, loss_ce, metrics = out if collect_metrics else (out[0], out[1], None)
@@ -397,8 +395,6 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
             pad_mask=pad_mask,
             loop_ce_weights=TrainingConfig.loop_ce_weights,
             loop_ce_subsample=TrainingConfig.loop_ce_subsample,
-            correct_proj=model.correct_proj,
-            lambda_conf=TrainingConfig.lambda_conf,
         )
         
         loss = loss + TrainingConfig.aux_loss_weight * aux_loss
@@ -857,8 +853,6 @@ def pretrain(phase=None):
                     per_loop_ce_str = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                     p_halt_mean = metrics["p_halt_mean"].item()
                     ponder_val = metrics["ponder"].item()
-                    conf_loss_val = metrics["conf_loss"].item() if metrics["conf_loss"] is not None else float("nan")
-                    p_correct_val = metrics["p_correct"].item() if metrics["p_correct"] is not None else float("nan")
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
                     top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
 
@@ -875,8 +869,8 @@ def pretrain(phase=None):
                         f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
                         f"Aux Loss: {aux_loss.item():.4f} | Ponder: {ponder_val:.4f} "
                         f"(lambda={metrics['lambda_ponder_now']:.2e}, target={ponder_controller.lambda_ponder:.4g}) | "
-                        f"Conf Loss: {conf_loss_val:.4f} | loop_scale: [{loop_scale_str}] | p_halt: {p_halt_mean:.4f} | "
-                        f"p_correct: {p_correct_val:.4f} | p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
+                        f"loop_scale: [{loop_scale_str}] | p_halt: {p_halt_mean:.4f} | "
+                        f"p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
                         f"per-loop CE: [{per_loop_ce_str}] | mean loops: {mean_loops:.2f} | "
                         f"Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
                         f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min | "

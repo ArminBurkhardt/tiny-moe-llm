@@ -92,7 +92,6 @@ training:
                            # so the loop count stays a runtime choice at inference; also cuts mean
                            # training compute. loop_ce_weights is truncated and rescaled so the
                            # deepest loop actually run always carries weight 1.0. 0.0 disables it.
-  lambda_conf: 0.05 # weight on the correctness head's BCE loss (final loop only)
   grad_accumulation_steps: 16
   seed: 42
   data_dir: "data/prepared" # dir holding {phase}.bin/.idx from scripts/prepare_data.py (Step 11)
@@ -109,11 +108,11 @@ training:
   hf_upload_repo: "ikeafisch4/temp-train" # "" disables uploads (local runs); delete the key
                                           # entirely to fall back to utils.HF_UPLOAD_REPO
 
-sft: # PLAN.md Step 12. Runs LOCALLY on the dev GPU, not on vast.ai -- the pretrained checkpoint and
-     # manifest.json come down from the Hub once pretraining finishes. Loss weights (lambda_mtp,
-     # aux_loss_weight, loop_ce_weights/subsample, loop_count_sampling, lambda_conf, ponder_*) are
-     # deliberately NOT duplicated here: SFT reuses pretrain.train_step unchanged, so p_halt and
-     # p_correct keep getting supervised exactly as they were (PLAN.md Step 12: "still free").
+sft: # Runs LOCALLY on the dev GPU -- the pretrained checkpoint and manifest.json come down from the
+     # Hub once pretraining finishes. Loss weights (lambda_mtp, aux_loss_weight,
+     # loop_ce_weights/subsample, loop_count_sampling, ponder_*) are deliberately NOT duplicated
+     # here: SFT reuses pretrain.train_step unchanged, so the objective is identical by
+     # construction rather than by two copies agreeing.
   data_dir: "data/prepared"
   train_split: "sft_train"
   val_split: "sft_val"
@@ -141,8 +140,8 @@ sft: # PLAN.md Step 12. Runs LOCALLY on the dev GPU, not on vast.ai -- the pretr
                                      # ~79GB of uploads on a ~3h run.
   keep_local_checkpoints: 3
   eval_every_tokens: 25000000 # decoupled from (and 4x more frequent than) the checkpoint cadence:
-                              # the validation pass is seconds and its p_correct-vs-p_max reading
-                              # is the early warning for Step 12's acceptance criterion
+                              # the validation pass is seconds, and its p_max/top-1 reading on a
+                              # fixed slice is the early warning for the abstention criterion
   eval_max_batches: 40 # cap on the validation pass, so it stays a couple of seconds
   hf_upload_repo: "" # local run: uploads off by default. Set a repo id (or pass --upload) to mirror
                      # SFT checkpoints to the Hub like the pretraining run does. 

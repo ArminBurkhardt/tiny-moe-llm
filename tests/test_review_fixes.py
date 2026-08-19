@@ -85,8 +85,7 @@ print(f"[ok] p_max: max abs diff vs fp32 softmax = {(cheap - ref).abs().max().it
 
 # --- per-loop CE subsampling is an unbiased estimate of the full-token CE ---
 kw = dict(mtp_outputs=mtp, lm_head=model.mtp_head.lm_head, main_lm_head=model.lm_head,
-          pad_mask=pad_mask, loop_ce_weights=[0.2, 0.3, 1.0], correct_proj=model.correct_proj,
-          lambda_conf=0.05, return_metrics=True)
+          pad_mask=pad_mask, loop_ce_weights=[0.2, 0.3, 1.0], return_metrics=True)
 full = compute_mtp_loss(h, labels, loop_ce_subsample=1.0, **kw)
 subs = [compute_mtp_loss(h, labels, loop_ce_subsample=0.25, **kw) for _ in range(12)]
 for li in range(N_LOOPS - 1):
@@ -133,8 +132,7 @@ for n in (1, 2, 3):
     loss_n, _ = compute_mtp_loss(h_n, labels, mtp_outputs=mtp_n, lm_head=model.mtp_head.lm_head,
                                  main_lm_head=model.lm_head, pad_mask=pad_mask,
                                  loop_ce_weights=loop_ce_weights_for(n),
-                                 loop_ce_subsample=0.25, correct_proj=model.correct_proj,
-                                 lambda_conf=0.05)
+                                 loop_ce_subsample=0.25)
     (loss_n + aux_n).backward()
     assert torch.isfinite(loss_n), (n, loss_n)
     g = model.moe.loop_scale.grad

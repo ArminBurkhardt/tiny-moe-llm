@@ -69,7 +69,6 @@ def _safe_cross_entropy(logits: torch.Tensor, labels: torch.Tensor) -> torch.Ten
 
 def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.Tensor,
                        chunk_size: int = CE_CHUNK_SIZE,
-                       correct_proj: nn.Module = None,
                        collect_metrics: bool = False):
     """mean cross entropy of lm_head(hidden) [T, H] vs labels [T], without ever materializing the full [T, vocab] logits.
 
@@ -77,56 +76,41 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
     peak logit memory is chunk_size * vocab instead of T * vocab
     the logits dominate activation memory here. otherwise equivalent to a normal F.cross_entropy(lm_head(hidden), labels, ignore_index=-100).
 
-    when correct_proj is given (PLAN.md Step 4b), also returns the mean correctness head BCE loss
-    for the same tokens, reusing each chunk's already-live logits for the free is_correct target
-    instead of a second lm_head(hidden) pass. Returns (ce_loss, conf_loss) then, else just ce_loss.
-
-    when collect_metrics is also set (PLAN.md Step 7 instrumentation), additionally returns a dict
-    with mean p_correct/p_max/top1_acc over the same valid tokens -- reusing this chunk's already
-    materialized logits/correct_logit under no_grad, so it's a few cheap reductions, not a second
-    forward pass.
+    when collect_metrics is set, additionally returns a dict with mean p_max/top1_acc over the same
+    valid tokens -- reusing this chunk's already materialized logits under no_grad, so it's a few
+    cheap reductions, not a second forward pass. ``p_max`` is the model's confidence signal
+    everywhere downstream now that the learned correctness head is gone: it beat ``p_correct`` on
+    ECE and AUROC on the real checkpoint, and ``1 - p_correct`` scored below chance at flagging
+    unanswerable questions (docs/CONCLUSION.md).
     """
     n_valid = (labels != -100).sum()
     if n_valid == 0:
-        # keep the head(s) in the autograd graph so DDP still sees their grads
+        # keep the head in the autograd graph so DDP still sees its grads
         z = lm_head(hidden[:1]).sum() * 0.0
-        if correct_proj is None:
-            return z
-        conf_z = correct_proj(hidden[:1]).sum() * 0.0
         if collect_metrics:
             zm = z.new_zeros(())
-            return z, conf_z, {"p_correct": zm, "p_max": zm, "top1_acc": zm}
-        return z, conf_z
+            return z, {"p_max": zm, "top1_acc": zm}
+        return z
 
-    if correct_proj is not None:
+    if collect_metrics:
         def _chunk_loss(h: torch.Tensor, l: torch.Tensor):
             h0 = h.size(0)
             logits = unpad(lm_head(pad_for_low_fp(h)), h0)
             ce = F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
             valid = (l != -100).to(logits.dtype)
             with torch.no_grad():
-                # free target: no labels, no extra forward pass needed. must stay no_grad -- a
-                # differentiable target here would leak gradient back into the LM logits/lm_head
-                # through the "correct" label itself, on top of correct_proj's own gradient.
                 max_logit, argmax = logits.max(-1)
-                is_correct = (argmax == l).float()
-            correct_logit = correct_proj(h).squeeze(-1)
-            conf = F.binary_cross_entropy_with_logits(correct_logit, is_correct, reduction="none")
-            if collect_metrics:
-                with torch.no_grad():
-                    p_correct_sum = (torch.sigmoid(correct_logit) * valid).sum()
-                    # p_max == softmax(logits).max() == 1 / sum_j exp(l_j - l_max). computed this
-                    # way to avoid an fp32 copy of the [chunk, vocab] logits: at chunk_size=2048 /
-                    # vocab=65536 a `.float().softmax(-1)` is two ~537MB transients, allocated on
-                    # every step AND again on the checkpoint recompute. the exp() temporary here
-                    # stays in the logits' own dtype and the sum accumulates in fp32.
-                    p_max_sum = (
-                        (1.0 / (logits - max_logit.unsqueeze(-1)).exp().sum(-1, dtype=torch.float32))
-                        * valid
-                    ).sum()
-                    top1_sum = (is_correct * valid).sum()
-                return ce, (conf * valid).sum(), p_correct_sum, p_max_sum, top1_sum
-            return ce, (conf * valid).sum()
+                # p_max == softmax(logits).max() == 1 / sum_j exp(l_j - l_max). computed this
+                # way to avoid an fp32 copy of the [chunk, vocab] logits: at chunk_size=8192 /
+                # vocab=65536 a `.float().softmax(-1)` is two ~2GB transients, allocated on
+                # every step AND again on the checkpoint recompute. the exp() temporary here
+                # stays in the logits' own dtype and the sum accumulates in fp32.
+                p_max_sum = (
+                    (1.0 / (logits - max_logit.unsqueeze(-1)).exp().sum(-1, dtype=torch.float32))
+                    * valid
+                ).sum()
+                top1_sum = ((argmax == l).to(logits.dtype) * valid).sum()
+            return ce, p_max_sum, top1_sum
     else:
         def _chunk_loss(h: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
             h0 = h.size(0)
@@ -135,9 +119,7 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
             return F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
 
     loss_sum = hidden.new_zeros(())
-    conf_sum = hidden.new_zeros(()) if correct_proj is not None else None
     if collect_metrics:
-        p_correct_sum = hidden.new_zeros(())
         p_max_sum = hidden.new_zeros(())
         top1_sum = hidden.new_zeros(())
     T = hidden.size(0)
@@ -148,28 +130,16 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
             out = checkpoint(_chunk_loss, h_chunk, l_chunk, use_reentrant=False)
         else:
             out = _chunk_loss(h_chunk, l_chunk)
-        if correct_proj is not None:
-            if collect_metrics:
-                ce, conf, pc, pm, t1 = out
-                p_correct_sum = p_correct_sum + pc
-                p_max_sum = p_max_sum + pm
-                top1_sum = top1_sum + t1
-            else:
-                ce, conf = out
-            conf_sum = conf_sum + conf
+        if collect_metrics:
+            ce, pm, t1 = out
+            p_max_sum = p_max_sum + pm
+            top1_sum = top1_sum + t1
         else:
             ce = out
         loss_sum = loss_sum + ce
 
-    if correct_proj is not None:
-        if collect_metrics:
-            metrics = {
-                "p_correct": p_correct_sum / n_valid,
-                "p_max": p_max_sum / n_valid,
-                "top1_acc": top1_sum / n_valid,
-            }
-            return loss_sum / n_valid, conf_sum / n_valid, metrics
-        return loss_sum / n_valid, conf_sum / n_valid
+    if collect_metrics:
+        return loss_sum / n_valid, {"p_max": p_max_sum / n_valid, "top1_acc": top1_sum / n_valid}
     return loss_sum / n_valid
 
 
@@ -182,8 +152,6 @@ def compute_mtp_loss(
     main_lm_head: nn.Module = None,
     pad_mask: torch.Tensor = None,
     loop_ce_weights: list = None,
-    correct_proj: nn.Module = None,
-    lambda_conf: float = 0.0,
     return_metrics: bool = False,
     loop_ce_subsample: float = 1.0,
 ):
@@ -212,7 +180,6 @@ def compute_mtp_loss(
         loss = outputs.new_zeros(())
         n_loops = len(loop_ce_weights)
         per_loop_ce = [] if return_metrics else None
-        conf_loss = None
 
         # token subsample for the non-final loops (see loop_ce_subsample in the docstring).
         # indices are built in the flat [B*S] space rather than [B*(S-1)] so each loop's hidden
@@ -235,18 +202,14 @@ def compute_mtp_loss(
             else:
                 hidden = outputs[loop, :, :-1, :].contiguous().view(-1, H)
                 labels_for_loop = main_labels
-            # correctness head (PLAN.md Step 4b) reads only the final loop's hidden states --
-            # p_halt asks "is more compute useful", this asks "is this prediction correct", and
-            # they come apart on confident hallucinations, so it's deliberately not per-loop.
-            if loop == n_loops - 1 and correct_proj is not None:
-                if return_metrics:
-                    loop_ce, conf_loss, head_metrics = _chunked_linear_ce(
-                        main_lm_head, hidden, labels_for_loop, correct_proj=correct_proj, collect_metrics=True,
-                    )
-                    metrics.update(head_metrics)
-                else:
-                    loop_ce, conf_loss = _chunked_linear_ce(main_lm_head, hidden, labels_for_loop, correct_proj=correct_proj)
-                loss = loss + lambda_conf * conf_loss
+            # p_max / top-1 are read off the FINAL loop only: they are the reported confidence
+            # signal, and reading them at an intermediate depth would describe a readout no
+            # downstream consumer (abstention, calibration, generation) ever uses.
+            if return_metrics and loop == n_loops - 1:
+                loop_ce, head_metrics = _chunked_linear_ce(
+                    main_lm_head, hidden, labels_for_loop, collect_metrics=True,
+                )
+                metrics.update(head_metrics)
             else:
                 loop_ce = _chunked_linear_ce(main_lm_head, hidden, labels_for_loop)
             loss = loss + weight * loop_ce
@@ -255,8 +218,6 @@ def compute_mtp_loss(
                 per_loop_ce.append(loop_ce.detach())
         if return_metrics:
             metrics["per_loop_ce"] = per_loop_ce
-            metrics["conf_loss"] = conf_loss.detach() if conf_loss is not None else None
-            metrics.setdefault("p_correct", None)
             metrics.setdefault("p_max", None)
             metrics.setdefault("top1_acc", None)
     else:
