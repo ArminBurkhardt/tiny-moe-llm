@@ -112,5 +112,27 @@ sft: # Runs LOCALLY on the dev GPU -- the pretrained checkpoint and manifest.jso
                               # the validation pass is seconds, and its p_max/top-1 reading on a
                               # fixed slice is the early warning for the abstention criterion
   eval_max_batches: 40 # cap on the validation pass, so it stays a couple of seconds
+  conversation_loss_weighting: false # false = plain per-token CE, i.e. the objective the existing
+                                     # SFT checkpoint was trained under. `repair:` below turns it on
   hf_upload_repo: "" # local run: uploads off by default. Set a repo id (or pass --upload) to mirror
-                     # SFT checkpoints to the Hub like the pretraining run does. 
+                     # SFT checkpoints to the Hub like the pretraining run does.
+
+repair: # NEXT.md Phase 2: the abstention repair finetune, `python scripts/sft.py --repair`.
+        # Read by config.py's RepairConfig, which SUBCLASSES SFTConfig -- every key omitted here
+        # (batch size, seq length, dropout, warmup, eval_max_batches) inherits `sft:` above, on
+        # purpose: this is the same objective and the same shape over a repaired corpus, and a
+        # second copy of those numbers is a second thing to keep in sync.
+        # Runs LOCALLY on the 5090 in BF16 (do not set USE_FP8).
+  train_split: "repair_train" # from `python scripts/prepare_sft_data.py --profile repair`
+  val_split: "repair_val"
+  lr: 1.0e-5 # ~1/3 of SFT's. The trunk is already post-SFT; this pass moves the abstention decision,
+             # it does not relearn the chat format. Every parameter is still fp32-shadowed (the
+             # ulp arithmetic in build_sft_param_groups only gets worse at a lower LR).
+  num_epochs: 1 # one pass over ~30M tokens. Two would start memorizing the repair corpus's own
+                # answers, which is the failure this whole phase is undoing
+  checkpoint_every_tokens: 10000000 # ~3 saves over the corpus; SFT's 100M would give zero
+  eval_every_tokens: 5000000
+  conversation_loss_weighting: true # Phase 2 fix #3: weight by 1/(supervised tokens in the
+                                    # conversation), so a ~6-token refusal stops mechanically
+                                    # out-earning a multi-sentence real answer
+  hf_upload_repo: "" # local run

@@ -32,7 +32,9 @@ import torch
 from modules.data import abstention
 from modules.data.chat import ASSISTANT_TOKEN, SYS_BEGIN_TOKEN, SYS_END_TOKEN, USER_TOKEN, ChatTemplate
 from modules.data.sft_dataset import SFTDataset
-from scripts.prepare_sft_data import build_corpus, render_gsm8k, render_squad_v2
+from scripts.prepare_sft_data import (
+    build_corpus, render_gsm8k, render_hotpot_qa, render_squad_v2, rows_to_conversations, SFTSource,
+)
 
 
 CONTROL_TOKENS = {
@@ -211,6 +213,54 @@ def test_dataset_never_splits_a_conversation():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_conversation_loss_weights():
+    """``loss_weights`` must be 1/n_supervised inside each conversation and 0 everywhere else.
+
+    NEXT.md Phase 2's fix #3. The property that matters is not the individual values but the
+    invariant they exist for: *every conversation in a row sums to 1.0*, so a 2-token refusal and a
+    40-token answer pull on the gradient equally. Also asserts weights are nonzero exactly where
+    labels are supervised -- a weight left on a ``-100`` position would inflate the denominator in
+    ``mtp._chunked_linear_ce`` and quietly rescale the whole loss.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        # deliberately uneven: 2 supervised tokens in the short docs, 8 in the long one
+        docs = make_docs(4, length=12)
+        long_ids = [500] + [ord("b")] * 8 + [901] + [ord("z")] * 7 + [501]
+        long_mask = [0] * 10 + [1] * 8
+        write_corpus(tmp, "sft_train", docs + [(long_ids, long_mask)])
+
+        dataset = SFTDataset(
+            tmp, MockTokenizer(), batch_size=4, max_length=64, split="sft_train",
+            num_mtp_tokens=2, shuffle=False,
+        )
+        total_weight, n_conversations = 0.0, 0
+        for batch in dataset:
+            weights, labels = batch["loss_weights"], batch["labels"]
+            assert weights.shape == labels.shape
+            assert weights.dtype == torch.float32
+            assert torch.equal(weights > 0, labels != -100), (
+                "weights must be nonzero exactly on supervised positions"
+            )
+            for row in range(weights.size(0)):
+                # one conversation per attention segment: sum this row's weights per segment
+                segments = batch["document_ids"][row]
+                for seg in segments.unique().tolist():
+                    seg_weight = float(weights[row][segments == seg].sum())
+                    if seg_weight == 0.0:
+                        continue  # a prompt-only or padding segment
+                    assert abs(seg_weight - 1.0) < 1e-5, (
+                        f"conversation weight must sum to 1.0, got {seg_weight}"
+                    )
+                    total_weight += seg_weight
+                    n_conversations += 1
+        assert n_conversations == 5, f"expected 5 conversations, weighted {n_conversations}"
+        assert abs(total_weight - 5.0) < 1e-5
+        print("  per-conversation loss weights: OK")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_epoch_permutation_is_deterministic():
     tmp = tempfile.mkdtemp()
     try:
@@ -289,10 +339,14 @@ def test_renderers():
          "answers": {"text": [], "answer_start": []}}, rng,
     )
     # an empty reference answer must become a *recognizable* abstention, not an empty target --
-    # the acceptance metric (abstention precision/recall) can only count what it can identify
-    assert unanswerable[-1]["content"] in abstention.ABSTENTIONS_PASSAGE
+    # the acceptance metric (abstention precision/recall) can only count what it can identify.
+    # The default draw is the WIDE training set (Phase 2's fix #4), and is_abstention has to know
+    # every one of them or the false-abstention rate it reports is flattering rather than true.
+    assert unanswerable[-1]["content"] in abstention.ABSTENTIONS_PASSAGE_TRAIN
     assert abstention.is_abstention(unanswerable[-1]["content"])
     assert not abstention.is_abstention("Paris")
+    for phrasing in abstention.ABSTENTIONS_PASSAGE_TRAIN:
+        assert abstention.is_abstention(phrasing), f"undetectable training phrasing: {phrasing!r}"
 
     gsm = render_gsm8k(
         {"question": "q?", "answer": "Step? ** 48/2 = <<48/2=24>>24 clips.\n#### 24"}, rng,
@@ -300,7 +354,61 @@ def test_renderers():
     solution = gsm[-1]["content"]
     assert "<<" not in solution and "####" not in solution, "calculator/answer markup must be stripped"
     assert solution.endswith("The answer is 24."), solution
-    print("  squad_v2 / gsm8k renderers: OK")
+
+    hotpot = render_hotpot_qa(
+        {"question": "Which came first?", "answer": "Arthur's Magazine",
+         "context": {"title": ["Arthur's Magazine", "First for Women", "Blank"],
+                     "sentences": [["Arthur's Magazine was a magazine. ", "It ran until 1846."],
+                                   ["First for Women is a magazine."],
+                                   []]}}, rng,
+    )
+    passage = hotpot[0]["content"]
+    # every non-empty paragraph, titled, in dataset order -- the distractors are the point
+    assert "Arthur's Magazine: Arthur's Magazine was a magazine. It ran until 1846." in passage
+    assert "First for Women: First for Women is a magazine." in passage
+    assert "Blank" not in passage, "an empty paragraph must be dropped, not rendered as a bare title"
+    assert hotpot[-1]["content"] == "Arthur's Magazine"
+    print("  squad_v2 / gsm8k / hotpot_qa renderers: OK")
+
+
+def test_unanswerable_downsampling():
+    """``unanswerable_keep`` must thin only the unanswerable rows, and reproducibly.
+
+    Phase 2's fix #1. The filter runs before the shard's conversation list exists, so the resume
+    state's ``row_idx`` indexes the *kept* rows -- which is only safe if the same (spec, frame, seed)
+    yields the same list every time, in this process and the next one.
+    """
+    import random
+
+    def frame(n_answerable, n_unanswerable):
+        rows = [{"context": f"ctx {i}", "question": f"q{i}",
+                 "answers": {"text": ["a"], "answer_start": [0]}} for i in range(n_answerable)]
+        rows += [{"context": f"ctx u{i}", "question": f"qu{i}",
+                  "answers": {"text": [], "answer_start": []}} for i in range(n_unanswerable)]
+        # a plain list of dicts is enough: rows_to_conversations only calls .to_dict("records")
+        class _Frame:
+            columns = ["context", "question", "answers"]
+            def to_dict(self, _orient):
+                return rows
+        return _Frame()
+
+    spec = SFTSource("squad_v2", "r", "p", (".parquet",), render="squad_v2", weight=1.0,
+                     unanswerable_keep=0.25, qa=True)
+    kept = [c for c, _ in rows_to_conversations(spec, frame(200, 200), random.Random(11))]
+    abstained = sum(abstention.is_abstention(c[-1]["content"]) for c in kept)
+    answered = len(kept) - abstained
+    assert answered == 200, f"answerable rows must never be dropped, kept {answered}"
+    assert 20 <= abstained <= 80, f"expected ~25% of 200 unanswerable rows, kept {abstained}"
+
+    again = [c for c, _ in rows_to_conversations(spec, frame(200, 200), random.Random(11))]
+    assert [c[-1]["content"] for c in again] == [c[-1]["content"] for c in kept], (
+        "same spec + same seed must give the same kept rows AND the same phrasings"
+    )
+
+    keep_all = SFTSource("squad_v2", "r", "p", (".parquet",), render="squad_v2", weight=1.0)
+    full = [c for c, _ in rows_to_conversations(keep_all, frame(200, 200), random.Random(11))]
+    assert len(full) == 400, f"unanswerable_keep=1.0 must drop nothing, got {len(full)}"
+    print("  squad_v2 unanswerable down-sampling: OK")
 
 
 def fake_source(conversations, holdout_keys=None):
@@ -377,8 +485,10 @@ if __name__ == "__main__":
     test_chat_template_rejects()
     test_dataset_labels_and_segments()
     test_dataset_never_splits_a_conversation()
+    test_conversation_loss_weights()
     test_epoch_permutation_is_deterministic()
     test_resume_position_is_gap_free()
     test_renderers()
+    test_unanswerable_downsampling()
     test_build_corpus()
     print("all SFT data tests passed")

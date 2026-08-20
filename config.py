@@ -150,6 +150,12 @@ class SFTConfig:
     eval_every_tokens = int(_Block.get("eval_every_tokens", 25_000_000))
     eval_max_batches = int(_Block.get("eval_max_batches", 40))
 
+    # weight every CE term by 1/(supervised tokens in the conversation) instead of counting tokens
+    # (NEXT.md Phase 2's fix #3). Off here so this class still describes the run that produced the
+    # existing SFT checkpoint; RepairConfig turns it on. The weights themselves are always in the
+    # batch -- see modules/data/sft_dataset.py.
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", False))
+
     # same None-vs-"" distinction as TrainingConfig.hf_upload_repo: absent means "fall back to
     # utils.HF_UPLOAD_REPO", explicit "" means uploads off (the default for a local run).
     _raw_upload_repo = _Block.get("hf_upload_repo", "")
@@ -168,4 +174,49 @@ class SFTConfig:
         pretrained state dict loads into the overridden model unchanged.
         """
         return {**ModelConfig.Params, "dropout": cls.dropout}
+
+
+class RepairConfig(SFTConfig):
+    """NEXT.md Phase 2's abstention repair finetune, read from config.yaml's ``repair:`` block.
+
+    A **subclass**, not a second full block: the repair pass is the SFT run with a different corpus,
+    a lower learning rate, one epoch and per-conversation loss weighting. Everything it does not
+    name -- batch size, sequence length, the fp32-master arrangement, dropout, ``eval_max_batches``,
+    ``model_params()`` -- inherits from ``SFTConfig`` by ordinary attribute lookup, which is the
+    point: "same objective and same shape, repaired data" stops being true the moment a second copy
+    of those numbers can drift.
+
+    Only the keys listed below are readable from the ``repair:`` block. Anything else in it is
+    ignored rather than silently half-applied -- ``scripts/sft.py --repair`` reads this class, not
+    the yaml.
+    """
+    _Block = Config.get("repair", {}) or {}
+
+    train_split = str(_Block.get("train_split", "repair_train"))
+    val_split = str(_Block.get("val_split", "repair_val"))
+    # ~1/3 of SFT's 3e-5. The trunk is already post-SFT; this pass has to move the abstention
+    # decision without relearning the chat format.
+    lr = float(_Block.get("lr", 1.0e-5))
+    num_epochs = int(_Block.get("num_epochs", 1))
+    weight_decay = float(_Block.get("weight_decay", SFTConfig.weight_decay))
+    dropout = float(_Block.get("dropout", SFTConfig.dropout))
+    grad_accumulation_steps = int(
+        _Block.get("grad_accumulation_steps", SFTConfig.grad_accumulation_steps)
+    )
+    warmup_fraction = float(_Block.get("warmup_fraction", SFTConfig.warmup_fraction))
+    lr_min_factor = float(_Block.get("lr_min_factor", SFTConfig.lr_min_factor))
+    seed = int(_Block.get("seed", SFTConfig.seed))
+    # a ~30M-token corpus wants a much tighter cadence than SFT's 100M, or the run ends without
+    # ever having written a rolling checkpoint
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 10_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 5_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
+    # the whole reason this profile exists -- on by default here, unlike SFTConfig
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", True))
+
+    # same None-vs-"" distinction as everywhere else; inherits SFT's resolved value (uploads off for
+    # a local run) when the repair block says nothing
+    _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
 

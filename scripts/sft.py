@@ -1,4 +1,4 @@
-"""Supervised fine-tuning.
+"""Supervised fine-tuning, and NEXT.md Phase 2's abstention repair pass on top of it.
 
 Written for a **local** run -- the pretrained checkpoint and ``manifest.json`` come down from the
 Hub once pretraining finishes (``--from-hub`` does that), and the fine-tune itself is a couple of
@@ -29,11 +29,20 @@ What is genuinely different:
   * **A validation pass** on ``sft_val`` at checkpoint cadence, reporting the calibration signals
     (``p_max``/top-1) the abstention acceptance criterion is about.
 
+**``--repair`` runs NEXT.md Phase 2** through this same function: the abstention repair finetune is
+the SFT run with a repaired corpus (``repair_train``/``repair_val``, from
+``prepare_sft_data.py --profile repair``), ``lr=1e-5``, one epoch, and per-conversation loss
+weighting. It reads ``RepairConfig`` instead of ``SFTConfig``, writes into ``ckpts/repair`` under
+phase ``"repair"``, and is seeded with ``-c <the SFT checkpoint>``. One code path rather than a
+second script, for the same reason ``train_step`` is shared: what has to change between the two runs
+is the data and three numbers, and anything else that drifts makes the comparison meaningless.
+
 Run from the repo root:
 
     python scripts/sft.py --from-hub          # pull the pretrained checkpoint, then train
     python scripts/sft.py -c ckpts/training/checkpoint_phase2_final.pt
     python scripts/sft.py                     # resume from the newest checkpoint in ckpts/sft
+    python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
 """
 import os
 import sys
@@ -62,7 +71,7 @@ from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
 from modules.runtime.status import eta_seconds, format_duration, write_status
-from config import ModelConfig, SFTConfig, TrainingConfig
+from config import ModelConfig, RepairConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
     USE_LOW_PRECISION, chosen_recipe, log_precision_mode, sample_n_loops,
     save_expert_selection_graph, save_loss_graph, train_step,
@@ -77,6 +86,12 @@ SFT_PHASE = "sft"
 # run_state.json, STOP sentinel and retention policy all assume that run), and mixing SFT files in
 # would confuse checkpoints.resume_phase_index if the supervisor ever ran against the same box.
 SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
+# --repair's counterparts. A distinct phase label AND a distinct directory, for the same two
+# reasons: load_sft_checkpoint refuses to adopt another run's optimizer state by name, and a repair
+# checkpoint must never be picked up as the resume point of an interrupted SFT run (its LR schedule,
+# epoch count and objective are all different).
+REPAIR_PHASE = "repair"
+REPAIR_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "repair")
 # --from-hub lands the pretrained checkpoint HERE, deliberately not in SFT_CHECKPOINT_DIR: it is
 # named checkpoint_phase2_final.pt, which matches ckpt_lib's "checkpoint_*.pt" resume scan, so a
 # second launch would offer pretraining's own optimizer/scheduler state to load_sft_checkpoint as
@@ -177,21 +192,24 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int) ->
     return rows
 
 
-def build_sft_scheduler(optimizer: optim.Optimizer, total_steps: int):
+def build_sft_scheduler(optimizer: optim.Optimizer, total_steps: int, config=SFTConfig):
     """Linear warmup -> cosine decay to ``lr * lr_min_factor``, anchored to this run's own steps.
 
     Not shared with ``pretrain.build_scheduler``: that one is anchored to
     ``TrainingConfig.total_steps`` (the combined pretraining budget) because phase 2 has to
     continue phase 1's decay. SFT is a fresh schedule over a fresh optimizer.
+
+    Args:
+        config: ``SFTConfig`` or ``RepairConfig`` -- the run profile whose lr/warmup this follows.
     """
-    warmup_steps = max(1, min(int(total_steps * SFTConfig.warmup_fraction), total_steps - 1))
+    warmup_steps = max(1, min(int(total_steps * config.warmup_fraction), total_steps - 1))
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps,
     )
     cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(total_steps - warmup_steps, 1),
-        eta_min=SFTConfig.lr * SFTConfig.lr_min_factor,
+        eta_min=config.lr * config.lr_min_factor,
     )
     return torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
@@ -213,7 +231,7 @@ def pull_from_hub(repo_id: str, filename: str, dest_dir: str, token: str = None)
 
 
 def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token_count,
-                        start_token_count, global_offset, losses, seed):
+                        start_token_count, global_offset, losses, seed, phase=SFT_PHASE):
     """Write an SFT checkpoint atomically.
 
     Deliberately its own function rather than an extension of ``utils.save_checkpoint``: SFT needs
@@ -234,7 +252,7 @@ def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token
         "dataset_idx": step,
         "token_count": token_count,
         "global_offset": global_offset,
-        "phase": SFT_PHASE,
+        "phase": phase,
         "losses": losses,
         # SFT-only extras, ignored by utils.load_checkpoint's .get()-based reader
         "sft": {"start_token_count": start_token_count, "seed": seed},
@@ -250,22 +268,25 @@ def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token
     logger.info(f"Checkpoint saved at {path}")
 
 
-def load_sft_checkpoint(model, optimizer, scheduler, path):
-    """Restore a full SFT run from its own checkpoint. Returns the resume state dict.
+def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PHASE,
+                        checkpoint_dir=SFT_CHECKPOINT_DIR):
+    """Restore a full SFT (or repair) run from its own checkpoint. Returns the resume state dict.
 
-    Raises on anything that is not an SFT checkpoint -- and checks that *before* touching the
-    model, so a rejected file leaves no partial state behind. A pretraining checkpoint dropped into
-    ``ckpts/sft`` by hand would otherwise load cleanly: its optimizer state has the same two param
-    groups with the same shapes, so AdamW's moments from a 4e-4 run would be silently adopted as
-    this fine-tune's, along with a scheduler anchored to the 29.9B-token cosine.
+    Raises on anything that is not a checkpoint of ``expected_phase`` -- and checks that *before*
+    touching the model, so a rejected file leaves no partial state behind. A pretraining checkpoint
+    dropped into ``ckpts/sft`` by hand would otherwise load cleanly: its optimizer state has the
+    same two param groups with the same shapes, so AdamW's moments from a 4e-4 run would be silently
+    adopted as this fine-tune's, along with a scheduler anchored to the 29.9B-token cosine. The same
+    argument covers SFT vs. repair, which differ by an order of magnitude in LR and by a whole
+    objective.
     """
     checkpoint = torch.load(path, map_location="cpu")
     phase = checkpoint.get("phase")
-    if phase != SFT_PHASE:
+    if phase != expected_phase:
         raise ValueError(
-            f"{os.path.basename(path)} was written during phase={phase!r}, not {SFT_PHASE!r}. "
+            f"{os.path.basename(path)} was written during phase={phase!r}, not {expected_phase!r}. "
             f"Pass it with -c to initialize FROM it instead of resuming it, and keep "
-            f"{SFT_CHECKPOINT_DIR} for SFT checkpoints only."
+            f"{checkpoint_dir} for {expected_phase} checkpoints only."
         )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -304,8 +325,9 @@ def load_pretrained_weights(model, path: str):
 
 
 @torch.no_grad()
-def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_batches: int):
-    """Validation pass over ``sft_val``: CE on supervised tokens plus the calibration signals.
+def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_batches: int,
+             conversation_weighting: bool = False):
+    """Validation pass over the val split: CE on supervised tokens plus the calibration signals.
 
     Reports ``p_max``/top-1 accuracy because the acceptance criterion is about the abstention
     signal's calibration, not about val loss, and a fixed held-out slice shows drift in it far
@@ -313,6 +335,13 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
 
     Runs at the full configured loop depth (no ``n_loops`` override, no loop-count sampling) and
     with subsampling off, so successive eval numbers are read at one fixed operating point.
+
+    Args:
+        conversation_weighting: mirror the training objective's per-conversation weighting into the
+            reported CE. On means val CE tracks what is actually being minimized; it also means the
+            number is not comparable to a run with it off. ``p_max``/top-1 stay token-level either
+            way (``_chunked_linear_ce`` never weights them), so those two remain comparable across
+            every checkpoint this repo has measured.
     """
     was_training = model.training
     model.eval()
@@ -321,7 +350,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     # pretrain.dry_run)
     token_count_before = model._token_tracker.num_tokens
 
-    ce_sum, token_sum = 0.0, 0
+    ce_sum, ce_weight_sum, token_sum = 0.0, 0.0, 0
     signal_sums = {"p_max": 0.0, "top1_acc": 0.0}
     n_batches = 0
 
@@ -333,6 +362,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
         document_ids = batch["document_ids"].to(device)
         cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
         pad_mask = input_ids == pad_token_id
+        loss_weights = batch["loss_weights"].to(device) if conversation_weighting else None
 
         with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
             out = model(
@@ -351,14 +381,22 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 loop_ce_weights=TrainingConfig.loop_ce_weights,
                 loop_ce_subsample=1.0,
                 return_metrics=True,
+                loss_weights=loss_weights,
             )
 
         # weight each batch by its supervised token count: rows differ a lot in how much of them
-        # is prompt, so an unweighted mean over batches is not the corpus mean
+        # is prompt, so an unweighted mean over batches is not the corpus mean. Under
+        # conversation weighting the batch's CE is a per-conversation mean, so its denominator is
+        # the batch's total weight instead -- mixing the two would over-count long-answer batches
+        # in exactly the direction this phase is trying to remove.
         n_supervised = int((labels[:, 1:] != -100).sum().item())
         if n_supervised == 0:
             continue
-        ce_sum += loss_ce.item() * n_supervised
+        ce_weight = (
+            float(loss_weights[:, 1:].sum().item()) if loss_weights is not None else n_supervised
+        )
+        ce_sum += loss_ce.item() * ce_weight
+        ce_weight_sum += ce_weight
         token_sum += n_supervised
         for key in ("p_max", "top1_acc"):
             value = metrics.get(key)
@@ -369,78 +407,91 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     if was_training:
         model.train()
 
-    if token_sum == 0:
+    if token_sum == 0 or ce_weight_sum == 0:
         return None
-    result = {"ce": ce_sum / token_sum, "tokens": token_sum, "batches": n_batches}
+    result = {"ce": ce_sum / ce_weight_sum, "tokens": token_sum, "batches": n_batches}
     result.update({key: total / token_sum for key, total in signal_sums.items()})
     result["ppl"] = math.exp(min(result["ce"], 20.0))
     return result
 
 
 def sft(args):
-    data_dir = os.path.join(BASE_DIR, SFTConfig.data_dir)
+    # one function, two profiles. --repair swaps the config class, the phase label and the
+    # checkpoint directory and nothing else: see this module's docstring for why the repair pass is
+    # not a second script.
+    cfg = RepairConfig if args.repair else SFTConfig
+    phase = REPAIR_PHASE if args.repair else SFT_PHASE
+    checkpoint_dir = REPAIR_CHECKPOINT_DIR if args.repair else SFT_CHECKPOINT_DIR
+
+    data_dir = os.path.join(BASE_DIR, cfg.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
     logger.info(f"Tokenizer loaded from {TOKENIZER_DIR} with vocab size {tokenizer.vocab_size}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
     log_precision_mode()
+    logger.info(
+        f"Profile: {phase} (lr={cfg.lr:.1e}, {cfg.num_epochs} epoch(s), "
+        f"splits {cfg.train_split}/{cfg.val_split}, per-conversation loss weighting "
+        f"{'ON' if cfg.conversation_loss_weighting else 'off'}) -> {checkpoint_dir}"
+    )
 
     train_dataset = SFTDataset(
         data_dir=data_dir,
         tokenizer=tokenizer,
-        batch_size=SFTConfig.Batch_size,
-        max_length=SFTConfig.Seq_length,
-        split=SFTConfig.train_split,
+        batch_size=cfg.Batch_size,
+        max_length=cfg.Seq_length,
+        split=cfg.train_split,
         num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
-        seed=SFTConfig.seed,
+        seed=cfg.seed,
     )
     val_dataset = SFTDataset(
         data_dir=data_dir,
         tokenizer=tokenizer,
-        batch_size=SFTConfig.Batch_size,
-        max_length=SFTConfig.Seq_length,
-        split=SFTConfig.val_split,
+        batch_size=cfg.Batch_size,
+        max_length=cfg.Seq_length,
+        split=cfg.val_split,
         num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
-        seed=SFTConfig.seed,
+        seed=cfg.seed,
         shuffle=False,  # a stable order makes successive eval numbers comparable
     )
     dataloader = DataLoader(train_dataset, batch_size=None, num_workers=NUM_DATA_WORKERS,
                             prefetch_factor=2)
 
     rows_per_epoch = estimate_packed_rows(
-        train_dataset.idx_path, SFTConfig.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
+        train_dataset.idx_path, cfg.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
     )
-    micro_steps = rows_per_epoch * SFTConfig.num_epochs / SFTConfig.Batch_size
-    total_steps = max(1, int(micro_steps / SFTConfig.grad_accumulation_steps))
+    micro_steps = rows_per_epoch * cfg.num_epochs / cfg.Batch_size
+    total_steps = max(1, int(micro_steps / cfg.grad_accumulation_steps))
     logger.info(
-        f"SFT plan: ~{rows_per_epoch:,} packed rows/epoch x {SFTConfig.num_epochs} epochs "
-        f"-> ~{total_steps:,} optimizer steps at batch {SFTConfig.Batch_size} x accum "
-        f"{SFTConfig.grad_accumulation_steps}"
+        f"{phase} plan: ~{rows_per_epoch:,} packed rows/epoch x {cfg.num_epochs} epochs "
+        f"-> ~{total_steps:,} optimizer steps at batch {cfg.Batch_size} x accum "
+        f"{cfg.grad_accumulation_steps}"
     )
 
     # dropout override only; every other model hyperparameter must match the pretrained checkpoint
-    model = TinyMoETransformer(**SFTConfig.model_params()).to(device).to(BF16).train()
+    model = TinyMoETransformer(**cfg.model_params()).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
 
-    param_groups, master_pairs = build_sft_param_groups(model, SFTConfig.weight_decay)
-    optimizer = optim.AdamW(param_groups, lr=SFTConfig.lr)
-    scheduler = build_sft_scheduler(optimizer, total_steps)
+    param_groups, master_pairs = build_sft_param_groups(model, cfg.weight_decay)
+    optimizer = optim.AdamW(param_groups, lr=cfg.lr)
+    scheduler = build_sft_scheduler(optimizer, total_steps, cfg)
 
-    os.makedirs(SFT_CHECKPOINT_DIR, exist_ok=True)
-    ckpt_lib.cleanup_stale_files(SFT_CHECKPOINT_DIR)
-    run_state_path = os.path.join(SFT_CHECKPOINT_DIR, "run_state.json")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    ckpt_lib.cleanup_stale_files(checkpoint_dir)
+    run_state_path = os.path.join(checkpoint_dir, "run_state.json")
 
     start_epoch, step_offset, start_doc_idx = 0, 0, 0
     losses, resumed = [], False
     start_token_count, token_count = 0, 0
 
     found = ckpt_lib.find_resume_checkpoint(
-        SFT_CHECKPOINT_DIR, lambda path: load_sft_checkpoint(model, optimizer, scheduler, path)
+        checkpoint_dir,
+        lambda path: load_sft_checkpoint(model, optimizer, scheduler, path, phase, checkpoint_dir),
     )
     if found is not None:
         _, state = found
@@ -450,20 +501,20 @@ def sft(args):
         start_token_count = state["start_token_count"]
         start_doc_idx = state["global_offset"]
         losses = state["losses"]
-        if state["seed"] != SFTConfig.seed:
+        if state["seed"] != cfg.seed:
             # the resume position indexes into a permutation generated from the seed; reading it
             # back under a different seed silently reshuffles which conversations were "already
             # seen", so refuse rather than half-repeat and half-skip an epoch
             raise SystemExit(
-                f"checkpoint was written with sft.seed={state['seed']} but config.yaml now says "
-                f"{SFTConfig.seed}. The document order (and therefore the resume position) is a "
+                f"checkpoint was written with seed={state['seed']} but config.yaml now says "
+                f"{cfg.seed}. The document order (and therefore the resume position) is a "
                 f"function of the seed -- restore the old seed or start a fresh run directory."
             )
         model._token_tracker.num_tokens = token_count
         resumed = True
         logger.info(
-            f"Resumed SFT at epoch {start_epoch}, position {start_doc_idx:,}, "
-            f"{(token_count - start_token_count) / 1e6:.1f}M SFT tokens"
+            f"Resumed {phase} at epoch {start_epoch}, position {start_doc_idx:,}, "
+            f"{(token_count - start_token_count) / 1e6:.1f}M {phase} tokens"
         )
     else:
         init_path = args.checkpoint
@@ -483,8 +534,10 @@ def sft(args):
                 logger.warning(f"could not pull manifest.json from {repo}: {e}")
         if not init_path:
             raise SystemExit(
-                "no SFT checkpoint to resume and no pretrained checkpoint given -- pass "
-                "--from-hub, or -c <path to checkpoint_phase2_final.pt>"
+                f"no {phase} checkpoint to resume and no checkpoint to initialize from -- pass "
+                + ("-c <path to an SFT checkpoint, e.g. "
+                   "ckpts/trained/checkpoint_sft_final_phase0.pt>" if args.repair
+                   else "--from-hub, or -c <path to checkpoint_phase2_final.pt>")
             )
         start_token_count = load_pretrained_weights(model, init_path)
         token_count = start_token_count
@@ -501,31 +554,31 @@ def sft(args):
     # same stop contract as pretraining, so an unattended/interruptible box gets a checkpoint out
     # of a SIGTERM instead of losing everything since the last save. clear_sentinel() first: a STOP
     # left over from a previous run would otherwise kill every relaunch before it trains a step.
-    control = RunControl(SFT_CHECKPOINT_DIR)
+    control = RunControl(checkpoint_dir)
     control.clear_sentinel()
     control.install()
 
-    upload_repo = args.upload_repo if args.upload_repo is not None else SFTConfig.upload_repo(HF_UPLOAD_REPO)
+    upload_repo = args.upload_repo if args.upload_repo is not None else cfg.upload_repo(HF_UPLOAD_REPO)
     if not upload_repo:
         logger.warning(
-            "SFT uploads are OFF (sft.hf_upload_repo is empty). Fine locally; on a rented box the "
-            "checkpoints die with the instance -- pass --upload-repo <repo> there."
+            f"{phase} uploads are OFF ({phase}.hf_upload_repo is empty). Fine locally; on a rented "
+            "box the checkpoints die with the instance -- pass --upload-repo <repo> there."
         )
     hf = HFSync(upload_repo, token=get_hf_token())
-    loss_png = os.path.join(SFT_CHECKPOINT_DIR, "loss_graph.png")
-    experts_png = os.path.join(SFT_CHECKPOINT_DIR, "expert_selection.png")
-    status_path = os.path.join(SFT_CHECKPOINT_DIR, "status.json")
+    loss_png = os.path.join(checkpoint_dir, "loss_graph.png")
+    experts_png = os.path.join(checkpoint_dir, "expert_selection.png")
+    status_path = os.path.join(checkpoint_dir, "status.json")
 
     accelerator = Accelerator(
         device_placement=True,
         split_batches=True,
-        gradient_accumulation_steps=SFTConfig.grad_accumulation_steps,
+        gradient_accumulation_steps=cfg.grad_accumulation_steps,
     )
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     unwrapped_model = accelerator.unwrap_model(model)
 
     full_n_loops = ModelConfig.Params["n_loops"]
-    loop_rng = random.Random(SFTConfig.seed)
+    loop_rng = random.Random(cfg.seed)
     worker_state = torch.full((max(NUM_DATA_WORKERS, 1),), -1, dtype=torch.long, device=device)
 
     def snapshot_global_offset(fallback):
@@ -541,26 +594,26 @@ def sft(args):
     target_tokens = None  # filled in after the first log interval, once tokens/row is known
 
     def save_and_sync(epoch, step, loss_value, tokens, final=False):
-        name = (ckpt_lib.final_name(SFT_PHASE) if final
-                else ckpt_lib.rolling_name(SFT_PHASE, tokens - start_token_count, loss_value))
-        path = os.path.join(SFT_CHECKPOINT_DIR, name)
+        name = (ckpt_lib.final_name(phase) if final
+                else ckpt_lib.rolling_name(phase, tokens - start_token_count, loss_value))
+        path = os.path.join(checkpoint_dir, name)
         save_sft_checkpoint(
             unwrapped_model, optimizer, scheduler, path,
             epoch=epoch, step=step, token_count=tokens, start_token_count=start_token_count,
             global_offset=snapshot_global_offset(start_doc_idx), losses=losses,
-            seed=SFTConfig.seed,
+            seed=cfg.seed, phase=phase,
         )
-        ckpt_lib.write_run_state(run_state_path, SFT_PHASE, tokens, name)
+        ckpt_lib.write_run_state(run_state_path, phase, tokens, name)
         try:
             save_loss_graph(losses, loss_png)
             save_expert_selection_graph(unwrapped_model.moe.expert_tracker.get_stats(), experts_png)
         except Exception as e:
             logger.error(f"Error occurred while saving graphs: {e}")
 
-        repo_dir = "sft/final" if final else "sft"
+        repo_dir = f"{phase}/final" if final else phase
         hf.upload(path, f"{repo_dir}/{name}", droppable=not final)
-        for local, remote in ((status_path, "sft/status.json"),
-                              (loss_png, "sft/graphs/loss_graph.png")):
+        for local, remote in ((status_path, f"{phase}/status.json"),
+                              (loss_png, f"{phase}/graphs/loss_graph.png")):
             if os.path.isfile(local):
                 hf.upload(local, remote)
         # retention: only deletes what is both outside the window AND confirmed uploaded. With
@@ -568,15 +621,18 @@ def sft(args):
         # local run simply keeps every checkpoint -- which is the right default when the disk is
         # the only copy.
         for deleted in ckpt_lib.prune_checkpoints(
-            SFT_CHECKPOINT_DIR, SFTConfig.keep_local_checkpoints, hf.is_uploaded
+            checkpoint_dir, cfg.keep_local_checkpoints, hf.is_uploaded
         ):
-            hf.delete(f"sft/{os.path.basename(deleted)}")
+            hf.delete(f"{phase}/{os.path.basename(deleted)}")
 
     def run_validation(epoch, step):
         stats = evaluate(unwrapped_model, val_dataset, device, tokenizer.pad_token_id,
-                         SFTConfig.eval_max_batches)
+                         cfg.eval_max_batches,
+                         conversation_weighting=cfg.conversation_loss_weighting)
         if stats is None:
-            logger.warning("validation pass produced no supervised tokens -- is sft_val empty?")
+            logger.warning(
+                f"validation pass produced no supervised tokens -- is {cfg.val_split} empty?"
+            )
             return
         logger.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
@@ -585,15 +641,15 @@ def sft(args):
         )
 
     sft_tokens = token_count - start_token_count
-    next_checkpoint = sft_tokens + SFTConfig.checkpoint_every_tokens
-    next_eval = sft_tokens + SFTConfig.eval_every_tokens
+    next_checkpoint = sft_tokens + cfg.checkpoint_every_tokens
+    next_eval = sft_tokens + cfg.eval_every_tokens
     # bound before the try: the interrupt handler saves a checkpoint using both, and a Ctrl-C
     # during the very first batch must not turn into a NameError that loses the save
     step, epoch = step_offset, start_epoch
     stop_training, exit_code = False, EXIT_OK
 
     try:
-        for epoch in range(start_epoch, SFTConfig.num_epochs):
+        for epoch in range(start_epoch, cfg.num_epochs):
             resume_epoch = resumed and epoch == start_epoch
             train_dataset.set_epoch(epoch)
             train_dataset.start_doc_idx = start_doc_idx if resume_epoch else 0
@@ -633,6 +689,10 @@ def sft(args):
                     no_decay_master_pairs=master_pairs,
                     collect_metrics=is_log_step,
                     n_loops=step_n_loops,
+                    # per-conversation weighting, off for plain SFT. The tensor is in every batch;
+                    # not passing it is exactly the plain per-token objective.
+                    loss_weights=(batch["loss_weights"].to(device)
+                                  if cfg.conversation_loss_weighting else None),
                 )
 
                 if not is_log_step:
@@ -652,7 +712,7 @@ def sft(args):
                     # tokens/step is only knowable once training has run: packing density depends
                     # on the corpus, not the config. Anchors the ETA, never the LR schedule.
                     target_tokens = int(sft_tokens / max(step, 1) * total_steps
-                                        * SFTConfig.grad_accumulation_steps)
+                                        * cfg.grad_accumulation_steps)
 
                 per_loop_ce = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                 loop_scale = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
@@ -667,7 +727,7 @@ def sft(args):
                     f"Aux: {aux_loss.item():.4f} | loop_scale: [{loop_scale}] | "
                     f"p_max: {_metric('p_max'):.4f} | top1_acc: {_metric('top1_acc'):.4f} | "
                     f"per-loop CE: [{per_loop_ce}] | "
-                    f"LR: {scheduler.get_last_lr()[0]:.3e} | SFT tokens: {sft_tokens / 1e6:.2f}M | "
+                    f"LR: {scheduler.get_last_lr()[0]:.3e} | {phase} tokens: {sft_tokens / 1e6:.2f}M | "
                     f"Tokens/sec: {tokens_per_sec:.0f} | "
                     f"Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | "
                     f"Time: {(now - timer) / 60:.2f} min"
@@ -675,7 +735,7 @@ def sft(args):
                 )
 
                 write_status(
-                    status_path, phase=SFT_PHASE, tokens=sft_tokens,
+                    status_path, phase=phase, tokens=sft_tokens,
                     phase_target=target_tokens or 0, run_target=target_tokens or 0,
                     tokens_per_sec=tokens_per_sec, loss=val_loss,
                     eta_phase=format_duration(eta) if eta is not None else "n/a",
@@ -685,7 +745,7 @@ def sft(args):
 
                 if sft_tokens >= next_eval:
                     run_validation(epoch, step)
-                    next_eval = sft_tokens + SFTConfig.eval_every_tokens
+                    next_eval = sft_tokens + cfg.eval_every_tokens
 
                 # polled at the log cadence: a stat every few seconds, no GPU sync, and well
                 # inside vast's SIGTERM grace period
@@ -699,7 +759,7 @@ def sft(args):
 
                 if sft_tokens >= next_checkpoint or control.take_checkpoint_request():
                     save_and_sync(epoch, step, val_loss, token_count)
-                    next_checkpoint = sft_tokens + SFTConfig.checkpoint_every_tokens
+                    next_checkpoint = sft_tokens + cfg.checkpoint_every_tokens
 
             if stop_training:
                 break
@@ -708,7 +768,7 @@ def sft(args):
             start_doc_idx, step_offset = 0, 0
             resumed = False
             worker_state.fill_(-1)
-            logger.info(f"Epoch {epoch} finished at {sft_tokens / 1e6:.2f}M SFT tokens")
+            logger.info(f"Epoch {epoch} finished at {sft_tokens / 1e6:.2f}M {phase} tokens")
 
         if stop_training:
             # a stop is not a finished run: no final checkpoint, and a restartable exit code so a
@@ -716,12 +776,12 @@ def sft(args):
             return exit_code
 
         token_count = unwrapped_model._token_tracker.sync()
-        run_validation(SFTConfig.num_epochs - 1, step)
-        save_and_sync(SFTConfig.num_epochs - 1, step, losses[-1] if losses else float("nan"),
+        run_validation(cfg.num_epochs - 1, step)
+        save_and_sync(cfg.num_epochs - 1, step, losses[-1] if losses else float("nan"),
                       token_count, final=True)
         logger.info(
-            f"SFT complete: {(token_count - start_token_count) / 1e6:.2f}M tokens over "
-            f"{SFTConfig.num_epochs} epochs in {(time.time() - timer) / 60:.1f} min"
+            f"{phase} complete: {(token_count - start_token_count) / 1e6:.2f}M tokens over "
+            f"{cfg.num_epochs} epochs in {(time.time() - timer) / 60:.1f} min"
         )
     except KeyboardInterrupt:
         logger.info("Interrupted. Saving checkpoint...")
@@ -740,10 +800,14 @@ def sft(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="supervised fine-tuning")
+    parser = argparse.ArgumentParser(description="supervised fine-tuning (and Phase 2's repair pass)")
+    parser.add_argument("--repair", action="store_true",
+                        help="run NEXT.md Phase 2's abstention repair finetune instead: "
+                             "config.yaml's repair: block, the repair_train/repair_val splits, and "
+                             "ckpts/repair. Seed it with -c <an SFT checkpoint>")
     parser.add_argument("--checkpoint", "-c", default=None,
-                        help="pretrained checkpoint to initialize from (ignored when resuming an "
-                             "SFT run from ckpts/sft)")
+                        help="checkpoint to initialize from (ignored when resuming a run from this "
+                             "profile's own checkpoint directory)")
     parser.add_argument("--from-hub", action="store_true",
                         help="download the pretrained checkpoint and manifest.json from the "
                              "training mirror repo before starting")
@@ -752,8 +816,8 @@ def main():
     parser.add_argument("--hub-file", default=DEFAULT_HUB_CHECKPOINT,
                         help=f"path within the repo (default: {DEFAULT_HUB_CHECKPOINT})")
     parser.add_argument("--upload-repo", default=None,
-                        help="mirror SFT checkpoints to this repo ('' disables; default: "
-                             "config.yaml's sft.hf_upload_repo)")
+                        help="mirror checkpoints to this repo ('' disables; default: config.yaml's "
+                             "sft.hf_upload_repo / repair.hf_upload_repo)")
     return sft(parser.parse_args())
 
 

@@ -1,17 +1,41 @@
-"""Build the SFT corpus from PLAN.md Step 12's five sources.
+"""Build an SFT corpus: the original Step 12 mix, or Phase 2's abstention-repair mix.
 
-Writes ``{data_dir}/sft_train.{bin,idx,mask}`` and ``{data_dir}/sft_val.{bin,idx,mask}``: the same
-flat uint16 token stream + uint64 document-offset layout the pretraining corpus uses, plus a third
-uint8-per-token file marking which tokens are supervised (assistant content and its terminating
-EOS -- see ``modules/data/chat.py``). ``modules/data/sft_dataset.py`` reads the triple.
+Writes ``{data_dir}/{prefix}_train.{bin,idx,mask}`` and ``{data_dir}/{prefix}_val.{bin,idx,mask}``:
+the same flat uint16 token stream + uint64 document-offset layout the pretraining corpus uses, plus
+a third uint8-per-token file marking which tokens are supervised (assistant content and its
+terminating EOS -- see ``modules/data/chat.py``). ``modules/data/sft_dataset.py`` reads the triple.
+
+``--profile sft`` (default, prefix ``sft``) builds Step 12's mix:
 
 | dataset | role |
 |---|---|
 | `HuggingFaceTB/smoltalk2` (no-think SFT splits) | general instruction following |
+| `HuggingFaceH4/ultrachat_200k` (train_sft) | general multi-turn chat |
 | `rajpurkar/squad_v2` | **primary abstention supervision** -- the unanswerable half is the point |
 | `allenai/tulu-3-sft-personas-math` | short worked solutions |
 | `openai/gsm8k` (socratic) | short numbered steps |
 | `HuggingFaceH4/no_robots` | human-written; tone and refusal style |
+
+``--profile repair`` (prefix ``repair``) builds Phase 2's ~30M-token repair corpus, which exists
+because that mix produced a model that refuses 78.4% of *answerable* questions. Same machinery,
+three differences, one per item on NEXT.md's Phase 2 list:
+
+  * **SQuAD v2's unanswerable rows are down-sampled** (``--squad-unanswerable-fraction``, 0.12 for
+    this profile) from their natural ~33% of the source to ~12% of its kept rows.
+  * **Answerable extractive QA is added** under the *same* instruction string: `rajpurkar/squad`
+    (SQuAD 1.1) and `hotpotqa/hotpot_qa` (distractor). Reusing ``SQUAD_INSTRUCTION`` verbatim is the
+    whole point -- what has to change is P(answer | this exact prompt shape), and the eval measures
+    that shape.
+  * **General chat is kept in the mix** at ~35% of the budget. A QA-only repair pass at lr=1e-5
+    over 30M tokens would trade the false-abstention rate for instruction following.
+
+Two sources NEXT.md names are deliberately **not** here: NQ-open and TriviaQA's ``nocontext``
+configs are closed-book (no passage at all), so they neither share the prompt shape Gate P2 measures
+nor teach extraction -- at 332M params they teach guessing, which is the opposite of the calibration
+target. Adding them later is a one-line ``SFTSource``; see ``REPAIR_SOURCES``.
+
+Phase 2's remaining item, per-conversation loss weighting, is not a data change: it lives in
+``modules/data/sft_dataset.py`` + ``modules/model/mtp.py``.
 
 Unlike ``scripts/prepare_data.py`` this runs **locally**, not on the rented box: the pretrained
 checkpoint and ``manifest.json`` come down from the Hub once pretraining finishes, and everything
@@ -33,7 +57,10 @@ Three things here are load-bearing for correctness rather than convenience:
     supervised EOS, which teaches the model not to stop. Per-source drop counts land in the
     manifest so a mix that quietly lost most of a source is visible.
 
-Run from the repo root: `python scripts/prepare_sft_data.py`.
+Run from the repo root:
+
+    python scripts/prepare_sft_data.py                    # Step 12's mix -> sft_train/sft_val
+    python scripts/prepare_sft_data.py --profile repair    # Phase 2's mix -> repair_train/repair_val
 """
 
 import os
@@ -41,8 +68,9 @@ import sys
 import json
 import time
 import random
+import hashlib
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterator, List, Optional, Sequence
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -74,6 +102,13 @@ class SFTSource:
     weight: float
     file_filter: Optional[Callable[[str], bool]] = None
     holdout: bool = False              # check each document against the pretraining holdout hashes
+    # fraction of this source's *unanswerable* rows to keep (squad_v2 only; every other source is
+    # answerable by construction). 1.0 keeps all of them, which is what the original Step 12 mix
+    # did and what the 78.4% false-abstention rate came out of.
+    unanswerable_keep: float = 1.0
+    # counted into the realized "unanswerable share of QA conversations" the manifest reports.
+    # Purely bookkeeping -- it does not change what gets written.
+    qa: bool = False
 
 
 def _no_think_sft_split(path: str) -> bool:
@@ -107,7 +142,7 @@ SOURCES = [
     SFTSource("ultrachat", "HuggingFaceH4/ultrachat_200k", "data/train_sft", (".parquet",),
               render="messages", weight=0.20),
     SFTSource("squad_v2", "rajpurkar/squad_v2", "squad_v2/train", (".parquet",),
-              render="squad_v2", weight=0.20),
+              render="squad_v2", weight=0.20, qa=True),
     SFTSource("tulu_math", "allenai/tulu-3-sft-personas-math", "data/train", (".parquet",),
               render="messages", weight=0.10),
     SFTSource("no_robots", "HuggingFaceH4/no_robots", "data/train", (".parquet",),
@@ -116,23 +151,73 @@ SOURCES = [
               render="gsm8k", weight=0.05),
 ]
 
+# Phase 2's repair mix (see the module docstring). QA-shaped sources take ~65% of the budget, of
+# which only squad_v2 contributes refusals and only a down-sampled twelfth of its rows at that; the
+# rest of the budget keeps general instruction following alive.
+#
+# Note what the two answerable QA sources each buy, because they are not interchangeable:
+# `rajpurkar/squad` (SQuAD 1.1) is largely the same passages and questions as squad_v2's answerable
+# half, so it does not add *new* evidence -- it adds answerable volume under an identical prompt,
+# which is the same lever as down-sampling the refusals and is listed separately in NEXT.md for that
+# reason. `hotpot_qa`'s distractor split is the one that adds genuinely new passages, and its ten
+# paragraphs per question (only two of them relevant) also teach reading past distractors, which is
+# what Phase 4's distractor-evidence condition will want anyway.
+REPAIR_SOURCES = [
+    SFTSource("squad_v2", "rajpurkar/squad_v2", "squad_v2/train", (".parquet",),
+              render="squad_v2", weight=0.30, unanswerable_keep=0.12, qa=True),
+    SFTSource("squad_v1", "rajpurkar/squad", "plain_text/train", (".parquet",),
+              render="squad_v2", weight=0.20, qa=True),
+    SFTSource("hotpot_qa", "hotpotqa/hotpot_qa", "distractor/train", (".parquet",),
+              render="hotpot_qa", weight=0.15, qa=True),
+    SFTSource("smoltalk2", "HuggingFaceTB/smoltalk2", "SFT/", (".parquet",),
+              render="messages", weight=0.20, file_filter=_no_think_sft_split, holdout=True),
+    SFTSource("ultrachat", "HuggingFaceH4/ultrachat_200k", "data/train_sft", (".parquet",),
+              render="messages", weight=0.10),
+    SFTSource("no_robots", "HuggingFaceH4/no_robots", "data/train", (".parquet",),
+              render="messages", weight=0.05),
+]
+
+PROFILES = {"sft": SOURCES, "repair": REPAIR_SOURCES}
+# defaults per profile: the Step 12 corpus is a full post-training run, the repair corpus is a short
+# targeted finetune (NEXT.md Phase 2: "~20-50M tokens, lr=1e-5, 1 epoch").
+PROFILE_TARGET_TOKENS = {"sft": 300_000_000, "repair": 30_000_000}
+# 1.0 = keep every unanswerable row, i.e. exactly what the original Step 12 build did.
+PROFILE_UNANSWERABLE_FRACTION = {"sft": 1.0, "repair": 0.12}
+
 SQUAD_INSTRUCTION = (
     "Answer the question using only the passage below. If the passage does not contain the "
     "answer, say so."
 )
 
 
-def render_squad_v2(row: dict, rng: random.Random) -> Optional[List[dict]]:
-    """One SQuAD v2 row -> a single-turn conversation.
+def is_unanswerable_squad(row: dict) -> bool:
+    """Whether a SQuAD-schema row has no reference answer (SQuAD v2's unanswerable third).
+
+    Shared by the renderer and the down-sampling filter so "unanswerable" means one thing. The
+    numpy-array length check is the same one ``eval_abstention.squad_references`` makes: pandas
+    hands back an array whose truthiness is ambiguous.
+    """
+    answers = row.get("answers") or {}
+    texts = answers.get("text") if isinstance(answers, dict) else None
+    return not [str(t).strip() for t in (texts if texts is not None else []) if str(t).strip()]
+
+
+def render_squad_v2(row: dict, rng: random.Random,
+                    phrasings: Sequence[str] = abstention.ABSTENTIONS_PASSAGE_TRAIN) -> Optional[List[dict]]:
+    """One SQuAD-schema row -> a single-turn conversation. Also renders SQuAD 1.1 unchanged.
 
     The unanswerable half carries an empty reference answer, so an abstention has to be supplied;
-    it comes from ``modules.data.abstention``'s small fixed set rather than free text, for the
-    reasons in that module's docstring (the acceptance metric has to be able to *detect* an
-    abstention, and a closed set makes that exact rather than a classification problem).
+    it comes from ``modules.data.abstention``'s closed set rather than free text, for the reasons in
+    that module's docstring (the acceptance metric has to be able to *detect* an abstention, and a
+    closed set makes that exact rather than a classification problem). ``phrasings`` defaults to the
+    **wide** training set -- Phase 2's fix #4, so no single refusal string is the whole target.
 
     The instruction explicitly licenses abstention. Without it, an unanswerable target is
     indistinguishable from a model that simply refuses on a question it could have answered --
     the prompt has to make "say so" a legitimate response for the supervision to mean anything.
+    SQuAD 1.1 rows go through the *same* instruction even though none of them is unanswerable: the
+    quantity Phase 2 has to move is P(answer | this exact prompt shape), and a different instruction
+    would train a different shape.
     """
     context = str(row.get("context") or "").strip()
     question = str(row.get("question") or "").strip()
@@ -146,10 +231,51 @@ def render_squad_v2(row: dict, rng: random.Random) -> Optional[List[dict]]:
     if candidates:
         answer = candidates[0]
     else:
-        answer = abstention.pick(abstention.ABSTENTIONS_PASSAGE, rng)
+        answer = abstention.pick(phrasings, rng)
 
     return [
         {"role": "user", "content": f"{SQUAD_INSTRUCTION}\n\nPassage:\n{context}\n\nQuestion: {question}"},
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def render_hotpot_qa(row: dict, rng: random.Random) -> Optional[List[dict]]:
+    """One HotpotQA distractor row -> a single-turn conversation under ``SQUAD_INSTRUCTION``.
+
+    ``context`` is ``{"title": [str], "sentences": [[str]]}`` -- ten paragraphs, of which two hold
+    the supporting facts and eight are retrieved distractors. All ten are rendered, in the order the
+    dataset gives them, as ``"Title: sentence sentence ..."`` blocks: dropping the distractors would
+    turn a multi-hop reading task into a one-paragraph lookup, and the distractors are the part that
+    teaches reading *past* irrelevant evidence.
+
+    Titles are kept because they carry the entity the hop is about, and paragraphs are joined with
+    blank lines so the passage has visible structure rather than one run-on wall of text. The answer
+    is a short span (or the literal "yes"/"no" for comparison questions), which is the same output
+    shape SQuAD supervises.
+    """
+    question = str(row.get("question") or "").strip()
+    answer = str(row.get("answer") or "").strip()
+    context = row.get("context")
+    if not question or not answer or context is None:
+        return None
+
+    titles = context.get("title") if isinstance(context, dict) else None
+    sentence_lists = context.get("sentences") if isinstance(context, dict) else None
+    if titles is None or sentence_lists is None:
+        return None
+
+    paragraphs = []
+    for title, sentences in zip(titles, sentence_lists):
+        body = "".join(str(s) for s in (sentences if sentences is not None else [])).strip()
+        if not body:
+            continue
+        paragraphs.append(f"{str(title).strip()}: {body}")
+    if not paragraphs:
+        return None
+
+    passage = "\n\n".join(paragraphs)
+    return [
+        {"role": "user", "content": f"{SQUAD_INSTRUCTION}\n\nPassage:\n{passage}\n\nQuestion: {question}"},
         {"role": "assistant", "content": answer},
     ]
 
@@ -209,8 +335,17 @@ def rows_to_conversations(spec: SFTSource, frame: pd.DataFrame, rng: random.Rand
             yield conversation, key
         return
 
-    renderer = {"squad_v2": render_squad_v2, "gsm8k": render_gsm8k}[spec.render]
+    renderer = {
+        "squad_v2": render_squad_v2, "gsm8k": render_gsm8k, "hotpot_qa": render_hotpot_qa,
+    }[spec.render]
     for row in frame.to_dict("records"):
+        if spec.unanswerable_keep < 1.0 and is_unanswerable_squad(row) and rng.random() >= spec.unanswerable_keep:
+            # Phase 2's fix #1. Dropped *before* the renderer and therefore before this shard's
+            # conversation list exists, so it never occupies a row_idx -- the resume state stays a
+            # plain position in the kept list and no "skipped" counter has to be threaded through
+            # the writer. That also means this filter has to be reproducible across processes, which
+            # is what make_generator_factory's stable per-file seed is for.
+            continue
         conversation = renderer(row, rng)
         if conversation:
             yield conversation, None
@@ -245,7 +380,12 @@ def make_generator_factory(spec: SFTSource, files: Sequence[str], scratch_dir: s
             except OSError:
                 pass
 
-            rng = random.Random(seed ^ (hash(filename) & 0xFFFFFFFF))
+            # sha1, not the builtin hash(): str hashing is salted per process (PYTHONHASHSEED), so
+            # hash() gave this shard a different shuffle, different abstention phrasings and -- now
+            # that unanswerable_keep draws from the same rng -- a different kept subset on every
+            # restart, while the resume state points at a row_idx in the *old* ordering.
+            digest = hashlib.sha1(filename.encode("utf-8")).digest()
+            rng = random.Random(seed ^ int.from_bytes(digest[:4], "big"))
             conversations = list(rows_to_conversations(spec, frame, rng))
             rng.shuffle(conversations)
             del frame
@@ -325,6 +465,7 @@ def build_corpus(
     seed: int = 42,
     checkpoint_docs: int = 5000,
     encode_batch_size: int = 256,
+    split_prefix: str = "sft",
 ) -> dict:
     """Interleave sources, encode with the chat template, write both splits.
 
@@ -335,32 +476,41 @@ def build_corpus(
     Args:
         source_entries: ``[{"key", "weight", "generator_factory"}]``, the factory taking
             ``(start_file_idx, start_row_idx)`` and yielding ``(file_idx, row_idx, conversation, key)``.
+            An optional ``"qa"`` flag marks a source as QA-shaped, which only affects the realized
+            "unanswerable share of QA conversations" this returns.
         target_tokens: total tokens to write across BOTH splits.
         template: the chat template doing the rendering and masking.
         holdout_hashes: conversation hashes phase-2 pretraining already consumed; skipped.
         max_doc_tokens: conversations longer than this are dropped (never truncated).
-        val_fraction: share of conversations routed to ``sft_val`` instead of ``sft_train``.
+        val_fraction: share of conversations routed to the val split instead of the train split.
         checkpoint_docs: fsync + persist the resume sidecar every N committed conversations.
         encode_batch_size: conversations per tokenizer call (the fast tokenizer parallelizes
             across a batch on its own threads; per-conversation calls are mostly FFI overhead).
+        split_prefix: writes ``{prefix}_train`` / ``{prefix}_val``. "sft" for Step 12's corpus,
+            "repair" for Phase 2's.
 
     Returns:
-        The final resume state, including per-source realized token counts and drop reasons.
+        The final resume state, including per-source realized token counts, drop reasons and
+        committed abstention counts.
     """
+    train_split, val_split = f"{split_prefix}_train", f"{split_prefix}_val"
     state = load_state(state_path)
     state.setdefault("sources", {})
     state.setdefault("splits", {})
     state.setdefault("skipped", {})
-    for split in ("sft_train", "sft_val"):
+    for split in (train_split, val_split):
         state["splits"].setdefault(split, {"doc_count": 0, "tokens_written": 0})
     for entry in source_entries:
-        state["sources"].setdefault(
+        source_state = state["sources"].setdefault(
             entry["key"], {"file_idx": 0, "row_idx": 0, "tokens": 0, "docs": 0, "done": False},
         )
+        # counted on commit rather than at render time: what matters for Phase 2's ratio is what
+        # actually landed in the corpus, after the length filter and the target-token cutoff
+        source_state.setdefault("abstentions", 0)
         state["skipped"].setdefault(entry["key"], {"too_long": 0, "holdout": 0, "unrenderable": 0})
 
     writers = {split: SplitWriter(data_dir, split, state["splits"][split])
-               for split in ("sft_train", "sft_val")}
+               for split in (train_split, val_split)}
     holdout_hashes = holdout_hashes or set()
     split_rng = random.Random(seed)
 
@@ -425,7 +575,7 @@ def build_corpus(
 
         encoded = template.encode_batch([c for _, _, _, c, _ in picks])
 
-        for (pick, file_idx, row_idx, _, key), result in zip(picks, encoded):
+        for (pick, file_idx, row_idx, conversation, key), result in zip(picks, encoded):
             source_state = active[pick]["state"]
             # the source position advances even for a rejected conversation: it WAS consumed, and
             # not recording that would replay it on every resume
@@ -445,10 +595,12 @@ def build_corpus(
                 state["skipped"][pick]["too_long"] += 1
                 continue
 
-            split = "sft_val" if split_rng.random() < val_fraction else "sft_train"
+            split = val_split if split_rng.random() < val_fraction else train_split
             writers[split].write(ids, mask)
             source_state["tokens"] += len(ids)
             source_state["docs"] += 1
+            if abstention.is_abstention(str(conversation[-1].get("content") or "")):
+                source_state["abstentions"] += 1
             since_checkpoint += 1
             if total_tokens() >= target_tokens:
                 break
@@ -464,11 +616,20 @@ def build_corpus(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build the SFT corpus (PLAN.md Step 12)")
+    parser = argparse.ArgumentParser(description="Build an SFT corpus (Step 12's mix or Phase 2's repair mix)")
+    parser.add_argument("--profile", choices=sorted(PROFILES), default="sft",
+                        help="which source mix to build. 'sft' -> sft_train/sft_val (PLAN.md Step "
+                             "12); 'repair' -> repair_train/repair_val (NEXT.md Phase 2)")
     parser.add_argument("--data-dir", default=os.path.join(BASE_DIR, "data", "prepared"))
     parser.add_argument("--tokenizer-dir", default=TOKENIZER_DIR)
-    parser.add_argument("--target-tokens", type=int, default=300_000_000,
-                        help="total tokens across sft_train + sft_val")
+    parser.add_argument("--target-tokens", type=int, default=None,
+                        help="total tokens across both splits (default: 300M for --profile sft, "
+                             "30M for --profile repair)")
+    parser.add_argument("--squad-unanswerable-fraction", type=float, default=None,
+                        help="fraction of squad_v2's unanswerable rows to KEEP (default: 1.0 for "
+                             "--profile sft, 0.12 for --profile repair). This is a fraction of that "
+                             "one source's rows -- the realized share across all QA sources is "
+                             "reported at the end and is what NEXT.md's 10-15%% target refers to")
     parser.add_argument("--max-doc-tokens", type=int, default=4094,
                         help="drop conversations longer than this (default: seq_length - mtp separator)")
     parser.add_argument("--val-fraction", type=float, default=0.01)
@@ -487,6 +648,19 @@ def main():
                         help="repo to pull the manifest from (default: config.yaml's "
                              "training.hf_upload_repo)")
     args = parser.parse_args()
+
+    target_tokens = args.target_tokens or PROFILE_TARGET_TOKENS[args.profile]
+    unanswerable_keep = (
+        args.squad_unanswerable_fraction if args.squad_unanswerable_fraction is not None
+        else PROFILE_UNANSWERABLE_FRACTION[args.profile]
+    )
+    # dataclasses.replace rather than mutating the module-level specs: they are shared state, and a
+    # test (or a second call) reading a spec someone else's --squad-unanswerable-fraction had
+    # rewritten is the kind of bug that only shows up in the realized counts
+    sources = [
+        replace(spec, unanswerable_keep=unanswerable_keep) if spec.render == "squad_v2" else spec
+        for spec in PROFILES[args.profile]
+    ]
 
     os.makedirs(args.data_dir, exist_ok=True)
     scratch_dir = os.path.join(args.data_dir, "_sft_scratch")
@@ -523,7 +697,7 @@ def main():
     hf_api = HfApi(token=hf_token)
 
     files_by_source, revision_by_source = {}, {}
-    for spec in SOURCES:
+    for spec in sources:
         try:
             info = hf_api.dataset_info(spec.repo_id)
             all_files = hf_api.list_repo_files(spec.repo_id, repo_type="dataset", revision=info.sha)
@@ -543,55 +717,76 @@ def main():
         revision_by_source[spec.key] = info.sha
         logger.info(f"source {spec.key}: {len(filtered)} files (revision {info.sha[:10]})")
 
-    total_w = sum(s.weight for s in SOURCES)
+    total_w = sum(s.weight for s in sources)
     source_entries = [
         {
             "key": spec.key,
             "weight": spec.weight / total_w,
+            "qa": spec.qa,
             "generator_factory": make_generator_factory(
                 spec, files_by_source[spec.key], scratch_dir, hf_token, args.seed,
                 revision_by_source[spec.key],
             ),
         }
-        for spec in SOURCES
+        for spec in sources
     ]
 
-    state_path = os.path.join(args.data_dir, "_prepare_state_sft.json")
-    logger.info(f"=== SFT: target {args.target_tokens:,} tokens across {len(source_entries)} sources ===")
+    state_path = os.path.join(args.data_dir, f"_prepare_state_{args.profile}.json")
+    logger.info(
+        f"=== {args.profile}: target {target_tokens:,} tokens across {len(source_entries)} sources "
+        f"(squad_v2 unanswerable rows kept: {unanswerable_keep:.0%}) ==="
+    )
     t0 = time.time()
     final_state = build_corpus(
-        source_entries, args.target_tokens, template, args.data_dir, state_path,
+        source_entries, target_tokens, template, args.data_dir, state_path,
         holdout_hashes=holdout_hashes, max_doc_tokens=args.max_doc_tokens,
         val_fraction=args.val_fraction, seed=args.seed,
         checkpoint_docs=args.checkpoint_docs, encode_batch_size=args.encode_batch,
+        split_prefix=args.profile,
     )
     elapsed = time.time() - t0
 
     per_source = {}
-    for spec in SOURCES:
+    qa_conversations, qa_abstentions = 0, 0
+    for spec in sources:
         source_state = final_state["sources"][spec.key]
-        target_k = int(args.target_tokens * (spec.weight / total_w))
+        target_k = int(target_tokens * (spec.weight / total_w))
         pct = (source_state["tokens"] / target_k - 1) * 100 if target_k else 0.0
         skipped = final_state["skipped"][spec.key]
         logger.info(
-            f"[sft] {spec.key}: {source_state['tokens']:,} / {target_k:,} tokens ({pct:+.1f}%), "
-            f"{source_state['docs']:,} conversations, skipped "
+            f"[{args.profile}] {spec.key}: {source_state['tokens']:,} / {target_k:,} tokens "
+            f"({pct:+.1f}%), {source_state['docs']:,} conversations "
+            f"({source_state['abstentions']:,} abstentions), skipped "
             f"{skipped['too_long']} too long / {skipped['holdout']} holdout / "
             f"{skipped['unrenderable']} unrenderable"
         )
+        if spec.qa:
+            qa_conversations += source_state["docs"]
+            qa_abstentions += source_state["abstentions"]
         per_source[spec.key] = {
             "repo_id": spec.repo_id,
             "revision": revision_by_source[spec.key],
             "target_tokens": target_k,
             "realized_tokens": source_state["tokens"],
             "conversations": source_state["docs"],
+            "abstentions": source_state["abstentions"],
+            "unanswerable_keep": spec.unanswerable_keep,
             "skipped": skipped,
         }
+
+    # the number NEXT.md's Phase 2 target is stated against. --squad-unanswerable-fraction controls
+    # one source's rows; this is what that turns into once the other QA sources, the length filter
+    # and the token cutoff have had their say, and it is the figure to adjust the flag against.
+    qa_share = qa_abstentions / qa_conversations if qa_conversations else float("nan")
+    logger.info(
+        f"[{args.profile}] unanswerable share of QA conversations: {qa_share:.1%} "
+        f"({qa_abstentions:,} / {qa_conversations:,}) -- NEXT.md Phase 2 targets 10-15%"
+    )
 
     # acceptance checks, mirroring prepare_data.py's: the idx must be monotone and end exactly at
     # the bin's length, and the mask must be exactly one byte per token
     splits = {}
-    for split in ("sft_train", "sft_val"):
+    for split in (f"{args.profile}_train", f"{args.profile}_val"):
         bin_path = os.path.join(args.data_dir, f"{split}.bin")
         idx_path = os.path.join(args.data_dir, f"{split}.idx")
         mask_path = os.path.join(args.data_dir, f"{split}.mask")
@@ -612,10 +807,17 @@ def main():
             f"{supervised:,} supervised ({100 * supervised / max(int(idx[-1]), 1):.1f}%)"
         )
 
-    manifest["sft_prep"] = {
+    # one manifest key per profile, so building the repair corpus never overwrites the record of
+    # what the SFT corpus was built from
+    manifest[f"{args.profile}_prep"] = {
         "tokenizer_dir": args.tokenizer_dir,
+        "profile": args.profile,
         "seed": args.seed,
-        "target_tokens": args.target_tokens,
+        "target_tokens": target_tokens,
+        "squad_unanswerable_fraction": unanswerable_keep,
+        "qa_conversations": qa_conversations,
+        "qa_abstentions": qa_abstentions,
+        "qa_unanswerable_share": qa_share,
         "max_doc_tokens": args.max_doc_tokens,
         "val_fraction": args.val_fraction,
         "holdout_hashes_applied": len(holdout_hashes),
@@ -625,7 +827,7 @@ def main():
     }
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
-    logger.info(f"recorded SFT prep manifest in {MANIFEST_PATH}")
+    logger.info(f"recorded {args.profile} prep manifest in {MANIFEST_PATH}")
 
 
 if __name__ == "__main__":
