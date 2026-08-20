@@ -101,9 +101,11 @@ scripts/
   migrate_phase0.py         folds the deleted halt gate into loop_scale, strips both old heads
   prepare_data.py           builds phase1/phase2.bin/.idx from the Hub source mix, runs
                              on the rented box, not locally -- see "Data prep" below
-  prepare_sft_data.py       builds sft_train/sft_val .bin/.idx/.mask, runs LOCALLY
+  prepare_sft_data.py       builds sft_train/sft_val .bin/.idx/.mask, runs LOCALLY.
+                             `--profile repair` builds Phase 2's repair_train/repair_val instead
   sft.py                    THE post-training entry point: local, single GPU, reuses
-                             pretrain.train_step verbatim
+                             pretrain.train_step verbatim. `--repair` runs Phase 2's repair
+                             finetune through the same function (RepairConfig, ckpts/repair)
   eval_calibration.py       p_max ECE/AUROC, early-exit curve, loop-convergence statistics.
                              Also the Gate P0 harness for any head removal
   eval_abstention.py        the acceptance metric: SQuAD v2 abstention precision/recall + ECE,
@@ -157,7 +159,9 @@ bash scripts/setup.sh --hf-token X   # rented box only: deps, token, tokenizer, 
 python scripts/run_training.py       # the real run: phase1 -> phase2, restarts on preemption
 python scripts/pretrain.py --phase phase1   # one phase; resumes from the newest LOADABLE ckpt
 python scripts/prepare_sft_data.py   # SFT corpus; needs manifest.json's holdout hashes first
+python scripts/prepare_sft_data.py --profile repair          # Phase 2's ~50M-token repair corpus
 python scripts/sft.py --from-hub     # SFT: pull the pretrained ckpt + manifest, then train
+python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt   # Phase 2
 python scripts/migrate_phase0.py -c CKPT     # fold+strip a pre-Phase-0 checkpoint
 python scripts/eval_calibration.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4
 python scripts/eval_abstention.py    # acceptance; -c CKPT --baseline-checkpoint PRETRAINED
@@ -181,7 +185,7 @@ not) lives in [docs/runbook.md](docs/runbook.md), not here.
 
 ## Config
 
-`config.yaml` -> `config.py` exposes four surfaces:
+`config.yaml` -> `config.py` exposes five surfaces:
 
 - `ModelConfig.Params` — kwargs splatted straight into `TinyMoETransformer(**...)`.
 - `ModelConfig.Forward` — kwargs splatted into `model(...)`; currently empty.
@@ -196,11 +200,20 @@ not) lives in [docs/runbook.md](docs/runbook.md), not here.
   reads — both gitignored artifacts produced by `scripts/prepare_data.py`.
 - `SFTConfig` — the `sft:` block. Only what SFT genuinely does differently: its own
   lr/epochs/batch/seq, the `{train,val}_split` stems, the per-epoch shuffle `seed`, the eval and
-  checkpoint cadences, and a `dropout` override applied via `SFTConfig.model_params()` (dropout is
-  not a parameter, so the pretrained state dict still loads unchanged). **Every loss weight is
-  absent on purpose** — `scripts/sft.py` reuses `pretrain.train_step`, which reads them from
-  `TrainingConfig`. Same `None`-vs-`""` `hf_upload_repo` distinction as `TrainingConfig`, but it
-  defaults to `""` (uploads off) because SFT is a local run.
+  checkpoint cadences, `conversation_loss_weighting`, and a `dropout` override applied via
+  `SFTConfig.model_params()` (dropout is not a parameter, so the pretrained state dict still loads
+  unchanged). **Every loss weight is absent on purpose** — `scripts/sft.py` reuses
+  `pretrain.train_step`, which reads them from `TrainingConfig`. Same `None`-vs-`""`
+  `hf_upload_repo` distinction as `TrainingConfig`, but it defaults to `""` (uploads off) because
+  SFT is a local run.
+- `RepairConfig` — the `repair:` block, and a **subclass of `SFTConfig`**: only the keys it names
+  are readable from that block, and everything else (batch size, seq length, dropout, warmup,
+  `model_params()`) inherits by ordinary attribute lookup. That inheritance is the invariant — the
+  repair pass is meant to be the SFT run with different data, so a second copy of those numbers is
+  a second thing that can drift. It overrides `lr` (1e-5), `num_epochs` (1), the splits, the
+  cadences, `grad_accumulation_steps` (2, purely to buy optimizer steps on a 14x smaller corpus)
+  and `conversation_loss_weighting` (**true** — this is off in `SFTConfig` so that class still
+  describes the run that produced the existing SFT checkpoint).
 
 There is **no config key for the depth policy**. `converge_tol` / `min_loops` are inference-time
 arguments to `TinyMoETransformer.forward`, not trained quantities — that is the point of them.
@@ -619,6 +632,32 @@ on a rented box lives in [docs/runbook.md](docs/runbook.md) §10.
   labels and every loss term — including the MTP heads, which read the same `labels` tensor —
   already honours `ignore_index=-100`. Consequence: every loss weight lives in `TrainingConfig`,
   not `SFTConfig`.
+- **`sft(args)` runs two profiles, selected by `--repair`** (Phase 2 of
+  [NEXT.md](docs/plans/NEXT.md)). It swaps three things and nothing else: the config class
+  (`SFTConfig` / `RepairConfig`), the phase label (`"sft"` / `"repair"`) and the checkpoint
+  directory (`ckpts/sft` / `ckpts/repair`). Distinct phase labels are load-bearing in both
+  directions — `load_sft_checkpoint` takes the expected phase and refuses anything else, so neither
+  run can adopt the other's AdamW moments or LR schedule, and the SFT checkpoint is passed to the
+  repair run with `-c` (an *initializer*, via `load_pretrained_weights`, which drops optimizer
+  state on purpose). The seed must be a **migrated** checkpoint (`*_phase0.pt`); a pre-Phase-0 one
+  still has `halt_proj`/`correct_proj` in its state dict and won't load.
+- **Per-conversation loss weighting** (`SFTConfig.conversation_loss_weighting`, off; `RepairConfig`,
+  on). `SFTDataset` always emits `loss_weights [B, S]` = `1/(supervised tokens in this
+  conversation)` on supervised positions and 0 elsewhere; the trainer decides whether to pass them,
+  so one corpus serves both objectives and not passing them is bit-for-bit the old per-token mean.
+  They flow `train_step -> compute_mtp_loss -> _chunked_linear_ce`, which turns every CE term into
+  `sum(w*ce)/sum(w)`. Three details:
+  - **Aligned with `targets`, not with the shifted labels.** Each term shifts them exactly as it
+    shifts its labels (`[:, 1:]` for the main CE, `[:, shift:]` for MTP head *i*), and
+    `_chunked_linear_ce` masks the denominator by `labels != -100` itself, so a stray weight on an
+    ignored position can't inflate it.
+  - **`p_max`/`top1_acc` stay unweighted**, always. They are compared across pretraining, SFT and
+    `eval_calibration.py`; weighting them would redefine a reported number without renaming it.
+  - **It changes what a source's mix weight buys.** `prepare_sft_data.py`'s weights are token-budget
+    shares, but under conversation weighting a source's influence is its share of *conversations* —
+    and at ~206 tokens for a SQuAD row against ~1,340 for a HotpotQA one those differ by 6.5x. The
+    repair mix's 50/50 QA/chat token split is what produces its 72/28 conversation split; retune
+    against the realized counts prep prints, never against the weights.
 - **The model's global token counter is CONTINUED, not reset.** The router noise anneal is driven
   from it and has long finished at ~16B tokens. SFT progress is `token_count - start_token_count`,
   and `start_token_count` is why `sft.py` writes its own checkpoint payload (a strict *superset* of
@@ -686,13 +725,17 @@ on a rented box lives in [docs/runbook.md](docs/runbook.md) §10.
     on the real run** — read the generated-answers block first.
   - `expected_calibration_error`/`roc_auc` are imported from `scripts/eval_calibration.py` so both
     evals compute them with the same code. Don't fork them.
-- **Abstention phrasings are a small fixed closed set** (`modules/data/abstention.py`). SQuAD v2's
-  unanswerable rows have a literally empty reference answer, so a phrasing has to be supplied;
-  keeping the set closed is what makes `is_abstention` an exact check rather than a classification
-  problem. **The SFT run collapsed onto them** — 7,786 of 11,873 completions were literally
-  `"The passage doesn't say."`, including on 78.4% of *answerable* questions. Repairing that is
-  Phase 2 of [NEXT.md](docs/plans/NEXT.md); assume any abstention number off the current SFT
-  checkpoint is measuring that collapse.
+- **Abstention phrasings are a closed set** (`modules/data/abstention.py`). SQuAD v2's unanswerable
+  rows have a literally empty reference answer, so a phrasing has to be supplied; keeping the set
+  closed is what makes `is_abstention` an exact check rather than a classification problem. **The
+  SFT run collapsed onto them** — 7,786 of 11,873 completions were literally `"The passage doesn't
+  say."`, including on 78.4% of *answerable* questions; assume any abstention number off the
+  pre-repair SFT checkpoint is measuring that collapse. Phase 2 widened the set the corpus draws
+  from to 15 phrasings (`ABSTENTIONS_PASSAGE_TRAIN`) while leaving `ABSTENTIONS_PASSAGE` (the
+  original 5) as what `eval_abstention.py` *forces* as a reference target, so its teacher-forced CE
+  stays comparable. **`is_abstention` matches the union**, and must: a detector that knew only the
+  original five would miss abstentions worded the new way and report a lower false-abstention rate
+  than the model earns — flattering the exact number Gate P2 checks.
 - `estimate_packed_rows` replays the packing rule over `{split}.idx` to anchor the LR schedule.
   "corpus tokens / (batch * seq)" is not a usable estimate here — no-split packing plus separator
   slots easily costs 10%, which would end the cosine well before the data does.

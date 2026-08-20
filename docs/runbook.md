@@ -381,3 +381,32 @@ happened on the real run: teacher-forced ECE read 0.026 against the pretrained b
 clean PASS) while the model was refusing 78% of answerable questions. Token-level calibration
 measures next-token confidence on a *given* reference string; it says nothing about whether the
 answer-level decision was right. Read the generated-answers block first.
+
+## 11. The abstention repair pass ([NEXT.md](plans/NEXT.md) Phase 2)
+
+Runs **locally on the 5090, in BF16** — do not set `USE_FP8`. It is the same script and the same
+objective as §10 with a repaired corpus, three config numbers and per-conversation loss weighting;
+everything in §10.4 and §10.5 applies unchanged.
+
+```bash
+python scripts/prepare_sft_data.py --profile repair       # ~50M tokens, ~15 min, download-bound
+python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
+python scripts/eval_abstention.py -c ckpts/repair/checkpoint_repair_final.pt \
+    --max-examples 2000 --batch-size 16 --skip-forced
+```
+
+- **Seed it with `-c`, always.** `--repair` resumes only from `ckpts/repair`; the SFT checkpoint is
+  an *initializer*, and `load_sft_checkpoint` refuses to adopt it as a resume point by name (its
+  optimizer state came from a 3e-5 cosine over a 14x larger corpus).
+- **The seed checkpoint must be a migrated one** (`*_phase0.pt`, from `scripts/migrate_phase0.py`).
+  A pre-Phase-0 checkpoint still has `halt_proj`/`correct_proj` in its state dict and will not load.
+- **Run the eval on the pre-repair checkpoint too, with identical flags**, before or after. Gate P2
+  is a before/after comparison and §10.5's second warning (fixed `--batch-size` / `--max-examples`)
+  is what makes the two numbers comparable.
+- Prep prints **`unanswerable share of QA conversations`** at the end. That is the knob's actual
+  effect; `--squad-unanswerable-fraction` scales one source and the corpus-wide share is what
+  NEXT.md's 10–15% target means. Rebuild with a higher fraction if it comes out low and abstention
+  recall collapses.
+- Checkpoints land in `ckpts/repair/` under phase `repair`, on the same rolling/final naming and the
+  same stop contract. `eval_abstention.py`'s default `--checkpoint` still searches `ckpts/sft`, so
+  pass `-c` explicitly here.

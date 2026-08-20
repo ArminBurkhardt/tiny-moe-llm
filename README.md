@@ -128,8 +128,10 @@ scripts/
   prune_vocab.py               one-shot 129280 -> 65536 vocab prune
   migrate_phase0.py            folds the deleted halt gate into loop_scale, strips both old heads
   eval_calibration.py          p_max calibration, early-exit curve, loop-convergence statistics
-  prepare_sft_data.py          builds sft_train/sft_val .bin/.idx/.mask from the SFT source mix
-  sft.py                       supervised fine-tuning; reuses pretrain.train_step unchanged
+  prepare_sft_data.py          builds sft_train/sft_val .bin/.idx/.mask from the SFT source mix;
+                                --profile repair builds the abstention-repair corpus instead
+  sft.py                       supervised fine-tuning; reuses pretrain.train_step unchanged.
+                                --repair runs the abstention repair finetune through the same loop
   eval_abstention.py           SQuAD v2 abstention precision/recall + calibration
 modules/model/
   transformer.py               TinyMoETransformer (top-level model) + the convergence exit
@@ -146,7 +148,7 @@ modules/model/
 modules/data/dataset.py        mmap flat-file dataset with document packing
 modules/data/sft_dataset.py    mmap SFT dataset: explicit loss mask, per-epoch shuffle
 modules/data/chat.py           chat template + token-level loss masking
-modules/data/abstention.py     the fixed abstention/hedge phrasings
+modules/data/abstention.py     the closed set of abstention/hedge phrasings
 modules/runtime/               unattended-run machinery (no GPU/TE dependency)
   checkpoints.py               naming, retention, latest-VALID resume, resume verification
   hf_sync.py                   background uploader to the Hugging Face Hub
