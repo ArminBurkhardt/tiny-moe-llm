@@ -115,6 +115,7 @@ def train_step(
     no_decay_master_pairs: list = None,
     collect_metrics: bool = False,
     n_loops: int = None,
+    loss_weights: torch.Tensor = None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -126,6 +127,9 @@ def train_step(
         n_loops: loop depth for this step (see sample_n_loops). None runs the configured depth.
             loop_ce_weights is truncated/rescaled to match, so the deepest loop actually run is
             always the one carrying weight 1.0.
+        loss_weights: optional ``[B, S]`` per-token loss weights, aligned with ``labels``. Only SFT
+            passes them (per-conversation weighting -- see ``modules/data/sft_dataset.py``);
+            pretraining leaves them None, which is bit-for-bit the plain per-token mean.
     """
     loop_ce_weights = (
         TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
@@ -169,6 +173,7 @@ def train_step(
                 loop_ce_weights=loop_ce_weights,
                 loop_ce_subsample=TrainingConfig.loop_ce_subsample,
                 return_metrics=collect_metrics,
+                loss_weights=loss_weights,
             )
             loss, loss_ce, metrics = out if collect_metrics else (out[0], out[1], None)
 

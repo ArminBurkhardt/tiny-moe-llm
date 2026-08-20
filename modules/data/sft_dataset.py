@@ -26,6 +26,17 @@ Resume granularity is a *position in the permuted order*, not a raw document id:
 with the same ``position % num_workers`` arithmetic, so one conservative min-across-workers scalar
 (the trainer's ``global_offset``) is still enough. Reading it back under a different ``seed`` or
 ``epoch`` would resume against a different permutation -- both are checkpointed for that reason.
+
+Every batch also carries **``loss_weights``**, a ``[B, S]`` float tensor holding ``1 / (supervised
+tokens in this conversation)`` on each supervised position and 0 elsewhere -- NEXT.md Phase 2's
+fix #3. Under plain per-token CE every supervised token counts the same, so a conversation's
+influence on the gradient is proportional to how long its answer is; SQuAD v2's ~6-token refusal is
+then the cheapest loss reduction in the corpus, and the real SFT run duly collapsed onto one
+literal refusal string on 78.4% of *answerable* questions. Weighting by these makes the objective a
+mean over conversations of the mean CE *within* a conversation, so a refusal and a multi-sentence
+answer carry the same weight regardless of length. It is emitted unconditionally and cheaply (one
+float per token, computed in the worker); whether the loss actually uses it is the trainer's
+decision (``SFTConfig.conversation_loss_weighting``), so the same corpus serves both objectives.
 """
 import os
 from typing import Iterator
@@ -148,8 +159,8 @@ class SFTDataset(IterableDataset):
             f"(global resume point {self.start_doc_idx})"
         )
 
-        batch_input_ids, batch_doc_ids, batch_labels = [], [], []
-        current_seq, current_labels, current_sections = [], [], []
+        batch_input_ids, batch_doc_ids, batch_labels, batch_weights = [], [], [], []
+        current_seq, current_labels, current_weights, current_sections = [], [], [], []
         # position of the last conversation actually copied into a row. Every yield below happens
         # with ``current_seq`` empty, so at that moment this is exactly "the last position whose
         # tokens are inside the batch being handed out" -- which is what the trainer's
@@ -164,6 +175,7 @@ class SFTDataset(IterableDataset):
             pad_len = self.max_length - len(current_seq)
             padded = current_seq + [self._pad_id] * pad_len
             labels = current_labels + [-100] * pad_len
+            weights = current_weights + [0.0] * pad_len
 
             # one causal segment per conversation block; trailing row padding becomes length-1
             # (self-attention only) segments, exactly as in the pretraining dataset
@@ -181,23 +193,28 @@ class SFTDataset(IterableDataset):
             batch_input_ids.append(padded)
             batch_doc_ids.append(doc_ids)
             batch_labels.append(torch.tensor(labels, dtype=torch.long))
+            batch_weights.append(torch.tensor(weights, dtype=torch.float32))
 
             current_seq.clear()
             current_labels.clear()
+            current_weights.clear()
             current_sections.clear()
 
         def yield_batch():
-            nonlocal batch_input_ids, batch_doc_ids, batch_labels
+            nonlocal batch_input_ids, batch_doc_ids, batch_labels, batch_weights
             batch = {
                 "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
                 "document_ids": torch.tensor(batch_doc_ids, dtype=torch.long),
                 "labels": torch.stack(batch_labels),
+                # per-conversation loss weights; see the module docstring. Aligned with input_ids,
+                # so a consumer shifts them exactly like it shifts labels.
+                "loss_weights": torch.stack(batch_weights),
                 # [B]-shaped so accelerate's batch splitting treats them like input_ids; the
                 # trainer takes the min across workers at checkpoint time (PLAN.md Step 9)
                 "doc_idx": torch.full((len(batch_input_ids),), committed_position, dtype=torch.long),
                 "worker_id": torch.full((len(batch_input_ids),), worker_id, dtype=torch.long),
             }
-            batch_input_ids, batch_doc_ids, batch_labels = [], [], []
+            batch_input_ids, batch_doc_ids, batch_labels, batch_weights = [], [], [], []
             return batch
 
         for position in range(first, num_docs, num_workers):
@@ -227,13 +244,21 @@ class SFTDataset(IterableDataset):
                 if len(batch_input_ids) == self.batch_size:
                     yield yield_batch()
 
+            # 1 / supervised tokens, so every conversation contributes the same total weight
+            # regardless of answer length. A conversation with nothing supervised cannot occur (the
+            # chat template rejects those at prep time), but a 0 here would be a NaN there.
+            n_supervised = sum(supervised)
+            per_token_weight = 1.0 / n_supervised if n_supervised else 0.0
+
             current_seq.extend(tokens)
             current_labels.extend(
                 token if flag else -100 for token, flag in zip(tokens, supervised)
             )
+            current_weights.extend(per_token_weight if flag else 0.0 for flag in supervised)
             # separator slots: pad ids, never supervised (the conversation's own EOS already is)
             current_seq.extend([self._pad_id] * self.num_mtp_tokens)
             current_labels.extend([-100] * self.num_mtp_tokens)
+            current_weights.extend([0.0] * self.num_mtp_tokens)
             current_sections.append(block_len)
             committed_position = position
 
