@@ -9,8 +9,9 @@ measurement — see [runbook.md](../runbook.md) §10.5):
 --max-examples 2000 --batch-size 16 --skip-forced   # greedy, <= 32 new tokens
 ```
 
-2,000 questions: 1,013 unanswerable, 987 answerable. Per-question records in
-`abstention_before_repair.json` / `abstention_after_repair.json`.
+2,000 questions: 1,013 unanswerable, 987 answerable. Per-question records were written next to this
+file as `abstention_before_repair.json` / `abstention_after_repair.json` — untracked, since
+`.gitignore` swallows `*.json`, so regenerate them with the command above if you need them.
 
 | | before (`checkpoint_sft_final_phase0`) | after (`checkpoint_repair_final`) |
 |---|---|---|
