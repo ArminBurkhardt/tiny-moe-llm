@@ -307,6 +307,65 @@ finetune peaks at 29.55GB allocated on the 32GB 5090, pushing the driver to ~32.
 into **shared system memory** at 9.4k tokens/sec. At 4 x 4096 with accumulation 4 — identical tokens
 per optimizer step, identical objective — it is 21.36GB, resident, at 22-37k tokens/sec.
 
+### Early stopping is not the recall lever (2026-08-20)
+
+Checked first, because it would have been free. The rolling checkpoints, all at the same eval flags
+as the table above:
+
+| | SFT seed | 30M | 40M | final (49.3M) |
+|---|---|---|---|---|
+| false abstention (answerable half) | 0.7832 | 0.1429 | 0.1226 | 0.1358 |
+| abstention precision | 0.5154 | 0.5778 | 0.5784 | 0.5759 |
+| abstention recall | 0.8115 | 0.1905 | 0.1639 | 0.1797 |
+| EM (answerable half) | 0.0648 | 0.1520 | 0.1641 | 0.1611 |
+| abstentions made (of 2,000) | 1,595 | 334 | 287 | 316 |
+
+**The flip is complete well before 30M** and precision is flat at ~0.578 across all of them, so
+there is no intermediate checkpoint that trades back into balance — it is one policy sampled at
+three times, not a trajectory through a better one. The corpus ratio is the lever.
+
+### Retune at 0.55, and archiving the corpus (2026-08-20)
+
+Ordered, because steps 1 and 3 are both about not destroying the thing being replaced:
+
+```bash
+# 1. keep the 0.40 build. prepare_sft_data.py deletes each source shard right after appending it,
+#    so a corpus overwritten in place costs a full re-download and re-tokenize to get back
+mkdir -p data/prepared_frac040
+mv data/prepared/repair_{train,val}.{bin,idx,mask} \
+   data/prepared/_prepare_state_repair.json data/prepared_frac040/
+
+# 2. rebuild at the top of the 10-15% band. check the realized share the run prints at the end
+#    BEFORE training on it -- it is a share of QA conversations, not of squad_v2's rows
+python scripts/prepare_sft_data.py --profile repair --squad-unanswerable-fraction 0.55
+
+# 3. a fresh run directory. sft.py resumes from the newest checkpoint in ckpts/repair, so leaving
+#    the previous run there means adopting its optimizer state and LR schedule, not replacing it
+mv ckpts/repair ckpts/repair_frac040
+python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
+
+# 4. the gate, at the exact flags every number above was measured at (batch size is part of the
+#    measurement -- the MoE's grouped GEMM tiles by the batch's per-expert row counts)
+python scripts/eval_abstention.py -c ckpts/repair/checkpoint_repair_final.pt \
+  --max-examples 2000 --batch-size 16 --skip-forced
+```
+
+**Archive a corpus rather than rebuilding it.** `scripts/archive_corpus.py` packs a split's
+`.bin`/`.idx`/`.mask` plus the prep resume sidecar into one `.tar.gz` under `data/archives/`, with a
+JSON sidecar holding per-file sha256, the token/document counts read off the files themselves, and
+the matching `manifest.json` slice. Restore is always explicit, so an archive can never silently
+shadow a fresh build:
+
+```bash
+python scripts/archive_corpus.py pack --all        # every split in data/prepared
+python scripts/archive_corpus.py list              # measured counts vs. what the builder claimed
+python scripts/archive_corpus.py restore repair_train --force
+```
+
+The measured-vs-claimed split in `list` is load-bearing on this box: the dev machine's
+`phase1.bin` is a small local stand-in while `manifest.json` describes the rented box's 24.7B-token
+build, and the two must not be read for each other.
+
 ---
 
 ## Phase 3 — IR expert reshape and sharpening

@@ -2,7 +2,8 @@ __pycache__
 venv
 data/datasets
 data/index
-data/prepared
+data/prepared*
+data/archives
 ckpts
 *.key
 *.cmd

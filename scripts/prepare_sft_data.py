@@ -642,10 +642,10 @@ def main():
     parser.add_argument("--tokenizer-dir", default=TOKENIZER_DIR)
     parser.add_argument("--target-tokens", type=int, default=None,
                         help="total tokens across both splits (default: 300M for --profile sft, "
-                             "30M for --profile repair)")
+                             "50M for --profile repair)")
     parser.add_argument("--squad-unanswerable-fraction", type=float, default=None,
                         help="fraction of squad_v2's unanswerable rows to KEEP (default: 1.0 for "
-                             "--profile sft, 0.12 for --profile repair). This is a fraction of that "
+                             "--profile sft, 0.55 for --profile repair). This is a fraction of that "
                              "one source's rows -- the realized share across all QA sources is "
                              "reported at the end and is what NEXT.md's 10-15%% target refers to")
     parser.add_argument("--max-doc-tokens", type=int, default=4094,
