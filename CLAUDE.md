@@ -108,6 +108,10 @@ scripts/
                              Also the Gate P0 harness for any head removal
   eval_abstention.py        the acceptance metric: SQuAD v2 abstention precision/recall + ECE,
                              LOCAL, needs an SFT checkpoint
+  eval_stage0.py            NEXT.md's Phase 1 diagnostics: IR retrieval entropy + ablation (Gate
+                             G1), per-loop query drift, residual/readout loop dynamics, oracle
+                             minimum sufficient depth. Read-only -- probes via forward hooks so a
+                             diagnostic can never change what it measures
   __init__.py               empty; exists only so tests can `from scripts.run_training import ...`
 modules/model/
   transformer.py            TinyMoETransformer + TokenTracker + the convergence exit
@@ -157,6 +161,7 @@ python scripts/sft.py --from-hub     # SFT: pull the pretrained ckpt + manifest,
 python scripts/migrate_phase0.py -c CKPT     # fold+strip a pre-Phase-0 checkpoint
 python scripts/eval_calibration.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4
 python scripts/eval_abstention.py    # acceptance; -c CKPT --baseline-checkpoint PRETRAINED
+python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4 --max-loops 6
 python scripts/inference.py          # interactive; -c CKPT -p PROMPT -n 200 --temperature 0.8
 python scripts/gradio_app.py         # same generation path, browser UI
 bash tests/run_env_check.sh          # torch/flash/TE/tokenizer smoke check

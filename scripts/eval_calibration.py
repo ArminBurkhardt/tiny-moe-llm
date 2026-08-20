@@ -128,8 +128,8 @@ def expected_calibration_error(confidences: np.ndarray, correctness: np.ndarray,
     return float(ece)
 
 
-def _chunked_eval(lm_head, hidden: torch.Tensor, labels: torch.Tensor, collect: bool = False,
-                  chunk_size: int = CE_CHUNK_SIZE):
+def chunked_eval(lm_head, hidden: torch.Tensor, labels: torch.Tensor, collect: bool = False,
+                 chunk_size: int = CE_CHUNK_SIZE):
     """no_grad chunked CE + (with ``collect``) per-token diagnostics.
 
     Bounds logit memory to ``chunk_size * vocab`` like ``mtp.py``'s training-time chunked CE, but
@@ -139,6 +139,10 @@ def _chunked_eval(lm_head, hidden: torch.Tensor, labels: torch.Tensor, collect: 
 
     ``argmax`` is returned for every chunk regardless of ``collect``: the loop-to-loop convergence
     statistics need each loop's top-1, not just the final one's.
+
+    Public (rather than underscore-private) because ``scripts/eval_stage0.py`` reads the same
+    per-loop readout and must read it with the same code -- an independently written second copy is
+    how two evals start disagreeing about a CE they both call "held-out CE".
     """
     T = hidden.size(0)
     ce_sum, n_valid = 0.0, 0
@@ -204,7 +208,7 @@ def collect_stats(model: TinyMoETransformer, dataset: Dataset, tokenizer, device
         for loop in range(hidden_all.size(0)):
             h = hidden_all[loop, :, :-1, :].contiguous().view(-1, hidden_all.size(-1))
             is_final = loop == hidden_all.size(0) - 1
-            ce_sum, n_valid, extra = _chunked_eval(model.lm_head, h, main_labels, collect=is_final)
+            ce_sum, n_valid, extra = chunked_eval(model.lm_head, h, main_labels, collect=is_final)
             per_loop_ce_sum[loop] += ce_sum
             per_loop_count[loop] += n_valid
             if is_final:
