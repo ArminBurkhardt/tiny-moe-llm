@@ -200,6 +200,11 @@ class RepairConfig(SFTConfig):
     num_epochs = int(_Block.get("num_epochs", 1))
     weight_decay = float(_Block.get("weight_decay", SFTConfig.weight_decay))
     dropout = float(_Block.get("dropout", SFTConfig.dropout))
+    # micro batch and accumulation move together on purpose: their product is the tokens per
+    # optimizer step, and only the product is part of the objective. See config.yaml -- the smaller
+    # micro batch is a memory fix (SFT's 8 spills into shared system memory on a 32GB card), the
+    # accumulation restores what it cost.
+    Batch_size = int(_Block.get("batch_size", SFTConfig.Batch_size))
     grad_accumulation_steps = int(
         _Block.get("grad_accumulation_steps", SFTConfig.grad_accumulation_steps)
     )

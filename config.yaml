@@ -85,8 +85,10 @@ sft: # Runs LOCALLY on the dev GPU -- the pretrained checkpoint and manifest.jso
   data_dir: "data/prepared"
   train_split: "sft_train"
   val_split: "sft_val"
-  batch_size: 8 # pretraining ran B=8 at 25.45GB peak; halving it leaves headroom for the fp32
-                # master weights below on a 32GB card
+  batch_size: 8 # what the real SFT run used. NOTE this is measured at 29.55GB peak allocated on the
+                # 32GB 5090, which pushes total driver usage to ~32.0GB and spills into shared
+                # system memory (~4x throughput loss). `repair:` below drops to 4 and doubles the
+                # accumulation instead; do the same here before any further local SFT run
   seq_length: 4096 # same as pretraining: packing means a shorter row wouldn't save anything, and a
                    # longer max_doc_tokens keeps more of smoltalk2's conversations
   grad_accumulation_steps: 4 # ~131k tokens per optimizer step
@@ -130,11 +132,17 @@ repair: # NEXT.md Phase 2: the abstention repair finetune, `python scripts/sft.p
              # ulp arithmetic in build_sft_param_groups only gets worse at a lower LR).
   num_epochs: 1 # one pass over ~50M tokens. Two would start memorizing the repair corpus's own
                 # answers, which is the failure this whole phase is undoing
-  grad_accumulation_steps: 2 # ~65k tokens/optimizer step instead of SFT's ~131k. The corpus is 14x
-                             # smaller than SFT's, so at SFT's accumulation this pass would be ~380
-                             # optimizer steps total; halving it buys ~760 without touching the
-                             # objective. The only inherited number this profile overrides for a
-                             # reason other than "the corpus is different"
+  batch_size: 4 # NOT inherited: `sft:`'s 8 peaks at 29.55GB allocated on this 32GB 5090, and the
+                # driver then backs the rest with SHARED (system) memory instead of failing --
+                # measured 32,057 of 32,607 MiB in use at 9.4k tokens/sec, roughly a quarter of what
+                # the card does when it stays resident. Halving the micro batch halves the
+                # activations (weights + fp32 masters + Adam moments are a fixed ~4.7GB) and is
+                # invisible to the objective, since grad_accumulation_steps below restores the
+                # tokens per optimizer step exactly
+  grad_accumulation_steps: 4 # 4 x 4096 x 4 = ~65k tokens/optimizer step, half of SFT's ~131k. The
+                             # corpus is 14x smaller than SFT's, so at SFT's tokens/step this pass
+                             # would be ~380 optimizer steps total; this buys ~830 without touching
+                             # the objective
   checkpoint_every_tokens: 10000000 # ~5 saves over the corpus; SFT's 100M would give zero
   eval_every_tokens: 5000000
   conversation_loss_weighting: true # Phase 2 fix #3: weight by 1/(supervised tokens in the
