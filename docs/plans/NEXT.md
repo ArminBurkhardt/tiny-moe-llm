@@ -224,7 +224,7 @@ information.
 
 ---
 
-## Phase 2 — Abstention repair (parallel track, independent subsystem)
+## Phase 2 — Abstention repair (parallel track, independent subsystem) ✅
 
 Runs alongside Phase 1/3; touches only data. **Owns the first half of the abstention fix**;
 Phase 4's no-evidence condition owns the second, and each is measured separately so the movement is
@@ -250,6 +250,62 @@ Delivery: a short repair finetune on the existing SFT checkpoint (~20–50M toke
 
 **Gate P2:** answerable-half false-abstention rate materially below the current **78.4%**;
 abstention precision clearly above the ~0.50 base rate. Step 13's eventual bar is <10%.
+
+### What shipped (2026-08-20)
+
+All four fixes, plus the repair finetune. Full report and the corpus composition behind it in
+[docs/measurements/abstention_repair.md](../measurements/abstention_repair.md).
+
+- **1 — down-sampling** is `SFTSource.unanswerable_keep` / `--squad-unanswerable-fraction`, applied
+  before the shard's conversation list exists so it never occupies a resume `row_idx`. 0.40 for the
+  repair profile, 1.0 (no-op) for the plain SFT one.
+- **2 — answerable extractive QA**: `rajpurkar/squad` (SQuAD 1.1) and `hotpotqa/hotpot_qa`
+  (distractor), both rendered under `SQUAD_INSTRUCTION` **verbatim**, because the quantity that has
+  to move is P(answer | this exact prompt shape). **NQ-open and TriviaQA were deliberately left
+  out**: their usable configs are closed-book, so they share neither the prompt shape Gate P2
+  measures nor the extraction task, and at 332M params closed-book QA targets teach guessing — the
+  opposite of the calibration goal.
+- **3 — per-conversation loss weighting**: `SFTDataset` emits `loss_weights` = `1/(supervised tokens
+  in this conversation)`, plumbed through `train_step` → `compute_mtp_loss` → `_chunked_linear_ce`,
+  which becomes `sum(w*ce)/sum(w)`. `p_max`/top-1 stay token-level so they remain comparable across
+  every checkpoint measured here. Off for `SFTConfig`, on for `RepairConfig`.
+- **4 — 15 abstention phrasings** (`ABSTENTIONS_PASSAGE_TRAIN`) for training, with
+  `ABSTENTIONS_PASSAGE` (the original 5) still the eval's forced reference. `is_abstention` matches
+  the union — a detector that knew only the old five would under-report the very rate this gate
+  checks.
+
+**Gate P2 passed** (2,000 SQuAD v2 validation questions, identical flags on both checkpoints):
+
+| | `sft_final_phase0` | `repair_final` |
+|---|---|---|
+| **false abstention (answerable half)** | **0.7832** | **0.1358** |
+| abstention precision (base rate 0.5065) | 0.5154 ± 0.0125 | 0.5759 ± 0.0278 |
+| abstention recall | 0.8115 | 0.1797 |
+| EM / token F1 (answerable half) | 0.0648 / 0.0806 | 0.1611 / 0.2162 |
+| most common completion | 1,398 / 2,000 | 259 / 2,000 |
+| distinct completions | 320 | 1,293 |
+
+**Read the recall row.** The collapse is gone — one string went from 70% of all completions to 13%,
+and answerable-half EM tripled — but the model now over-answers: it fails to refuse 82% of
+unanswerable questions, where before it refused 81% of them. That is the half of the abstention fix
+this document assigns to **Phase 4's no-evidence condition**, and this is the first checkpoint where
+the two halves are measured separately rather than confounded. The nearer lever is data: the
+realized unanswerable share came out at **9.6% of QA conversations**, just under the 10-15% target,
+so `--squad-unanswerable-fraction 0.55` is the obvious retune before anything architectural.
+
+Two things that did **not** move, and matter:
+
+- **`p_max` still carries no signal about answerability.** AUROC of `1 - p_max` for detecting an
+  unanswerable question: 0.462 before, 0.471 after — below chance both times. It predicts whether
+  *this answer* is right (0.619 → 0.660) and nothing about whether the question could be answered.
+  Same conclusion Phase 0 reached about `p_correct`, unchanged by repairing the data.
+- **`repair_val` CE fell 2.088 → 1.910 with `p_max` and top-1 flat** across all nine eval points.
+  The trunk did not move; the abstention decision did.
+
+One operational finding worth carrying into every future local run: at `sft:`'s batch size of 8 the
+finetune peaks at 29.55GB allocated on the 32GB 5090, pushing the driver to ~32.0GB and spilling
+into **shared system memory** at 9.4k tokens/sec. At 4 x 4096 with accumulation 4 — identical tokens
+per optimizer step, identical objective — it is 21.36GB, resident, at 22-37k tokens/sec.
 
 ---
 
@@ -424,6 +480,9 @@ special/added token unconditionally) but changes the template for every existing
   architecture rather than the prompt.
 - **P0** — head removal is behaviorally neutral (loss/top-1 within noise).
 - **P2** — answerable-half false abstention well below 78.4%, precision above the ~0.50 base rate.
+  **Measured 2026-08-20: 0.1358 and 0.5759 (base rate 0.5065) — PASS.** Abstention *recall* fell
+  0.81 → 0.18 in exchange; that half belongs to G3's no-evidence condition, and the data lever
+  (unanswerable share landed at 9.6% of QA conversations, under the 10-15% target) is untried.
 
 ## Risks
 

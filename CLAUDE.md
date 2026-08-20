@@ -37,12 +37,16 @@ varlen attention, optionally in FP8/NVFP4 via NVIDIA Transformer Engine.
 Research code, not a library: no packaging, no test framework, no CI. Entry points are the
 scripts under [scripts/](scripts/).
 
-One real run exists: 16B tokens of pretraining on a rented H100 plus a local 2-epoch SFT pass.
+One real run exists: 16B tokens of pretraining on a rented H100 plus a local 2-epoch SFT pass, then
+a local 49M-token abstention repair pass on top of it (NEXT.md Phase 2).
 [docs/CONCLUSION.md](docs/CONCLUSION.md) is the write-up, including the two failures that Phase 0
-below acted on. The plan from here is [docs/plans/NEXT.md](docs/plans/NEXT.md).
+below acted on. The plan from here is [docs/plans/NEXT.md](docs/plans/NEXT.md); Phases 0, 1 and 2
+are done, and their measurements are in [docs/measurements/](docs/measurements/).
 
-**All future finetuning runs locally on the 5090.** A cluster with ~5k train-hours is expected for
-the real post-POC run.
+**All future finetuning runs locally on the 5090, in BF16 — do not set `USE_FP8`.** Size the micro
+batch to stay resident: 4 x 4096 peaks at 21.4GB, 8 x 4096 peaks at 29.6GB and spills into shared
+system memory at a ~3x throughput cost. A cluster with ~5k train-hours is expected for the real
+post-POC run.
 
 ## Phase 0: what was just removed
 
@@ -730,7 +734,10 @@ on a rented box lives in [docs/runbook.md](docs/runbook.md) §10.
   closed is what makes `is_abstention` an exact check rather than a classification problem. **The
   SFT run collapsed onto them** — 7,786 of 11,873 completions were literally `"The passage doesn't
   say."`, including on 78.4% of *answerable* questions; assume any abstention number off the
-  pre-repair SFT checkpoint is measuring that collapse. Phase 2 widened the set the corpus draws
+  pre-repair SFT checkpoint is measuring that collapse. **Phase 2 fixed that half**: `--repair`
+  brings false abstention to 13.6% and answerable-half EM from 0.065 to 0.161, at the cost of
+  recall falling 0.81 → 0.18 (the model now under-abstains). Numbers and caveats in
+  [docs/measurements/abstention_repair.md](docs/measurements/abstention_repair.md). Phase 2 widened the set the corpus draws
   from to 15 phrasings (`ABSTENTIONS_PASSAGE_TRAIN`) while leaving `ABSTENTIONS_PASSAGE` (the
   original 5) as what `eval_abstention.py` *forces* as a reference target, so its teacher-forced CE
   stays comparable. **`is_abstention` matches the union**, and must: a detector that knew only the
