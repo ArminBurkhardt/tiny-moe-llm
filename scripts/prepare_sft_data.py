@@ -16,18 +16,21 @@ terminating EOS -- see ``modules/data/chat.py``). ``modules/data/sft_dataset.py`
 | `openai/gsm8k` (socratic) | short numbered steps |
 | `HuggingFaceH4/no_robots` | human-written; tone and refusal style |
 
-``--profile repair`` (prefix ``repair``) builds Phase 2's ~30M-token repair corpus, which exists
+``--profile repair`` (prefix ``repair``) builds Phase 2's ~50M-token repair corpus, which exists
 because that mix produced a model that refuses 78.4% of *answerable* questions. Same machinery,
 three differences, one per item on NEXT.md's Phase 2 list:
 
-  * **SQuAD v2's unanswerable rows are down-sampled** (``--squad-unanswerable-fraction``, 0.12 for
-    this profile) from their natural ~33% of the source to ~12% of its kept rows.
+  * **SQuAD v2's unanswerable rows are down-sampled** (``--squad-unanswerable-fraction``, 0.40 for
+    this profile), taking refusals from ~37% of that source's realized rows to ~11% of all QA
+    conversations. The flag scales one source; the corpus-wide share it produces is printed at the
+    end of the run and is the number NEXT.md's 10-15% target is stated against.
   * **Answerable extractive QA is added** under the *same* instruction string: `rajpurkar/squad`
     (SQuAD 1.1) and `hotpotqa/hotpot_qa` (distractor). Reusing ``SQUAD_INSTRUCTION`` verbatim is the
     whole point -- what has to change is P(answer | this exact prompt shape), and the eval measures
     that shape.
-  * **General chat is kept in the mix** at ~35% of the budget. A QA-only repair pass at lr=1e-5
-    over 30M tokens would trade the false-abstention rate for instruction following.
+  * **General chat is kept in the mix** at half the token budget, which is ~30% of conversations --
+    the unit that matters once the loss is weighted per conversation. A QA-only repair pass at
+    lr=1e-5 would trade the false-abstention rate for instruction following.
 
 Two sources NEXT.md names are deliberately **not** here: NQ-open and TriviaQA's ``nocontext``
 configs are closed-book (no passage at all), so they neither share the prompt shape Gate P2 measures
@@ -151,9 +154,17 @@ SOURCES = [
               render="gsm8k", weight=0.05),
 ]
 
-# Phase 2's repair mix (see the module docstring). QA-shaped sources take ~65% of the budget, of
-# which only squad_v2 contributes refusals and only a down-sampled twelfth of its rows at that; the
-# rest of the budget keeps general instruction following alive.
+# Phase 2's repair mix (see the module docstring). QA-shaped sources take half the token budget, of
+# which only squad_v2 contributes refusals and only a down-sampled ~40% of its unanswerable rows at
+# that; the other half keeps general instruction following alive.
+#
+# **These weights are token-budget shares, but the repair run weights its loss per CONVERSATION**
+# (``RepairConfig.conversation_loss_weighting``), so what actually determines a source's influence
+# on the gradient is its share of *conversations*, and the two are wildly different here: a SQuAD
+# row is ~206 tokens and a HotpotQA row ~1,340. The 50/50 token split below is what produces a
+# roughly 70/30 conversation split between QA and chat -- measured, not assumed, from a 2M-token
+# trial build. Retune the weights against the realized conversation counts the run prints, not
+# against these numbers.
 #
 # Note what the two answerable QA sources each buy, because they are not interchangeable:
 # `rajpurkar/squad` (SQuAD 1.1) is largely the same passages and questions as squad_v2's answerable
@@ -161,28 +172,35 @@ SOURCES = [
 # which is the same lever as down-sampling the refusals and is listed separately in NEXT.md for that
 # reason. `hotpot_qa`'s distractor split is the one that adds genuinely new passages, and its ten
 # paragraphs per question (only two of them relevant) also teach reading past distractors, which is
-# what Phase 4's distractor-evidence condition will want anyway.
+# what Phase 4's distractor-evidence condition will want anyway -- but at ~6.5x the tokens per
+# conversation it buys the least gradient weight per token of anything here, hence the small share.
 REPAIR_SOURCES = [
     SFTSource("squad_v2", "rajpurkar/squad_v2", "squad_v2/train", (".parquet",),
-              render="squad_v2", weight=0.30, unanswerable_keep=0.12, qa=True),
+              render="squad_v2", weight=0.25, unanswerable_keep=0.40, qa=True),
     SFTSource("squad_v1", "rajpurkar/squad", "plain_text/train", (".parquet",),
-              render="squad_v2", weight=0.20, qa=True),
+              render="squad_v2", weight=0.17, qa=True),
     SFTSource("hotpot_qa", "hotpotqa/hotpot_qa", "distractor/train", (".parquet",),
-              render="hotpot_qa", weight=0.15, qa=True),
+              render="hotpot_qa", weight=0.08, qa=True),
     SFTSource("smoltalk2", "HuggingFaceTB/smoltalk2", "SFT/", (".parquet",),
-              render="messages", weight=0.20, file_filter=_no_think_sft_split, holdout=True),
+              render="messages", weight=0.28, file_filter=_no_think_sft_split, holdout=True),
     SFTSource("ultrachat", "HuggingFaceH4/ultrachat_200k", "data/train_sft", (".parquet",),
-              render="messages", weight=0.10),
+              render="messages", weight=0.14),
     SFTSource("no_robots", "HuggingFaceH4/no_robots", "data/train", (".parquet",),
-              render="messages", weight=0.05),
+              render="messages", weight=0.08),
 ]
 
 PROFILES = {"sft": SOURCES, "repair": REPAIR_SOURCES}
 # defaults per profile: the Step 12 corpus is a full post-training run, the repair corpus is a short
-# targeted finetune (NEXT.md Phase 2: "~20-50M tokens, lr=1e-5, 1 epoch").
-PROFILE_TARGET_TOKENS = {"sft": 300_000_000, "repair": 30_000_000}
-# 1.0 = keep every unanswerable row, i.e. exactly what the original Step 12 build did.
-PROFILE_UNANSWERABLE_FRACTION = {"sft": 1.0, "repair": 0.12}
+# targeted finetune (NEXT.md Phase 2: "~20-50M tokens, lr=1e-5, 1 epoch"). The top of that range,
+# because only ~28% of the repair corpus is supervised -- QA passages are long prompts -- so 50M
+# corpus tokens is ~14M tokens of actual supervision.
+PROFILE_TARGET_TOKENS = {"sft": 300_000_000, "repair": 50_000_000}
+# 1.0 = keep every unanswerable row, i.e. exactly what the original Step 12 build did. 0.40 is
+# calibrated, not guessed: squad_v2's realized unanswerable share is ~37% of its rows (a little above
+# the source's 33.4% because refusals are short and more of them fit per token), and squad_v2 is
+# ~58% of QA conversations here, so keeping 40% of them lands the QA-wide share near 11%. The run
+# prints the realized number -- adjust against that.
+PROFILE_UNANSWERABLE_FRACTION = {"sft": 1.0, "repair": 0.40}
 
 SQUAD_INSTRUCTION = (
     "Answer the question using only the passage below. If the passage does not contain the "

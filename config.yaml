@@ -128,9 +128,14 @@ repair: # NEXT.md Phase 2: the abstention repair finetune, `python scripts/sft.p
   lr: 1.0e-5 # ~1/3 of SFT's. The trunk is already post-SFT; this pass moves the abstention decision,
              # it does not relearn the chat format. Every parameter is still fp32-shadowed (the
              # ulp arithmetic in build_sft_param_groups only gets worse at a lower LR).
-  num_epochs: 1 # one pass over ~30M tokens. Two would start memorizing the repair corpus's own
+  num_epochs: 1 # one pass over ~50M tokens. Two would start memorizing the repair corpus's own
                 # answers, which is the failure this whole phase is undoing
-  checkpoint_every_tokens: 10000000 # ~3 saves over the corpus; SFT's 100M would give zero
+  grad_accumulation_steps: 2 # ~65k tokens/optimizer step instead of SFT's ~131k. The corpus is 14x
+                             # smaller than SFT's, so at SFT's accumulation this pass would be ~380
+                             # optimizer steps total; halving it buys ~760 without touching the
+                             # objective. The only inherited number this profile overrides for a
+                             # reason other than "the corpus is different"
+  checkpoint_every_tokens: 10000000 # ~5 saves over the corpus; SFT's 100M would give zero
   eval_every_tokens: 5000000
   conversation_loss_weighting: true # Phase 2 fix #3: weight by 1/(supervised tokens in the
                                     # conversation), so a ~6-token refusal stops mechanically
