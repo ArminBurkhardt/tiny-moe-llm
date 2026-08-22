@@ -107,6 +107,23 @@ into shared system memory — 9.4k tokens/sec. At 4 × 4096 with accumulation 4 
 optimizer step) it is 21.36 GB, fully resident, and 22–37k tokens/sec. Same objective, ~3x the
 throughput.
 
+## Early stopping is not the recall lever (2026-08-20)
+
+Checked first, because it would have been free. The rolling checkpoints of the 0.40 run, all at
+the same eval flags as the table above:
+
+| | SFT seed | 30M | 40M | final (49.3M) |
+|---|---|---|---|---|
+| false abstention (answerable half) | 0.7832 | 0.1429 | 0.1226 | 0.1358 |
+| abstention precision | 0.5154 | 0.5778 | 0.5784 | 0.5759 |
+| abstention recall | 0.8115 | 0.1905 | 0.1639 | 0.1797 |
+| EM (answerable half) | 0.0648 | 0.1520 | 0.1641 | 0.1611 |
+| abstentions made (of 2,000) | 1,595 | 334 | 287 | 316 |
+
+**The flip is complete well before 30M** and precision is flat at ~0.578 across all of them, so
+there is no intermediate checkpoint that trades back into balance — it is one policy sampled at
+three times, not a trajectory through a better one. The corpus ratio is the lever.
+
 ## The 0.55 rebuild (2026-08-22)
 
 The retune the section above called for. `--squad-unanswerable-fraction 0.55`, everything else
@@ -158,3 +175,56 @@ CE fell 2.0552 → 1.8995 monotonically over ten eval points (against 2.088 → 
 `p_max` (0.5703 → 0.5717) and top-1 (0.5492 → 0.5493) flat, and `loop_scale` drifted
 `[0.5000, 0.2412, 0.1152]` → `[0.5039, 0.2383, 0.1123]` — the same signature as before, trunk
 untouched, only the abstention decision moving.
+
+## The command sequence that produced the retune
+
+Kept because steps 1 and 3 are both about not destroying the thing being replaced:
+
+```bash
+# 1. keep the 0.40 build. prepare_sft_data.py deletes each source shard right after appending it,
+#    so a corpus overwritten in place costs a full re-download and re-tokenize to get back
+mkdir -p data/prepared_frac040
+mv data/prepared/repair_{train,val}.{bin,idx,mask} \
+   data/prepared/_prepare_state_repair.json data/prepared_frac040/
+
+# 2. rebuild at the top of the 10-15% band. check the realized share the run prints at the end
+#    BEFORE training on it -- it is a share of QA conversations, not of squad_v2's rows
+python scripts/prepare_sft_data.py --profile repair --squad-unanswerable-fraction 0.55
+
+# 3. a fresh run directory. sft.py resumes from the newest checkpoint in ckpts/repair, so leaving
+#    the previous run there means adopting its optimizer state and LR schedule, not replacing it
+mv ckpts/repair ckpts/repair_frac040
+python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
+
+# 4. the gate, at the exact flags every number above was measured at (batch size is part of the
+#    measurement -- the MoE's grouped GEMM tiles by the batch's per-expert row counts)
+python scripts/eval_abstention.py -c ckpts/repair/checkpoint_repair_final.pt \
+  --max-examples 2000 --batch-size 16 --skip-forced
+```
+
+**Archive a corpus rather than rebuilding it.** `scripts/archive_corpus.py` packs a split's
+`.bin`/`.idx`/`.mask` plus the prep resume sidecar into one `.tar.gz` under `data/archives/`, with
+a JSON sidecar holding per-file sha256, the token/document counts read off the files themselves,
+and the matching `manifest.json` slice. Restore is always explicit, so an archive can never
+silently shadow a fresh build:
+
+```bash
+python scripts/archive_corpus.py pack --all        # every split in data/prepared
+python scripts/archive_corpus.py list              # measured counts vs. what the builder claimed
+python scripts/archive_corpus.py restore repair_train --force
+
+# a superseded build kept beside the one that replaced it. --name labels the archive; the files it
+# restores are still repair_train.*, because that is what the trainer reads
+python scripts/archive_corpus.py pack repair_train --data-dir data/prepared_frac040 \
+  --name repair_train_frac040
+```
+
+Both repair builds are archived: `repair_train` / `repair_val` at 0.55 and
+`repair_train_frac040` / `repair_val_frac040` at 0.40, ~64 MB each compressed against 150 MB raw
+(the `.mask` files are near-all-zero and give almost everything back). A restore was verified
+byte-identical against its source directory, and refuses to overwrite without `--force`.
+
+The measured-vs-claimed split in `list` is load-bearing on this box: the dev machine's
+`phase1.bin` is a small local stand-in — 50.0M tokens — while `manifest.json` describes the rented
+box's 24.7B-token build, and the two must not be read for each other. `list` prints the
+disagreement rather than hiding it.

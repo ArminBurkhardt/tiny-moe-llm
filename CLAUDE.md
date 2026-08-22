@@ -865,6 +865,7 @@ Note the `.gitignore` swallows `*.json` (so `data_config.json` and `manifest.jso
   fix is real plumbing, not a flag.
 - `eval_abstention.py` has no KV cache at all, so it is quadratic in answer length; use
   `--max-examples` for a first look.
-- 0c's second criterion from [NEXT.md](docs/plans/NEXT.md) ("evidence still arriving") is
-  **unimplemented** — the append-only evidence buffer it reads does not exist until Phase 4.
+- The depth policy's second criterion from [NEXT.md](docs/plans/NEXT.md) ("evidence still
+  arriving") is **unimplemented** — the append-only evidence buffer it reads does not exist until
+  Phase 4.
 - README notes token counts can be inflated by tens of tokens per batch.
