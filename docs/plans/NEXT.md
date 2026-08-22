@@ -291,7 +291,8 @@ unanswerable questions, where before it refused 81% of them. That is the half of
 this document assigns to **Phase 4's no-evidence condition**, and this is the first checkpoint where
 the two halves are measured separately rather than confounded. The nearer lever is data: the
 realized unanswerable share came out at **9.6% of QA conversations**, just under the 10-15% target,
-so `--squad-unanswerable-fraction 0.55` is the obvious retune before anything architectural.
+so `--squad-unanswerable-fraction 0.55` is the obvious retune before anything architectural. That
+retune was run — it recovers part of the recall and none of the precision; see below.
 
 Two things that did **not** move, and matter:
 
@@ -324,9 +325,48 @@ as the table above:
 there is no intermediate checkpoint that trades back into balance — it is one policy sampled at
 three times, not a trajectory through a better one. The corpus ratio is the lever.
 
-### Retune at 0.55, and archiving the corpus (2026-08-20)
+### Retune at 0.55: the ratio is a threshold, not a discriminator (2026-08-22)
 
-Ordered, because steps 1 and 3 are both about not destroying the thing being replaced:
+Run. The rebuild landed the unanswerable share at **12.5% of QA conversations** (13,211 / 105,668),
+up from 9.6% and inside the 10-15% band, with the corpus otherwise the same shape — 49.50M tokens,
+40.4% supervised against 49.5M and 40.3% — so the ratio is the only variable that moved:
+
+| | SFT seed | repair @ 0.40 | repair @ 0.55 |
+|---|---|---|---|
+| unanswerable share of QA conversations | — | 9.6% | 12.5% |
+| **false abstention (answerable half)** | **0.7832** | **0.1358** | **0.1611** |
+| abstention precision (base rate 0.5065) | 0.5154 | 0.5759 | 0.5782 |
+| abstention recall | 0.8115 | 0.1797 | 0.2152 |
+| abstention F1 | 0.6304 | 0.2739 | 0.3137 |
+| EM / token F1 (answerable half) | 0.0648 / 0.0806 | 0.1611 / 0.2162 | 0.1641 / 0.2189 |
+| overall correctness | 0.4430 | 0.1705 | 0.1900 |
+| abstentions made (of 2,000) | 1,595 | 316 | 377 |
+| AUROC(1 - `p_max` → unanswerable) | 0.4618 | 0.4711 | 0.4775 |
+
+**Precision did not move: 0.5759 → 0.5782.** It has now been measured at ~0.578 six times — the
+30M, 40M and final checkpoints of the 0.40 run, and the final one here — while recall ranged 0.16
+to 0.22 and false abstention 0.12 to 0.16. A 30% relative increase in unanswerable training
+conversations bought 19% more abstentions (316 → 377) at the *same* hit rate. The corpus ratio
+slides the operating point along a fixed curve; it does not bend the curve.
+
+That bounds what the lever can ever deliver. Reaching the seed's 0.81 recall by ratio alone means
+~1,600 abstentions, and at precision 0.578 that is 675 false ones on 987 answerable questions —
+the collapse again, arrived at from the other side. The seed reached 0.81 recall at precision
+0.5154, barely over the 0.5065 base rate, which is precisely what "refuse almost everything" scores.
+**The missing quantity is discrimination, and `p_max` does not carry it** — AUROC of `1 - p_max` for
+detecting an unanswerable question is 0.4775, still below chance, the third checkpoint in a row to
+say so. That is Phase 4's no-evidence condition, not a data-mix problem.
+
+0.55 is nonetheless the better operating point and is now the default in `prepare_sft_data.py`:
+recall +20% relative and overall correctness 0.171 → 0.190 for 2.5 points of false abstention, with
+answer quality unchanged-to-better (EM 0.1611 → 0.1641) and no re-collapse (`"The passage doesn't
+say."` is 274 / 2,000 completions against 259, over 1,263 distinct completions against 1,293).
+`repair_val` CE fell 2.055 → 1.900 monotonically over ten eval points with `p_max` (0.570 → 0.572)
+and top-1 (0.549 → 0.549) flat — same signature as the 0.40 run, the trunk untouched. 49.33M tokens,
+1 epoch, 21.6 min, 21.36 GB peak, 22-40k tokens/sec.
+
+The sequence that produced it, kept because steps 1 and 3 are both about not destroying the thing
+being replaced:
 
 ```bash
 # 1. keep the 0.40 build. prepare_sft_data.py deletes each source shard right after appending it,
@@ -360,11 +400,22 @@ shadow a fresh build:
 python scripts/archive_corpus.py pack --all        # every split in data/prepared
 python scripts/archive_corpus.py list              # measured counts vs. what the builder claimed
 python scripts/archive_corpus.py restore repair_train --force
+
+# a superseded build kept beside the one that replaced it. --name labels the archive; the files it
+# restores are still repair_train.*, because that is what the trainer reads
+python scripts/archive_corpus.py pack repair_train --data-dir data/prepared_frac040 \
+  --name repair_train_frac040
 ```
 
+Both repair builds are archived: `repair_train` / `repair_val` at 0.55 and
+`repair_train_frac040` / `repair_val_frac040` at 0.40, ~64 MB each compressed against 150 MB raw
+(the `.mask` files are near-all-zero and give almost everything back). A restore was verified
+byte-identical against its source directory, and refuses to overwrite without `--force`.
+
 The measured-vs-claimed split in `list` is load-bearing on this box: the dev machine's
-`phase1.bin` is a small local stand-in while `manifest.json` describes the rented box's 24.7B-token
-build, and the two must not be read for each other.
+`phase1.bin` is a small local stand-in — 50.0M tokens — while `manifest.json` describes the rented
+box's 24.7B-token build, and the two must not be read for each other. `list` prints the
+disagreement rather than hiding it.
 
 ---
 

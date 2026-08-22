@@ -176,7 +176,7 @@ SOURCES = [
 # conversation it buys the least gradient weight per token of anything here, hence the small share.
 REPAIR_SOURCES = [
     SFTSource("squad_v2", "rajpurkar/squad_v2", "squad_v2/train", (".parquet",),
-              render="squad_v2", weight=0.25, unanswerable_keep=0.40, qa=True),
+              render="squad_v2", weight=0.25, unanswerable_keep=0.55, qa=True),
     SFTSource("squad_v1", "rajpurkar/squad", "plain_text/train", (".parquet",),
               render="squad_v2", weight=0.17, qa=True),
     SFTSource("hotpot_qa", "hotpotqa/hotpot_qa", "distractor/train", (".parquet",),
@@ -195,12 +195,16 @@ PROFILES = {"sft": SOURCES, "repair": REPAIR_SOURCES}
 # because only ~28% of the repair corpus is supervised -- QA passages are long prompts -- so 50M
 # corpus tokens is ~14M tokens of actual supervision.
 PROFILE_TARGET_TOKENS = {"sft": 300_000_000, "repair": 50_000_000}
-# 1.0 = keep every unanswerable row, i.e. exactly what the original Step 12 build did. 0.40 is
-# calibrated, not guessed: squad_v2's realized unanswerable share is ~37% of its rows (a little above
-# the source's 33.4% because refusals are short and more of them fit per token), and squad_v2 is
-# ~58% of QA conversations here, so keeping 40% of them lands the QA-wide share near 11%. The run
-# prints the realized number -- adjust against that.
-PROFILE_UNANSWERABLE_FRACTION = {"sft": 1.0, "repair": 0.40}
+# 1.0 = keep every unanswerable row, i.e. exactly what the original Step 12 build did. 0.55 is
+# measured, not guessed: 0.40 was built and trained first and realized a 9.6% unanswerable share of
+# QA conversations, just under NEXT.md Phase 2's 10-15% band; 0.55 realizes 12.5%. Note the share is
+# over QA *conversations*, not squad_v2's rows -- squad_v2 is ~58% of the QA conversations here and
+# its realized unanswerable share is ~37% of its own rows (a little above the source's 33.4% because
+# refusals are short and more of them fit per token). The run prints the realized number; retune
+# against that, never against this fraction. What the retune bought is in NEXT.md Phase 2: recall
+# 0.180 -> 0.215 at flat precision (~0.578), i.e. the ratio moves the threshold, not the model's
+# ability to tell the two cases apart.
+PROFILE_UNANSWERABLE_FRACTION = {"sft": 1.0, "repair": 0.55}
 
 SQUAD_INSTRUCTION = (
     "Answer the question using only the passage below. If the passage does not contain the "

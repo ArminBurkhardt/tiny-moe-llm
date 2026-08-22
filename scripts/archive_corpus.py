@@ -192,8 +192,8 @@ def manifest_record(split):
     return None
 
 
-def pack(split, data_dir, archive_dir, force=False, compress=True):
-    """Write one split to ``{archive_dir}/{split}.tar.gz`` plus a JSON sidecar.
+def pack(split, data_dir, archive_dir, force=False, compress=True, name=None):
+    """Write one split to ``{archive_dir}/{name}.tar.gz`` plus a JSON sidecar.
 
     The archive is written to a ``.tmp`` path and renamed only once the sidecar is complete, so an
     interrupted pack can never leave a truncated archive that looks finished.
@@ -205,21 +205,27 @@ def pack(split, data_dir, archive_dir, force=False, compress=True):
         force: overwrite an existing archive of the same name.
         compress: gzip the tar. .mask files are near-all-zero and compress enormously; token
             streams give roughly a third back.
+        name: archive label, defaulting to ``split``. Two builds of the same split -- a retuned
+            corpus and the superseded one it is compared against -- collide otherwise, and the
+            loser of that collision is a corpus that costs a full re-download to rebuild. The
+            member filenames stay the split stems regardless, so a restore always lands under the
+            names the trainer reads.
 
     Returns:
         Path to the written archive.
     """
     paths = split_files(data_dir, split)
+    name = name or split
     suffix = ".tar.gz" if compress else ".tar"
-    archive_path = os.path.join(archive_dir, split + suffix)
-    sidecar_path = os.path.join(archive_dir, split + ".json")
+    archive_path = os.path.join(archive_dir, name + suffix)
+    sidecar_path = os.path.join(archive_dir, name + ".json")
 
     if os.path.exists(archive_path) and not force:
         raise FileExistsError(f"{archive_path} already exists -- pass --force to overwrite")
 
     os.makedirs(archive_dir, exist_ok=True)
     raw_bytes = sum(os.path.getsize(p) for p in paths)
-    logger.info(f"packing {split}: {len(paths)} files, {raw_bytes / 1e6:,.1f} MB raw")
+    logger.info(f"packing {split} as {name}: {len(paths)} files, {raw_bytes / 1e6:,.1f} MB raw")
 
     members = []
     for path in paths:
@@ -237,6 +243,7 @@ def pack(split, data_dir, archive_dir, force=False, compress=True):
     os.replace(tmp_path, archive_path)
 
     sidecar = {
+        "name": name,
         "split": split,
         "archive": os.path.basename(archive_path),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -259,24 +266,25 @@ def pack(split, data_dir, archive_dir, force=False, compress=True):
 
 
 def load_sidecars(archive_dir):
-    """Every sidecar in an archive directory, split -> dict.
+    """Every sidecar in an archive directory, archive label -> dict.
 
     Args:
         archive_dir: directory written by :func:`pack`.
 
     Returns:
-        Dict of split stem to sidecar contents, skipping sidecars whose archive is gone.
+        Dict of archive label to sidecar contents, skipping sidecars whose archive is gone.
+        Sidecars written before ``pack`` grew a label fall back to their split stem.
     """
     if not os.path.isdir(archive_dir):
         return {}
     found = {}
-    for name in sorted(os.listdir(archive_dir)):
-        if not name.endswith(".json"):
+    for filename in sorted(os.listdir(archive_dir)):
+        if not filename.endswith(".json"):
             continue
-        with open(os.path.join(archive_dir, name), "r", encoding="utf-8") as f:
+        with open(os.path.join(archive_dir, filename), "r", encoding="utf-8") as f:
             sidecar = json.load(f)
         if os.path.isfile(os.path.join(archive_dir, sidecar.get("archive", ""))):
-            found[sidecar["split"]] = sidecar
+            found[sidecar.get("name", sidecar["split"])] = sidecar
     return found
 
 
@@ -292,45 +300,50 @@ def do_list(archive_dir):
         return
 
     print(f"{archive_dir}\n")
-    header = f"{'split':<16} {'tokens':>15} {'docs':>12} {'size':>10}  created"
+    header = f"{'archive':<24} {'tokens':>15} {'docs':>12} {'size':>10}  created"
     print(header)
     print("-" * len(header))
-    for split, sidecar in sidecars.items():
+    for label, sidecar in sidecars.items():
         m = sidecar["measured"]
-        print(f"{split:<16} {m['tokens']:>15,} {m['documents']:>12,} "
+        print(f"{label:<24} {m['tokens']:>15,} {m['documents']:>12,} "
               f"{sidecar['archive_bytes'] / 1e6:>9,.0f}M  {sidecar['created']}")
         if "supervised_tokens" in m:
             share = m["supervised_tokens"] / max(m["tokens"], 1)
-            print(f"{'':<16} {m['supervised_tokens']:>15,} supervised ({share:.1%})")
+            print(f"{'':<24} {m['supervised_tokens']:>15,} supervised ({share:.1%})")
+        if sidecar["split"] != label:
+            # a labelled archive restores under the split's own filenames, not the label's --
+            # say which, because that is what a restore is about to overwrite.
+            print(f"{'':<24} restores as {sidecar['split']}.*")
         record = sidecar.get("manifest_record") or {}
         claimed = record.get("realized_tokens") or record.get("total_tokens")
         if claimed and abs(claimed - m["tokens"]) > max(m["tokens"] * 0.01, 1000):
             # not an error: the dev box's phase files are a local stand-in while the manifest
             # describes the rented box's build. printed so nobody reads one for the other.
-            print(f"{'':<16} note: {record['_source_key']} reports {claimed:,} tokens "
+            print(f"{'':<24} note: {record['_source_key']} reports {claimed:,} tokens "
                   f"-- this archive is a different build")
     print()
 
 
-def restore(split, data_dir, archive_dir, force=False):
+def restore(label, data_dir, archive_dir, force=False):
     """Extract one archived split back into ``data_dir`` and verify every member's sha256.
 
     Args:
-        split: split stem to restore.
+        label: archive label to restore -- the split stem unless ``pack`` was given a ``name``.
         data_dir: destination prepared directory.
         archive_dir: directory written by :func:`pack`.
         force: overwrite files that already exist in ``data_dir``.
 
     Raises:
-        FileNotFoundError: no archive for that split.
+        FileNotFoundError: no archive under that label.
         FileExistsError: a target file exists and ``force`` is not set.
         ValueError: an extracted file's sha256 does not match the sidecar.
     """
     sidecars = load_sidecars(archive_dir)
-    if split not in sidecars:
+    if label not in sidecars:
         raise FileNotFoundError(
-            f"no archive for {split} in {archive_dir} (have: {', '.join(sidecars) or 'nothing'})")
-    sidecar = sidecars[split]
+            f"no archive for {label} in {archive_dir} (have: {', '.join(sidecars) or 'nothing'})")
+    sidecar = sidecars[label]
+    split = sidecar["split"]
     archive_path = os.path.join(archive_dir, sidecar["archive"])
 
     existing = [m["name"] for m in sidecar["members"]
@@ -363,9 +376,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("command", choices=("pack", "list", "restore"))
     parser.add_argument("splits", nargs="*",
-                        help="split stems, e.g. phase1 repair_train. omit with --all")
+                        help="pack: split stems, e.g. phase1 repair_train (omit with --all). "
+                             "restore: archive labels, which are the split stems unless the pack "
+                             "was given --name")
     parser.add_argument("--all", action="store_true",
                         help="pack: every split found in --data-dir")
+    parser.add_argument("--name",
+                        help="pack: store one split under this archive label instead of its stem, "
+                             "so a superseded build can be kept beside the one that replaced it. "
+                             "the restored filenames are still the split's own")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
     parser.add_argument("--archive-dir", default=DEFAULT_ARCHIVE_DIR)
     parser.add_argument("--force", action="store_true",
@@ -386,11 +405,14 @@ def main():
         logger.info(f"found {len(splits)} split(s): {', '.join(splits)}")
     if not splits:
         raise SystemExit(f"{args.command} needs at least one split name (or --all for pack)")
+    if args.name and (args.command != "pack" or len(splits) != 1):
+        # one label cannot name several archives, and it means nothing on the restore side
+        raise SystemExit("--name applies to `pack` with exactly one split")
 
     for split in splits:
         if args.command == "pack":
             pack(split, args.data_dir, args.archive_dir,
-                 force=args.force, compress=not args.no_compress)
+                 force=args.force, compress=not args.no_compress, name=args.name)
         else:
             restore(split, args.data_dir, args.archive_dir, force=args.force)
 

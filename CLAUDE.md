@@ -107,6 +107,9 @@ scripts/
                              on the rented box, not locally -- see "Data prep" below
   prepare_sft_data.py       builds sft_train/sft_val .bin/.idx/.mask, runs LOCALLY.
                              `--profile repair` builds Phase 2's repair_train/repair_val instead
+  archive_corpus.py         pack/list/restore a prepared split as one .tar.gz + sha256 sidecar,
+                             so replacing a corpus never costs a re-download -- both prepare
+                             scripts delete each source shard as soon as they have appended it
   sft.py                    THE post-training entry point: local, single GPU, reuses
                              pretrain.train_step verbatim. `--repair` runs Phase 2's repair
                              finetune through the same function (RepairConfig, ckpts/repair)
@@ -164,6 +167,8 @@ python scripts/run_training.py       # the real run: phase1 -> phase2, restarts 
 python scripts/pretrain.py --phase phase1   # one phase; resumes from the newest LOADABLE ckpt
 python scripts/prepare_sft_data.py   # SFT corpus; needs manifest.json's holdout hashes first
 python scripts/prepare_sft_data.py --profile repair          # Phase 2's ~50M-token repair corpus
+python scripts/archive_corpus.py pack --all      # save data/prepared before overwriting it
+python scripts/archive_corpus.py list            # measured counts vs. what the builder claimed
 python scripts/sft.py --from-hub     # SFT: pull the pretrained ckpt + manifest, then train
 python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt   # Phase 2
 python scripts/migrate_phase0.py -c CKPT     # fold+strip a pre-Phase-0 checkpoint
@@ -735,8 +740,11 @@ on a rented box lives in [docs/runbook.md](docs/runbook.md) §10.
   SFT run collapsed onto them** — 7,786 of 11,873 completions were literally `"The passage doesn't
   say."`, including on 78.4% of *answerable* questions; assume any abstention number off the
   pre-repair SFT checkpoint is measuring that collapse. **Phase 2 fixed that half**: `--repair`
-  brings false abstention to 13.6% and answerable-half EM from 0.065 to 0.161, at the cost of
-  recall falling 0.81 → 0.18 (the model now under-abstains). Numbers and caveats in
+  brings false abstention to 16.1% and answerable-half EM from 0.065 to 0.164, at the cost of
+  recall falling 0.81 → 0.22 (the model now under-abstains). Retuning
+  `--squad-unanswerable-fraction` 0.40 → 0.55 (now the default) moved recall 0.18 → 0.22 at flat
+  precision ~0.578, which is the finding: the corpus ratio picks where on the curve the model sits
+  and does not improve the curve, so the rest belongs to Phase 4. Numbers and caveats in
   [docs/measurements/abstention_repair.md](docs/measurements/abstention_repair.md). Phase 2 widened the set the corpus draws
   from to 15 phrasings (`ABSTENTIONS_PASSAGE_TRAIN`) while leaving `ABSTENTIONS_PASSAGE` (the
   original 5) as what `eval_abstention.py` *forces* as a reference target, so its teacher-forced CE
