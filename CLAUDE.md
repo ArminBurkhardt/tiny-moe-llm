@@ -117,6 +117,10 @@ scripts/
                              Also the Gate P0 harness for any head removal
   eval_abstention.py        the acceptance metric: SQuAD v2 abstention precision/recall + ECE,
                              LOCAL, needs an SFT checkpoint
+  eval_benchmarks.py        the fixed benchmark suite: log-likelihood MC + closed-book generation,
+                             ONE scoring path for this model and for the HF peers. Downloads into
+                             data/benchmarks (refused inside data/prepared*, data/datasets,
+                             data/archives) and peer weights into ckpts/peers
   eval_stage0.py            NEXT.md's Phase 1 diagnostics: IR retrieval entropy + ablation (Gate
                              G1), per-loop query drift, residual/readout loop dynamics, oracle
                              minimum sufficient depth. Read-only -- probes via forward hooks so a
@@ -174,7 +178,12 @@ python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt  
 python scripts/migrate_phase0.py -c CKPT     # fold+strip a pre-Phase-0 checkpoint
 python scripts/eval_calibration.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4
 python scripts/eval_abstention.py    # acceptance; -c CKPT --baseline-checkpoint PRETRAINED
+python scripts/eval_abstention.py -c CKPT --max-examples 2000 --batch-size 16 --skip-forced \
+  --example-offset 2000              # the disjoint slice, i.e. the eval sampling noise measurement
 python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4 --max-loops 6
+python scripts/eval_benchmarks.py --peer pythia-410m --validate \
+  --json-out docs/measurements/benchmarks/pythia-410m.json   # a peer, measured once and frozen
+python scripts/eval_benchmarks.py -c CKPT --compare docs/measurements/benchmarks/*.json
 python scripts/inference.py          # interactive; -c CKPT -p PROMPT -n 200 --temperature 0.8
 python scripts/gradio_app.py         # same generation path, browser UI
 bash tests/run_env_check.sh          # torch/flash/TE/tokenizer smoke check
@@ -865,12 +874,23 @@ Current branch `ir-train-build`; PRs target `prototype`.
 **Commit messages are a single line. No body, no bullets, no `Co-Authored-By` trailer** — the
 trailer counts as a body and must be omitted even though the harness's default instructions ask for
 it. Style is `feat:` / `docs:` / `chore:` / `merge:` plus a short description of the change itself.
-No plan/step numbers in the subject (those belong in code comments), no config/version labels, and
-prefer plain unhyphenated phrasing over compound modifiers — "construction time assertions", not
-"construction-time assertions".
+No config/version labels, and prefer plain unhyphenated phrasing over compound modifiers —
+"construction time assertions", not "construction-time assertions".
 
-Note the `.gitignore` swallows `*.json` (so `data_config.json` and `manifest.json` are untracked),
-`*.cmd`, `*.key`, `ckpts/`, `venv/`, `env_init`, and `data/prepared`. `tests/` is tracked.
+**Never name a plan document, phase, gate or step in a commit message or a code comment.** Not
+"Phase 1b", not "Gate G1", not "NEXT.md", not "PLAN.md Step 5". Plans get rewritten, renumbered and
+superseded; a comment that says *why the code is the way it is* keeps working afterwards and a
+comment that says *which step asked for it* becomes a dangling reference to a document that no
+longer says that. Write the reason instead — "the corpus builders delete shards from here", not
+"1b.1 requires isolation". Docs under [docs/](docs/) are the exception: prose about the plan belongs
+in `docs/plans/` and `docs/measurements/`, which is where the numbering is maintained. Some older
+comments still carry `PLAN.md Step N` references; leave them alone unless you are editing that line
+anyway, and drop the reference when you do.
+
+Note the `.gitignore` swallows `*.json` (so `data_config.json` and `manifest.json` are untracked,
+and so are the eval scripts' per-question and per-benchmark result files), `*.log` (eval run logs;
+the numbers belong in `docs/measurements/`, not in a captured stdout), `*.cmd`, `*.key`, `ckpts/`,
+`venv/`, `env_init`, `data/prepared*` and `data/benchmarks`. `tests/` is tracked.
 
 ## Known rough edges
 
