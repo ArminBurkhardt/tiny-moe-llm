@@ -445,13 +445,20 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
 
 
 def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: Optional[int],
-                  max_prompt_tokens: int, seed: int, with_forced: bool = True) -> List[dict]:
+                  max_prompt_tokens: int, seed: int, with_forced: bool = True,
+                  offset: int = 0) -> List[dict]:
     """Render, tokenize and (optionally) subsample the validation split.
 
     Subsampling shuffles before truncating so a capped run keeps the split's answerable/unanswerable
     balance in expectation; the shuffle is seeded so two runs of this script compare like for like.
     Over-long rows are **dropped, not truncated** -- truncating a passage can remove the very span
     that makes a question answerable, silently relabelling it.
+
+    ``offset`` skips that many *usable* questions before collecting any, which is how a disjoint
+    slice of the same seeded shuffle is taken: ``--example-offset 2000 --max-examples 2000`` is
+    questions 2000-4000 of exactly the ordering ``--max-examples 2000`` reads the first 2000 of.
+    Same split, same shuffle, same flags -- so the spread between the two is eval sampling noise and
+    nothing else.
 
     ``with_forced=False`` (``--skip-forced``) skips the second full-corpus tokenizer pass that the
     teacher-forced targets need; the passages dominate that cost and they are already encoded.
@@ -461,6 +468,7 @@ def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: 
     rng.shuffle(rows)
 
     records, forced_conversations, dropped_long, dropped_bad = [], [], 0, 0
+    skipped = 0
     for row in rows:
         if max_examples is not None and len(records) >= max_examples:
             break
@@ -473,6 +481,11 @@ def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: 
         prompt_ids = template.encode_prompt(messages)
         if len(prompt_ids) > max_prompt_tokens:
             dropped_long += 1
+            continue
+        if skipped < offset:
+            # counted only once it is known to be usable, so the offset indexes the same sequence
+            # the un-offset run collects -- an offset over raw rows would land somewhere else
+            skipped += 1
             continue
         if with_forced:
             # the forced target is exactly what prepare_sft_data.render_squad_v2 would have written
@@ -501,12 +514,14 @@ def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: 
     logger.info(
         f"{len(kept):,} validation questions "
         f"({sum(r['unanswerable'] for r in kept):,} unanswerable), "
+        f"skipped {skipped:,} by --example-offset, "
         f"dropped {dropped_long:,} over {max_prompt_tokens} prompt tokens / {dropped_bad:,} unusable"
     )
     return kept
 
 
-def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: int) -> None:
+def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: int,
+           offset: int = 0) -> None:
     abstained = np.array([r["abstained"] for r in records], dtype=bool)
     unanswerable = np.array([r["unanswerable"] for r in records], dtype=bool)
     em = np.array([r["em"] for r in records], dtype=np.float64)
@@ -518,6 +533,7 @@ def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: 
     answerable = ~unanswerable
 
     print("\n=== SQuAD v2 validation, generated answers ===")
+    print(f"  slice: questions {offset:,}-{offset + len(records):,} of the seeded shuffle")
     print(f"  questions: {len(records):,}  ({int(unanswerable.sum()):,} unanswerable, "
           f"{int(answerable.sum()):,} answerable)")
     print(f"  abstention precision: {scores['precision']:.4f}   "
@@ -577,6 +593,9 @@ def main():
                         help="directory of local squad_v2 validation parquet shards (skips the Hub)")
     parser.add_argument("--max-examples", type=int, default=None,
                         help="cap the eval to this many questions (seeded subsample; default: all)")
+    parser.add_argument("--example-offset", type=int, default=0,
+                        help="skip this many usable questions first, taking a disjoint slice of the "
+                             "same seeded shuffle -- the eval-sampling noise measurement")
     parser.add_argument("--max-prompt-tokens", type=int, default=1024,
                         help="drop questions whose rendered prompt exceeds this (never truncated)")
     parser.add_argument("--max-new-tokens", type=int, default=32,
@@ -604,12 +623,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     template = ChatTemplate(tokenizer)
 
-    scratch_dir = os.path.join(BASE_DIR, "data", "prepared", "_squad_val_scratch")
+    # the eval split lives with the other benchmark downloads, not under data/prepared: the corpus
+    # builders delete shards from there and archive_corpus.py packs it wholesale
+    scratch_dir = os.path.join(BASE_DIR, "data", "benchmarks", "squad_v2_validation")
     frame = load_squad_validation(scratch_dir, args.hf_token or get_hf_token(), args.squad_dir)
     records = build_records(
         frame, template, max_examples=args.max_examples,
         max_prompt_tokens=args.max_prompt_tokens, seed=args.seed,
-        with_forced=not args.skip_forced,
+        with_forced=not args.skip_forced, offset=args.example_offset,
     )
     if not records:
         raise SystemExit("no usable validation questions -- check --max-prompt-tokens / --squad-dir")
@@ -660,7 +681,7 @@ def main():
                 max_seq_len=ModelConfig.Params["max_seq_len"], n_bins=args.n_bins,
             )
 
-    report(records, forced, baseline, args.n_bins)
+    report(records, forced, baseline, args.n_bins, args.example_offset)
 
     if args.json_out:
         payload = {
@@ -668,6 +689,7 @@ def main():
             "baseline_checkpoint": args.baseline_checkpoint,
             "temperature": args.temperature,
             "seed": args.seed,
+            "example_offset": args.example_offset,
             "forced": forced,
             "baseline_forced": baseline,
             "records": [
