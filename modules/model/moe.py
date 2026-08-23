@@ -10,6 +10,7 @@ from transformer_engine.pytorch import checkpoint
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
+from modules.model.information_retrieval import RetrievalEntropyTracking
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
 
 
@@ -315,6 +316,17 @@ class LoopMixtureOfExperts(nn.Module):
 
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
+        # one retrieval entropy tracker shared by every IR expert, so the trainer reads a single
+        # per loop vector regardless of how many IR slots the pool has. None when there are no IR
+        # experts at all -- the log line then just omits the field
+        if num_ir_experts > 0:
+            self.ir_tracker = RetrievalEntropyTracking(num_entries=num_ir_entries, n_loops=n_loops)
+            for expert in self.experts:
+                if isinstance(expert, InformationRetrievalExpert):
+                    expert.ir_module.tracker = self.ir_tracker
+        else:
+            self.ir_tracker = None
+
     @property
     def num_experts(self):
         return self._num_attn_experts + self._num_ir_experts + self._num_mlp_experts
@@ -388,7 +400,10 @@ class LoopMixtureOfExperts(nn.Module):
         expert_cache = []
         for i in range(self.first_mlp_index):
             slot_cache = kv_cache.slots[i] if kv_cache is not None else None
-            if isinstance(self.experts[i], (SelfAttention, InformationRetrievalExpert)):
+            if isinstance(self.experts[i], InformationRetrievalExpert):
+                # loop_idx is passed for the entropy instrumentation only (see forward's docstring)
+                expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache, loop_idx=loop_idx))
+            elif isinstance(self.experts[i], SelfAttention):
                 expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
             elif isinstance(self.experts[i], CrossAttention):
                 expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
@@ -491,6 +506,9 @@ class LoopMixtureOfExperts(nn.Module):
         hidden_states_all = []
 
         self.expert_tracker.begin_forward(n_loops)
+        if self.ir_tracker is not None:
+            # one update per (loop, IR expert) pair, which is the cap the recompute guard needs
+            self.ir_tracker.begin_forward(n_loops * self._num_ir_experts)
 
         # rotary cos/sin for the expert attention, computed once and reused across loops/experts
         if kv_cache is not None:

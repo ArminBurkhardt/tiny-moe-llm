@@ -716,6 +716,15 @@ def sft(args):
 
                 per_loop_ce = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                 loop_scale = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
+                # per loop IR retrieval entropy over ln(num_ir_entries), same field pretrain.py logs
+                ir_entropy = (
+                    unwrapped_model.moe.ir_tracker.get_stats()
+                    if unwrapped_model.moe.ir_tracker is not None else []
+                )
+                ir_entropy_str = (
+                    "IR E/lnN: [" + ", ".join(f"{e:.4f}" for e in ir_entropy) + "] | "
+                    if ir_entropy else ""
+                )
 
                 def _metric(key):
                     value = metrics.get(key)
@@ -726,7 +735,7 @@ def sft(args):
                     f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
                     f"Aux: {aux_loss.item():.4f} | loop_scale: [{loop_scale}] | "
                     f"p_max: {_metric('p_max'):.4f} | top1_acc: {_metric('top1_acc'):.4f} | "
-                    f"per-loop CE: [{per_loop_ce}] | "
+                    f"per-loop CE: [{per_loop_ce}] | {ir_entropy_str}"
                     f"LR: {scheduler.get_last_lr()[0]:.3e} | {phase} tokens: {sft_tokens / 1e6:.2f}M | "
                     f"Tokens/sec: {tokens_per_sec:.0f} | "
                     f"Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | "

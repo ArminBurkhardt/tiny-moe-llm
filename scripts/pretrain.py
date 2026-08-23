@@ -811,6 +811,18 @@ def pretrain(phase=None):
                     # "loop 3 grew, loops 1-2 collapsed" is exactly the failure a single mean hides
                     loop_scale_str = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
                     per_loop_ce_str = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
+                    # IR retrieval entropy as a fraction of ln(num_ir_entries), same units as
+                    # eval_stage0.py's diagnostic 1: 1.0 = the read is uniform over the table, i.e.
+                    # it stores nothing. Per loop for the same reason loop_scale is, and empty
+                    # (field omitted) on a config with no IR experts
+                    ir_entropy = (
+                        unwrapped_model.moe.ir_tracker.get_stats()
+                        if unwrapped_model.moe.ir_tracker is not None else []
+                    )
+                    ir_entropy_str = (
+                        " | IR E/lnN: [" + ", ".join(f"{e:.4f}" for e in ir_entropy) + "]"
+                        if ir_entropy else ""
+                    )
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
                     top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
 
@@ -821,7 +833,7 @@ def pretrain(phase=None):
                         f"Aux Loss: {aux_loss.item():.4f} | "
                         f"loop_scale: [{loop_scale_str}] | "
                         f"p_max: {p_max_val:.4f} | top1_acc: {top1_val:.4f} | "
-                        f"per-loop CE: [{per_loop_ce_str}] | mean loops: {mean_loops:.2f} | "
+                        f"per-loop CE: [{per_loop_ce_str}]{ir_entropy_str} | mean loops: {mean_loops:.2f} | "
                         f"Tokens: {n_tokens / 1e6:.2f}M | Tokens/sec: {tokens_per_sec:.2f} | "
                         f"MFU: {mfu_str} | Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | Time: {(now - timer) / 60:.2f} min | "
                         f"ETA: {format_duration(eta_phase)}"

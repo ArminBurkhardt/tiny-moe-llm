@@ -92,11 +92,14 @@ class InformationRetrievalExpert(nn.Module):
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, loop_idx: int = 0) -> torch.Tensor:
         x_norm = self.norm(x)
 
         down = self.down_proj(x_norm)
-        ir_output = self.ir_module(down)
+        # loop_idx only buckets the retrieval entropy instrumentation (see RetrievalEntropyTracking);
+        # the retrieval itself is loop independent, which is exactly what the Stage 0 query drift
+        # measurement found and what NEXT.md's loop conditioned query is meant to change
+        ir_output = self.ir_module(down, loop_idx=loop_idx)
         information = self.up_proj(ir_output)
 
         attn_output = self.attn(

@@ -341,6 +341,22 @@ space in `forward_step`; non-MLP slots become `(index 0, weight 0)` so they cont
 - `_ExpertTracking` guards against activation-checkpoint recompute double counting
   (`begin_forward(expected_updates)`) and only samples every 8th forward. Its stats are per-token
   EMAs in [0, 1], plotted to `ckpts/training/expert_selection.png`.
+- **IR retrieval entropy is instrumented during training too**, by `RetrievalEntropyTracking`
+  ([information_retrieval.py](modules/model/information_retrieval.py)) — same two guards as
+  `_ExpertTracking` and for the same reasons, one tracker (`moe.ir_tracker`, `None` when
+  `num_ir_experts == 0`) shared by every IR expert, one EMA slot per loop. It reads the softmax
+  weights that already exist inside `InformationRetrievalModule.forward` under `no_grad`, upcast to
+  fp32 in 1024-row chunks (67MB transient; a whole `[B*S, num_ir_entries]` fp32 copy would be
+  ~0.5GB of peak) via `torch.special.entr`, which is `-x log x` in one kernel — the written-out
+  `-(w * w.clamp_min(1e-12).log())` form measured 3x slower at `[16384, 8192]`. Cost is **1.5ms per
+  (loop, IR expert) on every 8th forward**, ~0.5ms amortized against a ~400ms step, and
+  **`update()` performs no host sync** (asserted with `torch.cuda.set_sync_debug_mode("error")`;
+  `get_stats()` is the only sync and runs at log cadence). **Reported
+  as `E / ln(num_ir_entries)`** — the same units `scripts/eval_stage0.py` prints, so a log line and
+  a Stage 0 report compare directly; 1.0 means the read is uniform, i.e. the table stores nothing.
+  `pretrain.py` and `sft.py` log it per loop at `LOG_INTERVAL` as `IR E/lnN: [...]` (`get_stats()`
+  is the only host sync). `loop_idx` is plumbed into the IR expert *only* to bucket this — the
+  retrieval itself is loop-independent, which is exactly what Stage 0's query-drift number found.
 
 **Gradient checkpointing**: use `from transformer_engine.pytorch import checkpoint`, never
 `torch.utils.checkpoint` — the latter breaks FP8/NVFP4 quantized layers. Two levels:

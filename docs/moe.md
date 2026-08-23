@@ -163,3 +163,19 @@ skew — now just the un-renormalized selection probability) and is plotted ever
 recompute guard (`begin_forward` / `_expected_updates`) prevents double counting when
 `route()` reruns on the gradient-checkpointing backward pass, under checkpointing the guard covers
 the sub-checkpointed case, though stats can still be double-counted in some configurations
+
+## Retrieval-entropy tracking
+
+`RetrievalEntropyTracking` (in `modules/model/information_retrieval.py`) does the same job for the IR
+experts table: an EMA, one slot per loop, of the retrieval softmax entropy divided by
+`ln(num_ir_entries)`. It reads the weights already computed inside `InformationRetrievalModule.forward`
+under `no_grad`, upcasting to fp32 in 1024-row chunks so the fp32 copy of a `[B*S, num_ir_entries]`
+tensor never exists whole (67MB transient instead of ~0.5GB), and carries the same recompute guard
+and every-8th-forward sampling as `_ExpertTracking`. The reduction is `torch.special.entr`, one
+kernel for `-x log x`, which measured 3x faster than the written-out clamp/log/multiply form at the
+real `[16384, 8192]` shape: 1.5ms per (loop, IR expert), so ~0.5ms amortized over a ~400ms step. No
+host sync happens in the step path; `get_stats()` is the only one, at log cadence. `LoopMixtureOfExperts` owns one instance (`moe.ir_tracker`, `None` when there are
+no IR experts) and hands it to every IR expert, so the trainer reads a single per-loop vector; it is
+logged as `IR E/lnN: [...]` at the training log interval. The normalization is what makes it directly
+comparable to the diagnostic 1 that `scripts/eval_stage0.py` prints: 1.0 is a uniform read over the
+whole table, i.e. the table stores nothing.

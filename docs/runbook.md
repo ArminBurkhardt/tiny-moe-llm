@@ -68,6 +68,11 @@ Run phase 1 by hand for ~200 steps and check the log line before committing to t
 - FP8 should actually be active. **`te.autocast(enabled=True)` raises if the device rejects the
   recipe — it does not silently fall back.** `log_precision_mode()`'s log line at startup states
   the resolved recipe either way, so check that instead of assuming a missing warning means BF16.
+- `IR E/lnN:` is the IR table's retrieval entropy over `ln(num_ir_entries)`, one entry per loop,
+  in the same units as [stage0_diagnostics.md](measurements/stage0_diagnostics.md). At init it sits
+  at ~1.0 (a uniform read over the table). It falling is the table learning to store something;
+  staying pinned at 1.0 is the failure the 16B run had, and is worth catching in the first hour
+  rather than at the end.
 
 Then **delete `ckpts/training/` and start clean**, so the real run does not resume from a
 200-step smoke checkpoint.

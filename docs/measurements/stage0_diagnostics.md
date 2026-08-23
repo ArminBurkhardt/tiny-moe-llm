@@ -8,6 +8,12 @@ P0 used (local `phase1`, doc 0 onward, 40 × 4 × 4096 = 654,128 supervised toke
 reading the same quantity that one did. The per-run report files are untracked (`.gitignore`
 swallows `*.json`); regenerate with the command in CLAUDE.md.
 
+Row 1's quantity is **also logged during training**, in the same `E / ln N` units: `pretrain.py` and
+`sft.py` print `IR E/lnN: [...]` (one entry per loop) at every log interval, off `moe.ir_tracker`'s
+per-loop EMA of the retrieval softmax. So the 99.5% below is a number you can watch move rather than
+one that needs an eval pass — which is what Gate G2 ("post-anneal entropy well below `ln 65536`")
+actually needs to be observable during the Phase 3 run.
+
 | | `sft_final` | `phase2_final` |
 |---|---|---|
 | 1. retrieval entropy, loop 3 (max `ln 8192` = 9.011) | 8.9671 (99.51%) | 8.9650 (99.49%) |
