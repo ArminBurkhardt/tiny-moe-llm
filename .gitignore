@@ -4,10 +4,12 @@ data/datasets
 data/index
 data/prepared*
 data/archives
+data/benchmarks
 ckpts
 *.key
 *.cmd
 *.json
+*.log
 
 # wsl environment for transformer-engine
 env_init
