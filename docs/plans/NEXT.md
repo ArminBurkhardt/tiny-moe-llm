@@ -111,7 +111,15 @@ finetunes this project has run; today the only trunk-health instrument is CE on 
 slice. That is a health check, not a quality claim, and it cannot see a capability regression that
 leaves average CE flat. This phase builds the instrument the rest of the plan reports against.
 
-### 1b.1 The suite (`scripts/eval_benchmarks.py`)
+### 1b.1 The suite (`scripts/eval_benchmarks.py`) ✅
+
+**Done 2026-08-23** — thirteen tasks, one scoring path for this model and the peers, harness
+validated against Pythia-410m's published zero-shot numbers (11 of 11 anchors inside 0.4 points
+against a 1.5-point tolerance) and all four peers measured and frozen. Full record:
+[measurements/benchmark_suite.md](../measurements/benchmark_suite.md). The spec below is what was
+built; two scoring conventions it does not mention (byte normalization excludes the joining space,
+LAMBADA's published perplexity is per document) were caught by the validation and are recorded
+there.
 
 Log-likelihood multiple-choice scoring (length-normalized where that is the published convention)
 plus a small generative set. **One script scores both this model and the HF peers**, so the
@@ -128,20 +136,26 @@ scoring code cannot differ between them:
   ~1 point. A harness that can't reproduce known numbers produces unknown numbers.
 
 Peers, chosen to bracket the token axis: **gpt2-medium** (355M, the nearest token-parity anchor),
-**Pythia-410M** (300B tokens, the scaling-trend anchor), **SmolLM2-360M** (11T, the data
-ceiling), **Qwen2.5-0.5B** (the practical upper bound of the class). Peer numbers are measured
-once and frozen with the suite.
+**Pythia-410M** (300B tokens, the scaling-trend anchor), **SmolLM2-360M** (**4T**, not 11T as
+written here originally — 11T is the 1.7B model; the data ceiling either way), **Qwen2.5-0.5B**
+(18T, the practical upper bound of the class). Peer numbers are measured once and frozen with the
+suite.
 
-### 1b.2 The noise floor
+### 1b.2 The noise floor — slice noise done, seed noise open
 
 Gates need honest thresholds more than they need ambition. Two cheap measurements, written to
-`docs/measurements/noise_floor.md`:
+[`docs/measurements/noise_floor.md`](../measurements/noise_floor.md):
 
 - **Seed noise:** re-run the 0.55 repair finetune with a different `sft.seed` (identical corpus,
   ~22 min) and re-run the abstention eval. The per-metric spread between the two finals is the
-  training-seed σ on every abstention metric.
+  training-seed σ on every abstention metric. **Not run.**
 - **Slice noise:** the same checkpoint on SQuAD v2 validation questions 2000–4000. The spread
-  against the standard slice is the eval-sampling σ.
+  against the standard slice is the eval-sampling σ. ✅ **Done 2026-08-23** via
+  `eval_abstention.py --example-offset`. The decision metrics move ≤0.004 and are dominated by
+  their own binomial error (precision ±0.026 on ~370 abstentions); answerable-half EM moves 0.015;
+  AUROC moves 0.029 and crosses chance, so no argument may rest on the abstention signal being
+  specifically *below* 0.5. The standard slice reproduced the recorded 0.55 numbers to four
+  decimals on every metric.
 
 From here on, a gate that says "must not regress" means "within the documented noise", and a gate
 that says "must improve" means "by ≥3σ".
