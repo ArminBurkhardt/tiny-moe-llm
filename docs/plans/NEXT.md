@@ -66,6 +66,7 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 | replay floor | **Every finetune carries ≥20% general LM/chat replay.** Phase 4/5 are the big spends and a narrow corpus that quietly costs trunk quality is the classic way to lose the final model. |
 | final POC model | **One consolidation SFT + preference pass** (Phase 6), not the current stack of narrow repairs on an SFT that predates everything learned since. |
 | real run | **500M-class, ≤5k H100-hours, target ~1k.** FP8 recipe and MFU work are validated on short runs *before* any long-run tokens are spent (Phase 7) — the 16B run left FP8 unused at MFU ~11%, and throughput multiplies the budget directly. |
+| trunk objective | **AR LoopLM, POC and real run.** A masked-diffusion trunk is parked with an explicit unpark condition (see Parked): swapping the objective replaces the measurement instruments, not just the model, and its one real advantage here is already installed by 5c item 1. |
 
 ---
 
@@ -662,3 +663,20 @@ Written before anything is rented, containing:
 - **`num_ir_experts > 1`.** The one invasive option — shifts `first_mlp_index` and the router's
   output dim, needs a surgical remap of the router weight rather than a plain load. Only once a
   single sharpened, grown table demonstrably helps and is saturating.
+- **Masked-diffusion trunk.** Not a stage swap — a different project: the benchmark suite scores
+  log-likelihoods (diffusion yields ELBO bounds), `p_max` and the entire calibration/abstention
+  record assume per-token AR confidence, MTP / KV cache / the convergence exit are AR machinery,
+  and extractive span copying — the one thing 332M provably does — is what left-to-right decoding
+  with a reader is shaped for. At 16B single-epoch tokens the public record (LLaDA-class models
+  needing trillions of tokens to reach AR peers) puts diffusion behind AR at matched compute at
+  this scale; its genuine case is the **data-constrained multi-epoch regime** ("Diffusion Beats
+  Autoregressive in Data-Constrained Settings", Prabhudesai et al. 2025), where repetition decays
+  slower for diffusion than for AR. That regime is a live possibility for the real run: at 7a's
+  target throughput, 5k hours can consume 2–4x the capped 4-epoch supply of a 100B-token unique
+  corpus. **Unparks iff 7b's budget math lands data-bound** (capacity tokens ≥ ~2x the 4-epoch
+  supply) — then buy one ~16B-token matched-compute *multi-epoch* A/B (AR vs. masked diffusion,
+  same corpus, same suite) with an ELBO scoring path validated against a published diffusion
+  peer's numbers first, same rule as G0; a harness that can't reproduce LLaDA/Dream can't rank
+  the A/B. What LoopLM keeps either way: diffusion's actual mechanism advantage — iterative
+  refinement conditioned on the step index — is exactly what the loop-conditioned query/router
+  bias installs, without abandoning the objective every instrument is built on.
