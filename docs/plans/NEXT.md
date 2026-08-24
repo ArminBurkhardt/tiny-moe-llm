@@ -423,6 +423,23 @@ per-sequence-at-prefill kills multi-hop. The design that works:
 ANN cost scales with loops × sequences, not tokens, and it is exactly the two-stage
 retrieve/read structure the module already implements.
 
+**Key granularity vs. reader granularity — the needle decision.** A single 384-d vector is
+faithful to ~100–300 tokens; a needle sentence inside a 4096-token chunk dilutes out of the
+chunk's pooled embedding, and no later stage can recover a candidate the ANN never surfaced. So
+the two granularities are decoupled: **the ANN indexes fine keys** (sentence windows, ~32–128
+tokens — KILT's 100-word passages already sit in this band), each mapped to its parent chunk,
+and **the reader gets the parent chunk's tokens** around the hit. A chunk's score is its best
+sentence hit (late-interaction MaxSim, structurally), so the needle's own key is what gets
+found. This is the two-stage shape from the parametric table again — chunk as cluster, its
+sentence keys as members — and the IR expert's exact stage scores the candidates' precomputed
+fine keys (~64 chunks × ~8 sentences per loop, trivial) in the same softmax as the parametric
+candidates, behind the per-source scale; nothing about the learned table changes. Two
+boundaries, stated now: verbatim needles are lexical, not semantic, so the ANN candidates are
+**unioned with BM25's** rather than asked to beat them (G4 keeps BM25 as the bar on the semantic
+side only); and **no learned encoder touches raw chunk tokens at selection time** — that is a
+cross-encoder, it cannot scale past the candidate set, and extracting the relevant tokens is
+already the reader's job. The learned surface stays the query adapter and the logit scale.
+
 ### 5c. Depth curriculum (Stage 5) — the only thing that makes >3 loops pay
 
 Loop 3 buys ~0 nats today. ">3 loops" is not a config change; later loops need a *reason* to
