@@ -250,6 +250,31 @@ them on a fixed token cadence (checkpoint the assignment alongside the keys) and
 so a loss step at refresh boundaries is attributable. This mirrors the ANN structure used for the
 external corpus, which is the point: one retrieval mechanism, two backing stores.
 
+Clustering decisions, made now rather than at implementation time:
+
+- **Spherical k-means with a balance cap.** Scoring is cosine over L2-normalized keys, so
+  centroids are means of normalized members, renormalized — plain Euclidean Lloyd's optimizes the
+  wrong metric. Cap cluster size at ~2x the mean during refresh: unbalanced clusters make the
+  probe cost per token variable and leave whole key regions unreachable, i.e. untrainable.
+- **Measure candidate recall at every refresh.** Recall@32 of the two-stage path against exact
+  full scoring on a fixed query sample — one cheap matmul. Below ~0.9, raise the probed clusters
+  from 4 before blaming the training; a centroid path that silently misses the true top-k turns
+  the anneal into noise.
+- **Recycle dead entries at refresh.** A sharpened softmax trains only what it selects; entries
+  whose selection EMA stays ~0 over a refresh window get their key re-seeded to a recent
+  underserved query and their value zeroed — the same zero-init neutrality pattern as everything
+  else here. The per-entry EMA rides the existing tracker machinery.
+- **Fallback, named now: product-key memory.** Two 256-entry half-key codebooks give *exact*
+  top-k over all 65536 composed keys at 2×256 scoring cost, fully differentiable, no centroids,
+  no refresh, no staleness (Lample et al. 2019; PEER 2024). It is the fallback rather than the
+  default only because it cannot back the external corpus (FAISS needs real centroids) and one
+  shared mechanism is the design bet. If G2's dynamics show refresh churn or cluster collapse,
+  PKM is the measured alternative for the parametric table — a swap, not a redesign.
+
+If arm B wins, one refinement worth its own short measurement: a lower LR on `z_keys` than on
+`y_values`, so the key space stays a semantic index (what the warm start bought) while the values
+learn content — key drift erasing the warm start would show up as the B arm converging to A.
+
 ### Temperature
 
 **Do not just lower the constant.** `y_values` have only ever been read as a near-uniform
@@ -314,6 +339,10 @@ supply. Measure its effect separately from Phase 2's numbers.
 at step 0. Two properties fall out free: **no corpus attached → bit-identical to today** (one
 checkpoint serves both modes), and **softmax mass on external vs. parametric entries is a
 groundedness signal** — "I retrieved nothing relevant" becomes measurable instead of guessed.
+One added tensor, decided now: a **learned per-source logit scale on the external half** of the
+concatenated scores. Post-anneal `z_keys` and adapter-mapped bge keys land at different logit
+scales, and without the scale the mass split — the G3b signal itself — measures that mismatch
+rather than relevance. Init to match the parametric scale; G3b is read after it.
 
 **Option B — CrossAttention reads evidence tokens.** `other` in `transformer.py` is already a
 per-call injection port re-read at every loop. Swap `_moe_ple(input_ids)` for embedded retrieved
@@ -427,6 +456,22 @@ The template change invalidates existing SFT checkpoints' chat formatting, and t
 *because Phase 6 re-runs the full SFT anyway* — this is the one moment in the plan where a
 template migration is free. Build the RAG SFT corpus (evidence-attached conversations, including
 abstention-with-empty-retrieval rows) here; Phase 6 consumes it.
+
+### 5e. The needle eval (what "retrieval at this scale" is allowed to claim)
+
+Plant one unique fact in one of N attached chunks (N = 4, 16, 64, 256; distractors drawn from the
+same document distribution) and ask for it. Report **two numbers per N, never one**: selector hit
+rate (the needle chunk carries the top read mass) and end-to-end EM — so a miss is attributable
+to selection vs. reading, the same stage separation the whole architecture is built on. This is
+G6's beyond-context claim in eval form; it runs at the standard flags and its N=64+ rows are
+quoted alongside G6.
+
+The honest scope, stated once: **the needle lives in the evidence pathway, not the parametric
+table.** ANN recall gets the chunk into the buffer, the IR read ranks it, CrossAttention copies
+from its actual tokens — copying is the operation a 332M model can do reliably. A 256-d value
+cannot store a verbatim fact; 65536 of them are a learned cache of frequent atoms, not a document
+store, and no gate asks the table to pass a needle test. "RAG over more tokens than any context
+window holds" is a claim about the buffer + reader, and this eval is what licenses it.
 
 **Gate G5:** EM/F1 on NQ-open / TriviaQA / **PopQA**, corpus attached vs. not — the attach delta
 must be ≥3σ. Then the depth ablation: EM at `n_loops` = 2, 3, 4, 6, 8 with corpus attached.
