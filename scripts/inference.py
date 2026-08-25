@@ -139,7 +139,9 @@ def stream_generate(
             n_extra = min(num_mtp_tokens, model.mtp_head.num_extra_tokens)
             mtp_logits = [model.mtp_head.lm_head(extra[:, -1:, i, :]) for i in range(n_extra)]
             return logits, mtp_logits
-        out = model(ids, **kwargs)
+        # no drafting requested -> don't run the head whose output would be dropped. It reads the
+        # same hidden state the logits come from, so the sampled tokens are unchanged
+        out = model(ids, skip_mtp=True, **kwargs)
         logits = out[0] if isinstance(out, tuple) else out
         return logits, []
 

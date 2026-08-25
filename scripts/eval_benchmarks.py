@@ -535,8 +535,11 @@ class TinyBackend(Backend):
         return self.tokenizer.decode(list(ids), skip_special_tokens=True)
 
     def _final_hidden(self, ids: torch.Tensor, doc: torch.Tensor) -> torch.Tensor:
+        # skip_mtp: the drafted tokens are discarded here, and the head is paid over the whole
+        # prefix of every scored continuation
         cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(doc)
-        out = self.model(input_ids=ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_hidden=True)
+        out = self.model(input_ids=ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                         return_hidden=True, skip_mtp=True)
         hidden_all = out[0] if isinstance(out, tuple) else out
         return hidden_all[-1]
 

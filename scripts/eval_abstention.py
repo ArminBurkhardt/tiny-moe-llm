@@ -258,10 +258,15 @@ def _final_hidden(model: TinyMoETransformer, input_ids: torch.Tensor, document_i
     ``return_hidden=True`` is what keeps this affordable: the alternative returns
     ``[B, S, vocab]`` logits (1GB at B=16/S=512/vocab=65536 in bf16), where every caller here needs
     the head applied to a handful of positions at most.
+
+    ``skip_mtp=True`` for the same reason one step further out: nothing here reads the drafted
+    tokens, and the head would otherwise run over the whole prefix on every decode step of a
+    cache-free generation loop.
     """
     cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
     out = model(
         input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_hidden=True,
+        skip_mtp=True,
     )
     hidden_all = out[0] if isinstance(out, tuple) else out
     return hidden_all[-1]

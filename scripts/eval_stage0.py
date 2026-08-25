@@ -220,9 +220,9 @@ def collect(model, dataset, device, max_batches, max_loops, n_loops_cfg, top_m):
 
         probe.reset("full")
         hidden_all = model(input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                           return_hidden=True, n_loops=max_loops)
+                           return_hidden=True, n_loops=max_loops, skip_mtp=True)
         if isinstance(hidden_all, tuple):
-            hidden_all = hidden_all[0]                       # MTP checkpoints return (hidden, extra)
+            hidden_all = hidden_all[0]                       # kept: without skip_mtp it is a tuple
         loops_run = hidden_all.size(0)
 
         # ---- readout per loop: CE, top-1, convergence, oracle depth ----
@@ -288,7 +288,7 @@ def collect(model, dataset, device, max_batches, max_loops, n_loops_cfg, top_m):
         for mode, key in (("zero", "zero"), ("mean", "mean")):
             probe.reset(mode)
             ablated = model(input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                            return_hidden=True, n_loops=n_loops_cfg)
+                            return_hidden=True, n_loops=n_loops_cfg, skip_mtp=True)
             if isinstance(ablated, tuple):
                 ablated = ablated[0]
             for loop in range(ablated.size(0)):

@@ -316,6 +316,7 @@ class TinyMoETransformer(nn.Module):
         kv_cache=None,
         converge_tol: float = None,
         min_loops: int = 1,
+        skip_mtp: bool = False,
     ):
         """forward pass of the model
 
@@ -342,6 +343,12 @@ class TinyMoETransformer(nn.Module):
                 ``kv_cache``. Defaults to None (always run the full depth).
             min_loops (int, optional): floor on the loop count when ``converge_tol`` is set.
                 Defaults to 1.
+            skip_mtp (bool, optional): don't run the MTP head at all, and drop
+                ``extra_token_outputs`` from the return. The head is a pure function of the final
+                loop's normed hidden state, so not running it cannot change the logits -- but it is
+                paid over the whole prefix on every generated token, and every caller that only
+                wants logits (greedy decode, the log-likelihood scorers, the calibration probes)
+                was throwing the result away. Defaults to False.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -366,7 +373,7 @@ class TinyMoETransformer(nn.Module):
             # never the raw residual stream, so per-loop CE needs this too.
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
-            extra_token_outputs = self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
+            extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=self.use_sub_checkpointing)
             x = x_all if return_hidden else self.lm_head(x)
         else:
             assert kv_cache is None or cu_seqlens is None, "kv_cache decoding is single-sequence only, cu_seqlens must be None"
@@ -378,7 +385,7 @@ class TinyMoETransformer(nn.Module):
             _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
-            extra_token_outputs = self._mtp_forward(x, use_checkpointing=False)
+            extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=False)
             x = x_all if return_hidden else self.lm_head(x)
 
         if extra_token_outputs is not None:

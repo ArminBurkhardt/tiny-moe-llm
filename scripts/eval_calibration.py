@@ -198,9 +198,10 @@ def collect_stats(model: TinyMoETransformer, dataset: Dataset, tokenizer, device
 
         hidden_all = model(
             input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_hidden=True,
+            skip_mtp=True,   # nothing here reads the drafted tokens
         )
         if isinstance(hidden_all, tuple):
-            hidden_all = hidden_all[0]   # MTP checkpoints return (hidden, extra_token_outputs)
+            hidden_all = hidden_all[0]   # kept: a call without skip_mtp returns (hidden, extra)
         # hidden_all: [n_loops, B, S, H] post-norm
 
         main_labels = labels[:, 1:].contiguous().view(-1)
