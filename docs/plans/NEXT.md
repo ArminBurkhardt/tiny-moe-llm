@@ -161,12 +161,40 @@ Gates need honest thresholds more than they need ambition. Two cheap measurement
 From here on, a gate that says "must not regress" means "within the documented noise", and a gate
 that says "must improve" means "by ≥3σ".
 
-### 1b.3 The answerability probe (decides where Phase 4's burden lies)
+### 1b.3 The answerability probe ✅
 
-Freeze the repaired checkpoint. Fit a logistic probe on ~10k SQuAD v2 *train* questions:
+**Done 2026-08-26** — `scripts/eval_probe.py`, run on all three checkpoints rather than only the
+repaired one, which is what made the result interpretable. Full record:
+[measurements/answerability_probe.md](../measurements/answerability_probe.md).
+
+Neither branch below fired cleanly. **The hidden-state probe reads AUROC 0.5804 / 0.5850 / 0.5839 on
+the pretrained trunk, the SFT checkpoint and the repair checkpoint** — agreeing to within 0.005, an
+order of magnitude inside the ±0.030 slice noise. So the signal is real (it beats the best free
+scalar by 0.032–0.060, outside that noise), it is weak (0.58, not 0.7), and **it is a property of
+the pretrained trunk that 758M tokens of finetuning did not move in either direction.** That is the
+representation-level form of "the corpus ratio slides the operating point along a fixed curve": the
+finetunes were re-reading a fixed representation, not changing it. `p_max`, entropy and the top-1
+margin carry nothing on any checkpoint, fitted or not (0.454–0.548) — the fourth independent reading
+of that.
+
+Consequences, which the phases below now assume:
+
+- **Phase 4 keeps the burden.** Three checkpoints of finetuning put no discrimination into the
+  trunk, so it has to come from information the trunk does not have.
+- **G3b's comparison changes, its threshold does not.** "Beat `p_max`'s 0.462–0.478" was a
+  chance-level bar. The real bar is **0.584** — what a free linear read of the existing trunk
+  already gives — and G3b's 0.65 clears it by 0.066, so the gate stands as written, now against an
+  honest baseline.
+- **Phase 6 is asked for something easier than it was.** The preference pass no longer has to
+  invent a distinction the model cannot represent; it has to make the policy use one that
+  measurably exists. At matched recall a probe threshold is already 0.13 more precise than the
+  shipped policy at half its false-abstention rate — a better-shaped curve that is still not bent
+  (precision at recall 0.55 is 0.557, barely over the 0.507 base rate).
+
+The branches this was run to decide, kept for the record:
+
 features = final-loop last-position hidden state plus the free scalars (`p_max`, entropy, top-1
-margin); target = answerable/unanswerable. Evaluate AUROC on the standard 2,000-question slice.
-Minutes of compute, and it splits the abstention problem cleanly:
+margin); target = answerable/unanswerable, AUROC read on the standard 2,000-question slice.
 
 - **AUROC ≈ 0.5** → the signal is not in the trunk's representation at all. Only new information
   (Phase 4's evidence) can create it; no readout trick will.
@@ -174,14 +202,17 @@ Minutes of compute, and it splits the abstention problem cleanly:
   thresholded probe is a legitimate shipping mechanism (tunable operating point, minutes to
   refit), and Phase 6's preference pass has something real to amplify.
 
-Either answer changes what Phases 4 and 6 are on the hook for, which is why it runs first.
+### 1b.4 Stop paying for MTP where it is discarded ✅
 
-### 1b.4 Stop paying for MTP where it is discarded
+**Done 2026-08-26** — `TinyMoETransformer.forward` takes `skip_mtp`, which skips the head and drops
+`extra_token_outputs` from the return; `inference.py` (when not drafting), `eval_abstention.py`,
+`eval_benchmarks.py`, `eval_calibration.py` and `eval_stage0.py` all pass it.
+`tests/test_mtp_skip.py` is the structural check this item asked for: logits, per-loop hidden states
+and every step of a KV-cached decode are **bit-identical** with the head on and off — equality, not
+a tolerance, since a tolerance would hide exactly the bug it checks for.
 
-`_mtp_forward` runs unconditionally and `inference.py` / `eval_abstention.py` throw the result
-away — paid over the whole prefix, every generated token, in every generative eval this plan runs
-dozens of times. Skip it when its output is unused. Correctness is checked structurally: logits on
-a fixed prompt must be bit-identical before/after.
+`_mtp_forward` used to run unconditionally while those callers threw the result away — paid over the
+whole prefix, on every generated token, in every generative eval this plan runs dozens of times.
 
 ### 1b.5 Baseline snapshot
 
@@ -379,8 +410,9 @@ Phase 3. Conversation weighting on (it is what fixed the last policy collapse).
 no-evidence ≫ under gold; benchmark suite within noise.
 
 **Gate G3b (the discrimination gate):** AUROC of the external-mass groundedness signal for
-detecting unanswerable questions **≥ 0.65** on the standard SQuAD v2 slice — against `p_max`'s
-0.462–0.478 record across three checkpoints. First reading of the bent curve: precision above
+detecting unanswerable questions **≥ 0.65** on the standard SQuAD v2 slice. The bar to beat is
+**not** `p_max`'s 0.462–0.478 (that is chance) but the **0.584** a free linear probe of the
+existing trunk already reads (1b.3) — 0.65 clears it by 0.066, which is why the threshold stands. First reading of the bent curve: precision above
 0.578 by ≥3σ at recall ≥ 0.5 (the hard bar lands at G7). If the groundedness signal *also* fails
 to discriminate, Phase 6's probe + preference pass is the only lever left and the Phase 7
 go/no-go table says so explicitly.
@@ -606,8 +638,8 @@ Written before anything is rented, containing:
   ablation well off the 0.0004 floor; A/B arm chosen (Phase 3).
 - **G3** — gold-vs-no-evidence CE gap ≥ ~0.3 nats; abstention under no-evidence ≫ under gold;
   benchmarks within noise (Phase 4).
-- **G3b** — groundedness AUROC ≥ 0.65 for unanswerable detection, against `p_max`'s below-chance
-  record (Phase 4).
+- **G3b** — groundedness AUROC ≥ 0.65 for unanswerable detection, against the trunk probe's
+  **0.584** rather than `p_max`'s below-chance record (Phase 4).
 - **G4** — recall@k beats BM25 **and** the frozen-embedder baseline (Phase 5a).
 - **G5** — corpus-attached EM/F1 delta ≥3σ on NQ-open / TriviaQA / PopQA; depth ablation at
   `n_loops` = 2, 3, 4, 6, 8. **Flat past 3 → ship 3 and don't rationalize it** (Phase 5b/5c).
@@ -637,8 +669,10 @@ Written before anything is rented, containing:
   its own number, not folded into an average.
 - **Both discrimination signals could fail.** `p_max` already has (three checkpoints); if Phase
   4's groundedness mass also can't separate answerable from unanswerable, the fallback is Phase
-  1b's probe + Phase 6's preference pass, and the calibration story ships weaker. The class claim
-  survives; the gate table must say which story shipped.
+  1b's probe + Phase 6's preference pass, and the calibration story ships weaker. **1b.3 measured
+  how weak that fallback is: AUROC 0.584, identical on all three checkpoints**, so the fallback is
+  a better-shaped curve at low recall, not a discriminator. The class claim survives; the gate
+  table must say which story shipped.
 - **Benchmark contamination.** fineweb-edu's decontamination against these suites is not
   guaranteed. Standard val/test splits only, and a single suspiciously-strong benchmark is
   treated as suspect, not as a win.

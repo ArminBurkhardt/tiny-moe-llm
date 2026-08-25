@@ -121,6 +121,10 @@ scripts/
                              ONE scoring path for this model and for the HF peers. Downloads into
                              data/benchmarks (refused inside data/prepared*, data/datasets,
                              data/archives) and peer weights into ckpts/peers
+  eval_probe.py             linear answerability probe: fits logistic regression on the final
+                             loop's last-position hidden state over squad_v2/TRAIN, reads AUROC on
+                             the same standard validation slice eval_abstention.py uses. Answers
+                             "is the signal in the representation or only missing from the policy"
   eval_stage0.py            NEXT.md's Phase 1 diagnostics: IR retrieval entropy + ablation (Gate
                              G1), per-loop query drift, residual/readout loop dynamics, oracle
                              minimum sufficient depth. Read-only -- probes via forward hooks so a
@@ -180,6 +184,7 @@ python scripts/eval_calibration.py -c CKPT --start-doc-idx 0 --max-batches 40 --
 python scripts/eval_abstention.py    # acceptance; -c CKPT --baseline-checkpoint PRETRAINED
 python scripts/eval_abstention.py -c CKPT --max-examples 2000 --batch-size 16 --skip-forced \
   --example-offset 2000              # the disjoint slice, i.e. the eval sampling noise measurement
+python scripts/eval_probe.py -c CKPT --json-out docs/measurements/probe_CKPT.json   # answerability
 python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4 --max-loops 6
 python scripts/eval_benchmarks.py --peer pythia-410m --validate \
   --json-out docs/measurements/benchmarks/pythia-410m.json   # a peer, measured once and frozen
@@ -379,7 +384,11 @@ pass `main_lm_head=` or you'll silently double the activation peak.
 
 **Forward return arity.** `return_aux_loss=True` yields `(x, aux_loss)`, plus
 `extra_token_outputs` as a third element when MTP is on. It used to carry `p_halt` between the two
-— any call site still unpacking four values is pre-Phase-0.
+— any call site still unpacking four values is pre-Phase-0. **`skip_mtp=True` drops that third
+element** *and* skips running the head: it is a pure function of the final loop's normed hidden
+state, so not running it cannot move the logits (`tests/test_mtp_skip.py` asserts bit-identity, not
+a tolerance), but leaving it on costs the whole prefix on every generated token. Every eval script
+and the non-drafting inference path pass it; the drafting path and training do not.
 
 **Per-loop CE supervision**: with `return_hidden=True` the returned "hidden states" are actually
 `self.norm` applied at *every* loop, stacked to `[loops_run, B, S, H]` (index `[-1]` is the final
@@ -759,6 +768,13 @@ on a rented box lives in [docs/runbook.md](docs/runbook.md) §10.
     on the real run** — read the generated-answers block first.
   - `expected_calibration_error`/`roc_auc` are imported from `scripts/eval_calibration.py` so both
     evals compute them with the same code. Don't fork them.
+  - **`scripts/eval_probe.py` reuses this script's loader, renderer and slice by import**
+    (`load_squad_split`, `build_records`, `_final_hidden`), which is what makes its AUROC comparable
+    to the numbers above rather than a second measurement of a slightly different thing. Its finding
+    is a fact about the model, not about a checkpoint: a linear probe of the final loop's
+    last-position hidden state reads **0.584** for unanswerable detection on the pretrained trunk,
+    the SFT checkpoint and the repair checkpoint alike (within 0.005), while every confidence scalar
+    sits at chance. The finetunes re-read a fixed representation; they did not change it.
 - **Abstention phrasings are a closed set** (`modules/data/abstention.py`). SQuAD v2's unanswerable
   rows have a literally empty reference answer, so a phrasing has to be supplied; keeping the set
   closed is what makes `is_abstention` an exact check rather than a classification problem. **The
