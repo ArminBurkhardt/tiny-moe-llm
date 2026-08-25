@@ -213,17 +213,18 @@ def score(x: np.ndarray, mean: np.ndarray, std: np.ndarray, w: torch.Tensor, b: 
     return (z @ w + b).sigmoid().double().cpu().numpy()
 
 
-def fit_and_score(train_x: np.ndarray, train_y: np.ndarray, dev_x: np.ndarray, dev_y: np.ndarray,
+def fit_and_score(fit_x: np.ndarray, fit_y: np.ndarray, dev_x: np.ndarray, dev_y: np.ndarray,
                   eval_x: np.ndarray, device: str) -> dict:
-    """Pick L2 on the dev split, refit on train+dev, score the eval slice.
+    """Pick L2 on the dev split, refit on fit+dev, score the eval slice.
 
-    The refit matters: the L2 chosen on a 80% fit would be mistuned for the 100% one only mildly,
-    but throwing away a fifth of the fit data after using it purely to choose one scalar is waste,
-    and the eval slice never enters either step.
+    ``fit_x`` is the fitting portion of the train questions and ``dev_x`` the part held back to
+    choose one scalar; the refit then uses both. Throwing the dev fifth away afterwards would be
+    waste, and the eval slice enters neither step -- tuning on it would report a number the next
+    checkpoint cannot reproduce.
     """
-    mean, std = standardize(train_x)
-    z_fit = torch.from_numpy(((train_x - mean) / std).astype(np.float32)).to(device)
-    y_fit = torch.from_numpy(train_y.astype(np.float32)).to(device)
+    mean, std = standardize(fit_x)
+    z_fit = torch.from_numpy(((fit_x - mean) / std).astype(np.float32)).to(device)
+    y_fit = torch.from_numpy(fit_y.astype(np.float32)).to(device)
 
     best = None
     for l2 in L2_GRID:
@@ -232,8 +233,8 @@ def fit_and_score(train_x: np.ndarray, train_y: np.ndarray, dev_x: np.ndarray, d
         if best is None or dev_auroc > best["dev_auroc"]:
             best = {"l2": l2, "dev_auroc": dev_auroc}
 
-    full_x = np.concatenate([train_x, dev_x], axis=0)
-    full_y = np.concatenate([train_y, dev_y], axis=0)
+    full_x = np.concatenate([fit_x, dev_x], axis=0)
+    full_y = np.concatenate([fit_y, dev_y], axis=0)
     mean, std = standardize(full_x)
     z_full = torch.from_numpy(((full_x - mean) / std).astype(np.float32)).to(device)
     y_full = torch.from_numpy(full_y.astype(np.float32)).to(device)
@@ -244,7 +245,7 @@ def fit_and_score(train_x: np.ndarray, train_y: np.ndarray, dev_x: np.ndarray, d
         "dev_auroc": best["dev_auroc"],
         "fit_auroc": roc_auc(score(full_x, mean, std, w, b, device), full_y),
         "eval_scores": score(eval_x, mean, std, w, b, device),
-        "n_features": train_x.shape[1],
+        "n_features": fit_x.shape[1],
     }
 
 
