@@ -92,8 +92,8 @@ def main():
     # row-divisibility workaround actually exists for.
     model.zero_grad(set_to_none=True)
     with te.autocast(enabled=True, recipe=nvfp4_recipe):
-        hidden, aux3, _, mtp3 = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
-                                      return_aux_loss=True, return_hidden=True)
+        hidden, aux3, mtp3 = model(input_ids=input_ids, cu_seqlens=cu, max_seqlen=maxlen,
+                                   return_aux_loss=True, return_hidden=True)
         (hidden.float().pow(2).mean() + mtp3.float().pow(2).mean() + aux3).backward()
     assert torch.isfinite(hidden).all() and torch.isfinite(mtp3).all()
     g3 = next(p.grad for p in model.parameters() if p.grad is not None)
