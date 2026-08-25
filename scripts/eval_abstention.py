@@ -79,7 +79,6 @@ from scripts.prepare_sft_data import SQUAD_INSTRUCTION
 from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, logger
 
 SQUAD_REPO = "rajpurkar/squad_v2"
-SQUAD_VAL_PREFIX = "squad_v2/validation"
 SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
 CE_CHUNK_SIZE = 2048
 
@@ -87,21 +86,27 @@ CE_CHUNK_SIZE = 2048
 # ---------------------------------------------------------------------------- data
 
 
-def load_squad_validation(scratch_dir: str, hf_token: Optional[str], local_dir: Optional[str]) -> pd.DataFrame:
-    """Read every ``squad_v2/validation`` parquet shard into one frame.
+def load_squad_split(scratch_dir: str, hf_token: Optional[str], local_dir: Optional[str],
+                     split: str = "validation") -> pd.DataFrame:
+    """Read every ``squad_v2/{split}`` parquet shard into one frame.
 
-    ``local_dir`` short-circuits the Hub entirely (any directory of validation parquet files), which
-    is what makes this runnable on a box that already has the shards or has no network. The Hub path
-    pins the dataset revision for the same reason ``prepare_sft_data.py`` does: a repo that updated
-    between the SFT corpus build and this eval would change what "held out" means.
+    ``local_dir`` short-circuits the Hub entirely (any directory of parquet files for that split),
+    which is what makes this runnable on a box that already has the shards or has no network. The
+    Hub path pins the dataset revision for the same reason ``prepare_sft_data.py`` does: a repo that
+    updated between the SFT corpus build and this eval would change what "held out" means.
+
+    ``split`` is a parameter because ``scripts/eval_probe.py`` fits on the *train* split while this
+    script scores the *validation* one -- one reader, so neither can drift into a different revision
+    or a different column convention than the other.
     """
+    prefix = f"squad_v2/{split}"
     if local_dir:
         files = sorted(
             os.path.join(local_dir, f) for f in os.listdir(local_dir) if f.endswith(".parquet")
         )
         if not files:
             raise SystemExit(f"no .parquet files in {local_dir}")
-        logger.info(f"reading {len(files)} local validation shard(s) from {local_dir}")
+        logger.info(f"reading {len(files)} local {split} shard(s) from {local_dir}")
         return pd.concat([pd.read_parquet(f, engine="pyarrow") for f in files], ignore_index=True)
 
     from huggingface_hub import HfApi, hf_hub_download
@@ -110,14 +115,14 @@ def load_squad_validation(scratch_dir: str, hf_token: Optional[str], local_dir: 
     info = api.dataset_info(SQUAD_REPO)
     names = sorted(
         f for f in api.list_repo_files(SQUAD_REPO, repo_type="dataset", revision=info.sha)
-        if f.startswith(SQUAD_VAL_PREFIX) and f.endswith(".parquet")
+        if f.startswith(prefix) and f.endswith(".parquet")
     )
     if not names:
         raise SystemExit(
-            f"no files under {SQUAD_VAL_PREFIX!r} in {SQUAD_REPO} -- the Hub layout may have "
+            f"no files under {prefix!r} in {SQUAD_REPO} -- the Hub layout may have "
             "changed; pass --squad-dir with local parquet shards instead"
         )
-    logger.info(f"downloading {len(names)} validation shard(s) from {SQUAD_REPO} @ {info.sha[:10]}")
+    logger.info(f"downloading {len(names)} {split} shard(s) from {SQUAD_REPO} @ {info.sha[:10]}")
     os.makedirs(scratch_dir, exist_ok=True)
     frames = []
     for name in names:
@@ -517,7 +522,7 @@ def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: 
         kept = records
 
     logger.info(
-        f"{len(kept):,} validation questions "
+        f"{len(kept):,} questions "
         f"({sum(r['unanswerable'] for r in kept):,} unanswerable), "
         f"skipped {skipped:,} by --example-offset, "
         f"dropped {dropped_long:,} over {max_prompt_tokens} prompt tokens / {dropped_bad:,} unusable"
@@ -631,7 +636,7 @@ def main():
     # the eval split lives with the other benchmark downloads, not under data/prepared: the corpus
     # builders delete shards from there and archive_corpus.py packs it wholesale
     scratch_dir = os.path.join(BASE_DIR, "data", "benchmarks", "squad_v2_validation")
-    frame = load_squad_validation(scratch_dir, args.hf_token or get_hf_token(), args.squad_dir)
+    frame = load_squad_split(scratch_dir, args.hf_token or get_hf_token(), args.squad_dir)
     records = build_records(
         frame, template, max_examples=args.max_examples,
         max_prompt_tokens=args.max_prompt_tokens, seed=args.seed,
