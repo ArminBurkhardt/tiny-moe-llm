@@ -89,7 +89,7 @@ from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.data.chat import ChatTemplate
 from config import ModelConfig
 from scripts.eval_abstention import generate_batch, normalize_answer
-from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, logger, model_params_for_state_dict
+from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, load_model_state, logger, model_params_for_state_dict
 
 # directories the benchmark cache must never resolve inside. the two corpus builders delete each
 # source shard the moment they have appended it, and archive_corpus.py packs whole split
@@ -1067,7 +1067,7 @@ def load_tiny_backend(checkpoint_path: str, tokenizer_dir: str, device: str,
     model = model.to(device).to(BF16)
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
-    model.load_state_dict(state_dict)
+    load_model_state(model, state_dict)
     model.eval()
 
     template = ChatTemplate(tokenizer) if use_chat else None

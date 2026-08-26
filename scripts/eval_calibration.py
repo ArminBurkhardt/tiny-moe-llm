@@ -47,7 +47,7 @@ from modules.model.transformer import TinyMoETransformer
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.data.dataset import Dataset
 from config import ModelConfig, TrainingConfig
-from utils import BASE_DIR, BF16, logger, model_params_for_state_dict, TOKENIZER_DIR
+from utils import BASE_DIR, BF16, load_model_state, logger, model_params_for_state_dict, TOKENIZER_DIR
 
 CE_CHUNK_SIZE = 2048
 
@@ -73,7 +73,7 @@ def load_model(checkpoint_path: str, device: str):
     model = TinyMoETransformer(**params).to(device).to(BF16)
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_model_state(model, ckpt["model_state_dict"])
     model.eval()
     # legacy (pre Step 9) checkpoints have no global_offset -- see utils.load_checkpoint
     global_offset = ckpt.get("global_offset", 0)

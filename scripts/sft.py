@@ -65,13 +65,14 @@ import transformer_engine.pytorch as te
 
 from modules.data.sft_dataset import SFTDataset
 from modules.model.attention import cu_seqlens_from_doc_ids
+from modules.model.information_retrieval import is_rebuilt_ir_param
 from modules.model.mtp import compute_mtp_loss
 from modules.model.transformer import TinyMoETransformer
 from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
 from modules.runtime.status import eta_seconds, format_duration, write_status
-from config import ModelConfig, RepairConfig, SFTConfig, TrainingConfig
+from config import IRConfig, ModelConfig, RepairConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
     USE_LOW_PRECISION, chosen_recipe, log_precision_mode, sample_n_loops,
     save_expert_selection_graph, save_loss_graph, train_step,
@@ -92,6 +93,10 @@ SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
 # epoch count and objective are all different).
 REPAIR_PHASE = "repair"
 REPAIR_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "repair")
+# --ir's counterparts, same contract again: the IR sharpening pass carries a second LR group and a
+# temperature anneal, so its optimizer state means nothing to either other profile.
+IR_PHASE = "ir"
+IR_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "ir")
 # --from-hub lands the pretrained checkpoint HERE, deliberately not in SFT_CHECKPOINT_DIR: it is
 # named checkpoint_phase2_final.pt, which matches ckpt_lib's "checkpoint_*.pt" resume scan, so a
 # second launch would offer pretraining's own optimizer/scheduler state to load_sft_checkpoint as
@@ -102,94 +107,48 @@ NUM_DATA_WORKERS = 4
 LOG_INTERVAL = 10
 
 
-def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float):
-    """Split parameters into decayed / undecayed groups, **all** shadowed by fp32 masters.
+def apply_ir_refresh(model, optimizer, master_pairs, stats):
+    """Re-cluster the IR tables and repair the optimizer state the recycling invalidated.
 
-    The decay split is the same one ``pretrain.build_param_groups`` makes and for the same reasons
-    (``moe.loop_scale``, ``layer_scalar`` and the RMSNorm gains all have a degenerate zero, and
-    every one of them is ndim <= 1).
+    Recycling rewrites individual rows of ``z_keys`` and ``y_values`` *outside* the optimizer. Two
+    things then have to be fixed or the recycle silently does nothing:
 
-    The difference is which tensors get an fp32 master. Pretraining shadows only the undecayed
-    group, on the argument that ordinary 2D weights are safe because "their values and needed steps
-    both scale with their own init std". **That argument does not survive SFT's learning rate.**
-    Redo the arithmetic at lr=3e-5: a hidden_size=768 weight sits around its init std ~0.02-0.03,
-    where bf16's ulp is ~0.4% of magnitude, i.e. ~1e-4. A steady-state AdamW step has magnitude
-    ~lr = 3e-5. That is three times *below* the ulp, so ``param -= lr * update`` rounds to exactly
-    the original bf16 value -- forever, no matter how much momentum accumulates. At pretraining's
-    4e-4 the same step is ~4x *above* the ulp and lands fine, which is why the narrower fix was
-    correct there and is not correct here.
+    - **The fp32 masters.** Every parameter here is stepped through a master and refreshed from it
+      after each step, so a master still holding the dead key would overwrite the new one on the
+      very next optimizer step.
+    - **AdamW's moments for those rows.** They describe a parameter that no longer exists; leaving
+      them means a recycled entry starts with the momentum of the entry it replaced, in a direction
+      that has nothing to do with its new position.
 
-    So: AdamW steps fp32 masters for everything, and the bf16 parameters the forward pass actually
-    reads are refreshed from their masters after every real optimizer step, via the same
-    ``sync_master_grads_``/``sync_master_values_`` pair pretraining already uses.
-
-    Cost at 332M params: ~4.0GB of optimizer state (1.3GB masters + 2.7GB fp32 Adam moments, since
-    ``torch.zeros_like(p)`` gives a master's moments fp32 where a bf16 parameter's would be bf16)
-    against ~1.4GB for the pretraining arrangement -- ~2.6GB more, which a 32GB local card running
-    a halved SFT batch has to spare. Note the masters are NOT checkpointed: a resume reseeds them
-    from the bf16 weights, so sub-ulp progress accumulated since the last save is discarded. That
-    is inherent -- the saved model is bf16 either way -- and bounded by one checkpoint interval.
+    Both are per-row, not per-tensor: the surviving 98% of the table keeps its moments, which is the
+    whole reason the recycle is cheap.
 
     Args:
-        model: the (already bf16) model.
-        weight_decay: applied to the ndim >= 2 group only.
+        model: the unwrapped ``TinyMoETransformer``.
+        optimizer: the AdamW whose state indexes the fp32 masters.
+        master_pairs: ``[(bf16_param, fp32_master)]`` from ``build_sft_param_groups``.
+        stats: what ``moe.refresh_ir_clusters`` returned, one dict per IR table.
 
     Returns:
-        ``(param_groups, master_pairs)`` where ``master_pairs`` is ``[(bf16_param, fp32_master)]``
-        covering every trainable parameter.
+        The same stats, with the (device-side) id tensors dropped so they are loggable.
     """
-    decay, no_decay = [], []
-    for param in model.parameters():
-        if not param.requires_grad:
-            continue
-        (no_decay if param.ndim <= 1 else decay).append(param)
-
-    decay_masters = [p.detach().clone().float().requires_grad_(True) for p in decay]
-    no_decay_masters = [p.detach().clone().float().requires_grad_(True) for p in no_decay]
-    logger.info(
-        f"SFT optimizer param groups: {len(decay)} decayed (wd={weight_decay}), {len(no_decay)} "
-        f"undecayed (norms/biases/gates); all {len(decay) + len(no_decay)} stepped via fp32 masters"
-    )
-    param_groups = [
-        {"params": decay_masters, "weight_decay": weight_decay},
-        {"params": no_decay_masters, "weight_decay": 0.0},
-    ]
-    master_pairs = list(zip(decay, decay_masters)) + list(zip(no_decay, no_decay_masters))
-    return param_groups, master_pairs
-
-
-def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int) -> int:
-    """How many packed rows the SFT corpus yields, by replaying the packing rule over the index.
-
-    The LR schedule needs a total step count up front, and "corpus tokens / (batch * seq)" is a bad
-    estimate here: SFTDataset never splits a conversation across rows, so every row carries some
-    trailing padding, and each conversation also costs ``num_mtp_tokens`` separator slots. On a
-    corpus of short conversations that gap is easily 10%, which would end the cosine well before
-    the data does and leave the tail of training at the LR floor.
-
-    The replay is over the on-disk order rather than the epoch's permutation -- the row count barely
-    moves between orderings (it depends on the length *distribution*, not the sequence), and doing
-    it exactly per epoch would mean materializing every permutation before training starts.
-
-    Args:
-        idx_path: ``{split}.idx``, uint64 document-end offsets with a leading 0.
-        max_length: row length.
-        num_mtp_tokens: separator slots appended after each conversation.
-
-    Returns:
-        Estimated number of packed rows for one epoch.
-    """
-    offsets = np.fromfile(idx_path, dtype=np.uint64)
-    lengths = np.diff(offsets).astype(np.int64) + num_mtp_tokens
-    lengths = lengths[lengths <= max_length]
-
-    rows, used = 1, 0
-    for length in lengths.tolist():
-        if used + length > max_length:
-            rows += 1
-            used = 0
-        used += length
-    return rows
+    masters = {id(p): m for p, m in master_pairs}
+    clean = []
+    for module, table_stats in zip(model.moe.ir_modules, stats):
+        ids = table_stats.pop("recycled_ids", None)
+        if ids is not None:
+            for param in (module.z_keys, module.y_values):
+                master = masters.get(id(param))
+                if master is None:
+                    continue
+                master.index_copy_(0, ids, param.detach().index_select(0, ids).float())
+                state = optimizer.state.get(master)
+                if state:
+                    for key in ("exp_avg", "exp_avg_sq"):
+                        if key in state:
+                            state[key].index_fill_(0, ids, 0.0)
+        clean.append(table_stats)
+    return clean
 
 
 def build_sft_scheduler(optimizer: optim.Optimizer, total_steps: int, config=SFTConfig):
@@ -199,21 +158,28 @@ def build_sft_scheduler(optimizer: optim.Optimizer, total_steps: int, config=SFT
     ``TrainingConfig.total_steps`` (the combined pretraining budget) because phase 2 has to
     continue phase 1's decay. SFT is a fresh schedule over a fresh optimizer.
 
+    One MULTIPLICATIVE shape applied to every param group, rather than a warmup plus a
+    ``CosineAnnealingLR``. The two are the same curve for a single group, but the IR profile runs
+    two base rates (a from-scratch table at 3e-4, a 16B-token trunk at 1e-5) and
+    ``CosineAnnealingLR``'s ``eta_min`` is one absolute floor shared by all groups -- so the fresh
+    group would decay by 600x while the trunk decayed by 20x. A factor decays both by the same
+    ratio, which is what "same schedule, different rates" has to mean.
+
     Args:
-        config: ``SFTConfig`` or ``RepairConfig`` -- the run profile whose lr/warmup this follows.
+        config: ``SFTConfig``, ``RepairConfig`` or ``IRConfig`` -- the profile whose warmup and
+            floor this follows.
     """
     warmup_steps = max(1, min(int(total_steps * config.warmup_fraction), total_steps - 1))
-    warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps,
-    )
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(total_steps - warmup_steps, 1),
-        eta_min=config.lr * config.lr_min_factor,
-    )
-    return torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
-    )
+    decay_steps = max(total_steps - warmup_steps, 1)
+    floor = config.lr_min_factor
+
+    def shape(step: int) -> float:
+        if step < warmup_steps:
+            return 0.01 + (1.0 - 0.01) * step / warmup_steps
+        progress = min((step - warmup_steps) / decay_steps, 1.0)
+        return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=shape)
 
 
 def pull_from_hub(repo_id: str, filename: str, dest_dir: str, token: str = None) -> str:
@@ -419,9 +385,14 @@ def sft(args):
     # one function, two profiles. --repair swaps the config class, the phase label and the
     # checkpoint directory and nothing else: see this module's docstring for why the repair pass is
     # not a second script.
-    cfg = RepairConfig if args.repair else SFTConfig
-    phase = REPAIR_PHASE if args.repair else SFT_PHASE
-    checkpoint_dir = REPAIR_CHECKPOINT_DIR if args.repair else SFT_CHECKPOINT_DIR
+    if args.repair and args.ir:
+        raise SystemExit("--repair and --ir are different profiles; pick one")
+    if args.ir:
+        cfg, phase, checkpoint_dir = IRConfig, IR_PHASE, IR_CHECKPOINT_DIR
+    elif args.repair:
+        cfg, phase, checkpoint_dir = RepairConfig, REPAIR_PHASE, REPAIR_CHECKPOINT_DIR
+    else:
+        cfg, phase, checkpoint_dir = SFTConfig, SFT_PHASE, SFT_CHECKPOINT_DIR
 
     data_dir = os.path.join(BASE_DIR, cfg.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
@@ -477,7 +448,9 @@ def sft(args):
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
 
-    param_groups, master_pairs = build_sft_param_groups(model, cfg.weight_decay)
+    param_groups, master_pairs = build_sft_param_groups(
+        model, cfg.weight_decay, fresh_lr=getattr(cfg, "fresh_lr", None),
+    )
     optimizer = optim.AdamW(param_groups, lr=cfg.lr)
     scheduler = build_sft_scheduler(optimizer, total_steps, cfg)
 
@@ -643,6 +616,12 @@ def sft(args):
     sft_tokens = token_count - start_token_count
     next_checkpoint = sft_tokens + cfg.checkpoint_every_tokens
     next_eval = sft_tokens + cfg.eval_every_tokens
+    # the IR profile's two extra schedules. Both are driven from the log block, which already
+    # syncs the token counter -- neither adds a host sync of its own, and LOG_INTERVAL is ~160k
+    # tokens here, far finer than either cadence needs.
+    total_micro_steps = max(1, total_steps * cfg.grad_accumulation_steps)
+    next_refresh = sft_tokens + getattr(cfg, "cluster_refresh_tokens", 0)
+    ir_refresh_stats = []
     # bound before the try: the interrupt handler saves a checkpoint using both, and a Ctrl-C
     # during the very first batch must not turn into a NameError that loses the save
     step, epoch = step_offset, start_epoch
@@ -714,6 +693,25 @@ def sft(args):
                     target_tokens = int(sft_tokens / max(step, 1) * total_steps
                                         * cfg.grad_accumulation_steps)
 
+                if args.ir:
+                    # anneal the retrieval temperature on MICRO-step progress, not on tokens: the
+                    # token target is only estimable once training has run, and the anneal has to
+                    # be a known function of position from step 0 to be reproducible.
+                    scale = cfg.temperature_scale(step / total_micro_steps)
+                    unwrapped_model.moe.set_ir_temperature_scale(scale)
+                    if sft_tokens >= next_refresh:
+                        ir_refresh_stats = apply_ir_refresh(
+                            unwrapped_model, optimizer, master_pairs,
+                            unwrapped_model.moe.refresh_ir_clusters(dead_quantile=cfg.dead_quantile),
+                        )
+                        next_refresh = sft_tokens + cfg.cluster_refresh_tokens
+                        # logged as its own line so a loss step at a refresh boundary is
+                        # attributable to the refresh rather than to the data
+                        logger.info(
+                            f"IR cluster refresh at {sft_tokens / 1e6:.1f}M {phase} tokens "
+                            f"(temperature scale {scale:.4f}): {ir_refresh_stats}"
+                        )
+
                 per_loop_ce = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                 loop_scale = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
                 # per loop IR retrieval entropy over ln(num_ir_entries), same field pretrain.py logs
@@ -722,9 +720,13 @@ def sft(args):
                     if unwrapped_model.moe.ir_tracker is not None else []
                 )
                 ir_entropy_str = (
-                    "IR E/lnN: [" + ", ".join(f"{e:.4f}" for e in ir_entropy) + "] | "
+                    f"IR E/ln{unwrapped_model.moe.ir_tracker.num_entries}: ["
+                    + ", ".join(f"{e:.4f}" for e in ir_entropy) + "] | "
                     if ir_entropy else ""
                 )
+                if args.ir:
+                    ir_module = unwrapped_model.moe.ir_modules[0]
+                    ir_entropy_str += f"IR temp: {float(ir_module.temperature):.4f} | "
 
                 def _metric(key):
                     value = metrics.get(key)
@@ -814,6 +816,11 @@ def main():
                         help="run NEXT.md Phase 2's abstention repair finetune instead: "
                              "config.yaml's repair: block, the repair_train/repair_val splits, and "
                              "ckpts/repair. Seed it with -c <an SFT checkpoint>")
+    parser.add_argument("--ir", action="store_true",
+                        help="run the IR table's sharpening finetune instead: config.yaml's ir: "
+                             "block, the ir_train/ir_val splits, ckpts/ir, a second learning rate "
+                             "for the rebuilt table and a retrieval temperature anneal. Seed it "
+                             "with -c <a scripts/migrate_ir_reshape.py output>")
     parser.add_argument("--checkpoint", "-c", default=None,
                         help="checkpoint to initialize from (ignored when resuming a run from this "
                              "profile's own checkpoint directory)")

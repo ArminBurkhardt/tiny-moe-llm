@@ -163,3 +163,38 @@ repair: # NEXT.md Phase 2: the abstention repair finetune, `python scripts/sft.p
                                     # conversation), so a ~6-token refusal stops mechanically
                                     # out-earning a multi-sentence real answer
   hf_upload_repo: "" # local run
+
+ir: # The IR table's sharpening finetune, `python scripts/sft.py --ir`. Read by config.py's
+    # IRConfig, another SUBCLASS of SFTConfig -- same trainer, same objective, different corpus,
+    # plus the machinery a freshly reshaped table needs. Seeded from a
+    # `scripts/migrate_ir_reshape.py` output, which rebuilt the table and dropped the optimizer
+    # state. Runs LOCALLY on the 5090 in BF16 (do not set USE_FP8).
+  train_split: "ir_train"
+  val_split: "ir_val"
+  lr: 1.0e-5 # the trunk's LR. It has 16B tokens of training in it and this pass is not meant to
+             # move it -- the benchmark suite is the gate on whether it did
+  fresh_lr: 3.0e-4 # z_keys / y_values / down_proj / up_proj / g_proj / log_temperature, all rebuilt
+                   # from scratch. At the trunk's 1e-5 against a frozen-ish trunk they would never
+                   # get anywhere; at 3e-4 the trunk would. Two groups, not a compromise value.
+  num_epochs: 1 # one pass. The table is learning to store text, not to memorize this corpus
+  batch_size: 4 # 4 x 4096 stays resident on the 32GB card (see `repair:` for what 8 costs)
+  grad_accumulation_steps: 4 # ~65k tokens per optimizer step
+  temperature_start: 1.0 # what the old constant was, so the run starts where the seed left off
+  temperature_end: 0.05 # the target sharpness. NOT reachable by lowering the constant afterwards:
+                        # values only ever read as a near-uniform mixture are not individually
+                        # meaningful, so a sharp read of them is a loss spike, not a retrieval
+  temperature_anneal_fraction: 0.7 # anneal over the first 70%, then train at the final temperature
+                                   # so the table learns under the read it will be evaluated with
+  cluster_refresh_tokens: 20000000 # re-run the balanced spherical k-means every 20M tokens. Two
+                                   # stage scoring is only exact while the centroids track the keys,
+                                   # and the keys are training -- the refresh logs its measured
+                                   # candidate recall@32, which is what says whether
+                                   # ir_probe_clusters is high enough
+  dead_quantile: 0.02 # re-seed the least-selected 2% of entries at each refresh (0.0 disables). A
+                      # sharpened softmax only trains what it selects, so an entry that stops being
+                      # selected is frozen for the rest of the run
+  checkpoint_every_tokens: 50000000
+  eval_every_tokens: 10000000
+  conversation_loss_weighting: false # this is a pretraining-style pass over documents, not a
+                                     # conversation-level policy fix
+  hf_upload_repo: "" # local run

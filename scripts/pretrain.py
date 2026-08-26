@@ -811,7 +811,8 @@ def pretrain(phase=None):
                     # "loop 3 grew, loops 1-2 collapsed" is exactly the failure a single mean hides
                     loop_scale_str = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
                     per_loop_ce_str = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
-                    # IR retrieval entropy as a fraction of ln(num_ir_entries), same units as
+                    # IR retrieval entropy as a fraction of ln(the softmax's width -- the whole
+                    # table on the exact path, read_top_k under two stage scoring), same units as
                     # eval_stage0.py's diagnostic 1: 1.0 = the read is uniform over the table, i.e.
                     # it stores nothing. Per loop for the same reason loop_scale is, and empty
                     # (field omitted) on a config with no IR experts
@@ -820,7 +821,8 @@ def pretrain(phase=None):
                         if unwrapped_model.moe.ir_tracker is not None else []
                     )
                     ir_entropy_str = (
-                        " | IR E/lnN: [" + ", ".join(f"{e:.4f}" for e in ir_entropy) + "]"
+                        f" | IR E/ln{unwrapped_model.moe.ir_tracker.num_entries}: ["
+                        + ", ".join(f"{e:.4f}" for e in ir_entropy) + "]"
                         if ir_entropy else ""
                     )
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")

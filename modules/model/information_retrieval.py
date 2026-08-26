@@ -99,6 +99,25 @@ class RetrievalEntropyTracking():
             self._warm = False
 
 
+def is_rebuilt_ir_param(name: str) -> bool:
+    """True for a parameter the 65536 x 256 reshape rebuilds from scratch.
+
+    One definition, two callers that must agree: ``scripts/migrate_ir_reshape.py`` decides what to
+    re-initialize, and ``scripts/sft.py`` decides what gets the fresh-parameter learning rate. If
+    those two lists ever disagreed, some tensor would be reset and then trained at a converged
+    trunk's LR, or carried over and trained at a from-scratch LR -- both silent.
+
+    The IR expert's own norm and attention are NOT in here: they were trained with the model and
+    only their input changes.
+    """
+    if ".ir_module." in name:
+        return True
+    # down_proj / up_proj live on the expert rather than the module, and their widths moved with
+    # ir_dim. Scoped to `experts.` so the dense decoder's identically-named MLP projections and the
+    # routed experts' grouped GEMMs are untouched.
+    return "experts." in name and (name.endswith("down_proj.weight") or name.endswith("up_proj.weight"))
+
+
 def _group_starts(group_ids: torch.Tensor, num_groups: int) -> torch.Tensor:
     """exclusive prefix sum of the per group counts of an already sorted ``group_ids``.
 
@@ -582,8 +601,9 @@ class InformationRetrievalModule(nn.Module):
             dead_quantile: fraction of entries eligible for recycling (0.0 disables).
 
         Returns:
-            dict of plain floats: candidate recall against exact scoring, the fraction of entries
-            with ~zero usage, and how many were recycled.
+            dict of plain floats, plus ``recycled_ids`` (a device tensor) when entries were
+            recycled -- the caller has to zero those rows' optimizer moments and re-seed their fp32
+            masters, or the next optimizer step writes the old key straight back over the new one.
         """
         assert self.num_clusters > 0, "refresh_clusters is two-stage only"
         stats = {}
@@ -632,8 +652,10 @@ class InformationRetrievalModule(nn.Module):
 
         self.z_keys.index_copy_(0, dead, (seeds * self.z_keys.float().norm(dim=-1).mean()).to(self.z_keys.dtype))
         self.y_values.index_copy_(0, dead, torch.zeros_like(self.y_values[dead]))
+        # seeded with the mean rather than 0, so a freshly recycled entry is not immediately the
+        # least-used one again at the next refresh before it has had a chance to be selected
         self.entry_usage.index_copy_(0, dead, torch.full_like(self.entry_usage[dead], float(self.entry_usage.mean())))
-        return {"recycled": num_dead}
+        return {"recycled": num_dead, "recycled_ids": dead}
 
     @torch.no_grad()
     def _candidate_recall(self, queries: torch.Tensor) -> float:

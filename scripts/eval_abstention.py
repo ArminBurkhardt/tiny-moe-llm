@@ -76,7 +76,7 @@ from modules.data.chat import ChatTemplate
 from config import ModelConfig, SFTConfig
 from scripts.eval_calibration import expected_calibration_error, roc_auc
 from scripts.prepare_sft_data import SQUAD_INSTRUCTION
-from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, logger, model_params_for_state_dict
+from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, load_model_state, logger, model_params_for_state_dict
 
 SQUAD_REPO = "rajpurkar/squad_v2"
 SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
@@ -255,7 +255,7 @@ def load_model(checkpoint_path: str, device: str) -> TinyMoETransformer:
     model = TinyMoETransformer(**params).to(device).to(BF16)
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
-    model.load_state_dict(state_dict)
+    load_model_state(model, state_dict)
     model.eval()
     return model
 

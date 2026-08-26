@@ -231,3 +231,79 @@ class RepairConfig(SFTConfig):
     _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
     hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
 
+
+class IRConfig(SFTConfig):
+    """The IR table's sharpening finetune, read from config.yaml's ``ir:`` block.
+
+    A **subclass** for the same reason ``RepairConfig`` is one: this is the same trainer, the same
+    objective and the same shape over a different corpus. What it adds is the machinery a freshly
+    reshaped table needs and the other two profiles have no use for.
+
+    Three things are genuinely new here, not just different numbers:
+
+    - **A second learning rate.** ``z_keys``/``y_values``/the IR projections were rebuilt from
+      scratch by ``scripts/migrate_ir_reshape.py``; the rest of the model is a 16B-token trunk. One
+      compromise LR is either too small to train the new tensors or large enough to damage the old
+      ones, so they get separate groups (``fresh_lr`` vs ``lr``) rather than a middle value.
+    - **A temperature anneal.** ``y_values`` have only ever been read as a near-uniform mixture, so
+      simply lowering the temperature afterwards reads out vectors nothing individually trained --
+      a loss spike, not a sharper retrieval. It has to come down *during* the run, from
+      ``temperature_start`` to ``temperature_end``.
+    - **A cluster refresh cadence.** Two stage scoring is only exact while the centroids track the
+      keys, and the keys are training. This is a real hyperparameter, not a detail.
+
+    This profile is deliberately NOT another QA-shaped repair: its corpus is a general LM mix with
+    chat replay, because the table's job is to have general text to store.
+    """
+    _Block = Config.get("ir", {}) or {}
+
+    train_split = str(_Block.get("train_split", "ir_train"))
+    val_split = str(_Block.get("val_split", "ir_val"))
+    lr = float(_Block.get("lr", 1.0e-5))
+    # the rebuilt tensors' own LR, in fresh-parameter territory rather than finetune territory
+    fresh_lr = float(_Block.get("fresh_lr", 3.0e-4))
+    num_epochs = int(_Block.get("num_epochs", 1))
+    weight_decay = float(_Block.get("weight_decay", SFTConfig.weight_decay))
+    dropout = float(_Block.get("dropout", SFTConfig.dropout))
+    Batch_size = int(_Block.get("batch_size", 4))
+    grad_accumulation_steps = int(_Block.get("grad_accumulation_steps", 4))
+    warmup_fraction = float(_Block.get("warmup_fraction", SFTConfig.warmup_fraction))
+    lr_min_factor = float(_Block.get("lr_min_factor", SFTConfig.lr_min_factor))
+    seed = int(_Block.get("seed", SFTConfig.seed))
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 50_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 10_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
+    # off: this is a pretraining-style pass over documents, not a conversation-level policy fix
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", False))
+
+    temperature_start = float(_Block.get("temperature_start", 1.0))
+    temperature_end = float(_Block.get("temperature_end", 0.05))
+    # fraction of the run the anneal spans; the rest trains at the final temperature, so the table
+    # gets time to actually learn under the sharp read rather than ending the run mid-transition
+    temperature_anneal_fraction = float(_Block.get("temperature_anneal_fraction", 0.7))
+
+    cluster_refresh_tokens = int(_Block.get("cluster_refresh_tokens", 20_000_000))
+    # fraction of entries eligible for recycling at each refresh. a sharpened softmax only trains
+    # what it selects, so entries that stop being selected are frozen; 0.0 disables recycling.
+    dead_quantile = float(_Block.get("dead_quantile", 0.02))
+
+    _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+    @classmethod
+    def temperature_scale(cls, progress: float) -> float:
+        """The anneal multiplier at ``progress`` in [0, 1] of the run.
+
+        Geometric, not linear: temperature enters the softmax as a divisor, so equal *ratios* are
+        equal steps in sharpness. A linear 1.0 -> 0.05 spends most of the run below 0.1 and does
+        almost all of its work in the first few percent.
+        """
+        import math
+
+        span = max(cls.temperature_anneal_fraction, 1e-6)
+        t = min(max(progress, 0.0) / span, 1.0)
+        return float(math.exp(
+            math.log(cls.temperature_start) * (1 - t) + math.log(cls.temperature_end) * t
+        ))
+

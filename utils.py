@@ -127,6 +127,27 @@ def model_params_for_state_dict(state_dict, params: dict) -> dict:
     return out
 
 
+def load_model_state(model, state_dict):
+    """``model.load_state_dict`` with the IR temperature's absence tolerated, and nothing else.
+
+    ``log_temperature`` became a parameter when the retrieval temperature stopped being a
+    hardcoded 1.0. Its init IS log(1.0) = 0, so a checkpoint written before it existed is exactly
+    reproduced by leaving the freshly initialized value in place -- there is no information to
+    recover and no ambiguity about what it was.
+
+    Kept as a named exception rather than ``strict=False`` for the reason ``load_checkpoint``'s
+    docstring gives: a blanket non-strict load is how a trunk tensor stays randomly initialized
+    without anyone noticing.
+    """
+    state = dict(state_dict)
+    own = model.state_dict()
+    for key in own:
+        if key.endswith("ir_module.log_temperature") and key not in state:
+            state[key] = own[key]
+    model.load_state_dict(state)
+    return model
+
+
 def load_checkpoint(model, optimizer, scheduler, path):
     """Restore a pretraining run. Returns a 6-tuple; pre-Phase-0 checkpoints returned 7.
 
