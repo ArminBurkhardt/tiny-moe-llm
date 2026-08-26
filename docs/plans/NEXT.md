@@ -70,7 +70,7 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 
 ---
 
-## Where this stands (Phases 0–2 ✅)
+## Where this stands (Phases 0–2 and 1b ✅)
 
 - **Phase 0 — heads out.** Both learned heads deleted; the halt gate's *measured* per-loop mean
   folded into `loop_scale` (`scripts/migrate_phase0.py`). Gate P0 passed on both checkpoints —
@@ -91,6 +91,17 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
   checkpoints running). The data lever is exhausted. Full record:
   [measurements/abstention_repair.md](../measurements/abstention_repair.md).
 
+- **Phase 1b — the instrument.** Thirteen-task suite validated against Pythia-410m's published
+  numbers, four peers frozen, eval-sampling noise floor measured, MTP skipped where its output is
+  discarded, and the three-checkpoint snapshot recorded: mean MC headroom **+0.088 / +0.081 /
+  +0.084** for the trunk / SFT / repair, against gpt2-medium's +0.193. Gate G0 **passed**. The
+  answerability probe reads **0.584 on all three checkpoints alike** — the trunk carries a weak
+  answerability signal that no finetune moved. Records:
+  [benchmark_suite.md](../measurements/benchmark_suite.md),
+  [noise_floor.md](../measurements/noise_floor.md),
+  [benchmark_snapshot.md](../measurements/benchmark_snapshot.md),
+  [answerability_probe.md](../measurements/answerability_probe.md).
+
 Three findings bind everything below:
 
 1. **The loop-conditioned IR query (5c item 1) is a precondition, not a refinement** — without it,
@@ -100,12 +111,15 @@ Three findings bind everything below:
    weakest measured component is a bad bet.
 3. **Abstention discrimination has to come from a new signal.** Phase 4's
    external-vs-parametric retrieval mass is the principled candidate; Phase 6's preference pass is
-   the behavioral one; Phase 1b's probe tells us whether the trunk already carries the signal at
-   all. Each is measured separately so the movement stays attributable.
+   the behavioral one. **1b.3 settled the third possibility**: a linear probe of the trunk reads
+   0.584 identically on all three checkpoints, so the representation carries a weak signal the
+   policy is not using — enough to make the preference pass an amplification rather than an
+   invention, nowhere near enough to ship. Each is measured separately so the movement stays
+   attributable.
 
 ---
 
-## Phase 1b — benchmark foundation and the noise floor (no training, ~a day)
+## Phase 1b — benchmark foundation and the noise floor ✅ (Gate G0 passed 2026-08-26)
 
 Runs **before Phase 3 touches a weight**. Phases 3–6 are trunk surgery followed by the largest
 finetunes this project has run; today the only trunk-health instrument is CE on a stale local
@@ -214,15 +228,38 @@ a tolerance, since a tolerance would hide exactly the bug it checks for.
 `_mtp_forward` used to run unconditionally while those callers threw the result away — paid over the
 whole prefix, on every generated token, in every generative eval this plan runs dozens of times.
 
-### 1b.5 Baseline snapshot
+### 1b.5 Baseline snapshot ✅
 
-Run the full suite on three checkpoints — `phase2_final_phase0` (pretrained trunk),
-`sft_final_phase0`, and repair @ 0.55 — and record it. This three-way snapshot is what every later
-phase diffs against, and it is also the first honest statement of where a 16B-token 332M model
-actually sits in its class.
+**Done 2026-08-26** — all three checkpoints through all thirteen tasks at the frozen flags. Full
+record: [measurements/benchmark_snapshot.md](../measurements/benchmark_snapshot.md).
 
-**Gate G0:** harness reproduces a published peer within tolerance; noise floor documented;
-three-checkpoint snapshot recorded.
+Mean MC headroom **+0.088 / +0.081 / +0.084** (pretrained trunk / SFT / repair @ 0.55) against
+gpt2-medium's +0.193, Pythia-410M's +0.208 and SmolLM2-360M's +0.345. Three readings that bind
+what follows:
+
+- **758M tokens of post-training moved the benchmark position by 0.007 of headroom**, and the
+  repair column sits *above* the SFT one. The narrow finetunes cost no general capability and
+  bought none — the same "policy change on a fixed representation" the probe found one level down.
+- **Below gpt2-medium at ~half its headroom** is the honest starting position, and nothing in the
+  suite separates "wastes capacity" from "hasn't seen the tokens". That separation is exactly what
+  Phases 3–6 buy by running each mechanism against its own ablation at matched compute.
+- **BoolQ regressed monotonically under post-training** (0.4599 → 0.4416 → 0.4190 `acc`, all below
+  the 0.50 chance of a two-option task; `acc_norm` on the same scores reads 0.6162 → 0.5920). A
+  yes/no answer-policy bias that deepened under the finetunes teaching the model to decline, and
+  invisible to average CE. Re-read it after Phase 4, whose no-evidence condition trains a different
+  decline behaviour.
+
+TriviaQA 0.000 → 0.014 and NQ-open 0.000 → 0.002 are now the recorded floor G5's corpus-attached
+delta is measured against; MMLU sits at chance on every column, as does GSM8K (0.018 / 0.005 /
+0.009), so Step 16 stays parked.
+
+The repair column also reproduced the 2026-08-23 shakedown **to four decimals on all thirteen
+tasks** while running in 7.3 min against 36.0 — 1b.4's `skip_mtp` confirmed free at full scale, not
+just in the unit test.
+
+**Gate G0: PASS.** Harness reproduced Pythia-410m on 11 of 11 published anchors inside 0.4 points
+(1b.1); noise floor documented for the eval-sampling half, with the training-seed half still open
+(1b.2); three-checkpoint snapshot recorded (1b.5).
 
 ---
 
@@ -630,7 +667,9 @@ Written before anything is rented, containing:
 ## Acceptance (all gates)
 
 - **G0** — benchmark harness reproduces a published peer; noise floor documented; three-checkpoint
-  snapshot recorded (Phase 1b).
+  snapshot recorded (Phase 1b). **PASS** (2026-08-26,
+  [record](../measurements/benchmark_snapshot.md)). The seed-noise half of 1b.2 is still open and
+  is the one thing G0 passed without.
 - **G1** — IR ablation ΔCE > ~0.02 nats (Phase 1). **Measured 2026-08-20: 0.0004 / 0.0002 nats —
   FAIL**, on the expected branch: the table is a bias term, the re-init is free, and the bar
   comes due again after the mechanism has something to retrieve.

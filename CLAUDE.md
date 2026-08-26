@@ -40,8 +40,11 @@ scripts under [scripts/](scripts/).
 One real run exists: 16B tokens of pretraining on a rented H100 plus a local 2-epoch SFT pass, then
 a local 49M-token abstention repair pass on top of it (NEXT.md Phase 2).
 [docs/CONCLUSION.md](docs/CONCLUSION.md) is the write-up, including the two failures that Phase 0
-below acted on. The plan from here is [docs/plans/NEXT.md](docs/plans/NEXT.md); Phases 0, 1 and 2
-are done, and their measurements are in [docs/measurements/](docs/measurements/).
+below acted on. The plan from here is [docs/plans/NEXT.md](docs/plans/NEXT.md); Phases 0, 1, 2 and
+1b are done, and their measurements are in [docs/measurements/](docs/measurements/). **The benchmark
+suite is the quality instrument now** — CE on the local slice is a health check, and
+[docs/measurements/benchmark_snapshot.md](docs/measurements/benchmark_snapshot.md) is the
+three-checkpoint baseline every later change is diffed against.
 
 **All future finetuning runs locally on the 5090, in BF16 — do not set `USE_FP8`.** Size the micro
 batch to stay resident: 4 x 4096 peaks at 21.4GB, 8 x 4096 peaks at 29.6GB and spills into shared
