@@ -594,11 +594,12 @@ class InformationRetrievalModule(nn.Module):
         the check on whether ``probe_clusters`` is high enough.
 
         Args:
-            recycle: re-seed entries whose usage EMA is at or below ``dead_quantile`` of the
-                distribution toward a recent underserved query, and zero their value. Zeroing the
-                value is the same neutrality trick used everywhere else here: a recycled entry
-                contributes nothing until it has learned something.
-            dead_quantile: fraction of entries eligible for recycling (0.0 disables).
+            recycle: re-seed entries a sharpened softmax has stopped selecting toward a recent
+                underserved query, and zero their value. Zeroing the value is the same neutrality
+                trick used everywhere else here: a recycled entry contributes nothing until it has
+                learned something.
+            dead_quantile: CAP on the fraction of entries recycled per refresh, not a target -- see
+                ``_recycle_dead``. 0.0 disables recycling.
 
         Returns:
             dict of plain floats, plus ``recycled_ids`` (a device tensor) when entries were
@@ -627,13 +628,27 @@ class InformationRetrievalModule(nn.Module):
         if has_queries:
             stats["recall"] = self._candidate_recall(queries)
         if self.entry_usage is not None:
-            stats["dead_frac"] = float((self.entry_usage <= 0).float().mean())
+            # same "below 1% of the mean" test the recycler uses, so the reported fraction is the
+            # population the cap is being applied to rather than a different notion of dead
+            threshold = self.entry_usage.mean() * 0.01
+            stats["dead_frac"] = float((self.entry_usage < threshold).float().mean())
         return stats
 
     @torch.no_grad()
-    def _recycle_dead(self, queries: torch.Tensor, dead_quantile: float):
-        """re-seed the least-selected entries onto queries the table currently serves worst."""
-        num_dead = int(self.num_entries * dead_quantile)
+    def _recycle_dead(self, queries: torch.Tensor, dead_quantile: float, dead_ratio: float = 0.01):
+        """re-seed genuinely unselected entries onto queries the table currently serves worst.
+
+        ``dead_quantile`` is a CAP, not a target: an entry is only recycled if its usage EMA is also
+        below ``dead_ratio`` of the table's mean, so a healthy table recycles nothing. Taking a
+        fixed bottom quantile every refresh instead would churn 2% of the keys on every cadence
+        whether or not anything had died -- 20% of the table over ten refreshes, each one thrown
+        back to a zero value, which is a slow leak of trained capacity dressed up as maintenance.
+        """
+        cap = int(self.num_entries * dead_quantile)
+        if cap == 0:
+            return {"recycled": 0}
+        threshold = self.entry_usage.mean() * dead_ratio
+        num_dead = int(min(cap, int((self.entry_usage < threshold).sum())))
         if num_dead == 0:
             return {"recycled": 0}
         dead = torch.topk(self.entry_usage, num_dead, largest=False).indices

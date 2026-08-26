@@ -32,9 +32,14 @@ model:
   # that. It is also the same retrieve-then-read shape the external corpus will use, deliberately.
   # 0 clusters = the exact full-table path every pre-reshape checkpoint was trained under.
   ir_num_clusters: 256 # must divide num_ir_entries; capacity is 65536/256 = 256 entries per cluster
-  ir_probe_clusters: 4 # -> ~1024 candidates scored exactly per token. Raise it if the refresh's
-                       # measured candidate recall@32 drops below ~0.9 -- a centroid path that
-                       # silently misses the true top-k turns the temperature anneal into noise
+  ir_probe_clusters: 8 # -> ~2048 candidates (3% of the table) scored exactly per token. Was 4, and
+                       # 4 measured candidate recall@32 hovering at 0.86-0.95 across a shakedown
+                       # run's refreshes -- straddling the 0.9 bar, i.e. the centroid stage
+                       # sometimes dropping entries the read wanted, which turns the temperature
+                       # anneal into noise rather than sharpening and would be indistinguishable
+                       # from the anneal simply failing. Doubling it costs ~1 MFLOP/token/loop out
+                       # of 481, which is not a trade worth thinking about. The refresh keeps
+                       # measuring the recall and the trainer warns below 0.9.
   ir_read_top_k: 32
 
   # mtp

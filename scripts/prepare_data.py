@@ -27,7 +27,16 @@ rather than an intentional 10% gap. We preserve the relative ratios and renormal
 `--phase1-tokens` (see `total_w` in run_phase's caller) rather than leaving 10% of the phase-1
 budget unwritten; flagged here since it's a real deviation from the literal table.
 
-Run from the repo root: `python scripts/prepare_data.py`.
+A third phase, `ir`, builds the much smaller corpus the IR table's sharpening finetune trains on:
+the same sources at their own weight column (~70% LM in the phase-2 proportions, 30% chat replay),
+`--val-tokens` cutting a contiguous tail into `ir_val`, and `--manifest-key` keeping its realized
+counts out of the 16B run's record. Everything else -- interleaving, resume, one shard in flight --
+is identical, because a 200M-token local build wants the same properties for the same reasons.
+
+Run from the repo root:
+
+    python scripts/prepare_data.py                       # the 16B run's phase1 + phase2
+    python scripts/prepare_data.py --phases ir --val-tokens 2000000 --manifest-key ir_prep
 """
 
 import os
@@ -68,6 +77,12 @@ class SourceSpec:
     gated: bool = False
     phase1_weight: float = 0.0
     phase2_weight: float = 0.0
+    # the IR table's sharpening corpus: the phase-2 LM proportions squeezed into 70% of the budget
+    # with chat replay taking the other 30%. Not phase 2 itself, because that mix is 85% LM / 15%
+    # chat and this pass has to keep chat behaviour alive while the table learns to store general
+    # text -- a sharpening run that quietly costs the trunk its instruction following would be
+    # invisible to CE and caught only by the benchmark suite, too late.
+    ir_weight: float = 0.0
 
 
 def _no_think_split(path: str) -> bool:
@@ -97,26 +112,26 @@ def doc_hash(text: str) -> str:
 # renormalized to 1.0 at run time, ratios among sources preserved.
 SOURCES = [
     SourceSpec("fineweb", "HuggingFaceFW/fineweb-edu", "data/CC-MAIN-2025-26/", (".parquet",),
-               format="parquet", text_columns=("text",), phase1_weight=0.55, phase2_weight=0.15),
+               format="parquet", text_columns=("text",), phase1_weight=0.55, phase2_weight=0.15, ir_weight=0.124),
     SourceSpec("dclm", "mlfoundations/dclm-baseline-1.0", "global-shard_01_of_10/", (".jsonl.zst",),
-               format="jsonl.zst", text_columns=("text",), phase1_weight=0.10, phase2_weight=0.0),
+               format="jsonl.zst", text_columns=("text",), phase1_weight=0.10, phase2_weight=0.0, ir_weight=0.0),
     SourceSpec("finepdfs", "HuggingFaceFW/finepdfs-edu", "data/eng_Latn/train/", (".parquet",),
-               format="parquet", text_columns=("text",), phase1_weight=0.07, phase2_weight=0.10),
+               format="parquet", text_columns=("text",), phase1_weight=0.07, phase2_weight=0.10, ir_weight=0.082),
     # Common Pile's stack-edu re-release: Stack-Edu's educational-quality code selection with
     # actual text materialized (unlike HuggingFaceTB/stack-edu, which only ships SWHIDs and
     # needs a separate Software Heritage S3 reconstruction step), filtered to openly-licensed
     # repos only (Blue Oak Council list) -- fully public, no gate, no access request.
     SourceSpec("code_edu", "common-pile/stackv2_edu_filtered", "", (".json.gz",),
                format="jsonl.gz", text_columns=("text",),
-               phase1_weight=0.12, phase2_weight=0.22),
+               phase1_weight=0.12, phase2_weight=0.22, ir_weight=0.181),
     SourceSpec("nemotron_math", "nvidia/Nemotron-CC-Math-v1", "4plus/", (".parquet",),
                format="parquet", text_columns=("text", "content"), gated=True,
-               phase1_weight=0.03, phase2_weight=0.30),
+               phase1_weight=0.03, phase2_weight=0.30, ir_weight=0.247),
     SourceSpec("wikipedia", "wikimedia/wikipedia", "20231101.en/", (".parquet",),
-               format="parquet", text_columns=("text",), phase1_weight=0.03, phase2_weight=0.08),
+               format="parquet", text_columns=("text",), phase1_weight=0.03, phase2_weight=0.08, ir_weight=0.066),
     SourceSpec("smoltalk2", "HuggingFaceTB/smoltalk2", "SFT/", (".parquet",),
                format="parquet", messages_field="messages", file_filter=_no_think_split,
-               phase1_weight=0.0, phase2_weight=0.15),
+               phase1_weight=0.0, phase2_weight=0.15, ir_weight=0.30),
 ]
 
 
@@ -368,13 +383,70 @@ def run_phase(
     return state
 
 
+def split_train_val(data_dir: str, phase: str, val_tokens: int) -> dict:
+    """Cut a finished ``{phase}.bin``/``.idx`` into ``{phase}_train`` and ``{phase}_val``.
+
+    Done as a post-step rather than by writing two files during the build, because the build's
+    resume contract is "one append-only pair, truncate back to the sidecar" and a second live
+    writer would double the state that has to stay in sync across an interruption for no benefit.
+    The cut is at a document boundary near the tail, so the val split is a contiguous slice of the
+    same interleaved mix rather than a resample of it.
+
+    Args:
+        data_dir: where ``{phase}.bin`` / ``{phase}.idx`` live.
+        phase: the split stem to cut.
+        val_tokens: approximate size of the val half, taken from the end.
+
+    Returns:
+        ``{"train_tokens", "val_tokens", "train_docs", "val_docs"}`` as realized.
+    """
+    bin_path = os.path.join(data_dir, f"{phase}.bin")
+    idx_path = os.path.join(data_dir, f"{phase}.idx")
+    offsets = np.fromfile(idx_path, dtype=np.uint64)
+    total = int(offsets[-1])
+    cut_token = max(0, total - val_tokens)
+    # searchsorted on the offsets is the document boundary at or after the cut
+    cut_doc = int(np.searchsorted(offsets, cut_token, side="left"))
+    cut_doc = min(max(cut_doc, 1), len(offsets) - 1)
+    cut_token = int(offsets[cut_doc])
+
+    tokens = np.memmap(bin_path, dtype=np.uint16, mode="r")
+    for name, tok_slice, off_slice in (
+        (f"{phase}_train", tokens[:cut_token], offsets[:cut_doc + 1]),
+        (f"{phase}_val", tokens[cut_token:], offsets[cut_doc:] - offsets[cut_doc]),
+    ):
+        np.asarray(tok_slice).tofile(os.path.join(data_dir, f"{name}.bin"))
+        np.asarray(off_slice, dtype=np.uint64).tofile(os.path.join(data_dir, f"{name}.idx"))
+    logger.info(
+        f"[{phase}] split at document {cut_doc:,}/{len(offsets) - 1:,}: "
+        f"{cut_token:,} train tokens, {total - cut_token:,} val tokens"
+    )
+    return {
+        "train_tokens": cut_token, "val_tokens": total - cut_token,
+        "train_docs": cut_doc, "val_docs": len(offsets) - 1 - cut_doc,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build phase1/phase2 bin/idx corpora (PLAN.md Step 11)")
     parser.add_argument("--data-dir", default=os.path.join(BASE_DIR, "data", "prepared"))
     parser.add_argument("--tokenizer-dir", default=DEFAULT_TOKENIZER_DIR)
     parser.add_argument("--phase1-tokens", type=int, default=25_500_000_000)
     parser.add_argument("--phase2-tokens", type=int, default=4_500_000_000)
-    parser.add_argument("--phases", nargs="+", default=["phase1", "phase2"], choices=["phase1", "phase2"])
+    parser.add_argument("--ir-tokens", type=int, default=210_000_000,
+                        help="size of the IR sharpening corpus (--phases ir), before the val cut")
+    parser.add_argument("--phases", nargs="+", default=["phase1", "phase2"],
+                        choices=["phase1", "phase2", "ir"])
+    parser.add_argument("--val-tokens", type=int, default=0,
+                        help="cut this many tokens off the end of each built phase into a "
+                             "{phase}_val split (0 = no cut). The finetune profiles want one; the "
+                             "pretraining phases do not, since their held-out slice is a "
+                             "--start-doc-idx into the same file")
+    parser.add_argument("--manifest-key", default="data_prep",
+                        help="top-level manifest.json key to write under. An auxiliary corpus MUST "
+                             "pass its own: the default key holds the 16B run's realized counts and "
+                             "smoltalk2_holdout_hashes, which scripts/prepare_sft_data.py reads to "
+                             "keep SFT off conversations pretraining already saw")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpoint-docs", type=int, default=2000, help="fsync + persist resume state every N documents")
     parser.add_argument("--tokenize-batch", type=int, default=256)
@@ -392,7 +464,7 @@ def main():
     if os.path.exists(MANIFEST_PATH):
         with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
             manifest = json.load(f)
-    data_prep = manifest.get("data_prep", {})
+    data_prep = manifest.get(args.manifest_key, {})
     data_prep["tokenizer_dir"] = args.tokenizer_dir
     data_prep["seed"] = args.seed
     data_prep.setdefault("sources", {})
@@ -426,7 +498,8 @@ def main():
         logger.info(f"source {spec.key}: {len(filtered)} files available (revision {info.sha[:10]})")
 
     for phase in args.phases:
-        target_tokens = args.phase1_tokens if phase == "phase1" else args.phase2_tokens
+        target_tokens = {"phase1": args.phase1_tokens, "phase2": args.phase2_tokens,
+                         "ir": args.ir_tokens}[phase]
         weight_attr = f"{phase}_weight"
         phase_sources = [s for s in SOURCES if getattr(s, weight_attr) > 0]
         total_w = sum(getattr(s, weight_attr) for s in phase_sources)
@@ -477,6 +550,8 @@ def main():
         }
         if phase == "phase2":
             data_prep["smoltalk2_holdout_hashes"] = final_state.get("holdout_hashes", [])
+        if args.val_tokens > 0:
+            data_prep[phase]["split"] = split_train_val(args.data_dir, phase, args.val_tokens)
 
     # acceptance checks (PLAN.md Step 11)
     total_bin_bytes = 0
@@ -492,10 +567,10 @@ def main():
     if total_bin_bytes > 70 * 1024 ** 3:
         logger.warning(f"combined bin size {total_bin_bytes / 1e9:.1f}GB exceeds the ~70GB peak-disk acceptance bound")
 
-    manifest["data_prep"] = data_prep
+    manifest[args.manifest_key] = data_prep
     with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
-    logger.info(f"recorded data prep manifest in {MANIFEST_PATH}")
+    logger.info(f"recorded {args.manifest_key} manifest in {MANIFEST_PATH}")
 
 
 if __name__ == "__main__":

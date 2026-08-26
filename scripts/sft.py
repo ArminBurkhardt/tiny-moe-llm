@@ -63,6 +63,7 @@ from accelerate import Accelerator
 
 import transformer_engine.pytorch as te
 
+from modules.data.dataset import Dataset
 from modules.data.sft_dataset import SFTDataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.information_retrieval import is_rebuilt_ir_param
@@ -105,10 +106,160 @@ PRETRAINED_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained")
 DEFAULT_HUB_CHECKPOINT = "checkpoints/final/checkpoint_phase2_final.pt"
 NUM_DATA_WORKERS = 4
 LOG_INTERVAL = 10
+# fraction of the exact top-k the two stage candidate set must contain, measured at every cluster
+# refresh. Below this the centroid stage is dropping entries the read wanted, and the fix is more
+# probed clusters, not more training (docs/plans/NEXT.md Phase 3).
+IR_MIN_CANDIDATE_RECALL = 0.9
 
 
+def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True):
+    """``SFTDataset`` when the split has a loss mask, the pretraining ``Dataset`` when it does not.
+
+    The IR sharpening pass trains on a general LM mix with chat replay, which
+    ``scripts/prepare_data.py`` writes as a plain ``{split}.bin``/``.idx`` pair with no mask -- and
+    it should not have one: every token of a web document is supervised, which is exactly what the
+    pretraining dataset's labels already mean. The two readers also pack differently for good
+    reasons (SFT never splits a conversation across rows because a split tail loses its prompt and
+    its supervised EOS; a web document has neither problem and splitting it wastes nothing), so
+    picking the reader by whether a mask exists picks the right packing at the same time.
+
+    Everything downstream is unchanged: both yield batch-aligned ``input_ids``/``labels``/
+    ``document_ids``/``doc_idx``/``worker_id``, and ``loss_weights`` -- the only key the LM reader
+    omits -- is read only under ``conversation_loss_weighting``, which is off for this profile.
+
+    Args:
+        shuffle: ignored for the LM reader, which reads in on-disk order on purpose (the corpus
+            builder already baked the source mix into that order).
+    """
+    if os.path.isfile(os.path.join(data_dir, f"{split}.mask")):
+        return SFTDataset(
+            data_dir=data_dir, tokenizer=tokenizer, batch_size=cfg.Batch_size,
+            max_length=cfg.Seq_length, split=split,
+            num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
+            seed=cfg.seed, shuffle=shuffle,
+        )
+    return Dataset(
+        data_dir=data_dir, tokenizer=tokenizer, batch_size=cfg.Batch_size,
+        max_length=cfg.Seq_length, split=split,
+        num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
+    )
+
+
+def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh_lr: float = None):
+    """Split parameters into decayed / undecayed groups, **all** shadowed by fp32 masters.
+
+    The decay split is the same one ``pretrain.build_param_groups`` makes and for the same reasons
+    (``moe.loop_scale``, ``layer_scalar`` and the RMSNorm gains all have a degenerate zero, and
+    every one of them is ndim <= 1).
+
+    The difference is which tensors get an fp32 master. Pretraining shadows only the undecayed
+    group, on the argument that ordinary 2D weights are safe because "their values and needed steps
+    both scale with their own init std". **That argument does not survive SFT's learning rate.**
+    Redo the arithmetic at lr=3e-5: a hidden_size=768 weight sits around its init std ~0.02-0.03,
+    where bf16's ulp is ~0.4% of magnitude, i.e. ~1e-4. A steady-state AdamW step has magnitude
+    ~lr = 3e-5. That is three times *below* the ulp, so ``param -= lr * update`` rounds to exactly
+    the original bf16 value -- forever, no matter how much momentum accumulates. At pretraining's
+    4e-4 the same step is ~4x *above* the ulp and lands fine, which is why the narrower fix was
+    correct there and is not correct here.
+
+    So: AdamW steps fp32 masters for everything, and the bf16 parameters the forward pass actually
+    reads are refreshed from their masters after every real optimizer step, via the same
+    ``sync_master_grads_``/``sync_master_values_`` pair pretraining already uses.
+
+    Cost at 332M params: ~4.0GB of optimizer state (1.3GB masters + 2.7GB fp32 Adam moments, since
+    ``torch.zeros_like(p)`` gives a master's moments fp32 where a bf16 parameter's would be bf16)
+    against ~1.4GB for the pretraining arrangement -- ~2.6GB more, which a 32GB local card running
+    a halved SFT batch has to spare. Note the masters are NOT checkpointed: a resume reseeds them
+    from the bf16 weights, so sub-ulp progress accumulated since the last save is discarded. That
+    is inherent -- the saved model is bf16 either way -- and bounded by one checkpoint interval.
+
+    Args:
+        model: the (already bf16) model.
+        weight_decay: applied to the ndim >= 2 groups only.
+        fresh_lr: when given, the rebuilt IR tensors (``is_rebuilt_ir_param``) go into their own
+            groups at this learning rate instead of sharing the run's. They are the only tensors in
+            the model with no training behind them: at the trunk's 1e-5 a from-scratch key table
+            against an otherwise converged model never gets anywhere, and at a rate that would
+            train it the 16B-token trunk moves too. The LR schedule still scales every group by the
+            same factor, so this sets two *base* rates, not two shapes.
+
+    Returns:
+        ``(param_groups, master_pairs)`` where ``master_pairs`` is ``[(bf16_param, fp32_master)]``
+        covering every trainable parameter.
+    """
+    buckets = {("trunk", True): [], ("trunk", False): [], ("fresh", True): [], ("fresh", False): []}
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        origin = "fresh" if (fresh_lr is not None and is_rebuilt_ir_param(name)) else "trunk"
+        buckets[(origin, param.ndim >= 2)].append(param)
+
+    param_groups, master_pairs, summary = [], [], []
+    for (origin, decayed), params in buckets.items():
+        if not params:
+            continue
+        masters = [p.detach().clone().float().requires_grad_(True) for p in params]
+        group = {"params": masters, "weight_decay": weight_decay if decayed else 0.0}
+        if origin == "fresh":
+            group["lr"] = fresh_lr
+        param_groups.append(group)
+        master_pairs.extend(zip(params, masters))
+        summary.append(f"{len(params)} {origin}/{'decayed' if decayed else 'undecayed'}")
+    logger.info(
+        f"SFT optimizer param groups: {', '.join(summary)} (wd={weight_decay})"
+        + (f", fresh lr={fresh_lr:.1e}" if fresh_lr is not None else "")
+        + f"; all {len(master_pairs)} stepped via fp32 masters"
+    )
+    return param_groups, master_pairs
+
+
+def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
+                         split_documents: bool = False) -> int:
+    """How many packed rows the corpus yields, by replaying the packing rule over the index.
+
+    The LR schedule needs a total step count up front, and "corpus tokens / (batch * seq)" is a bad
+    estimate for the SFT reader: ``SFTDataset`` never splits a conversation across rows, so every
+    row carries some trailing padding, and each conversation also costs ``num_mtp_tokens``
+    separator slots. On a corpus of short conversations that gap is easily 10%, which would end the
+    cosine well before the data does and leave the tail of training at the LR floor.
+
+    The replay is over the on-disk order rather than the epoch's permutation -- the row count barely
+    moves between orderings (it depends on the length *distribution*, not the sequence), and doing
+    it exactly per epoch would mean materializing every permutation before training starts.
+
+    Args:
+        idx_path: ``{split}.idx``, uint64 document-end offsets with a leading 0.
+        max_length: row length.
+        num_mtp_tokens: separator slots appended after each conversation.
+        split_documents: True for the pretraining ``Dataset``, which DOES split a document across
+            rows and therefore drops nothing and wastes only the separator slots. That reader also
+            keeps documents longer than ``max_length`` (it splits them), so the length filter below
+            would throw away most of a web corpus rather than a handful of over-long conversations.
+
+    Returns:
+        Estimated number of packed rows for one epoch.
+    """
+    offsets = np.fromfile(idx_path, dtype=np.uint64)
+    lengths = np.diff(offsets).astype(np.int64) + num_mtp_tokens
+    if split_documents:
+        return max(1, int(lengths.sum() // max_length) + 1)
+    lengths = lengths[lengths <= max_length]
+
+    rows, used = 1, 0
+    for length in lengths.tolist():
+        if used + length > max_length:
+            rows += 1
+            used = 0
+        used += length
+    return rows
+
+
+@torch.no_grad()
 def apply_ir_refresh(model, optimizer, master_pairs, stats):
     """Re-cluster the IR tables and repair the optimizer state the recycling invalidated.
+
+    Runs under ``no_grad`` because the fp32 masters are leaf tensors that require grad -- AdamW
+    steps them -- and an in-place write to one of those raises rather than quietly detaching.
 
     Recycling rewrites individual rows of ``z_keys`` and ``y_values`` *outside* the optimizer. Two
     things then have to be fixed or the recycle silently does nothing:
@@ -147,6 +298,17 @@ def apply_ir_refresh(model, optimizer, master_pairs, stats):
                     for key in ("exp_avg", "exp_avg_sq"):
                         if key in state:
                             state[key].index_fill_(0, ids, 0.0)
+        recall = table_stats.get("recall")
+        if recall is not None and recall < IR_MIN_CANDIDATE_RECALL:
+            # said loudly because the symptom otherwise looks like the anneal failing: if the
+            # centroid stage misses the entries the read wanted, sharpening the temperature just
+            # concentrates mass on the wrong candidates, and more training cannot fix it
+            logger.warning(
+                f"IR candidate recall@{module.read_top_k} = {recall:.3f}, below "
+                f"{IR_MIN_CANDIDATE_RECALL} -- raise model.ir_probe_clusters (currently "
+                f"{module.probe_clusters} of {module.num_clusters}) rather than reading the "
+                f"retrieval entropy as a training result"
+            )
         clean.append(table_stats)
     return clean
 
@@ -407,30 +569,15 @@ def sft(args):
         f"{'ON' if cfg.conversation_loss_weighting else 'off'}) -> {checkpoint_dir}"
     )
 
-    train_dataset = SFTDataset(
-        data_dir=data_dir,
-        tokenizer=tokenizer,
-        batch_size=cfg.Batch_size,
-        max_length=cfg.Seq_length,
-        split=cfg.train_split,
-        num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
-        seed=cfg.seed,
-    )
-    val_dataset = SFTDataset(
-        data_dir=data_dir,
-        tokenizer=tokenizer,
-        batch_size=cfg.Batch_size,
-        max_length=cfg.Seq_length,
-        split=cfg.val_split,
-        num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
-        seed=cfg.seed,
-        shuffle=False,  # a stable order makes successive eval numbers comparable
-    )
+    train_dataset = make_dataset(data_dir, cfg.train_split, tokenizer, cfg)
+    # a stable order makes successive eval numbers comparable
+    val_dataset = make_dataset(data_dir, cfg.val_split, tokenizer, cfg, shuffle=False)
     dataloader = DataLoader(train_dataset, batch_size=None, num_workers=NUM_DATA_WORKERS,
                             prefetch_factor=2)
 
     rows_per_epoch = estimate_packed_rows(
         train_dataset.idx_path, cfg.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
+        split_documents=isinstance(train_dataset, Dataset),
     )
     micro_steps = rows_per_epoch * cfg.num_epochs / cfg.Batch_size
     total_steps = max(1, int(micro_steps / cfg.grad_accumulation_steps))
@@ -630,7 +777,10 @@ def sft(args):
     try:
         for epoch in range(start_epoch, cfg.num_epochs):
             resume_epoch = resumed and epoch == start_epoch
-            train_dataset.set_epoch(epoch)
+            # the LM reader has no per-epoch permutation to set: it reads in on-disk order, which
+            # is where the corpus builder already put the source mix
+            if hasattr(train_dataset, "set_epoch"):
+                train_dataset.set_epoch(epoch)
             train_dataset.start_doc_idx = start_doc_idx if resume_epoch else 0
             if not resume_epoch:
                 worker_state.fill_(-1)
@@ -726,7 +876,7 @@ def sft(args):
                 )
                 if args.ir:
                     ir_module = unwrapped_model.moe.ir_modules[0]
-                    ir_entropy_str += f"IR temp: {float(ir_module.temperature):.4f} | "
+                    ir_entropy_str += f"IR temp: {ir_module.temperature.detach().item():.4f} | "
 
                 def _metric(key):
                     value = metrics.get(key)
