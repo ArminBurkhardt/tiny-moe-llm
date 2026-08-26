@@ -13,15 +13,17 @@ from modules.model.transformer import TinyMoETransformer
 from modules.model.kv_cache import KVCache
 from modules.data.chat import ChatTemplate
 from config import ModelConfig
-from utils import BASE_DIR, BF16, TOKENIZER_DIR
+from utils import BASE_DIR, BF16, model_params_for_state_dict, TOKENIZER_DIR
 
 
 def load_model(checkpoint_path: str, device: str):
-    model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16)
-    model.set_checkpointing(False, False)
-
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
+    # the checkpoint is the authority on its own IR table shape, so a pre-reshape checkpoint keeps
+    # loading after config.yaml moves on
+    params = model_params_for_state_dict(state_dict, ModelConfig.Params)
+    model = TinyMoETransformer(**params).to(device).to(BF16)
+    model.set_checkpointing(False, False)
     model.load_state_dict(state_dict)
     model.eval()
     return model

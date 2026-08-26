@@ -76,7 +76,7 @@ from modules.data.chat import ChatTemplate
 from config import ModelConfig, SFTConfig
 from scripts.eval_calibration import expected_calibration_error, roc_auc
 from scripts.prepare_sft_data import SQUAD_INSTRUCTION
-from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, logger
+from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, logger, model_params_for_state_dict
 
 SQUAD_REPO = "rajpurkar/squad_v2"
 SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
@@ -248,11 +248,14 @@ def load_model(checkpoint_path: str, device: str) -> TinyMoETransformer:
     ``[B, S, vocab]`` logits per extra token -- nothing here reads them, and materializing them
     would dominate the decode step's memory.
     """
-    model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get("model_state_dict", checkpoint)
+    # shape from the checkpoint, not config.yaml -- the pre-reshape checkpoints stay measurable
+    params = model_params_for_state_dict(state_dict, ModelConfig.Params)
+    model = TinyMoETransformer(**params).to(device).to(BF16)
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 

@@ -63,10 +63,13 @@ class InformationRetrievalExpert(nn.Module):
         input_size: int, 
         num_entries: int,
         ir_dim: int,
-        num_heads: int = 8, 
+        num_heads: int = 8,
         num_kv_heads: int = 4,
         dropout: float = 0.1,
         residual: bool = False,
+        num_clusters: int = 0,
+        probe_clusters: int = 4,
+        read_top_k: int = 32,
     ):
         super().__init__()
         self.input_size = input_size
@@ -88,6 +91,9 @@ class InformationRetrievalExpert(nn.Module):
             temperature=1.0,
             use_min_dist=False,
             residual=residual,
+            num_clusters=num_clusters,
+            probe_clusters=probe_clusters,
+            read_top_k=read_top_k,
         )
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)

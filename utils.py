@@ -92,6 +92,41 @@ def save_checkpoint(model, optimizer, scheduler, epoch, dataset_idx, path, token
     logger.info(f"Checkpoint saved at {path}")
 
 
+def model_params_for_state_dict(state_dict, params: dict) -> dict:
+    """``ModelConfig.Params`` with the IR table's shape taken from the checkpoint, not from yaml.
+
+    The 65536 x 256 reshape changed both the table's dimensions and whether it is read through
+    centroids, and every eval in this repo has to keep scoring the pre-reshape checkpoints -- they
+    are the baseline each gate is quoted against. Constructing from ``config.yaml`` alone would
+    make an old checkpoint fail to load the moment the yaml is flipped, which is the wrong way
+    round: the checkpoint is the authority on its own shape.
+
+    Reads three things off the state dict: the key table's ``[entries, dim]``, and whether a
+    ``centroids`` buffer exists at all (absent => the exact full-table path the old checkpoints
+    were trained under, so clusters are forced to 0).
+
+    Args:
+        state_dict: the checkpoint's ``model_state_dict``.
+        params: the yaml-derived kwargs to start from; not mutated.
+
+    Returns:
+        A copy with ``num_ir_entries`` / ``ir_dim`` / ``ir_num_clusters`` set to match.
+    """
+    out = dict(params)
+    keys = [k for k in state_dict if k.endswith("ir_module.z_keys")]
+    if not keys:
+        return out
+    entries, dim = tuple(state_dict[keys[0]].shape)
+    out["num_ir_entries"] = int(entries)
+    out["ir_dim"] = int(dim)
+    centroids = [k for k in state_dict if k.endswith("ir_module.centroids")]
+    if not centroids:
+        out["ir_num_clusters"] = 0
+    else:
+        out["ir_num_clusters"] = int(state_dict[centroids[0]].shape[0])
+    return out
+
+
 def load_checkpoint(model, optimizer, scheduler, path):
     """Restore a pretraining run. Returns a 6-tuple; pre-Phase-0 checkpoints returned 7.
 

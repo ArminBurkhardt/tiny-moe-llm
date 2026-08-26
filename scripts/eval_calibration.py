@@ -47,7 +47,7 @@ from modules.model.transformer import TinyMoETransformer
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.data.dataset import Dataset
 from config import ModelConfig, TrainingConfig
-from utils import BASE_DIR, BF16, logger, TOKENIZER_DIR
+from utils import BASE_DIR, BF16, logger, model_params_for_state_dict, TOKENIZER_DIR
 
 CE_CHUNK_SIZE = 2048
 
@@ -66,10 +66,13 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
 
 
 def load_model(checkpoint_path: str, device: str):
-    model = TinyMoETransformer(**ModelConfig.Params).to(device).to(BF16)
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    # the checkpoint, not config.yaml, is the authority on its own IR table shape -- the reshape
+    # must not stop the pre-reshape checkpoints from being scored, since they are the baseline
+    params = model_params_for_state_dict(ckpt["model_state_dict"], ModelConfig.Params)
+    model = TinyMoETransformer(**params).to(device).to(BF16)
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
-    ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     # legacy (pre Step 9) checkpoints have no global_offset -- see utils.load_checkpoint

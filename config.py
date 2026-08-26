@@ -22,6 +22,12 @@ class ModelConfig:
         "num_ir_experts": int(Config["model"]["num_ir_experts"]),
         "num_ir_entries": int(Config["model"]["num_ir_entries"]),
         "ir_dim": int(Config["model"]["ir_dim"]),
+        # two stage retrieval. 0 clusters keeps the exact full-table softmax, which is what every
+        # checkpoint before the 65536-entry reshape was trained under -- so the keys are optional
+        # and absent means "the old path".
+        "ir_num_clusters": int(Config["model"].get("ir_num_clusters", 0)),
+        "ir_probe_clusters": int(Config["model"].get("ir_probe_clusters", 4)),
+        "ir_read_top_k": int(Config["model"].get("ir_read_top_k", 32)),
         "dropout": float(Config["model"]["dropout"]),
         "top_k": int(Config["model"]["top_k"]),
         "n_loops": int(Config["model"]["n_loops"]),

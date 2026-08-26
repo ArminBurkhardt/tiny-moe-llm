@@ -177,6 +177,9 @@ class LoopMixtureOfExperts(nn.Module):
         num_ir_entries: int = 1024,
         ir_dim: int = 128,
         ir_residual: bool = False,
+        ir_num_clusters: int = 0,
+        ir_probe_clusters: int = 4,
+        ir_read_top_k: int = 32,
         max_seq_len: int = 4096,
         rope_theta: float = 100000.0,
         loop_scale_init: float = None,
@@ -198,6 +201,12 @@ class LoopMixtureOfExperts(nn.Module):
             num_ir_entries (int, optional): number of entries in the information retrieval expert. Defaults to 1024.
             ir_dim (int, optional): dimension of the information retrieval experts latent space. Defaults to 128.
             ir_residual (bool, optional): whether the information retrieval expert should have a residual connection. Defaults to False.
+            ir_num_clusters (int, optional): centroids for the IR table's two stage scoring. 0
+                keeps the exact full-table softmax, which is what every checkpoint before the
+                65536-entry reshape was trained under. Defaults to 0.
+            ir_probe_clusters (int, optional): how many centroids a token opens for exact scoring.
+                Defaults to 4.
+            ir_read_top_k (int, optional): how many entries the read softmax spans. Defaults to 32.
             loop_scale_init (float, optional): init value for every entry of the per-loop
                 ``loop_scale`` gate. Defaults to ``1 / sqrt(n_loops)``, which makes the whole loop
                 stack contribute roughly as much variance as the dense decoder's output at init
@@ -249,7 +258,10 @@ class LoopMixtureOfExperts(nn.Module):
                 num_heads=n_heads,
                 num_kv_heads=n_kv_heads,
                 dropout=dropout,
-                residual=ir_residual
+                residual=ir_residual,
+                num_clusters=ir_num_clusters,
+                probe_clusters=ir_probe_clusters,
+                read_top_k=ir_read_top_k,
             ) for _ in range(num_ir_experts)
         ])
         self.experts = nn.ModuleList(experts)
@@ -320,7 +332,12 @@ class LoopMixtureOfExperts(nn.Module):
         # per loop vector regardless of how many IR slots the pool has. None when there are no IR
         # experts at all -- the log line then just omits the field
         if num_ir_experts > 0:
-            self.ir_tracker = RetrievalEntropyTracking(num_entries=num_ir_entries, n_loops=n_loops)
+            # the tracker normalizes by the width of the softmax the module actually takes: the
+            # whole table on the exact path, only the read top-k once two stage scoring is on.
+            # Normalizing a top-32 read by ln 65536 would report 0.31 for a read that is perfectly
+            # uniform over everything it looked at, i.e. exactly the failure G1 measured, as a pass.
+            tracker_width = ir_read_top_k if ir_num_clusters > 0 else num_ir_entries
+            self.ir_tracker = RetrievalEntropyTracking(num_entries=tracker_width, n_loops=n_loops)
             for expert in self.experts:
                 if isinstance(expert, InformationRetrievalExpert):
                     expert.ir_module.tracker = self.ir_tracker
@@ -544,6 +561,34 @@ class LoopMixtureOfExperts(nn.Module):
     def set_router_noise(self, noise_factor: float):
         """set the global multiplier on the router's exploration noise (annealed 1 -> 0 by the trainer over training). 0 disables the noise entirely."""
         self.router.noise_factor = noise_factor
+
+    @property
+    def ir_modules(self):
+        """every ``InformationRetrievalModule`` in the expert pool, in router index order."""
+        return [e.ir_module for e in self.experts if isinstance(e, InformationRetrievalExpert)]
+
+    def set_ir_temperature_scale(self, scale: float):
+        """set the anneal multiplier on every IR table's learned temperature.
+
+        Driven by the trainer from the live token count, the same way the router noise anneal is.
+        Lowering the temperature only at inference is not equivalent: values that have only ever
+        been read as a near-uniform mixture are not individually meaningful, so a sharp read of
+        them is a loss spike rather than a sharper retrieval.
+        """
+        for module in self.ir_modules:
+            module.set_temperature_scale(scale)
+
+    def refresh_ir_clusters(self, recycle: bool = True, dead_quantile: float = 0.0):
+        """re-cluster every IR table and return one stats dict per table.
+
+        Called on a token cadence by the trainer, never inside the step path: it is a full k-means
+        over the key table plus an exact-scoring recall measurement, and it mutates the partition
+        the forward pass indexes.
+        """
+        return [
+            m.refresh_clusters(recycle=recycle, dead_quantile=dead_quantile)
+            for m in self.ir_modules if m.num_clusters > 0
+        ]
 
 
 

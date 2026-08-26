@@ -82,6 +82,9 @@ class TinyMoETransformer(nn.Module):
         num_ir_experts: int = 1,
         num_ir_entries: int = 8192,
         ir_dim: int = 256,
+        ir_num_clusters: int = 0,
+        ir_probe_clusters: int = 4,
+        ir_read_top_k: int = 32,
         dropout: float = 0.1,
         ple_embeddings_size: int = None,
         mtp_num_extra_tokens: int = 0,
@@ -140,6 +143,9 @@ class TinyMoETransformer(nn.Module):
             num_ir_experts=num_ir_experts,
             num_ir_entries=num_ir_entries,
             ir_dim=ir_dim,
+            ir_num_clusters=ir_num_clusters,
+            ir_probe_clusters=ir_probe_clusters,
+            ir_read_top_k=ir_read_top_k,
             dropout=dropout,
             top_k=top_k,
             n_loops=n_loops,
@@ -175,6 +181,18 @@ class TinyMoETransformer(nn.Module):
         mlp_expert_params = sum(p.numel() for p in self.moe.parallel_experts.parameters())
         active_frac = top_k / num_mlp_experts
         moe_active_params = moe_params - mlp_expert_params + int(mlp_expert_params * active_frac)
+
+        # the IR key/value table is the one place "2 x params" is not even approximately the
+        # compute: 33.5M parameters that a two stage read scores ~1.5% of. Bill it from the module's
+        # own arithmetic instead, or every MFU number in the run is off by more than a whole dense
+        # decoder. (On the exact path this comes back out to the same 2 x params it replaces.)
+        ir_table_params = sum(
+            m.z_keys.numel() + m.y_values.numel() for m in self.moe.ir_modules
+        )
+        ir_flops_per_token = sum(m.flops_per_token for m in self.moe.ir_modules)
+        # separate from moe_active_params on purpose: the table's weights ARE resident and read
+        # every loop, so they stay in the reported active param count. This is only the FLOP proxy.
+        moe_flop_params = moe_active_params - ir_table_params
         embed_params = self.gemma_decoder.embed_tokens.weight.numel()
         if self.gemma_decoder.ple is not None:
             embed_params += self.gemma_decoder.ple.weight.numel()
@@ -218,7 +236,8 @@ class TinyMoETransformer(nn.Module):
         # loop-count sampling (a step may run fewer than n_loops) would otherwise silently inflate
         # the reported MFU by charging every step for the full depth.
         self.dense_flops_per_token = 2 * body_params                 # decoder + heads' trunk, once
-        self.loop_flops_per_token = 2 * moe_active_params            # per MoE loop
+        # per MoE loop: dense matmuls at 2N, plus the IR table's own measured retrieval cost
+        self.loop_flops_per_token = 2 * moe_flop_params + ir_flops_per_token
         self.dense_attn_flops_per_seqsq = 2 * hidden_size * num_layers
         self.loop_attn_flops_per_seqsq = 2 * hidden_size * moe_attn_per_loop
         self.lm_head_flops_per_token = 2 * lm_head_params            # per application (once per loop)

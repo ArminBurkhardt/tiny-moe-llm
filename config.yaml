@@ -20,8 +20,22 @@ model:
 
   # information retrieval
   num_ir_experts: 1
-  num_ir_entries: 8192 # was 16384 -- dense every loop, ~11% of forward FLOPs, halving frees throughput + ~2GB peak mem
-  ir_dim: 128
+  num_ir_entries: 65536 # was 8192. The 8192 x 128 table measured 99.5% of maximum retrieval entropy
+                        # and zeroing its read cost 0.0004 nats of held-out CE -- it stored nothing,
+                        # so growing it costs nothing to throw away. It only grows because the two
+                        # stage read below makes 65536 entries cheaper to score than 8192 were.
+  ir_dim: 256 # was 128. A 128-d key/value is a thin thing to store an atom of content in, and the
+              # dimension has to match the external evidence path's adapter output later anyway.
+  # two stage scoring: probe ir_probe_clusters of ir_num_clusters centroids, score those clusters'
+  # members exactly, softmax-read the best ir_read_top_k of them. Full scoring at 65536 x 256 is
+  # ~275 GFLOP per loop at 8192 tokens and materializes a multi-GB softmax per loop; this is ~2% of
+  # that. It is also the same retrieve-then-read shape the external corpus will use, deliberately.
+  # 0 clusters = the exact full-table path every pre-reshape checkpoint was trained under.
+  ir_num_clusters: 256 # must divide num_ir_entries; capacity is 65536/256 = 256 entries per cluster
+  ir_probe_clusters: 4 # -> ~1024 candidates scored exactly per token. Raise it if the refresh's
+                       # measured candidate recall@32 drops below ~0.9 -- a centroid path that
+                       # silently misses the true top-k turns the temperature anneal into noise
+  ir_read_top_k: 32
 
   # mtp
   mtp_num_extra_tokens: 2
