@@ -544,7 +544,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
 
 
 def sft(args):
-    # one function, two profiles. --repair swaps the config class, the phase label and the
+    # one function, three profiles. --repair / --ir swap the config class, the phase label and the
     # checkpoint directory and nothing else: see this module's docstring for why the repair pass is
     # not a second script.
     if args.repair and args.ir:
@@ -555,6 +555,11 @@ def sft(args):
         cfg, phase, checkpoint_dir = RepairConfig, REPAIR_PHASE, REPAIR_CHECKPOINT_DIR
     else:
         cfg, phase, checkpoint_dir = SFTConfig, SFT_PHASE, SFT_CHECKPOINT_DIR
+    # two variants of the same profile (different seeds, identical everything else) would otherwise
+    # share a directory, and the second would silently RESUME the first instead of starting from
+    # its own seed -- the resume path only checks the phase label, which is the same for both
+    if args.run_name:
+        checkpoint_dir = f"{checkpoint_dir}_{args.run_name}"
 
     data_dir = os.path.join(BASE_DIR, cfg.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
@@ -971,6 +976,11 @@ def main():
                              "block, the ir_train/ir_val splits, ckpts/ir, a second learning rate "
                              "for the rebuilt table and a retrieval temperature anneal. Seed it "
                              "with -c <a scripts/migrate_ir_reshape.py output>")
+    parser.add_argument("--run-name", default=None,
+                        help="suffix the profile's checkpoint directory, e.g. --run-name random "
+                             "writes ckpts/ir_random. Required to run two seeds of one profile "
+                             "against each other: a shared directory means the second run resumes "
+                             "the first instead of starting from its own seed")
     parser.add_argument("--checkpoint", "-c", default=None,
                         help="checkpoint to initialize from (ignored when resuming a run from this "
                              "profile's own checkpoint directory)")

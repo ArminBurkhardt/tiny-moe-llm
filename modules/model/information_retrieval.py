@@ -615,6 +615,14 @@ class InformationRetrievalModule(nn.Module):
             F.normalize(self.query_reservoir.float(), p=2, dim=-1) if has_queries else None
         )
 
+        if self.entry_usage is not None:
+            # measured BEFORE recycling, and with the same "below 1% of the mean" test the recycler
+            # uses: this is the population the cap is applied to. Read after the recycler has
+            # re-seeded those entries' usage to the mean it would only ever report the overflow the
+            # cap refused, i.e. it would read ~0 exactly when the recycler is working hardest
+            threshold = self.entry_usage.mean() * 0.01
+            stats["dead_frac"] = float((self.entry_usage < threshold).float().mean())
+
         if recycle and dead_quantile > 0.0 and has_queries:
             stats.update(self._recycle_dead(queries, dead_quantile))
 
@@ -627,11 +635,6 @@ class InformationRetrievalModule(nn.Module):
 
         if has_queries:
             stats["recall"] = self._candidate_recall(queries)
-        if self.entry_usage is not None:
-            # same "below 1% of the mean" test the recycler uses, so the reported fraction is the
-            # population the cap is being applied to rather than a different notion of dead
-            threshold = self.entry_usage.mean() * 0.01
-            stats["dead_frac"] = float((self.entry_usage < threshold).float().mean())
         return stats
 
     @torch.no_grad()
