@@ -282,6 +282,7 @@ class InformationRetrievalModule(nn.Module):
         latent_dim,
         output_dim,
         temperature=1.0,
+        temperature_scale: float = 1.0,
         use_min_dist=False,
         residual=False,
         num_clusters: int = 0,
@@ -298,6 +299,8 @@ class InformationRetrievalModule(nn.Module):
             temperature: initial retrieval temperature. Now the init of a LEARNED
                 ``log_temperature`` rather than a constant, multiplied by an externally driven
                 anneal scale (see ``set_temperature_scale``).
+            temperature_scale: initial value of that anneal multiplier. It is a persistent buffer,
+                so a checkpoint carries the sharpness it was trained at; 1.0 is "no anneal yet".
             use_min_dist: If True, retrieves the vector with the **minimum** dot product. Exact
                 path only.
             residual: If True, considers `x` during output projection (output = g(y_ret, x)).
@@ -333,9 +336,13 @@ class InformationRetrievalModule(nn.Module):
         # trained. exp() keeps it positive without a clamp; init log(temperature) so a fresh module
         # starts exactly where the old constant was.
         self.log_temperature = nn.Parameter(torch.tensor(float(math.log(temperature))))
-        # externally driven anneal multiplier, a plain float (never a tensor: it is read once per
-        # forward as a scalar divisor and must not become a device sync or a graph node)
-        self.temperature_scale = 1.0
+        # externally driven anneal multiplier. a PERSISTENT BUFFER, not a plain float: the sharpness
+        # the anneal ends at is part of what the trained table means, and the values were only ever
+        # supervised at that sharpness. Kept as a float attribute it is absent from the state dict,
+        # so a finished checkpoint silently reloads at scale 1.0 and reads ~20x flatter than it
+        # trained -- which reads as "the anneal did nothing" on every eval. It is 0-dim and only
+        # ever divides, so it costs no sync and no graph node.
+        self.register_buffer("temperature_scale", torch.tensor(float(temperature_scale)))
 
         # optional instrumentation, attached from outside (LoopMixtureOfExperts shares one tracker
         # across every IR expert). None means the module is a plain retrieval module again
@@ -422,9 +429,14 @@ class InformationRetrievalModule(nn.Module):
         """the effective retrieval temperature: learned, times the external anneal scale."""
         return self.log_temperature.exp() * self.temperature_scale
 
+    @torch.no_grad()
     def set_temperature_scale(self, scale: float):
-        """set the anneal multiplier on the learned temperature (1.0 = no anneal)."""
-        self.temperature_scale = float(scale)
+        """set the anneal multiplier on the learned temperature (1.0 = no anneal).
+
+        Writes THROUGH the buffer rather than rebinding the attribute, so the value stays in the
+        state dict and a checkpoint keeps the sharpness it was trained at.
+        """
+        self.temperature_scale.fill_(float(scale))
 
     def forward(self, x: torch.Tensor, return_weights=False, loop_idx: int = 0, **kwargs) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
         """
