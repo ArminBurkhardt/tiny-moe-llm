@@ -50,19 +50,6 @@ from modules.model.transformer import TinyMoETransformer
 from config import ModelConfig
 from utils import BASE_DIR, BF16, TOKENIZER_DIR, logger, model_params_for_state_dict
 
-# the IR tensors this rebuilds. everything else in the state dict is carried over untouched, and a
-# name that survives here but changed shape would be a silent partial load -- hence the explicit list
-REBUILT_SUFFIXES = (
-    "ir_module.z_keys",
-    "ir_module.y_values",
-    "ir_module.g_proj.weight",
-    "ir_module.log_temperature",
-    "ir_module.centroids",
-    "ir_module.cluster_members",
-    "down_proj.weight",
-    "up_proj.weight",
-)
-
 EMBEDDER_REPO = "BAAI/bge-small-en-v1.5"
 
 
