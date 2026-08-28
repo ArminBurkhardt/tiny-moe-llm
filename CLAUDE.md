@@ -92,7 +92,9 @@ and `utils.load_checkpoint` says so by name if you try.
 ```
 config.py / config.yaml     all hyperparameters (yaml -> ModelConfig / TrainingConfig / SFTConfig)
 utils.py                    logger, BASE_DIR, dtype aliases, TOKENIZER_REPO/TOKENIZER_DIR/
-                             HF_UPLOAD_REPO, get_hf_token, save/load_checkpoint
+                             HF_UPLOAD_REPO, get_hf_token, save/load_checkpoint,
+                             model_params_for_state_dict + load_model_state (the checkpoint, not
+                             config.yaml, is the authority on a checkpoint's IR table shape)
 env_init                    WSL/CUDA env + venv activation (gitignored) -- see the top of this file
 scripts/
   run_training.py           THE unattended entry point: supervises phase1 -> phase2, relaunches
@@ -106,16 +108,24 @@ scripts/
   gradio_app.py             browser UI over inference.stream_generate (same path, no duplicate)
   prune_vocab.py            one-shot 129280 -> 65536 vocab prune, not part of training
   migrate_phase0.py         folds the deleted halt gate into loop_scale, strips both old heads
+  migrate_ir_reshape.py     rebuilds the IR expert at the larger table shape and re-inits the five
+                             tensors that change shape. `--arm random` / `--arm warm` (bge-small
+                             embeddings of corpus chunks, PCA'd to ir_dim) are the two key inits
   prepare_data.py           builds phase1/phase2.bin/.idx from the Hub source mix, runs
-                             on the rented box, not locally -- see "Data prep" below
+                             on the rented box, not locally -- see "Data prep" below.
+                             `--phases ir` builds the IR sharpening corpus LOCALLY, with its own
+                             per-source weight column and its own --manifest-key
   prepare_sft_data.py       builds sft_train/sft_val .bin/.idx/.mask, runs LOCALLY.
                              `--profile repair` builds Phase 2's repair_train/repair_val instead
   archive_corpus.py         pack/list/restore a prepared split as one .tar.gz + sha256 sidecar,
                              so replacing a corpus never costs a re-download -- both prepare
                              scripts delete each source shard as soon as they have appended it
   sft.py                    THE post-training entry point: local, single GPU, reuses
-                             pretrain.train_step verbatim. `--repair` runs Phase 2's repair
-                             finetune through the same function (RepairConfig, ckpts/repair)
+                             pretrain.train_step verbatim. `--repair` runs the abstention repair
+                             finetune through the same function (RepairConfig, ckpts/repair);
+                             `--ir` runs the IR sharpening finetune (IRConfig, ckpts/ir): a second
+                             LR group for the rebuilt tensors, the temperature anneal, and the
+                             cluster refresh
   eval_calibration.py       p_max ECE/AUROC, early-exit curve, loop-convergence statistics.
                              Also the Gate P0 harness for any head removal
   eval_abstention.py        the acceptance metric: SQuAD v2 abstention precision/recall + ECE,
@@ -139,7 +149,8 @@ modules/model/
   moe.py                    LoopMixtureOfExperts, ParallelSparseMoELayer, _ExpertTracking
   router.py                 Router (+ annealed exploration noise), compute_aux_loss
   experts.py                SelfAttention / CrossAttention / InformationRetrievalExpert
-  information_retrieval.py  learned key/value table with softmax retrieval
+  information_retrieval.py  learned key/value table, read exactly or through cluster centroids;
+                             balanced spherical k-means, usage EMA, query reservoir, refresh
   mtp.py                    MTPHead, chunked LM-head CE, compute_mtp_loss
   attention.py              varlen_attention, cu_seqlens_from_doc_ids, SDPA fallback
   kv_cache.py               LayerKVCache / KVCache: one slot per decoder layer and per
@@ -182,6 +193,11 @@ python scripts/archive_corpus.py pack --all      # save data/prepared before ove
 python scripts/archive_corpus.py list            # measured counts vs. what the builder claimed
 python scripts/sft.py --from-hub     # SFT: pull the pretrained ckpt + manifest, then train
 python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt   # Phase 2
+python scripts/prepare_data.py --phases ir --ir-tokens 210000000 --val-tokens 2000000 \
+  --manifest-key ir_prep             # the IR sharpening corpus; NEVER omit --manifest-key
+python scripts/migrate_ir_reshape.py -c CKPT --arm random     # the two IR key inits
+python scripts/migrate_ir_reshape.py -c CKPT --arm warm
+python scripts/sft.py --ir -c ckpts/trained/checkpoint_phase2_final_phase0_irrandom.pt
 python scripts/migrate_phase0.py -c CKPT     # fold+strip a pre-Phase-0 checkpoint
 python scripts/eval_calibration.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4
 python scripts/eval_abstention.py    # acceptance; -c CKPT --baseline-checkpoint PRETRAINED
@@ -240,6 +256,14 @@ not) lives in [docs/runbook.md](docs/runbook.md), not here.
   cadences, `grad_accumulation_steps` (2, purely to buy optimizer steps on a 14x smaller corpus)
   and `conversation_loss_weighting` (**true** — this is off in `SFTConfig` so that class still
   describes the run that produced the existing SFT checkpoint).
+- `IRConfig` — the `ir:` block, **also a subclass of `SFTConfig`**, for the same reason and with the
+  same inheritance. It overrides the splits, the cadences and `lr` (1e-5, the trunk's rate), and
+  adds four things the other two profiles have no use for: `fresh_lr` (3e-4, for the tensors the
+  reshape re-initialized — a fresh tensor at the trunk's rate would never move), the temperature
+  anneal (`temperature_start` / `temperature_end` / `temperature_anneal_fraction`), and
+  `cluster_refresh_tokens` / `dead_quantile`. `IRConfig.temperature_scale(progress)` interpolates
+  **geometrically** and clamps at 1.0: temperature is a divisor, so equal ratios are equal steps in
+  sharpness and a linear ramp would spend most of the run barely moving.
 
 There is **no config key for the depth policy**. `converge_tol` / `min_loops` are inference-time
 arguments to `TinyMoETransformer.forward`, not trained quantities — that is the point of them.
@@ -257,6 +281,15 @@ Constraints worth remembering:
   both dims), and (if MTP is enabled) by `lm_head_factor * 2` for the MTP head's own `SmallLMHead`
   (which runs on `hidden_size // 2`). `vocab_size` must also be `<= 65536` (the corpus is uint16).
   **Asserted at model construction** — distinct from `loop_ce_weights`' config-load-time assert.
+- `num_ir_entries` must be divisible by `ir_num_clusters` (asserted in `balanced_spherical_kmeans`)
+  — see the IR table read path invariants for why the clusters have to be exactly equal in size.
+  `ir_num_clusters: 0` is the exact full-table read, and is what a pre-reshape checkpoint loads as.
+- **The checkpoint, not `config.yaml`, decides a checkpoint's IR table shape.**
+  `utils.model_params_for_state_dict` reads `ir_module.z_keys`'s shape for `num_ir_entries`/`ir_dim`
+  and forces `ir_num_clusters=0` when the state dict has no `centroids`, so every eval script keeps
+  scoring pre-reshape baselines after the yaml moves on. `utils.load_model_state` then loads
+  strictly, tolerating exactly one absent key: `ir_module.log_temperature`, whose init *is*
+  `log(1.0)`, so an old checkpoint is reproduced exactly rather than approximately.
 - Things *not* in the yaml but hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL=20` in `pretrain.py`
   and `10` in `sft.py`, expert head counts `n_heads=16 / n_kv_heads=4` and `rope_theta`
   ([moe.py](modules/model/moe.py)), `CE_CHUNK_SIZE=8192` ([mtp.py](modules/model/mtp.py)),
@@ -270,7 +303,10 @@ Constraints worth remembering:
   folding them together is what made the pre-fix estimate understate real compute by ~2x:
   - `body_flops_per_token` — dense decoder + MoE matmuls. The MoE portion multiplies by `n_loops`
     (one shared module reused every loop: param count appears once, compute happens `n_loops`
-    times); the decoder runs once.
+    times); the decoder runs once. **The IR tables are subtracted out of the `2 * active_params`
+    matmul term and added back as each IR module's own `flops_per_token`** — a lookup table is not
+    a matmul, and billing 33.5M table parameters at `2 * params` would charge a two stage read
+    40x what it costs, hiding the entire reason the table can be that size.
   - `lm_head_flops_per_token` (**per application** — `lm_head` runs once *per loop* for per-loop
     CE, not once) and `mtp_flops_per_token`. Both are chunk-checkpointed inside `compute_mtp_loss`,
     so they cost fwd + recompute + bwd (**4x**) while the body costs 3x (activation checkpointing
@@ -368,12 +404,58 @@ space in `forward_step`; non-MLP slots become `(index 0, weight 0)` so they cont
   `-(w * w.clamp_min(1e-12).log())` form measured 3x slower at `[16384, 8192]`. Cost is **1.5ms per
   (loop, IR expert) on every 8th forward**, ~0.5ms amortized against a ~400ms step, and
   **`update()` performs no host sync** (asserted with `torch.cuda.set_sync_debug_mode("error")`;
-  `get_stats()` is the only sync and runs at log cadence). **Reported
-  as `E / ln(num_ir_entries)`** — the same units `scripts/eval_stage0.py` prints, so a log line and
-  a Stage 0 report compare directly; 1.0 means the read is uniform, i.e. the table stores nothing.
-  `pretrain.py` and `sft.py` log it per loop at `LOG_INTERVAL` as `IR E/lnN: [...]` (`get_stats()`
-  is the only host sync). `loop_idx` is plumbed into the IR expert *only* to bucket this — the
-  retrieval itself is loop-independent, which is exactly what Stage 0's query-drift number found.
+  `get_stats()` is the only sync and runs at log cadence). **Reported as `E / ln(width)`, where
+  `width` is whatever softmax the module actually takes** — `num_ir_entries` on the exact path,
+  `read_top_k` on the two stage path. Not the table size: a top-32 read cannot exceed `ln 32`
+  however flat it is, so normalizing it by `ln 65536` would report a sharp table that is in fact
+  perfectly uniform over everything it looked at. Same units `scripts/eval_stage0.py` prints, so a
+  log line and a Stage 0 report compare directly; 1.0 means the read is uniform, i.e. the table
+  stores nothing. `pretrain.py` and `sft.py` log it per loop at `LOG_INTERVAL` as
+  `IR E/ln{width}: [...]` (`get_stats()` is the only host sync). `loop_idx` is plumbed in *only*
+  to bucket this — the retrieval itself is loop-independent, which is exactly what Stage 0's
+  query-drift number found.
+
+**IR table read path** ([information_retrieval.py](modules/model/information_retrieval.py)). The
+table is `[num_ir_entries, ir_dim]` keys plus values, read by cosine similarity through a softmax
+divided by a learned `log_temperature`. `ir_num_clusters > 0` selects the **two stage** read; `0`
+keeps the exact full-table softmax, and both live in the same module because the migration has to
+be able to produce either. Measurements in
+[docs/measurements/ir_reshape.md](docs/measurements/ir_reshape.md).
+
+- **Two stage read**: score `num_clusters` centroids, take the top `probe_clusters`, score only
+  those clusters' keys exactly, take the global top `read_top_k`, softmax over *those* and gather
+  their values. It is what makes a 65536-entry table affordable — an exact read of it would cost
+  67M FLOP/token/loop against the two stage path's 1.72M, and the whole model is 484M.
+- **The clusters are exactly equal in size** (`balanced_spherical_kmeans` asserts
+  `num_entries % num_clusters == 0`). That is not a quality preference: equal sizes are what let
+  `cluster_members` be a `[C, capacity]` tensor and the candidate scoring be one `bmm`, with no
+  ragged gather and no host sync anywhere.
+- **Query dispatch is capacity-limited, MoE style.** Each `(token, probed cluster)` pair is a row;
+  pairs are sorted by cluster and packed into a fixed `query_capacity` per cluster. Overflow pairs
+  are routed to a **trash row** and masked to `-1e4` rather than dropped — finite, so a token whose
+  every probe overflowed still gets a uniform softmax instead of a NaN. The fixed capacity is the
+  point: a data-dependent row count would need `max()` on the host every step.
+- **No `torch.bincount` in the step path.** Its output size is `max(input) + 1`, which requires
+  reading `max(input)` to the host. `_group_starts` does the same job with
+  `zeros().scatter_add_()` plus a cumsum.
+- **`y_values` zero-init is the neutrality guarantee.** A freshly reshaped checkpoint retrieves the
+  zero vector whatever its keys are, so the IR expert contributes only `g_proj(0)`, a bias — the
+  migrated model *is* the read-zeroed ablation of its source, and measurably so (+0.0002 nats).
+  Same pattern as `loop_router_bias`.
+- **`entry_usage` / `query_reservoir` / `reservoir_ptr` are plain fp32 attributes, not buffers.**
+  `model.to(BF16)` would cast a registered buffer, and an EMA of per-entry read mass does not
+  survive bf16's ulp. They are lazily created on first use and are **training-only** (gated on
+  `self.training`) — an eval pass must not move what the next refresh acts on, which is what lets
+  `eval_stage0.py` call the module's own read routines to measure them.
+- **`refresh_clusters` re-runs k-means warm-started from the current centroids**, measures
+  `_candidate_recall` (the fraction of the exact top-k that survives into the candidate set) on the
+  reservoir, and optionally recycles dead entries. `dead_quantile` is a **cap, not a target**:
+  an entry is only recycled if it is also below `0.01 * mean(entry_usage)`, so a healthy table
+  recycles nothing instead of churning `dead_quantile` of itself at every refresh.
+- **Recall must be read on real queries.** Isotropic random queries score near the chance rate
+  `probe_clusters / num_clusters` because they concentrate nowhere; real `down_proj` outputs are
+  strongly anisotropic. `tests/test_ir_two_stage.py` therefore asserts the curve's *shape* — monotone
+  in probe count, above chance — and the absolute bar is checked at runtime against the reservoir.
 
 **Gradient checkpointing**: use `from transformer_engine.pytorch import checkpoint`, never
 `torch.utils.checkpoint` — the latter breaks FP8/NVFP4 quantized layers. Two levels:

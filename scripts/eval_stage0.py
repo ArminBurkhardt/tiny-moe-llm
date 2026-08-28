@@ -52,9 +52,11 @@ from config import ModelConfig, TrainingConfig
 from utils import BASE_DIR, logger, TOKENIZER_DIR
 from scripts.eval_calibration import chunked_eval, find_latest_checkpoint, load_model
 
-# chunk for the [tokens, num_ir_entries] retrieval softmax. 8192 tokens x 8192 entries in fp32 is
-# ~270MB transient, next to nothing on the eval box, and keeps the stats exact rather than binned.
-IR_CHUNK = 8192
+# chunk for the retrieval softmax, in tokens x entries. the two stage path only ever scores
+# read_top_k candidates per token so it is bounded whatever the table size; the exact path is
+# [chunk, num_entries] in fp32, and this budget keeps that transient at ~270MB whether the table
+# holds 8192 entries or 65536. exact stats, not binned.
+IR_CHUNK_CELLS = 8192 * 8192
 
 G1_THRESHOLD = 0.02  # nats of held-out CE the IR read must be worth (NEXT.md Gate G1)
 
@@ -140,12 +142,19 @@ class IRProbe:
 
 
 def retrieval_stats(ir_module, query: torch.Tensor, top_m: int = 32):
-    """Entropy and concentration of the IR softmax, recomputed from the captured query.
+    """Entropy and concentration of the IR softmax, replayed from the captured query.
 
-    Recomputed rather than captured because ``InformationRetrievalModule`` only returns the weights
-    when asked, and asking would mean editing the model to measure it. The arithmetic here is the
-    module's own (cosine similarity against L2-normalized keys, divided by ``temperature``), just
-    done in fp32 and chunked.
+    Replayed rather than captured because ``InformationRetrievalModule`` only returns the weights
+    when asked, and asking would mean editing the model to measure it. It calls the module's *own*
+    read routine rather than restating the arithmetic, which matters now that the two stage path
+    has arithmetic worth getting wrong: a second copy of the centroid probe, the capacity dispatch
+    and the local-to-global id mapping is a second thing that can drift from what the model does.
+    Both read routines are safe to call from here -- the usage EMA and the query reservoir are
+    gated on ``self.training``, so a diagnostic still cannot move what the next refresh acts on,
+    and the entropy tracker lives in ``forward`` rather than in the reads.
+
+    The returned ``width`` is how many entries the softmax actually spans: the whole table on the
+    exact path, ``read_top_k`` on the two stage path. Entropy is only interpretable against it.
 
     Args:
         ir_module: the ``InformationRetrievalModule``.
@@ -153,20 +162,24 @@ def retrieval_stats(ir_module, query: torch.Tensor, top_m: int = 32):
         top_m: how many entries the "top-m mass" column sums.
 
     Returns:
-        dict of scalar floats: entropy (nats), max weight, top-m mass.
+        dict of scalar floats: entropy (nats), max weight, top-m mass, softmax width, tokens.
     """
-    z = F.normalize(ir_module.z_keys.float(), p=2, dim=-1)
-    q = query.reshape(-1, query.shape[-1]).float()
-    ent, wmax, mass, n = 0.0, 0.0, 0.0, 0
-    for start in range(0, q.shape[0], IR_CHUNK):
-        qq = F.normalize(q[start:start + IR_CHUNK], p=2, dim=-1)
-        w = torch.softmax(qq @ z.t() / ir_module.temperature, dim=-1)
+    two_stage = ir_module.num_clusters > 0
+    chunk = 8192 if two_stage else max(256, IR_CHUNK_CELLS // ir_module.num_entries)
+    q = query.reshape(-1, query.shape[-1])
+    ent, wmax, mass, n, width = 0.0, 0.0, 0.0, 0, 0
+    for start in range(0, q.shape[0], chunk):
+        qq = F.normalize(q[start:start + chunk], p=2, dim=-1)
+        _, w = ir_module._two_stage_read(qq) if two_stage else ir_module._exact_read(qq)
+        w = w.float()
+        width = w.shape[-1]
         ent += float(-(w * w.clamp_min(1e-12).log()).sum(-1).sum())
-        top = w.topk(top_m, dim=-1).values
+        top = w.topk(min(top_m, width), dim=-1).values
         wmax += float(top[:, 0].sum())
         mass += float(top.sum())
         n += qq.shape[0]
-    return {"entropy": ent / n, "max_weight": wmax / n, "top_m_mass": mass / n, "tokens": n}
+    return {"entropy": ent / n, "max_weight": wmax / n, "top_m_mass": mass / n,
+            "width": width, "tokens": n}
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
@@ -253,6 +266,7 @@ def collect(model, dataset, device, max_batches, max_loops, n_loops_cfg, top_m):
         # ---- IR expert: what it retrieves, and how the router weights it ----
         for loop in range(loops_run):
             stats = retrieval_stats(probe.expert.ir_module, probe.queries[loop], top_m)
+            acc["ir_width"] = stats["width"]
             acc["ir_entropy"][loop] += stats["entropy"]
             acc["ir_max_w"][loop] += stats["max_weight"]
             acc["ir_top_m"][loop] += stats["top_m_mass"]
@@ -305,8 +319,13 @@ def collect(model, dataset, device, max_batches, max_loops, n_loops_cfg, top_m):
     return acc
 
 
-def report(acc, n_loops_cfg, num_ir_entries, top_m):
+def report(acc, n_loops_cfg, ir_module, top_m):
     b = max(acc["batches"], 1)
+    # the softmax's own width, not the table's size: a top-32 read cannot exceed ln 32 however flat
+    # it is, so normalizing it by ln 65536 would report a sharp table that is in fact uniform over
+    # everything it looked at. same units modules/model/information_retrieval.py logs during training
+    num_ir_entries = acc.get("ir_width") or ir_module.num_entries
+    top_m = min(top_m, num_ir_entries)
     tokens = max(acc["total"], 1)
     loops_run = len(acc["ce_sum"])
     per_loop_ce = [s / max(c, 1) for s, c in zip(acc["ce_sum"], acc["ce_n"])]
@@ -315,6 +334,9 @@ def report(acc, n_loops_cfg, num_ir_entries, top_m):
     max_entropy = math.log(num_ir_entries)
 
     print(f"\n=== 1. IR retrieval entropy (max = ln {num_ir_entries} = {max_entropy:.3f} nats) ===")
+    if ir_module.num_clusters > 0:
+        print(f"  two stage read: {ir_module.num_entries} entries in {ir_module.num_clusters} clusters, "
+              f"{ir_module.probe_clusters} probed, softmax over the top {ir_module.read_top_k}")
     print(f"  {'loop':<6} {'entropy':>9} {'frac of max':>12} {'max weight':>12} {f'top-{top_m} mass':>13} {'read dispersion':>16}")
     for loop in range(loops_run):
         ent = acc["ir_entropy"][loop] / b
@@ -431,7 +453,7 @@ def main():
     if acc["total"] == 0:
         raise SystemExit("No supervised tokens collected -- check --start-doc-idx/--max-batches.")
     logger.info(f"Evaluated {acc['batches']} batches, {acc['total']:,} supervised tokens")
-    report(acc, n_loops_cfg, ModelConfig.Params["num_ir_entries"], args.top_m)
+    report(acc, n_loops_cfg, model.moe.ir_modules[0], args.top_m)
 
 
 if __name__ == "__main__":
