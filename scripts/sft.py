@@ -78,7 +78,8 @@ from scripts.pretrain import (
     USE_LOW_PRECISION, chosen_recipe, log_precision_mode, sample_n_loops,
     save_expert_selection_graph, save_loss_graph, train_step,
 )
-from utils import BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, logger
+from utils import (BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, load_model_state,
+                   logger)
 
 # the phase label baked into checkpoint filenames and the run-state sidecar. Distinct from
 # ("phase1", "phase2") so ckpt_lib's newest-that-loads search can never pick up a pretraining
@@ -443,7 +444,10 @@ def load_pretrained_weights(model, path: str):
         The pretraining token count, carried forward on purpose -- see this module's docstring.
     """
     checkpoint = torch.load(path, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # through load_model_state, not load_state_dict: a seed built before the retrieval temperature
+    # became learned carries neither temperature tensor, and their inits ARE the 1.0 it was hardcoded
+    # to. Still strict about everything else -- a trunk tensor left random here would train anyway
+    load_model_state(model, checkpoint["model_state_dict"])
     token_count = checkpoint.get("token_count", 0)
     logger.info(
         f"Initialized from pretrained checkpoint {os.path.basename(path)} "
