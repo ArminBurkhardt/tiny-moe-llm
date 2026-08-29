@@ -58,7 +58,7 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 | abstention owner | **Sequenced and measured separately.** Data repair done — lever exhausted with precision pinned at ~0.578. Phase 4's groundedness signal and Phase 6's preference pass are the two levers left. |
 | depth policy | **Convergence exit + "evidence still arriving"** — no learned head, two criteria |
 | IR table | **256-d, 65536 entries, two-stage centroid scoring**; `y_values` zero-init on reshape so the surgery is behaviorally neutral at step 0 |
-| IR key init | **A/B measured, not assumed** — random vs warm-start from embedded text (Phase 3) |
+| IR key init | **Random.** The A/B was measured in Phase 3 and tied to four decimals; the warm start bought nothing and fit the clustering worse |
 | MTP | **Keep on** for training. Stop *computing* it where its output is discarded (Phase 1b) — a compute fix, not a removal. |
 | evidence RoPE | **Per-chunk position basis restarting at 0** |
 | ANN corpus | **phase1.bin for 5a InfoNCE, Wikipedia (KILT) for Stage 4/5 and all reported numbers** |
@@ -365,6 +365,40 @@ comes due after Phase 4/5 has given the mechanism something to retrieve. **Branc
 if the parametric table still ablates to ~0 after Phases 4–5, its size is frozen out of the real
 run spec — external memory then carries the mechanism, and the model does not pay 33M params for
 a bias term.
+
+### Outcome (2026-08-29) — measured in [ir_sharpening.md](../measurements/ir_sharpening.md)
+
+Both arms ran at 208M tokens off the same seed, ~72 min each on the 5090.
+[ir_reshape.md](../measurements/ir_reshape.md) covers the reshape itself: total params 332M → 364M,
+forward FLOP/token 490M → **484M** (the two stage read is cheaper than the old exact read of a table
+an eighth the size), and the migrated checkpoint confirmed behaviourally identical to its source
+(+0.0002 nats, i.e. exactly what deleting the read costs). `ir_probe_clusters` is **8**, not the 4
+guessed above — at 4, candidate recall@32 sat at 0.86–0.95 and drifted down as the anneal sharpened.
+
+**Gate G2: FAIL**, on the ablation, on both arms.
+
+- Retrieval entropy did fall: loop 1 reads `E / ln 32 = 0.911` (A) / `0.923` (B) with a max weight
+  4.4–4.6x uniform. Loops 2 and 3 stayed at 0.984–0.987, i.e. uniform — the same split the query
+  drift matrix shows, `cos(q1, q2) ≈ 0.32–0.37` against `cos(q2, q3) ≈ 0.98`. The table can only be
+  sharp for a query that varies, and the recurrence asks one question and then repeats it.
+- Held-out CE and the benchmark suite stayed within a finetune's worth of the seed (per-loop CE
+  3.3843 → 3.4109; mean MC headroom +0.088 → +0.072 / +0.076, with BoolQ again the outlier at
+  −4.6 / −5.0 points).
+- **The read-zeroed ablation did not move off the floor: 0.0002 nats, the same number the untrained
+  seed measured.** Per-loop CE is identical whether the trained checkpoint reads at temperature
+  scale 1.0 or the annealed 0.05, which is only possible if the retrieved value reaches the logits
+  with ~zero weight.
+- **The A/B is a tie, and that is the finding.** The two arms agree on CE to four decimals, on
+  ablation content, and on routed weight per loop. The key init is not the lever, so the "lower LR
+  on `z_keys` than `y_values`" refinement above is moot and the warm-start adapter is not carried
+  forward. Arm A (random keys) is the arm to keep, on the tiebreak that its clustering fit better —
+  arm B tripped the recall warning three times out of ten refreshes, arm A never.
+
+The branch stated above is therefore live and its condition is now half-met. The bottleneck is
+downstream of the table — `g_proj` and the residual scale discard the read — so **Phase 4 is what
+decides the table's fate**: if a mechanism with something real to retrieve still ablates to ~0, the
+33.5M params are frozen out of the real run spec. Nothing here recommends the product-key fallback:
+refresh churn and cluster collapse were not the failure mode, indifference downstream was.
 
 ---
 
@@ -674,7 +708,10 @@ Written before anything is rented, containing:
   FAIL**, on the expected branch: the table is a bias term, the re-init is free, and the bar
   comes due again after the mechanism has something to retrieve.
 - **G2** — post-anneal entropy ≪ `ln 65536`; held-out CE and benchmarks within noise; read-zeroed
-  ablation well off the 0.0004 floor; A/B arm chosen (Phase 3).
+  ablation well off the 0.0004 floor; A/B arm chosen (Phase 3). **Measured 2026-08-29: FAIL**
+  ([record](../measurements/ir_sharpening.md)). Entropy and CE/benchmarks passed; the ablation stayed
+  at 0.0002 nats, unmoved by 208M tokens on either arm. The A/B tied, so random keys are kept and
+  the table's fate rides on Phase 4.
 - **G3** — gold-vs-no-evidence CE gap ≥ ~0.3 nats; abstention under no-evidence ≫ under gold;
   benchmarks within noise (Phase 4).
 - **G3b** — groundedness AUROC ≥ 0.65 for unanswerable detection, against the trunk probe's

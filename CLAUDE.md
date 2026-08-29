@@ -40,8 +40,8 @@ scripts under [scripts/](scripts/).
 One real run exists: 16B tokens of pretraining on a rented H100 plus a local 2-epoch SFT pass, then
 a local 49M-token abstention repair pass on top of it (NEXT.md Phase 2).
 [docs/CONCLUSION.md](docs/CONCLUSION.md) is the write-up, including the two failures that Phase 0
-below acted on. The plan from here is [docs/plans/NEXT.md](docs/plans/NEXT.md); Phases 0, 1, 2 and
-1b are done, and their measurements are in [docs/measurements/](docs/measurements/). **The benchmark
+below acted on. The plan from here is [docs/plans/NEXT.md](docs/plans/NEXT.md); Phases 0, 1, 1b, 2
+and 3 are done, and their measurements are in [docs/measurements/](docs/measurements/). **The benchmark
 suite is the quality instrument now** — CE on the local slice is a health check, and
 [docs/measurements/benchmark_snapshot.md](docs/measurements/benchmark_snapshot.md) is the
 three-checkpoint baseline every later change is diffed against.
@@ -288,8 +288,12 @@ Constraints worth remembering:
   `utils.model_params_for_state_dict` reads `ir_module.z_keys`'s shape for `num_ir_entries`/`ir_dim`
   and forces `ir_num_clusters=0` when the state dict has no `centroids`, so every eval script keeps
   scoring pre-reshape baselines after the yaml moves on. `utils.load_model_state` then loads
-  strictly, tolerating exactly one absent key: `ir_module.log_temperature`, whose init *is*
-  `log(1.0)`, so an old checkpoint is reproduced exactly rather than approximately.
+  strictly, tolerating exactly two absent keys: `ir_module.log_temperature` and
+  `ir_module.temperature_scale`, whose inits *are* the 1.0 the temperature used to be hardcoded to,
+  so an old checkpoint is reproduced exactly rather than approximately. Every load path goes through
+  it **except the two resume paths** (`utils.load_checkpoint`, `sft.load_sft_checkpoint`), which stay
+  strict on purpose: there, an absent anneal multiplier means mid-run state was lost, not that a
+  known default applies.
 - Things *not* in the yaml but hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL=20` in `pretrain.py`
   and `10` in `sft.py`, expert head counts `n_heads=16 / n_kv_heads=4` and `rope_theta`
   ([moe.py](modules/model/moe.py)), `CE_CHUNK_SIZE=8192` ([mtp.py](modules/model/mtp.py)),
@@ -420,7 +424,12 @@ table is `[num_ir_entries, ir_dim]` keys plus values, read by cosine similarity 
 divided by a learned `log_temperature`. `ir_num_clusters > 0` selects the **two stage** read; `0`
 keeps the exact full-table softmax, and both live in the same module because the migration has to
 be able to produce either. Measurements in
-[docs/measurements/ir_reshape.md](docs/measurements/ir_reshape.md).
+[docs/measurements/ir_reshape.md](docs/measurements/ir_reshape.md) (the reshape's cost and the probe
+budget) and [docs/measurements/ir_sharpening.md](docs/measurements/ir_sharpening.md) (what 208M
+tokens of training the reshaped table bought). **The short version of the second: the table
+sharpens on the first loop and the model still does not use what it retrieves** — zeroing the read
+costs 0.0002 nats, the same as before it was trained, on both key inits. Anything that tries again
+here has to move that number, not the entropy.
 
 - **Two stage read**: score `num_clusters` centroids, take the top `probe_clusters`, score only
   those clusters' keys exactly, take the global top `read_top_k`, softmax over *those* and gather
@@ -442,6 +451,13 @@ be able to produce either. Measurements in
   zero vector whatever its keys are, so the IR expert contributes only `g_proj(0)`, a bias — the
   migrated model *is* the read-zeroed ablation of its source, and measurably so (+0.0002 nats).
   Same pattern as `loop_router_bias`.
+- **`temperature_scale`, the anneal multiplier the trainer drives, IS a persistent buffer**, and
+  `set_temperature_scale` writes *through* it rather than rebinding the attribute. The sharpness the
+  anneal ends at is part of what the trained table means — the values were only ever supervised at
+  that sharpness. As a plain float it is absent from the state dict, so a finished checkpoint
+  reloads at 1.0 and reads ~20x flatter than it trained, which looks exactly like "the anneal did
+  nothing" on every eval. This is the opposite call from the three attributes below, and for the
+  opposite reason: it is 0-dim, only ever divides, and must survive the round trip.
 - **`entry_usage` / `query_reservoir` / `reservoir_ptr` are plain fp32 attributes, not buffers.**
   `model.to(BF16)` would cast a registered buffer, and an EMA of per-entry read mass does not
   survive bf16's ulp. They are lazily created on first use and are **training-only** (gated on
