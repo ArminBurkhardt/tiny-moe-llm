@@ -57,7 +57,7 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 | query/key space | **B2** — external embedder (bge-small, 384-d) + adapter. Revisit B1 after 5a. |
 | abstention owner | **Sequenced and measured separately.** Data repair done — lever exhausted with precision pinned at ~0.578. Phase 4's groundedness signal and Phase 6's preference pass are the two levers left. |
 | depth policy | **Convergence exit + "evidence still arriving"** — no learned head, two criteria |
-| IR table | **256-d, 65536 entries, two-stage centroid scoring**; `y_values` zero-init on reshape so the surgery is behaviorally neutral at step 0 |
+| IR table | **384-d (bge-small's width), 65536 entries, two stage centroid scoring**; unit-norm value rows, and the neutrality zero on `g_proj` rather than on `y_values` — see Phase 3b for why the zero moved |
 | IR key init | **Random, provisionally.** Phase 3's A/B tied to four decimals and the warm start fit the clustering worse — but it ran while the read was worth 0.0002 nats, so no init difference *could* have shown. Re-open only if Phase 3b's scale fix passes |
 | MTP | **Keep on** for training. Stop *computing* it where its output is discarded (Phase 1b) — a compute fix, not a removal. |
 | evidence RoPE | **Per-chunk position basis restarting at 0** |
@@ -451,7 +451,7 @@ makes uniform selection 2/35 = 5.7%; IR measures 5.7% / 11.8% / 8.6% and takes 0
 when selected. A mean routed weight of 0.02–0.05 is what the arithmetic produces for any expert in
 this pool, not a router that learned to avoid retrieval.
 
-### The three changes
+### The changes
 
 Ordered by whether they preserve loadability, which is what decides where they go.
 
@@ -459,27 +459,43 @@ Ordered by whether they preserve loadability, which is what decides where they g
 `y_values` puts the zero on the *content* — 33.5M parameters that must travel ~250x in norm, under
 weight decay, with no pressure to make the trip. Zero-initializing `g_proj.weight` instead is the
 standard residual-branch pattern (ReZero / LayerScale): migration neutrality is preserved exactly,
-but the zero now sits on a 256x256 tensor that trains fast at `fresh_lr`. Note `∂L/∂y_values` is
+but the zero now sits on a `ir_dim x ir_dim` tensor that trains fast at `fresh_lr`. Note
+`∂L/∂y_values` is
 zero at step 0 because it flows through `g_proj` — `g_proj` moves first and the table learns behind
 it, so **log `‖g_proj‖` early to confirm it leaves zero** rather than assuming it.
 
-**2. Unit-normalize the value rows, and initialize them as one rotated orthonormal basis per
-cluster.** Normalizing in the forward makes the table store *directions* and removes magnitude as a
+**2. Unit-normalize the value rows, and initialize each cluster to a rotated orthonormal set.**
+Normalizing in the forward makes the table store *directions* and removes magnitude as a
 degree of freedom weight decay can eat; read magnitude then lands in `[1/√k, 1]` — ~0.177 for a
 uniform read over 32 rows, 1.0 for a peaked one — which is the confidence signal at a usable scale,
 with no constant to tune. It is also symmetric with the key side, which is already normalized by
 construction, and it is the convention the external corpus path arrives in anyway (bge outputs are
 L2-normalized), so one rule covers both backing stores.
 
-For the init: `num_ir_entries / ir_num_clusters = 65536 / 256 = 256 = ir_dim`, so **each cluster
-holds exactly as many entries as the space has dimensions** and can be seeded with one orthonormal
-basis, rotated per cluster. Within a probed cluster the candidates are then exactly mutually
-orthogonal — maximum discriminability where the read actually looks — and rotations keep
-cross-cluster correlation low. Constructive (one QR per cluster at migration), not an iterative
-repulsion. Random unit vectors are already near-optimal *on average* in 256-d (`E|cos| = 0.0625`);
-this buys the tail, which is the part that matters inside a cluster.
+For the init: each cluster holds `65536 / 256 = 256` entries, so seed each one with **256 mutually
+orthonormal vectors, rotated per cluster** (one QR per cluster at migration — constructive, not an
+iterative repulsion). Within a probed cluster the candidates are then exactly mutually orthogonal,
+which is maximum discriminability where the read actually looks, and the per-cluster rotation keeps
+cross-cluster correlation low. Random unit vectors are already near-optimal *on average* in a few
+hundred dimensions (`E|cos| = 1/√d`); this buys the tail, which is the part that matters among
+candidates that were selected for being close.
 
-**3. Independent gates for the non-MLP experts — deferred to the real run.** Non-MLP experts run
+**3. `ir_dim` 256 → 384.** The reshape rebuilds these tensors anyway, so the width is free to
+revisit exactly once, here. **384 is bge-small's native dimension**, and the evidence path is
+already committed to bge-small plus an adapter — at 256 that adapter compresses 384 → 256 and
+discards information before the table ever sees it; at 384 it is a rotation. Neither cost binds:
++16.8M parameters (33.5M → 50.3M table, 364M → 381M total), ~+0.3GB peak against a budget that only
+spills past ~29.6GB, and ~2.5M FLOP/token/loop against 1.72M in a 484M-FLOP model.
+
+1:1 (768) is the alternative and it is worse: 67M extra parameters, 18% of the model, to *upsample*
+a 384-d embedding into a width carrying no information the external path has. It buys only geometry
+(`E|cos|` 0.036 vs 0.051), which is not what is broken.
+
+One casualty: at 256 the identity `num_ir_entries / ir_num_clusters = ir_dim` made each cluster
+exactly one orthonormal basis. At 384 a cluster seeds 256 orthonormal vectors into a 384-d space —
+still exactly orthogonal, with slack, so better conditioned and less tidy.
+
+**4. Independent gates for the non-MLP experts — deferred to the real run.** Non-MLP experts run
 unconditionally (attention must see the whole sequence), so for IR the top-k mask buys **zero
 compute** and costs ~17x in signal. Underneath that, one softmax over a heterogeneous pool makes a
 memory read compete for probability mass against 32 MLP experts it is not a substitute for; the
@@ -495,9 +511,14 @@ evidence, and it belongs in Phase 7's architecture rather than bolted onto this 
 
 ### Arm C
 
-Changes 1 and 2 only, so the migrated checkpoint scores identically to its source at step 0 and any
-movement in the ablation is real. Same 208M corpus and settings as arms A and B: ~72 min plus ~15
-min of evals.
+Changes 1–3, all of which preserve loadability: the migrated checkpoint scores identically to its
+source at step 0 (`g_proj = 0`), so any movement in the ablation is real. Same 208M corpus and
+settings as arms A and B: ~72 min plus ~15 min of evals.
+
+It tests the scale fix and the width together, which is a confound worth naming. It is accepted
+because the risk is asymmetric — a wider table has more capacity and better key separation under the
+same scale fix, so it cannot plausibly *cause* a failure. What is lost is the ability to attribute
+credit if it passes, which nothing downstream needs.
 
 **Staged, with an early kill.** Read the ablation at 50M tokens (~18 min). Off the floor → run to
 208M and take the full gate. Still 0.0002 → stop, and the finding is that the scale was not the
