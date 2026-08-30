@@ -58,7 +58,7 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 | abstention owner | **Sequenced and measured separately.** Data repair done — lever exhausted with precision pinned at ~0.578. Phase 4's groundedness signal and Phase 6's preference pass are the two levers left. |
 | depth policy | **Convergence exit + "evidence still arriving"** — no learned head, two criteria |
 | IR table | **256-d, 65536 entries, two-stage centroid scoring**; `y_values` zero-init on reshape so the surgery is behaviorally neutral at step 0 |
-| IR key init | **Random.** The A/B was measured in Phase 3 and tied to four decimals; the warm start bought nothing and fit the clustering worse |
+| IR key init | **Random, provisionally.** Phase 3's A/B tied to four decimals and the warm start fit the clustering worse — but it ran while the read was worth 0.0002 nats, so no init difference *could* have shown. Re-open only if Phase 3b's scale fix passes |
 | MTP | **Keep on** for training. Stop *computing* it where its output is discarded (Phase 1b) — a compute fix, not a removal. |
 | evidence RoPE | **Per-chunk position basis restarting at 0** |
 | ANN corpus | **phase1.bin for 5a InfoNCE, Wikipedia (KILT) for Stage 4/5 and all reported numbers** |
@@ -388,17 +388,130 @@ guessed above — at 4, candidate recall@32 sat at 0.86–0.95 and drifted down 
   seed measured.** Per-loop CE is identical whether the trained checkpoint reads at temperature
   scale 1.0 or the annealed 0.05, which is only possible if the retrieved value reaches the logits
   with ~zero weight.
-- **The A/B is a tie, and that is the finding.** The two arms agree on CE to four decimals, on
-  ablation content, and on routed weight per loop. The key init is not the lever, so the "lower LR
-  on `z_keys` than `y_values`" refinement above is moot and the warm-start adapter is not carried
-  forward. Arm A (random keys) is the arm to keep, on the tiebreak that its clustering fit better —
-  arm B tripped the recall warning three times out of ten refreshes, arm A never.
+- **The A/B is a tie**, on CE to four decimals, on ablation content, and on routed weight per loop.
+  Arm A (random keys) is the arm to keep, on the tiebreak that its clustering fit better — arm B
+  tripped the recall warning three times out of ten refreshes, arm A never. **Read the tie as
+  uninformative rather than as a fact about key geometry**: Phase 3b found the read contributes
+  ~1e-3 of the residual on both arms, and an experiment in that regime cannot detect an init
+  difference. The "lower LR on `z_keys` than `y_values`" refinement above is parked, not refuted.
 
-The branch stated above is therefore live and its condition is now half-met. The bottleneck is
-downstream of the table — `g_proj` and the residual scale discard the read — so **Phase 4 is what
-decides the table's fate**: if a mechanism with something real to retrieve still ablates to ~0, the
-33.5M params are frozen out of the real run spec. Nothing here recommends the product-key fallback:
-refresh churn and cluster collapse were not the failure mode, indifference downstream was.
+**Phase 3b supersedes the diagnosis.** The bottleneck is not the model declining to use a good read;
+the read arrives ~250x below the query because the value side is never normalized, and the same
+attenuation is present in the pre-reshape trunk after 16B tokens. Nothing here recommends the
+product-key fallback either — refresh churn and cluster collapse were not the failure mode.
+
+---
+
+## Phase 3b — The read never reached a usable scale
+
+Self-contained. Phase 3 concluded the read was worth 0.0002 nats and left *why* open; a pathway
+probe answered it, and the answer is a scale bug rather than a verdict on the mechanism.
+
+### What was measured
+
+RMS over tokens, along the IR pathway, on both arms and on the pre-reshape trunk:
+
+| stage | arm A | arm B | pre-reshape trunk (16B tokens) |
+|---|---|---|---|
+| `x_norm` (the residual) | 0.992 | 0.992 | 0.991 |
+| `down` (the query) | 0.83–1.35 | 0.76–1.21 | 1.28–2.08 |
+| **`retrieved_y`** | **0.0034–0.0044** | **0.0032–0.0049** | **0.0020–0.0043** |
+| `information` (the expert's K/V) | 0.004–0.006 | 0.003–0.008 | 0.001–0.003 |
+| `expert_out` | 0.026–0.094 | 0.025–0.104 | 0.017–0.069 |
+
+The read arrives ~250x below the query it was issued from, so the IR expert puts 3e-4 to 1.6e-3 of
+magnitude into a unit-RMS residual. Zeroing it changes the expert's output by exactly 100% on every
+loop — nothing is gating it off, there is nothing there to gate.
+
+**The cause is that the value side is never normalized.** The query is `F.normalize`d and scored by
+cosine; the read is a convex combination of value rows, so `‖retrieved_y‖ ≤ max‖y_row‖ ≈ 0.05`, and
+a near-uniform read over 32 near-orthogonal rows divides that by another ~`√32`.
+
+Three facts that follow, each of which changes an earlier conclusion:
+
+- **This is not a "grafted on too late" problem.** The pre-reshape table had the IR expert present
+  for all 16B pretraining tokens and shows the same 0.002–0.004 read magnitude — and its `y_values`
+  RMS is **0.0204**, still exactly its `randn * 0.02` init. The mechanism has been suppressed the
+  whole time; it was never actually tested.
+- **The table did learn, at the wrong rate for the wrong reason.** Both arms took `y_values` from
+  exactly 0 to row norm 0.0507 in 208M tokens, so `fresh_lr` worked. But per-element movement was
+  0.0037 against 0.034 for a pure random walk at that step size — the steps cancel. Entries are
+  selected by a near-uniform read, so each receives averaged gradient from unrelated contexts, and
+  weight decay (`y_values` is `ndim=2`, so it is in the decayed group) reels in what has no
+  consistent direction. Selectivity and content are each waiting on the other.
+- **The gradient that teaches selectivity is proportional to how much the read moves the loss**, so
+  at 1e-3 of the residual the keys receive no supervision worth accumulating: `z_keys` relative
+  gradient 4.6e-6 against the trunk's 7.0e-4, 150x weaker, and `z_rms` unmoved from its init after
+  16B tokens. **This is why Phase 3's key-init A/B tied** — it ran in a regime where no init
+  difference could have been detected. That tie is evidence about the scale bug, not about key
+  geometry.
+
+**The router weight is not part of this.** 1 self-attn + 1 cross-attn + 1 IR + 32 MLP at `top_k: 2`
+makes uniform selection 2/35 = 5.7%; IR measures 5.7% / 11.8% / 8.6% and takes 0.35–0.48 of the gate
+when selected. A mean routed weight of 0.02–0.05 is what the arithmetic produces for any expert in
+this pool, not a router that learned to avoid retrieval.
+
+### The three changes
+
+Ordered by whether they preserve loadability, which is what decides where they go.
+
+**1. Move the neutrality zero from the values to the output projection.** Zero-initializing
+`y_values` puts the zero on the *content* — 33.5M parameters that must travel ~250x in norm, under
+weight decay, with no pressure to make the trip. Zero-initializing `g_proj.weight` instead is the
+standard residual-branch pattern (ReZero / LayerScale): migration neutrality is preserved exactly,
+but the zero now sits on a 256x256 tensor that trains fast at `fresh_lr`. Note `∂L/∂y_values` is
+zero at step 0 because it flows through `g_proj` — `g_proj` moves first and the table learns behind
+it, so **log `‖g_proj‖` early to confirm it leaves zero** rather than assuming it.
+
+**2. Unit-normalize the value rows, and initialize them as one rotated orthonormal basis per
+cluster.** Normalizing in the forward makes the table store *directions* and removes magnitude as a
+degree of freedom weight decay can eat; read magnitude then lands in `[1/√k, 1]` — ~0.177 for a
+uniform read over 32 rows, 1.0 for a peaked one — which is the confidence signal at a usable scale,
+with no constant to tune. It is also symmetric with the key side, which is already normalized by
+construction, and it is the convention the external corpus path arrives in anyway (bge outputs are
+L2-normalized), so one rule covers both backing stores.
+
+For the init: `num_ir_entries / ir_num_clusters = 65536 / 256 = 256 = ir_dim`, so **each cluster
+holds exactly as many entries as the space has dimensions** and can be seeded with one orthonormal
+basis, rotated per cluster. Within a probed cluster the candidates are then exactly mutually
+orthogonal — maximum discriminability where the read actually looks — and rotations keep
+cross-cluster correlation low. Constructive (one QR per cluster at migration), not an iterative
+repulsion. Random unit vectors are already near-optimal *on average* in 256-d (`E|cos| = 0.0625`);
+this buys the tail, which is the part that matters inside a cluster.
+
+**3. Independent gates for the non-MLP experts — deferred to the real run.** Non-MLP experts run
+unconditionally (attention must see the whole sequence), so for IR the top-k mask buys **zero
+compute** and costs ~17x in signal. Underneath that, one softmax over a heterogeneous pool makes a
+memory read compete for probability mass against 32 MLP experts it is not a substitute for; the
+codebase already concedes the point by keeping `shared_mlp` / `shared_attn` outside the router. The
+consistent design is a per-expert sigmoid gate for the non-MLP slots and the top-k softmax only over
+the MLP experts, where sparsity actually saves FLOPs.
+
+It is **not** loadable-neutral — it changes all three non-MLP experts' contribution for every token
+and the trunk has to re-equilibrate — and it is not yet justified. Arm C decides: if the read starts
+contributing and the router raises IR's selection rate on its own, the gate structure was never
+binding. If the read contributes when selected but selection stays pinned at uniform, that is the
+evidence, and it belongs in Phase 7's architecture rather than bolted onto this checkpoint.
+
+### Arm C
+
+Changes 1 and 2 only, so the migrated checkpoint scores identically to its source at step 0 and any
+movement in the ablation is real. Same 208M corpus and settings as arms A and B: ~72 min plus ~15
+min of evals.
+
+**Staged, with an early kill.** Read the ablation at 50M tokens (~18 min). Off the floor → run to
+208M and take the full gate. Still 0.0002 → stop, and the finding is that the scale was not the
+binding constraint after all, which is worth more than the remaining 54 minutes.
+
+**Gate G2b:** final-loop `dCE` with the read zeroed **> 0.01 nats** — half of G1's bar, since LM CE
+alone is not what the table is ultimately for, but 50x off the floor it has sat at through 16B + 208M
+tokens. Held-out CE and the benchmark suite within a finetune's noise of the seed, as in G2. Report
+IR selection rate per loop, `‖g_proj‖` against its zero init, and `‖y_values‖`, because those three
+say *which* of the changes did the work.
+
+If G2b passes, the parametric table is live and Phase 4 inherits a mechanism that works. If it
+fails, Phase 3's branch stands: the table's size is frozen out of the real run spec and external
+memory carries the mechanism alone.
 
 ---
 
@@ -710,8 +823,13 @@ Written before anything is rented, containing:
 - **G2** — post-anneal entropy ≪ `ln 65536`; held-out CE and benchmarks within noise; read-zeroed
   ablation well off the 0.0004 floor; A/B arm chosen (Phase 3). **Measured 2026-08-29: FAIL**
   ([record](../measurements/ir_sharpening.md)). Entropy and CE/benchmarks passed; the ablation stayed
-  at 0.0002 nats, unmoved by 208M tokens on either arm. The A/B tied, so random keys are kept and
-  the table's fate rides on Phase 4.
+  at 0.0002 nats, unmoved by 208M tokens on either arm. The A/B tied, so random keys are kept
+  provisionally.
+- **G2b** — the same question after the read is put at a usable scale: final-loop read-zeroed `dCE`
+  **> 0.01 nats**, CE and benchmarks within a finetune's noise, with IR selection rate per loop,
+  `‖g_proj‖` against its zero init and `‖y_values‖` reported alongside so the cause is attributable
+  (Phase 3b). Passing makes the parametric table live and hands Phase 4 a working mechanism; failing
+  freezes its size out of the real run spec.
 - **G3** — gold-vs-no-evidence CE gap ≥ ~0.3 nats; abstention under no-evidence ≫ under gold;
   benchmarks within noise (Phase 4).
 - **G3b** — groundedness AUROC ≥ 0.65 for unanswerable detection, against the trunk probe's
