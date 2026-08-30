@@ -11,6 +11,9 @@ class ModelConfig:
         "max_seq_len": int(Config["model"]["max_seq_length"]),
         "hidden_size": int(Config["model"]["hidden_size"]),
         "intermediate_size": int(Config["model"]["intermediate_size"]),
+        # routed + shared MoE experts only (Gemma4TextModel keeps plain intermediate_size);
+        # defaults to intermediate_size so config.yaml can omit the key entirely.
+        "moe_intermediate_size": int(Config["model"].get("moe_intermediate_size", Config["model"]["intermediate_size"])),
         "num_layers": int(Config["model"]["num_layers"]),
         "num_heads": int(Config["model"]["num_attention_heads"]),
         "head_dim": int(Config["model"]["head_dim"]),
@@ -19,6 +22,12 @@ class ModelConfig:
         "num_ir_experts": int(Config["model"]["num_ir_experts"]),
         "num_ir_entries": int(Config["model"]["num_ir_entries"]),
         "ir_dim": int(Config["model"]["ir_dim"]),
+        # two stage retrieval. 0 clusters keeps the exact full-table softmax, which is what every
+        # checkpoint before the 65536-entry reshape was trained under -- so the keys are optional
+        # and absent means "the old path".
+        "ir_num_clusters": int(Config["model"].get("ir_num_clusters", 0)),
+        "ir_probe_clusters": int(Config["model"].get("ir_probe_clusters", 4)),
+        "ir_read_top_k": int(Config["model"].get("ir_read_top_k", 32)),
         "dropout": float(Config["model"]["dropout"]),
         "top_k": int(Config["model"]["top_k"]),
         "n_loops": int(Config["model"]["n_loops"]),
@@ -27,10 +36,8 @@ class ModelConfig:
         "lm_head_factor": int(Config["model"]["lm_head_factor"]),
     }
     
-    Forward = {
-        "identity_skew": float(Config["model"]["identity_skew"]),
-    }
-    
+    Forward = {}
+
 class TrainingConfig:
     Batch_size = int(Config["training"]["batch_size"])
     Seq_length = int(Config["training"]["seq_length"])
@@ -47,5 +54,256 @@ class TrainingConfig:
     warmup_steps = int(Config["training"].get("warmup_steps", 0))
     noise_anneal_tokens = int(Config["training"].get("noise_anneal_tokens", 0))
     seed = int(Config["training"].get("seed", 42))
-    max_tokens_per_shard = int(Config["training"].get("max_tokens_per_shard", 200_000_000))
+    data_dir = str(Config["training"].get("data_dir", "data/prepared"))
+    phase = str(Config["training"].get("phase", "phase1"))
+
+    # per-loop CE supervision: ascending weights, one per loop, so lm_head has
+    # *some* incentive to make intermediate loops' hidden states legible without competing with
+    # the final loop's dominant supervision. Consumed directly in compute_mtp_loss's call sites,
+    # not passed into the model.
+    loop_ce_weights = [float(w) for w in Config["training"]["loop_ce_weights"]]
+    assert len(loop_ce_weights) == ModelConfig.Params["n_loops"], (
+        f"loop_ce_weights ({loop_ce_weights}) must have exactly one weight per loop "
+        f"(n_loops={ModelConfig.Params['n_loops']})"
+    )
+
+    # fraction of token positions supervised on the non-final loops. the final loop is always
+    # supervised in full, so this only cheapens the low-weight intermediate readouts.
+    loop_ce_subsample = float(Config["training"].get("loop_ce_subsample", 1.0))
+    assert 0.0 < loop_ce_subsample <= 1.0, (
+        f"loop_ce_subsample ({loop_ce_subsample}) must be in (0, 1]"
+    )
+
+    # stochastic loop depth: probability a step runs a reduced loop count (uniform 1..n_loops-1).
+    # this is the whole depth policy during training now that the halt head is gone -- the
+    # inference-time criterion (TinyMoETransformer's converge_tol) is parameter-free and needs
+    # every depth to be a real operating point, which is exactly what this trains.
+    # per-loop CE already supervises every prefix depth; this additionally makes the *model* see
+    # shallow depths as real inputs to the rest of training, so an inference-time loop-count
+    # override lands on a depth the model was actually trained at. 0.0 = always full depth.
+    loop_count_sampling = float(Config["training"].get("loop_count_sampling", 0.0))
+    assert 0.0 <= loop_count_sampling <= 1.0, (
+        f"loop_count_sampling ({loop_count_sampling}) must be in [0, 1]"
+    )
+
+    # checkpoint lifecycle for the unattended run
+    checkpoint_every_tokens = int(Config["training"].get("checkpoint_every_tokens", 400_000_000))
+    keep_local_checkpoints = int(Config["training"].get("keep_local_checkpoints", 2))
+    # None means "key absent, fall back to utils.HF_UPLOAD_REPO"; an explicit "" means "uploads
+    # off". Collapsing the two (defaulting to "" and then `value or HF_UPLOAD_REPO` at the call
+    # site) makes `hf_upload_repo: ""` silently upload anyway, which is the opposite of what the
+    # yaml comment promises -- and it is only noticed once a 2GB checkpoint is already on the Hub.
+    _raw_upload_repo = Config["training"].get("hf_upload_repo", None)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+    @classmethod
+    def upload_repo(cls, default: str) -> str:
+        """Resolve which repo to upload to.
+
+        Args:
+            default: utils.HF_UPLOAD_REPO, used only when config.yaml has no key at all.
+
+        Returns:
+            The repo id, or "" when uploads are explicitly disabled.
+        """
+        return default if cls.hf_upload_repo is None else cls.hf_upload_repo
+
+    # phase 1 gets this fraction of target_tokens, phase 2 the rest. target_tokens itself stays
+    # the COMBINED budget so total_steps and the cosine LR anchor are unchanged -- phase 2 must
+    # continue the decay from where phase 1 left it, not restart it.
+    phase1_fraction = float(Config["training"].get("phase1_fraction", 0.85))
+
+    @classmethod
+    def phase_target_tokens(cls, phase: str) -> int:
+        """Token count at which the given phase stops training."""
+        if phase == "phase1":
+            return int(cls.target_tokens * cls.phase1_fraction)
+        if phase == "phase2":
+            return cls.target_tokens
+        raise ValueError(f"unknown phase {phase!r}; expected 'phase1' or 'phase2'")
+
+
+class SFTConfig:
+    """Supervised fine-tuning knobs, read from config.yaml's ``sft:`` block.
+
+    Only the things SFT genuinely does differently live here. Every loss weight -- lambda_mtp,
+    aux_loss_weight, loop_ce_weights/loop_ce_subsample and loop_count_sampling -- is read from
+    ``TrainingConfig`` by ``scripts/pretrain.train_step``, which
+    ``scripts/sft.py`` reuses unchanged. That reuse is the point: the cheapest way to guarantee
+    the objective stays *identical* across the two runs is to not have a second copy of it.
+    """
+    _Block = Config.get("sft", {}) or {}
+
+    data_dir = str(_Block.get("data_dir", "data/prepared"))
+    train_split = str(_Block.get("train_split", "sft_train"))
+    val_split = str(_Block.get("val_split", "sft_val"))
+
+    Batch_size = int(_Block.get("batch_size", 4))
+    Seq_length = int(_Block.get("seq_length", 4096))
+    grad_accumulation_steps = int(_Block.get("grad_accumulation_steps", 8))
+    lr = float(_Block.get("lr", 3e-5))
+    weight_decay = float(_Block.get("weight_decay", 0.01))
+    num_epochs = int(_Block.get("num_epochs", 2))
+    warmup_fraction = float(_Block.get("warmup_fraction", 0.03))
+    lr_min_factor = float(_Block.get("lr_min_factor", 0.05))
+    dropout = float(_Block.get("dropout", 0.05))
+    # seeds the SFTDataset per-epoch document permutation. Changing it mid-run repoints every
+    # checkpointed resume position into a different order, so it is checkpointed alongside them.
+    seed = int(_Block.get("seed", 1234))
+
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 25_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", 3))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 25_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", 40))
+
+    # weight every CE term by 1/(supervised tokens in the conversation) instead of counting tokens
+    # (NEXT.md Phase 2's fix #3). Off here so this class still describes the run that produced the
+    # existing SFT checkpoint; RepairConfig turns it on. The weights themselves are always in the
+    # batch -- see modules/data/sft_dataset.py.
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", False))
+
+    # same None-vs-"" distinction as TrainingConfig.hf_upload_repo: absent means "fall back to
+    # utils.HF_UPLOAD_REPO", explicit "" means uploads off (the default for a local run).
+    _raw_upload_repo = _Block.get("hf_upload_repo", "")
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+    @classmethod
+    def upload_repo(cls, default: str) -> str:
+        """Resolve which repo to upload SFT checkpoints to ("" disables uploads)."""
+        return default if cls.hf_upload_repo is None else cls.hf_upload_repo
+
+    @classmethod
+    def model_params(cls) -> dict:
+        """``ModelConfig.Params`` with the SFT dropout override applied.
+
+        Dropout is not a parameter, so this changes nothing about checkpoint compatibility -- the
+        pretrained state dict loads into the overridden model unchanged.
+        """
+        return {**ModelConfig.Params, "dropout": cls.dropout}
+
+
+class RepairConfig(SFTConfig):
+    """NEXT.md Phase 2's abstention repair finetune, read from config.yaml's ``repair:`` block.
+
+    A **subclass**, not a second full block: the repair pass is the SFT run with a different corpus,
+    a lower learning rate, one epoch and per-conversation loss weighting. Everything it does not
+    name -- batch size, sequence length, the fp32-master arrangement, dropout, ``eval_max_batches``,
+    ``model_params()`` -- inherits from ``SFTConfig`` by ordinary attribute lookup, which is the
+    point: "same objective and same shape, repaired data" stops being true the moment a second copy
+    of those numbers can drift.
+
+    Only the keys listed below are readable from the ``repair:`` block. Anything else in it is
+    ignored rather than silently half-applied -- ``scripts/sft.py --repair`` reads this class, not
+    the yaml.
+    """
+    _Block = Config.get("repair", {}) or {}
+
+    train_split = str(_Block.get("train_split", "repair_train"))
+    val_split = str(_Block.get("val_split", "repair_val"))
+    # ~1/3 of SFT's 3e-5. The trunk is already post-SFT; this pass has to move the abstention
+    # decision without relearning the chat format.
+    lr = float(_Block.get("lr", 1.0e-5))
+    num_epochs = int(_Block.get("num_epochs", 1))
+    weight_decay = float(_Block.get("weight_decay", SFTConfig.weight_decay))
+    dropout = float(_Block.get("dropout", SFTConfig.dropout))
+    # micro batch and accumulation move together on purpose: their product is the tokens per
+    # optimizer step, and only the product is part of the objective. See config.yaml -- the smaller
+    # micro batch is a memory fix (SFT's 8 spills into shared system memory on a 32GB card), the
+    # accumulation restores what it cost.
+    Batch_size = int(_Block.get("batch_size", SFTConfig.Batch_size))
+    grad_accumulation_steps = int(
+        _Block.get("grad_accumulation_steps", SFTConfig.grad_accumulation_steps)
+    )
+    warmup_fraction = float(_Block.get("warmup_fraction", SFTConfig.warmup_fraction))
+    lr_min_factor = float(_Block.get("lr_min_factor", SFTConfig.lr_min_factor))
+    seed = int(_Block.get("seed", SFTConfig.seed))
+    # a ~30M-token corpus wants a much tighter cadence than SFT's 100M, or the run ends without
+    # ever having written a rolling checkpoint
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 10_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 5_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
+    # the whole reason this profile exists -- on by default here, unlike SFTConfig
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", True))
+
+    # same None-vs-"" distinction as everywhere else; inherits SFT's resolved value (uploads off for
+    # a local run) when the repair block says nothing
+    _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+
+class IRConfig(SFTConfig):
+    """The IR table's sharpening finetune, read from config.yaml's ``ir:`` block.
+
+    A **subclass** for the same reason ``RepairConfig`` is one: this is the same trainer, the same
+    objective and the same shape over a different corpus. What it adds is the machinery a freshly
+    reshaped table needs and the other two profiles have no use for.
+
+    Three things are genuinely new here, not just different numbers:
+
+    - **A second learning rate.** ``z_keys``/``y_values``/the IR projections were rebuilt from
+      scratch by ``scripts/migrate_ir_reshape.py``; the rest of the model is a 16B-token trunk. One
+      compromise LR is either too small to train the new tensors or large enough to damage the old
+      ones, so they get separate groups (``fresh_lr`` vs ``lr``) rather than a middle value.
+    - **A temperature anneal.** ``y_values`` have only ever been read as a near-uniform mixture, so
+      simply lowering the temperature afterwards reads out vectors nothing individually trained --
+      a loss spike, not a sharper retrieval. It has to come down *during* the run, from
+      ``temperature_start`` to ``temperature_end``.
+    - **A cluster refresh cadence.** Two stage scoring is only exact while the centroids track the
+      keys, and the keys are training. This is a real hyperparameter, not a detail.
+
+    This profile is deliberately NOT another QA-shaped repair: its corpus is a general LM mix with
+    chat replay, because the table's job is to have general text to store.
+    """
+    _Block = Config.get("ir", {}) or {}
+
+    train_split = str(_Block.get("train_split", "ir_train"))
+    val_split = str(_Block.get("val_split", "ir_val"))
+    lr = float(_Block.get("lr", 1.0e-5))
+    # the rebuilt tensors' own LR, in fresh-parameter territory rather than finetune territory
+    fresh_lr = float(_Block.get("fresh_lr", 3.0e-4))
+    num_epochs = int(_Block.get("num_epochs", 1))
+    weight_decay = float(_Block.get("weight_decay", SFTConfig.weight_decay))
+    dropout = float(_Block.get("dropout", SFTConfig.dropout))
+    Batch_size = int(_Block.get("batch_size", 4))
+    grad_accumulation_steps = int(_Block.get("grad_accumulation_steps", 4))
+    warmup_fraction = float(_Block.get("warmup_fraction", SFTConfig.warmup_fraction))
+    lr_min_factor = float(_Block.get("lr_min_factor", SFTConfig.lr_min_factor))
+    seed = int(_Block.get("seed", SFTConfig.seed))
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 50_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 10_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
+    # off: this is a pretraining-style pass over documents, not a conversation-level policy fix
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", False))
+
+    temperature_start = float(_Block.get("temperature_start", 1.0))
+    temperature_end = float(_Block.get("temperature_end", 0.05))
+    # fraction of the run the anneal spans; the rest trains at the final temperature, so the table
+    # gets time to actually learn under the sharp read rather than ending the run mid-transition
+    temperature_anneal_fraction = float(_Block.get("temperature_anneal_fraction", 0.7))
+
+    cluster_refresh_tokens = int(_Block.get("cluster_refresh_tokens", 20_000_000))
+    # fraction of entries eligible for recycling at each refresh. a sharpened softmax only trains
+    # what it selects, so entries that stop being selected are frozen; 0.0 disables recycling.
+    dead_quantile = float(_Block.get("dead_quantile", 0.02))
+
+    _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
+    @classmethod
+    def temperature_scale(cls, progress: float) -> float:
+        """The anneal multiplier at ``progress`` in [0, 1] of the run.
+
+        Geometric, not linear: temperature enters the softmax as a divisor, so equal *ratios* are
+        equal steps in sharpness. A linear 1.0 -> 0.05 spends most of the run below 0.1 and does
+        almost all of its work in the first few percent.
+        """
+        import math
+
+        span = max(cls.temperature_anneal_fraction, 1e-6)
+        t = min(max(progress, 0.0) / span, 1.0)
+        return float(math.exp(
+            math.log(cls.temperature_start) * (1 - t) + math.log(cls.temperature_end) * t
+        ))
 

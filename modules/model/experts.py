@@ -19,13 +19,14 @@ class SelfAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
         x_norm = self.norm(x)
         attn_output = self.attn(
             hidden_states=x_norm,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
+            kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
 
@@ -44,7 +45,7 @@ class CrossAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
         x_norm = self.norm(x)
         attn_output = self.attn(
             hidden_states=x_norm,
@@ -52,6 +53,7 @@ class CrossAttention(nn.Module):
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
             other_states=other,
+            kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
 
@@ -61,10 +63,13 @@ class InformationRetrievalExpert(nn.Module):
         input_size: int, 
         num_entries: int,
         ir_dim: int,
-        num_heads: int = 8, 
+        num_heads: int = 8,
         num_kv_heads: int = 4,
         dropout: float = 0.1,
         residual: bool = False,
+        num_clusters: int = 0,
+        probe_clusters: int = 4,
+        read_top_k: int = 32,
     ):
         super().__init__()
         self.input_size = input_size
@@ -86,15 +91,21 @@ class InformationRetrievalExpert(nn.Module):
             temperature=1.0,
             use_min_dist=False,
             residual=residual,
+            num_clusters=num_clusters,
+            probe_clusters=probe_clusters,
+            read_top_k=read_top_k,
         )
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, loop_idx: int = 0) -> torch.Tensor:
         x_norm = self.norm(x)
 
         down = self.down_proj(x_norm)
-        ir_output = self.ir_module(down)
+        # loop_idx only buckets the retrieval entropy instrumentation (see RetrievalEntropyTracking);
+        # the retrieval itself is loop independent, which is exactly what the Stage 0 query drift
+        # measurement found and what NEXT.md's loop conditioned query is meant to change
+        ir_output = self.ir_module(down, loop_idx=loop_idx)
         information = self.up_proj(ir_output)
 
         attn_output = self.attn(
@@ -103,6 +114,7 @@ class InformationRetrievalExpert(nn.Module):
             max_seqlen=max_seqlen,
             position_embeddings=position_embeddings,
             other_states=information,
+            kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
 

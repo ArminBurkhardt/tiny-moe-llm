@@ -120,6 +120,69 @@ def varlen_attention(
     return _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal)
 
 
+def cached_attention(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    kv_cache,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Causal attention against a growable ``LayerKVCache``, for single-sequence (unpacked)
+    incremental decoding.
+
+    ``q`` and ``k_new``/``v_new`` cover only the newly-appended tokens for this call (``Lq``
+    positions); ``kv_cache`` already holds every earlier token at this depth (see
+    ``modules/model/kv_cache.py`` for why that is valid under this model's causal structure). The
+    new K/V are appended to the cache first, then every query attends causally over the FULL
+    (old + new) key/value set -- aligned so query row ``i`` (absolute position
+    ``cache_len_before + i``) may see key column ``j`` iff ``j <= cache_len_before + i``.
+
+    Args:
+        q: queries, shape ``[B, Hq, Lq, D]``.
+        k_new, v_new: this call's new keys/values, shape ``[B, Hkv, Lq, D]``.
+        kv_cache: a ``LayerKVCache`` to append to and read the full history from.
+        dropout_p: attention dropout probability.
+        softmax_scale: attention scale. Defaults to ``D ** -0.5``.
+
+    Returns:
+        Attention output, shape ``[B, Lq, Hq, D]`` (matches ``varlen_attention``'s layout).
+    """
+    B, Hq, Lq, D = q.shape
+    Hkv = k_new.shape[1]
+    if softmax_scale is None:
+        softmax_scale = D ** -0.5
+
+    cache_len_before = kv_cache.length
+    k, v = kv_cache.update(k_new, v_new)
+    total_len = k.shape[2]
+
+    if Hkv != Hq:
+        k = k.repeat_interleave(Hq // Hkv, dim=1)
+        v = v.repeat_interleave(Hq // Hkv, dim=1)
+
+    if Lq == 1:
+        # the single new token is the last (and therefore latest) position in the cache -> every
+        # key is already causally visible, no mask needed
+        attn_mask, is_causal = None, False
+    elif cache_len_before == 0:
+        # plain prefill from an empty cache -> standard top-left-aligned causal mask
+        attn_mask, is_causal = None, True
+    else:
+        # continuing an already-primed cache with more than one new token (e.g. accepting several
+        # MTP-drafted tokens at once) -> explicit bottom-right-aligned causal mask
+        device = q.device
+        i = torch.arange(Lq, device=device).unsqueeze(1)
+        j = torch.arange(total_len, device=device).unsqueeze(0)
+        attn_mask = (j <= (cache_len_before + i))[None, None, :, :]
+        is_causal = False
+
+    out = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=softmax_scale, is_causal=is_causal,
+    )
+    return out.transpose(1, 2)  # [B, Lq, Hq, D]
+
+
 def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal):
     # default scaled product attention with a block diagonal mask (one block per document segment)
     device = q.device
