@@ -1,10 +1,11 @@
 # tiny-moe-llm
 
-An experimental **332M-parameter** language model exploring a **looped, sparsely-routed
+An experimental **364M-parameter** language model exploring a **looped, sparsely-routed
 mixture-of-experts** architecture on top of a dense Gemma4-style backbone.
 
 A dense decoder feeds a *single* MoE block that is applied `n_loops` times, so depth is recurrence
-rather than parameters. 332M total / 173M active per token.
+rather than parameters. 364M total / 205M active per token, of which a 33.5M-parameter
+information-retrieval table is a lookup rather than a matmul.
 
 One 16B-token run exists, pretrained on a rented H100 and fine-tuned locally.
 [docs/CONCLUSION.md](docs/CONCLUSION.md) is the honest write-up of what it did and did not work —
@@ -35,6 +36,126 @@ There is no identity expert. There is also no longer a learned halt head or corr
 were tried, both failed structurally rather than by mistuning, and both were removed. See
 [docs/moe.md](docs/moe.md) for what replaced them and [docs/CONCLUSION.md](docs/CONCLUSION.md) for
 the measurements that decided it.
+
+<details>
+<summary><b>Model flow</b> — one pass, end to end</summary>
+
+364M total, 204.8M active per token, ~484M forward FLOP/token at `seq_len=4096`.
+
+```
+tokens [B,S] = 4×4096, document-packed (uint16)
+  + document_ids ──► cu_seqlens ──► varlen flash-attn everywhere
+        │
+        ▼
+embed_tokens (65536 × 768) + per-layer embeddings (32/layer)
+        │
+        ▼
+┌─ DENSE DECODER — Gemma4-style, 8 layers, runs ONCE ──────┐
+│  GQA (12 heads, head_dim 64) + RoPE + RMSNorm(TE)        │
+│  SwiGLU MLP (2304) · layer_scalar gain per layer         │
+└──────────────────────────────────────────────────────────┘
+        │  h [B,S,768], RMS ≈ 1
+        ▼
+╔═ MoE BLOCK — ONE module, applied n_loops = 3 times ══════╗
+║                                                          ║
+║  router: 35 experts, top_k = 2                           ║
+║    + loop_router_bias(sinusoidal loop index)             ║
+║    + exploration noise × 0.3 (annealed → 0)              ║
+║                                                          ║
+║  accumulator seeded ALWAYS-ON, outside the router:       ║
+║    shared_mlp (SwiGLU 2304) + shared_attn                ║
+║                                                          ║
+║  [0] SelfAttn  [1] CrossAttn  [2] IR  │ [3..34] MLP ×32  ║
+║   └──── run UNCONDITIONALLY ────┘     └─ genuinely sparse║
+║        (routing only scales output)      grouped GEMM    ║
+║                                                          ║
+║  h = h + loop_scale[k] · dropout(post_norm(Σ))           ║
+║       loop_scale = [0.63, 0.32, 0.11]                    ║
+╚══════════════════════════════════════════════════════════╝
+        │  norm() applied at EVERY loop → [3,B,S,768]
+        ▼
+lm_head (factored ÷4) ──► per-loop CE, weighted
+                          (non-final loops subsampled to 0.25)
+MTP heads (+2 tokens) ──► chunked checkpointed CE on the final loop
+```
+
+Depth is recurrence, not parameters: the MoE block's weights appear once in the parameter count and
+run three times. The non-MLP experts run for every token regardless of routing — attention has to
+see the whole sequence — so the top-k mask only scales their output; sparsity buys compute for the
+32 MLP experts alone.
+
+</details>
+
+<details>
+<summary><b>The information-retrieval expert</b> — two stage read over a 65536-entry table</summary>
+
+```
+h ─► RMSNorm ─► down_proj 768→256 ─► F.normalize ─► query   RMS ≈ 1.0
+                                                      │
+        two stage read:  256 centroids → top-8 clusters
+                         → 8×256 = 2048 keys scored exactly
+                         → global top-32 → softmax/(T · anneal)
+                                                      │
+                            retrieved_y [.,256]   ◄── RMS ≈ 0.004
+                                                      │
+        g_proj 256→256 ─► up_proj 256→768 ─► information (K/V)
+                                                      │
+                    GQA: Q from h_norm, K/V from information
+                                                      │
+                            expert output ─► × gate ─► accumulator
+```
+
+The two stage read is what makes a table this size affordable: an exact read would cost 67M
+FLOP/token/loop against this path's 1.72M, in a 484M-FLOP model. Clusters are exactly equal in size
+so candidate scoring is one `bmm` with no ragged gather and no host sync.
+
+**It does not currently work, and the reason is in that diagram.** The read is a convex combination
+of value rows, so `‖retrieved_y‖ ≤ max‖y_row‖ ≈ 0.05`, and a near-uniform read over 32
+near-orthogonal rows divides that by another `√32` — the query side is normalized, the value side
+never was. The read therefore reaches the residual at ~1e-3 of its magnitude, and zeroing it costs
+0.0002 nats of held-out CE. The same attenuation is present in the pre-reshape checkpoint after 16B
+tokens, so this is a scale bug rather than a verdict on the mechanism. The fix and its gate are
+[NEXT.md's Phase 3b](docs/plans/NEXT.md); the measurements are in
+[docs/measurements/ir_sharpening.md](docs/measurements/ir_sharpening.md).
+
+</details>
+
+<details>
+<summary><b>Inference</b> — caching, drafting, and the depth policy</summary>
+
+`scripts/inference.py` is the reference path and `scripts/gradio_app.py` imports `stream_generate`
+from it, so the CLI and the UI cannot drift.
+
+| flag | what it does |
+|---|---|
+| *(default)* | KV-cached decode. Exact, not approximate: every attention call is causal, so a past token's output at a given depth never changes when later tokens are appended |
+| `--no-kv-cache` | the slow full-prefix reference path |
+| `--num-mtp-tokens N` | self-speculative drafting off the same step's final hidden state, greedily accepted with **no** rejection sampling — trades quality for forward passes. Default 0 |
+| `--converge-tol T` | the convergence exit (below). Forces the KV cache **off** |
+| `-n / --temperature / -p` | length, sampling temperature, prompt |
+
+**The KV cache** holds one slot per dense decoder layer, plus one per `(loop, non-MLP expert)` pair
+*and* per `(loop, shared_attn)` — the MoE block is the same weights re-applied over an evolving
+hidden state, not three independent layers, so each loop needs its own cache. Single-sequence only.
+
+**The depth policy is parameter-free.** After each loop the model reads out the **last position
+only** and stops when the top-1 token is unchanged *and* its log-probability moved by less than
+`converge_tol`. Three things make it work:
+
+- It reads the **readout**, not `‖Δh‖`. `loop_scale` still injects a sizeable hidden delta on the
+  last loop while the prediction is already stationary, so a hidden-state criterion never fires.
+- It is asserted **inference-only** — a short `hidden_states_all` would silently break per-loop CE.
+- It is asserted **mutually exclusive with the KV cache**: an exited loop appends no K/V for that
+  token, so a later full-depth step would attend over a cache with a hole in it. Filling those
+  cheaply is real plumbing through every attention expert, and is unimplemented.
+
+Pick the threshold from `scripts/eval_calibration.py`'s per-transition table. Measured on the 16B
+checkpoints: loop 1→2 top-1 agreement ~0.82 with mean `|Δ log p|` ~0.21, loop 2→3 ~0.94 / ~0.07.
+
+Streaming re-decodes the full generated id sequence each step and yields only the new suffix — a
+lone step's tokens can decode differently out of context, because of subword and space merges.
+
+</details>
 
 ## Documentation
 
@@ -159,7 +280,7 @@ tests/                         plain assert scripts, no pytest
 
 ## Configuration snapshot
 
-The default [config.yaml](config.yaml) produces a 332M-parameter model, 173M active per token:
+The default [config.yaml](config.yaml) produces a 364M-parameter model, 205M active per token:
 
 | | |
 |---|---|
@@ -167,9 +288,14 @@ The default [config.yaml](config.yaml) produces a 332M-parameter model, 173M act
 | layers / heads / head_dim | 8 / 12 / 64 |
 | MLP / attn / IR experts | 32 / 1 / 1 |
 | top-k / loops | 2 / 3 |
+| IR table: entries × dim | 65536 × 256 |
+| IR read: clusters / probed / top-k | 256 / 8 / 32 |
 | MTP extra tokens | 2 |
 | vocab / context length | 65536 / 4096 |
 | token budget | 16B (phase 1: 85%, phase 2: the anneal) |
+
+The 16B-token run predates the IR reshape and was trained at 332M / 173M with an `8192 × 128`
+exact-read table.
 
 ## Credit
 
