@@ -885,7 +885,17 @@ def sft(args):
                 )
                 if args.ir:
                     ir_module = unwrapped_model.moe.ir_modules[0]
-                    ir_entropy_str += f"IR temp: {ir_module.temperature.detach().item():.4f} | "
+                    # g_proj carries the migration's neutrality zero, so it is the tensor the whole
+                    # read is waiting on: dL/dy_values flows through it and is exactly zero until it
+                    # moves. Logged against the value rows' own norm so a run that sharpens without
+                    # ever leaving zero is visible in the first few log lines rather than at the
+                    # ablation. Both are host syncs, hence the log cadence.
+                    g_rms = ir_module.g_proj.weight.detach().float().pow(2).mean().sqrt().item()
+                    y_norm = ir_module.y_values.detach().float().norm(dim=-1).mean().item()
+                    ir_entropy_str += (
+                        f"IR temp: {ir_module.temperature.detach().item():.4f} | "
+                        f"|g_proj|rms: {g_rms:.2e} | |y|row: {y_norm:.4f} | "
+                    )
 
                 def _metric(key):
                     value = metrics.get(key)

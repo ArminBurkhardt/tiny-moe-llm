@@ -6,11 +6,21 @@ surgery free -- there is no learned content to preserve, so the table is rebuilt
 resized, and the only thing that has to be argued is what the *new* table starts from.
 
 **The reshaped checkpoint is behaviorally identical to the read-zeroing ablation of its source, by
-construction.** ``y_values`` is zeroed, so the read is the zero vector regardless of which entries
-the softmax picks; ``g_proj`` and ``up_proj`` are linear and bias-free, so the IR expert's
-cross-attention sees an all-zero value stream no matter how the re-initialized projections landed.
+construction.** ``g_proj.weight`` is zeroed, so the IR expert's cross-attention sees an all-zero
+value stream whatever the table retrieves -- ``g_proj`` and ``up_proj`` are linear and bias-free.
 The measured cost of that is Gate G1's own number, 0.0002-0.0004 nats. Nothing else about the model
 moves.
+
+**The zero sits on the output projection rather than on the values, and that is the point.**
+Zero-initializing ``y_values`` buys the same neutrality but puts it on the *content*: tens of
+millions of parameters that would have to travel ~250x in norm, under weight decay, driven only by
+whatever gradient a read worth ~1e-3 of the residual produces. The first sharpening run measured
+exactly that -- the values left zero but moved 9x less than a random walk at the same step size,
+because entries selected by a near uniform read receive averaged gradient from unrelated contexts
+and decay reels in what has no consistent direction. On ``g_proj`` the zero sits on one
+``ir_dim x ir_dim`` tensor that trains fast at the fresh-parameter LR, and the table learns behind
+it. ``dL/dy_values`` is zero at step 0 because it flows through ``g_proj``, so ``g_proj`` has to
+move first: log its norm early rather than assuming it left zero.
 
 Two key inits, measured against each other rather than assumed (docs/plans/NEXT.md Phase 3):
 
@@ -115,6 +125,12 @@ def pca_project(embeddings: torch.Tensor, dim: int) -> torch.Tensor:
     which is what the centroid probe has to find structure in.
     """
     x = embeddings - embeddings.mean(dim=0, keepdim=True)
+    if dim >= x.shape[1]:
+        # ir_dim has caught up with the embedder's own width, so there is nothing to project onto:
+        # the top-384 principal directions of a 384-d space are a rotation, and scoring is cosine,
+        # which a rotation leaves untouched. Centering still earns its place -- bge embeddings carry
+        # a strong mean direction that would otherwise dominate every cluster.
+        return x
     _, _, v = torch.pca_lowrank(x, q=min(dim + 16, x.shape[1]), niter=4)
     return x @ v[:, :dim]
 
@@ -153,10 +169,20 @@ def main():
                         help="tokens per sampled chunk; a single bge-small vector is faithful to "
                              "roughly this many")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--force", action="store_true",
+                        help="overwrite an existing output instead of refusing")
     args = parser.parse_args()
 
     src = args.checkpoint if os.path.isabs(args.checkpoint) else os.path.join(BASE_DIR, args.checkpoint)
     out_path = args.output or f"{os.path.splitext(src)[0]}_ir{args.arm}.pt"
+    # the default name is keyed to the arm, i.e. to the KEY init -- but the value side and the
+    # neutrality zero have changed underneath it, so re-running the same arm produces a different
+    # seed under the same filename and would silently replace the one an earlier run started from
+    if os.path.exists(out_path) and not args.force:
+        raise SystemExit(
+            f"{out_path} already exists. Pass -o to write a new seed alongside it, or --force to "
+            f"replace it -- an existing seed is what makes an earlier run reproducible."
+        )
 
     payload = torch.load(src, map_location="cpu", weights_only=False)
     state = payload.get("model_state_dict", payload)
@@ -196,11 +222,14 @@ def main():
         ir = model.moe.ir_modules[0]
         keys = build_keys(args.arm, model, args, tokenizer, args.device)
         ir.z_keys.copy_(keys.to(ir.z_keys.dtype))
-        # zero values: the read is then the zero vector whatever the softmax does, so the reshaped
-        # checkpoint IS the read-zeroed ablation of its source and needs no separate baseline
-        ir.y_values.zero_()
         ir.log_temperature.zero_()
         stats = ir.refresh_clusters(recycle=False)
+        # values AFTER the clustering: the init is orthonormal per cluster, so it has to know the
+        # partition the keys just produced rather than the trivial one the module was built with
+        ir.reset_values()
+        # the neutrality zero. g_proj is bias free, so a zero weight makes the whole IR read
+        # contribute nothing and the reshaped checkpoint IS the read-zeroed ablation of its source
+        ir.g_proj.weight.zero_()
     logger.info(f"initial clustering: {stats}")
 
     payload["model_state_dict"] = model.state_dict()
@@ -235,8 +264,9 @@ def main():
           f"{ModelConfig.Params['ir_num_clusters']} clusters, probe "
           f"{ModelConfig.Params['ir_probe_clusters']}, read top-{ModelConfig.Params['ir_read_top_k']}")
     print(f"  rebuilt:        {len(rebuilt)} tensors ({', '.join(k.split('.')[-1] for k in rebuilt)})")
-    print(f"  y_values zeroed -- the read is the zero vector, so this checkpoint scores exactly as")
-    print(f"                  the read-zeroed ablation of its source (0.0002-0.0004 nats)")
+    print(f"  values:         unit rows, orthonormal within each cluster")
+    print(f"  g_proj zeroed -- the expert's value stream is zero, so this checkpoint scores exactly")
+    print(f"                  as the read-zeroed ablation of its source (0.0002-0.0004 nats)")
     print(f"  optimizer/scheduler state dropped -- finetune seed, not a resume point")
     print(f"  wrote {out_path}")
 
