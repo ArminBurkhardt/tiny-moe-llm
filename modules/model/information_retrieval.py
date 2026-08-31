@@ -253,10 +253,15 @@ def _capacity_assign(sim: torch.Tensor, capacity: int, rounds: int) -> torch.Ten
 class InformationRetrievalModule(nn.Module):
     """learned key/value table read by a temperature-controlled softmax over cosine similarity.
 
+    Both sides of the table are unit normalized in the forward: the keys because the score is a
+    cosine similarity, and the values because otherwise the read's magnitude is whatever the rows
+    happened to drift to (see ``_value_table`` -- it was ~0.003 against a unit residual for the
+    entire 16B token run, which is the bug this normalization fixes).
+
     Exact path (``num_clusters == 0``):
         1. normalize: ``x_hat = x / ||x||``, ``z_hat = z / ||z||``
         2. similarity: ``s = (x_hat @ z_hat^T) / temperature``
-        3. softmax over the WHOLE table, read ``y = w @ Y``
+        3. softmax over the WHOLE table, read ``y = w @ Y_hat``
         4. project back with ``g``
 
     Two stage path (``num_clusters > 0``), which is what the 65536-entry table runs:
@@ -348,8 +353,10 @@ class InformationRetrievalModule(nn.Module):
         # across every IR expert). None means the module is a plain retrieval module again
         self.tracker: RetrievalEntropyTracking = None
 
-        # y vectors: trainable information vectors (the 'values')
-        self.y_values = nn.Parameter(torch.randn(num_entries, output_dim) * 0.02)
+        # y vectors: trainable information vectors (the 'values'). Read UNIT NORMALIZED (see
+        # reset_values and the read paths), so the table stores directions and the magnitude of a
+        # read is a property of the softmax rather than of how far the rows happened to drift.
+        self.y_values = nn.Parameter(torch.empty(num_entries, output_dim))
 
         # g(x) = final transformation layer
         # project the retrieved information back into the latent space
@@ -393,6 +400,7 @@ class InformationRetrievalModule(nn.Module):
             self._observe_counter = 0
 
         self.reset_keys()
+        self.reset_values()
 
     def reset_keys(self):
         """Ensures all z vectors are correctly initialized."""
@@ -403,6 +411,42 @@ class InformationRetrievalModule(nn.Module):
                     F.normalize(self.z_keys[self.cluster_members].float().mean(dim=1), p=2, dim=-1)
                     .to(self.centroids.dtype)
                 )
+
+    @torch.no_grad()
+    def reset_values(self):
+        """Seed the value table with unit rows, mutually orthonormal inside each cluster.
+
+        Unit rows because the read normalizes them anyway; the init only decides the *geometry* the
+        read starts from. Random unit vectors are already near-optimal on average in a few hundred
+        dimensions (``E|cos| = 1/sqrt(d)``), but the read only ever compares rows that a shared
+        cluster already selected for being close, so it is the tail of that distribution that
+        decides how distinguishable two candidates are. One QR per cluster makes the candidates
+        inside a cluster exactly mutually orthogonal -- constructive, rather than an iterative
+        repulsion -- and each cluster's independent draw keeps cross cluster correlation at the
+        random level.
+
+        Call it AFTER the partition is known: it seeds by ``cluster_members``, so on a fresh module
+        that is the trivial contiguous partition and on a migration it must follow the clustering.
+        Later refreshes repartition the table and break the property, which is expected -- it is an
+        init, not an invariant.
+        """
+        rand = torch.randn_like(self.y_values.float())
+        capacity = self.cluster_members.shape[1] if self.num_clusters > 0 else 0
+        if capacity == 0 or capacity > self.output_dim:
+            # more entries per cluster than dimensions: no orthonormal set that large exists, so
+            # fall back to plain unit rows rather than pretending
+            self.y_values.copy_(F.normalize(rand, p=2, dim=-1).to(self.y_values.dtype))
+            return
+        # batched over clusters, in chunks, so the [chunk, output_dim, capacity] workspace stays
+        # small -- the whole table at once is a second copy of it in fp32
+        for start in range(0, self.num_clusters, 32):
+            members = self.cluster_members[start:start + 32]                  # [c, capacity]
+            g = torch.randn(members.shape[0], self.output_dim, capacity,
+                            device=self.y_values.device, dtype=torch.float32)
+            # reduced QR: Q's COLUMNS are orthonormal, so the rows of Q^T are the value vectors
+            q, _ = torch.linalg.qr(g)                                         # [c, out, capacity]
+            rows = q.transpose(1, 2).reshape(-1, self.output_dim)
+            self.y_values.index_copy_(0, members.reshape(-1), rows.to(self.y_values.dtype))
 
     @property
     def flops_per_token(self) -> int:
@@ -495,9 +539,9 @@ class InformationRetrievalModule(nn.Module):
         # 3. retrieval process
         weights = F.softmax(logits, dim=-1)
 
-        # 4. retrieve the information vector y
+        # 4. retrieve the information vector y, over UNIT NORMALIZED value rows (see _value_table)
         # [T, num_entries] @ [num_entries, output_dim] -> [T, output_dim]
-        return torch.matmul(weights, self.y_values), weights
+        return torch.matmul(weights, self._value_table(self.y_values.dtype)), weights
 
     def _two_stage_read(self, q: torch.Tensor):
         """centroid probe then exact candidate scoring. [T, D] -> ([T, out], [T, read_top_k])."""
@@ -558,9 +602,30 @@ class InformationRetrievalModule(nn.Module):
 
         self._track_usage(q, entry_ids, weights)
 
-        values = F.embedding(entry_ids, self.y_values)                         # [T, read_top_k, out]
+        # normalize the TABLE and then gather, not the other way round: the gathered rows are
+        # [T, read_top_k, out], an order of magnitude more elements than the table itself
+        values = F.embedding(entry_ids, self._value_table(q.dtype))             # [T, read_top_k, out]
         read = torch.einsum("tk,tko->to", weights, values)
         return read, weights
+
+    def _value_table(self, dtype: torch.dtype) -> torch.Tensor:
+        """``y_values`` with unit rows -- the table as the read actually sees it.
+
+        Normalizing in the forward is what puts the read on a usable scale. Unnormalized, the read
+        is a convex combination of rows whose own norm nothing pushes up, so it is bounded by
+        ``max||y_row||`` and a near uniform read over ``read_top_k`` near orthogonal rows divides
+        that by another ``sqrt(k)``. Measured on the 16B trunk that landed at RMS ~0.003 against a
+        unit RMS residual, i.e. the retrieval was arithmetically incapable of moving the model
+        whatever it found. With unit rows the read magnitude lands in ``[1/sqrt(k), 1]`` -- ~0.18 for
+        a uniform read, 1.0 for a peaked one -- so the magnitude carries the read's confidence at a
+        scale the residual can feel, with no constant to tune.
+
+        It also removes magnitude as a degree of freedom weight decay can eat (``y_values`` is 2D,
+        so it is in the decayed group), makes the value side symmetric with the key side, which is
+        normalized by construction, and matches the convention the external corpus arrives in --
+        bge outputs are L2 normalized -- so one rule covers both backing stores.
+        """
+        return F.normalize(self.y_values, p=2, dim=-1).to(dtype)
 
     @torch.no_grad()
     def _track_usage(self, q: torch.Tensor, entry_ids: torch.Tensor, weights: torch.Tensor):
@@ -607,9 +672,8 @@ class InformationRetrievalModule(nn.Module):
 
         Args:
             recycle: re-seed entries a sharpened softmax has stopped selecting toward a recent
-                underserved query, and zero their value. Zeroing the value is the same neutrality
-                trick used everywhere else here: a recycled entry contributes nothing until it has
-                learned something.
+                underserved query, and draw their value afresh as a random unit direction -- the
+                read normalizes the value table, so a zero row is not neutral there, it is stuck.
             dead_quantile: CAP on the fraction of entries recycled per refresh, not a target -- see
                 ``_recycle_dead``. 0.0 disables recycling.
 
@@ -681,7 +745,14 @@ class InformationRetrievalModule(nn.Module):
         seeds = F.normalize(seeds + 0.01 * torch.randn_like(seeds), p=2, dim=-1)
 
         self.z_keys.index_copy_(0, dead, (seeds * self.z_keys.float().norm(dim=-1).mean()).to(self.z_keys.dtype))
-        self.y_values.index_copy_(0, dead, torch.zeros_like(self.y_values[dead]))
+        # a fresh random DIRECTION, not a zero row: the read normalizes the value table, and
+        # F.normalize maps a zero row to a zero row with an ill conditioned gradient, so an entry
+        # recycled to zero would be recycled to something permanently untrainable. Neutrality does
+        # not need to live here any more -- it lives on g_proj, which is where a migration zeroes.
+        self.y_values.index_copy_(
+            0, dead,
+            F.normalize(torch.randn_like(self.y_values[dead].float()), p=2, dim=-1).to(self.y_values.dtype),
+        )
         # seeded with the mean rather than 0, so a freshly recycled entry is not immediately the
         # least-used one again at the next refresh before it has had a chance to be selected
         self.entry_usage.index_copy_(0, dead, torch.full_like(self.entry_usage[dead], float(self.entry_usage.mean())))

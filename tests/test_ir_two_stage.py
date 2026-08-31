@@ -11,7 +11,10 @@ Three checks, in order of how much they would cost to get wrong:
    plain full-table top-k softmax read to bf16 tolerance. This is the check that the dispatch,
    capacity masking, and the local-index-to-entry-id remap are all consistent: any of them being
    off permutes the candidates and the comparison fails.
-3. **Partial probing recovers most of the exact top-k.** Not exact by construction -- that is the
+3. **The read lands on a usable scale.** Unit value rows, so the read's magnitude is bounded by the
+   softmax rather than by whatever norm the rows drifted to -- the failure that left the read at
+   ~0.003 of a unit residual for a whole pretraining run.
+4. **Partial probing recovers most of the exact top-k.** Not exact by construction -- that is the
    trade the two stage path makes -- but the refresh's recall diagnostic is what decides whether
    ``probe_clusters`` is high enough, so the same number is asserted here on clustered data.
 
@@ -56,6 +59,9 @@ mod = InformationRetrievalModule(
 ).to(DEV).to(torch.bfloat16)
 with torch.no_grad():
     mod.refresh_clusters(recycle=False)
+    # values are seeded orthonormal PER CLUSTER, so they have to be re-drawn after a re-clustering
+    # moves the membership -- the same ordering scripts/migrate_ir_reshape.py has to observe
+    mod.reset_values()
 
 q = F.normalize(torch.randn(512, D, device=DEV, dtype=torch.bfloat16), p=2, dim=-1)
 with torch.no_grad():
@@ -65,7 +71,9 @@ with torch.no_grad():
     scores = q.float() @ F.normalize(mod.z_keys.float(), p=2, dim=-1).t()
     top_s, top_i = torch.topk(scores, mod.read_top_k, dim=-1)
     ref_w = F.softmax(top_s / mod.temperature.float(), dim=-1)
-    ref_read = torch.einsum("tk,tko->to", ref_w, F.embedding(top_i, mod.y_values.float()))
+    # the values as the read sees them: unit rows, so the reference has to normalize too
+    ref_values = F.normalize(mod.y_values.float(), p=2, dim=-1)
+    ref_read = torch.einsum("tk,tko->to", ref_w, F.embedding(top_i, ref_values))
 
 w_err = (weights.float() - ref_w).abs().max()
 r_err = (read.float() - ref_read).abs().max()
@@ -75,6 +83,33 @@ assert w_err < 5e-2, f"read weights diverge from exact: max |dw| = {w_err:.4f}"
 assert r_err < 5e-2, f"retrieved vector diverges from exact: max |dy| = {r_err:.4f}"
 print(f"[ok] probe_clusters == num_clusters reproduces exact top-k scoring "
       f"(max |dw| {w_err:.2e}, max |dy| {r_err:.2e})")
+
+
+# --- 2b. the read lands on a scale the residual can feel -----------------------------------
+# The whole 16B token run read this table at RMS ~0.003 against a unit RMS residual, because
+# nothing normalized the value side. With unit rows the read's norm is bounded by the softmax
+# alone: 1/sqrt(k) for a perfectly uniform read, 1.0 for a fully peaked one. Asserting the band is
+# what would catch the normalization being dropped again -- a read below it cannot move the model
+# whatever it retrieves, and one above it means the rows are not unit after all.
+row_norms = mod.y_values.float().norm(dim=-1)
+assert (row_norms - 1.0).abs().max() < 1e-2, f"value rows are not unit: {row_norms.min():.3f}-{row_norms.max():.3f}"
+read_norm = read.float().norm(dim=-1)
+lo = 1.0 / (mod.read_top_k ** 0.5)
+# the mean, not the min: candidates are drawn from several clusters, and only WITHIN a cluster are
+# the rows exactly orthogonal, so an individual token's read can fall below 1/sqrt(k) on the cross
+# terms. The quantity that matters is the scale, and the failure this guards against is three
+# orders of magnitude away from either bound.
+assert lo * 0.5 < read_norm.mean() and read_norm.max() < 1.05, (
+    f"read norm mean {read_norm.mean():.3f}, max {read_norm.max():.3f}, expected ~[{lo:.3f}, 1.0]"
+)
+# and the orthonormal-within-a-cluster init actually holds where the read looks
+cl = mod.cluster_members[0]
+gram = F.normalize(mod.y_values[cl].float(), p=2, dim=-1)
+gram = gram @ gram.t()
+off = (gram - torch.eye(cl.numel(), device=DEV)).abs().max()
+assert off < 5e-2, f"values inside a cluster are not orthonormal: max |off-diagonal| {off:.3f}"
+print(f"[ok] unit value rows, mean read norm {read_norm.mean():.3f} against 1/sqrt(k) = {lo:.3f}, "
+      f"within-cluster max |off-diagonal| {off:.2e}")
 
 
 # --- 3. partial probing, and the recall diagnostic ----------------------------------------
