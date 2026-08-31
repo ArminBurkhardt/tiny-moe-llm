@@ -24,21 +24,28 @@ model:
                         # and zeroing its read cost 0.0004 nats of held-out CE -- it stored nothing,
                         # so growing it costs nothing to throw away. It only grows because the two
                         # stage read below makes 65536 entries cheaper to score than 8192 were.
-  ir_dim: 256 # was 128. A 128-d key/value is a thin thing to store an atom of content in, and the
-              # dimension has to match the external evidence path's adapter output later anyway.
+  ir_dim: 384 # was 128, then 256. 384 is bge-small's native width, and the external evidence path
+              # is committed to bge-small plus an adapter -- at 256 that adapter compresses 384 ->
+              # 256 and throws information away before the table ever sees it, while at 384 it is a
+              # rotation. The cost is ~17M parameters and ~0.8 MFLOP/token/loop in a 484 MFLOP
+              # model, neither of which binds. Going the whole way to hidden_size (768) would spend
+              # 67M parameters upsampling a 384-d embedding into a width carrying no information the
+              # external path has; it buys geometry, which is not what was broken.
   # two stage scoring: probe ir_probe_clusters of ir_num_clusters centroids, score those clusters'
-  # members exactly, softmax-read the best ir_read_top_k of them. Full scoring at 65536 x 256 is
+  # members exactly, softmax-read the best ir_read_top_k of them. Full scoring at 65536 x 384 is
   # ~275 GFLOP per loop at 8192 tokens and materializes a multi-GB softmax per loop; this is ~2% of
   # that. It is also the same retrieve-then-read shape the external corpus will use, deliberately.
   # 0 clusters = the exact full-table path every pre-reshape checkpoint was trained under.
-  ir_num_clusters: 256 # must divide num_ir_entries; capacity is 65536/256 = 256 entries per cluster
+  ir_num_clusters: 256 # must divide num_ir_entries; capacity is 65536/256 = 256 entries per cluster.
+                       # Capacity must also stay <= ir_dim, or the value init cannot seed a cluster
+                       # with mutually orthonormal rows and falls back to plain random unit ones.
   ir_probe_clusters: 8 # -> ~2048 candidates (3% of the table) scored exactly per token. Was 4, and
                        # 4 measured candidate recall@32 hovering at 0.86-0.95 across a shakedown
                        # run's refreshes -- straddling the 0.9 bar, i.e. the centroid stage
                        # sometimes dropping entries the read wanted, which turns the temperature
                        # anneal into noise rather than sharpening and would be indistinguishable
                        # from the anneal simply failing. Doubling it costs ~1 MFLOP/token/loop out
-                       # of 481, which is not a trade worth thinking about. The refresh keeps
+                       # of 488, which is not a trade worth thinking about. The refresh keeps
                        # measuring the recall and the trainer warns below 0.9.
   ir_read_top_k: 32
 

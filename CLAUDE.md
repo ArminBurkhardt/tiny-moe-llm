@@ -309,8 +309,8 @@ Constraints worth remembering:
     (one shared module reused every loop: param count appears once, compute happens `n_loops`
     times); the decoder runs once. **The IR tables are subtracted out of the `2 * active_params`
     matmul term and added back as each IR module's own `flops_per_token`** — a lookup table is not
-    a matmul, and billing 33.5M table parameters at `2 * params` would charge a two stage read
-    40x what it costs, hiding the entire reason the table can be that size.
+    a matmul, and billing 50.3M table parameters at `2 * params` would charge a two stage read
+    39x what it costs, hiding the entire reason the table can be that size.
   - `lm_head_flops_per_token` (**per application** — `lm_head` runs once *per loop* for per-loop
     CE, not once) and `mtp_flops_per_token`. Both are chunk-checkpointed inside `compute_mtp_loss`,
     so they cost fwd + recompute + bwd (**4x**) while the body costs 3x (activation checkpointing
@@ -434,7 +434,7 @@ here has to move that number, not the entropy.
 - **Two stage read**: score `num_clusters` centroids, take the top `probe_clusters`, score only
   those clusters' keys exactly, take the global top `read_top_k`, softmax over *those* and gather
   their values. It is what makes a 65536-entry table affordable — an exact read of it would cost
-  67M FLOP/token/loop against the two stage path's 1.72M, and the whole model is 484M.
+  101M FLOP/token/loop against the two stage path's 2.58M, and the whole model is 488M.
 - **The clusters are exactly equal in size** (`balanced_spherical_kmeans` asserts
   `num_entries % num_clusters == 0`). That is not a quality preference: equal sizes are what let
   `cluster_members` be a `[C, capacity]` tensor and the candidate scoring be one `bmm`, with no
@@ -447,10 +447,32 @@ here has to move that number, not the entropy.
 - **No `torch.bincount` in the step path.** Its output size is `max(input) + 1`, which requires
   reading `max(input)` to the host. `_group_starts` does the same job with
   `zeros().scatter_add_()` plus a cumsum.
-- **`y_values` zero-init is the neutrality guarantee.** A freshly reshaped checkpoint retrieves the
-  zero vector whatever its keys are, so the IR expert contributes only `g_proj(0)`, a bias — the
-  migrated model *is* the read-zeroed ablation of its source, and measurably so (+0.0002 nats).
-  Same pattern as `loop_router_bias`.
+- **Both sides of the table are unit-normalized in the forward.** The keys because the score is a
+  cosine similarity; the values (`_value_table`) because otherwise the read's magnitude is whatever
+  the rows drifted to — measured at RMS ~0.003 against a unit-RMS residual for the entire 16B-token
+  run, i.e. arithmetically incapable of moving the model whatever it retrieved. With unit rows the
+  read lands in `[1/√k, 1]`, so its magnitude *is* the read's confidence, with no constant to tune.
+  Normalize the table and then gather, never the reverse — the gathered rows are `[T, read_top_k,
+  out]`, an order of magnitude more elements than the table. It also matches the convention the
+  external corpus arrives in (bge outputs are L2-normalized), so one rule covers both stores.
+- **`g_proj.weight` zero-init is the neutrality guarantee**, written by the migration, not the
+  module. `g_proj` is bias-free, so a zero weight makes the IR expert's value stream zero whatever
+  the table retrieves — the migrated model *is* the read-zeroed ablation of its source, measurably
+  so (+0.0003 nats). Same pattern as `loop_router_bias`. **The zero deliberately does not sit on
+  `y_values`**: that puts it on 50M parameters that must travel ~250x in norm under weight decay,
+  driven only by whatever gradient a read worth 1e-3 of the residual produces — the first sharpening
+  run measured them moving 9x *less* than a random walk at the same step size. `∂L/∂y_values` flows
+  through `g_proj` and so is zero at step 0; `g_proj` moves first and the table learns behind it,
+  which is why `sft.py --ir` logs `|g_proj|rms` at every log step rather than assuming it left zero.
+- **`reset_values()` seeds each cluster with a rotated orthonormal set** (one batched QR per cluster
+  chunk), so candidates *inside* a cluster — the only ones a read ever compares — are exactly
+  mutually orthogonal, and each cluster's independent draw keeps cross-cluster correlation at the
+  random level. It seeds by `cluster_members`, so **call it after the partition is known**: on a
+  fresh module that is the trivial contiguous one, and in `migrate_ir_reshape.py` it must follow
+  `refresh_clusters`. Requires cluster capacity `<= ir_dim` (256 <= 384), else it falls back to
+  plain unit rows. Later refreshes repartition and break the property — it is an init, not an
+  invariant. Recycled entries get a fresh random unit direction, **not** a zero row: under a
+  normalized read a zero row stays zero with an ill-conditioned gradient, i.e. permanently dead.
 - **`temperature_scale`, the anneal multiplier the trainer drives, IS a persistent buffer**, and
   `set_temperature_scale` writes *through* it rather than rebinding the attribute. The sharpness the
   anneal ends at is part of what the trained table means — the values were only ever supervised at
