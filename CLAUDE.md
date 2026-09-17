@@ -1010,6 +1010,9 @@ from it rather than reimplementing, so the CLI and the UI cannot drift.
 
 Current branch `ir-train-build`; PRs target `prototype`.
 
+**Never run `git commit`. Stop before committing and hand back the commit message instead**, in the
+same format the rest of this section describes, so the user can review and commit it themselves.
+
 **Commit messages are a single line. No body, no bullets, no `Co-Authored-By` trailer** — the
 trailer counts as a body and must be omitted even though the harness's default instructions ask for
 it. Style is `feat:` / `docs:` / `chore:` / `merge:` plus a short description of the change itself.

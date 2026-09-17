@@ -4,7 +4,9 @@ The plan. The record of how we got here is [docs/CONCLUSION.md](../CONCLUSION.md
 run and everything it measured); read [CLAUDE.md](../../CLAUDE.md) first, it is authoritative for
 everything already built. Phases 0, 1 and 2 are **done** — their headline results are under
 "Where this stands" below and the full measurement records live in
-[docs/measurements/](../measurements/).
+[docs/measurements/](../measurements/). Published work on looped transformers, and where this model
+agrees or disagrees with it, is in [docs/looped-transformers.md](../looped-transformers.md); what it
+changed in this plan is under "What the looped-transformer literature changed" below.
 
 **The plan in one line:** prove every mechanism against its own ablation on a fixed benchmark
 suite — reshape the IR expert, feed the IR/CrossAttention pair real external evidence, align the
@@ -56,7 +58,10 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 | evidence port | **Option C** — IR expert = selector, CrossAttention expert = reader |
 | query/key space | **B2** — external embedder (bge-small, 384-d) + adapter. Revisit B1 after 5a. |
 | abstention owner | **Sequenced and measured separately.** Data repair done — lever exhausted with precision pinned at ~0.578. Phase 4's groundedness signal and Phase 6's preference pass are the two levers left. |
-| depth policy | **Convergence exit + "evidence still arriving"** — no learned head, two criteria |
+| depth policy | **Convergence exit + "evidence still arriving"** — no learned head, two criteria. A learned depth mechanism is only admissible if halting actually skips the computation it gates (see Parked) |
+| looping | **A spec requirement, not a hypothesis under test.** Recurrence has to pay at this size, so there is no non-looping comparison arm. Later loops that do not earn their compute are a defect in the architecture or its training, to be fixed (Phase 3c, 5c, 7c's coda) — never a reason to ship a shallower or non-looped model |
+| matched compute | **SMELT's definition:** equal compute per token, equal non-embedding parameters **and** equal KV-cache size. A depth or shape comparison that matches fewer than all three is not quoted as compute-matched |
+| coda blocks | **A from-scratch A/B in Phase 7c**, not a graft onto the POC checkpoint — see 7c for why |
 | IR table | **384-d (bge-small's width), 65536 entries, two stage centroid scoring**; unit-norm value rows, and the neutrality zero on `g_proj` rather than on `y_values` — see Phase 3b for why the zero moved |
 | IR key init | **Random, provisionally.** Phase 3's A/B tied to four decimals and the warm start fit the clustering worse — but it ran while the read was worth 0.0002 nats, so no init difference *could* have shown. Re-open only if Phase 3b's scale fix passes |
 | MTP | **Keep on** for training. Stop *computing* it where its output is discarded (Phase 1b) — a compute fix, not a removal. |
@@ -116,6 +121,48 @@ Three findings bind everything below:
    policy is not using — enough to make the preference pass an amplification rather than an
    invention, nowhere near enough to ship. Each is measured separately so the movement stays
    attributable.
+
+## What the looped-transformer literature changed (2026-09-15)
+
+Source: [docs/looped-transformers.md](../looped-transformers.md). The load-bearing results are
+SMELT (looped MoE at matched compute), Mixture-of-Recursions (the scale crossover) and Virtual Logic
+Depth (what loops buy); press reporting on frontier models using recurrent depth is not evidence and
+nothing below rests on it.
+
+- **Loops buy multi-step computation, not stored knowledge.** Virtual Logic Depth measured
+  memorization capacity flat in the number of block applications and multi-step math improving with
+  it. Two consequences: G5's depth curve is now read on multi-hop and reasoning tasks, with the
+  closed-book fact sets still measuring the index attach delta; and it is independent support for
+  the thesis — facts have to live in parameters or in the index, because loops cannot substitute
+  for either.
+- **This model sits near the scale where published looping stopped paying.** Mixture-of-Recursions
+  found a plain transformer best at 135M; Nanbeige kept only 2 passes at 3B. Looping is a spec
+  requirement here (decisions table), so this is a risk the plan designs against — Phase 3c, 5c,
+  7c's coda — not a question it spends compute testing.
+- **The loop 3 saturation is confounded by the deleted halt gate.** `[0.290, 0.134, 0.084]` is mean
+  pass-through `(1 - p_halt)`, so loop 3 was the most suppressed loop for all 16B pretraining tokens
+  (8% of its update passed against loop 1's 29%), and the migrated `loop_scale` is that gate folded
+  in rather than a second signal. Whether loop 3 was gated because it was useless or stayed useless
+  because it was gated is not decidable from the run. On the migrated checkpoints loop 3 buys
+  0.021 / 0.008 nats: small, not zero.
+- **Every published design separates refinement from readout.** Geiping sandwiches the recurrent
+  stack between prelude and coda blocks, MoR keeps a distinct first and last layer, SMELT loops the
+  middle half. This model has a prelude (the dense decoder) and no coda, and per-loop CE makes every
+  loop's state directly `lm_head`-readable. Tested as a from-scratch A/B in 7c.
+- **Published designs re-inject the input on every pass; the case is weaker here than there.**
+  Geiping's recurrent core *replaces* its state each pass, so without injection it loses the input.
+  This loop is residual, so the decoder output remains most of the state at every loop
+  (`‖Δh‖/‖h‖` = 0.87 / 0.36 / 0.10 on `phase2_final`), and CrossAttention already re-reads a
+  per-token embedding every loop. It is cheap and zero-init loadable, so it gets a short arm
+  (Phase 3c) rather than an argument either way.
+- **A learned depth mechanism must skip computation, or it is not learnable.** Phase 0's halt head
+  failure, generalized: a ponder cost needs a real compute saving to trade against, and a gate on
+  the loop's *output* while every expert still runs has none. Ouro's released adaptive depth has
+  the inference-time form of the same property. Carried into Parked.
+- **`loop_router_bias` is unpublished** — no surveyed system conditions routing on the loop index —
+  so it gets a read-only ablation in Phase 3c instead of inheriting evidence from anyone.
+- **Training from scratch beat upcycling** (Nanbeige). Every POC mechanism is grafted onto a
+  checkpoint trained without it, so POC gates measure lower bounds. Added to Risks.
 
 ---
 
@@ -536,6 +583,63 @@ memory carries the mechanism alone.
 
 ---
 
+## Phase 3c — Loop input injection
+
+Short, runs after Arm C and before the Phase 4 spend. It tests the one published loop mechanism
+this model lacks that can be added to the existing checkpoint without breaking loadability. Why it
+is worth an arm and why it is not a sure thing are both in "What the looped-transformer literature
+changed" above.
+
+### What changes
+
+Every loop's router and experts read `hidden_states + inject(e)`, where `e` is the dense decoder's
+output (`x.last_hidden_state`, the tensor loop 1 already starts from) and `inject` is a zero-init
+`768 x 768` linear: 0.59M parameters, one GEMM per loop. **The residual update is unchanged** —
+`hidden_states + loop_scale[k] * delta` still adds to the stream `lm_head` reads, so the injection
+reaches a readout only through what the experts compute from it. Zero init makes the migrated
+checkpoint score identically to its source at step 0, the same neutrality pattern as `g_proj` and
+`loop_router_bias`. This is the additive form of Geiping's concatenate-and-project adapter with the
+state half pinned at the identity; learning that half as well costs another `768 x 768` and buys a
+zero-init test nothing.
+
+The tensor goes in the fresh-parameter LR group. Log its RMS at every log step, as `sft.py --ir`
+does for `g_proj`, to confirm it actually leaves zero rather than assuming it.
+
+It also answers a question Phase 4 raises: Option B swaps CrossAttention's `_moe_ple(input_ids)`
+for evidence tokens, which removes the one per-loop input re-read the model has today. A clean
+negative here says that removal needs no replacement.
+
+### Arm D
+
+**Arm C's changes plus the injection, from the same migrated seed**, on the same 208M corpus and
+settings. Arm C is then its control at matched tokens for free, where seeding from Arm C's final
+would need a second no-injection run as the control. ~72 min plus evals. Arm C has to run to
+208M for this, so if G2b's 50M-token early kill fires, Arm C still runs to completion as the
+control.
+
+### Free diagnostic: the `loop_router_bias` ablation
+
+Read-only, on Arm C's final checkpoint, shaped like `eval_stage0.py`'s IR ablation: zero the loop
+bias at eval and read per-loop CE plus the overlap between consecutive loops' expert selections. The
+mechanism exists so consecutive loops route differently. If zeroing it changes neither number, it
+is not doing that job, and 5c's loop-conditioned IR query — a copy of its design — cannot assume
+the design works.
+
+**Gate G2c:** Arm D against Arm C at matched tokens, on the Stage 0 slice:
+
+- loop 3's gain (loop 2 CE minus loop 3 CE) at least **0.01 nats larger** than Arm C's — the
+  migrated checkpoints measured 0.008–0.021, so this at least doubles the smaller one;
+- later loops measurably less aligned with the previous loop's update (`cos(Δ3, Δ2)` down from
+  Arm C's), i.e. they stop repeating;
+- final-loop CE and the benchmark suite within a finetune's noise of Arm C;
+- `inject` RMS reported against its zero init.
+
+Pass: the injection is part of the trunk from here — Phases 4–6 seed from Arm D — and a component
+row in the real run spec. Fail: the residual-stream argument was right, and the depth burden moves
+to 5c's evidence and loop-conditioned query plus 7c's coda. **Neither branch cuts a loop.**
+
+---
+
 ## Phase 4 — Oracle evidence (the main POC training spend)
 
 The key trick: before any index exists, hand the model evidence you already know is relevant —
@@ -729,8 +833,17 @@ store, and no gate asks the table to pass a needle test. "RAG over more tokens t
 window holds" is a claim about the buffer + reader, and this eval is what licenses it.
 
 **Gate G5:** EM/F1 on NQ-open / TriviaQA / **PopQA**, corpus attached vs. not — the attach delta
-must be ≥3σ. Then the depth ablation: EM at `n_loops` = 2, 3, 4, 6, 8 with corpus attached.
-**Flat past 3 → the depth story is dead. Ship 3 and don't rationalize it.**
+must be ≥3σ. Then the depth ablation, corpus attached, at `n_loops` = 1, 2, 3, 4, 6, 8, **read on
+multi-hop and reasoning tasks**: HotpotQA validation (added to the suite here — its train split is a
+Phase 4 source, its validation split is not), ARC-Challenge and GSM8K. Loops buy multi-step
+computation, not stored facts (Virtual Logic Depth), so a depth curve read on closed-book fact
+lookup would come out flat whether or not the loops work. The three knowledge sets are still
+reported at every depth; they just do not decide it. GSM8K sits at its floor (0.009) and may stay
+there — it is recorded, and HotpotQA and ARC-Challenge carry the decision until it moves.
+**Flat past 3 → the depth story is dead. Ship 3 and don't rationalize it.** The low end of the
+curve is read too, and under the looping requirement it is not a result to ship: if 3 loops do not
+beat 1 on these tasks, the architecture or its training is defective and the fix lands before
+Phase 7, not in the run spec as a shallower model.
 
 **Gate G6 — the honest baseline: put the retrieved passages in the prompt as text.** If
 side-channel RAG only matches that, the architecture claim is unproven. The claim worth aiming at
@@ -794,6 +907,11 @@ spends a little compute to multiply the big spend, then writes the run down befo
 - **Inference-side:** the KV-cache ↔ convergence-exit exclusivity gets its real fix (K/V
   projections only for exited loops) **iff** G5 shipped depth > 3 or the exit is part of the
   shipped story; otherwise it stays a documented limitation rather than speculative plumbing.
+  Measure the cheap alternative first: fill an exited loop's cache slots with the last computed
+  loop's K/V for that token. It is wrong in principle, but consecutive late loops already agree on
+  top-1 ~93% of the time with `|Δ log p|` ~0.08, so it may be harmlessly wrong — one decode-quality
+  comparison against the uncached exit path settles it. Any future learned halt mechanism depends
+  on this fix, because it has to skip real compute to be trainable (Parked).
 
 **Gate G8:** ≥2x sustained tokens/s over the 97k/s baseline at equivalent shape, measured over
 ≥1h with checkpointing and upload machinery live, FP8 A/B within tolerance.
@@ -818,17 +936,215 @@ the 1k-hour floor is ~20x the POC's pretraining data. Consequences:
 Written before anything is rented, containing:
 
 - **The go/no-go component table** — one row per mechanism, filled by gates G2–G7: sharpened
-  parametric table (or frozen out, per the Phase 3 branch), evidence port, retriever adapter,
-  shipping `n_loops`, depth curriculum, preference pass. Nothing ships on promise.
+  parametric table (or frozen out, per the Phase 3 branch), loop input injection (G2c), evidence
+  port, retriever adapter, shipping `n_loops`, depth curriculum, coda, preference pass. Nothing
+  ships on promise. Record each gate's margin, not only pass/fail: POC mechanisms are grafts, so a
+  narrow miss is weak evidence against a component that the real run would train from scratch.
 - **Shape** for the ~500M model, derived from the POC's measured FLOP components (the
   construction-time estimate is the budget's anchor — recompute it, don't reuse it) and from
   where the POC was capacity-bound vs data-bound on the benchmark snapshot.
 - **LR transfer**: a 3-point LR sweep at reduced width, ~1B tokens each, local (days, not rented
   hours) — or a µP-style parameterization if it can be adopted cheaply; decided in the spec, not
   mid-run.
+- **Coda A/B, from scratch.** One or two non-shared dense blocks between the loop and `lm_head`,
+  against none, at matched compute (the decisions table's definition), ~1–2B tokens per arm at
+  reduced width, run locally alongside the LR sweep. Every published looped design separates the
+  refinement stack from the readout; this one makes the loop do both, and per-loop CE makes every
+  loop's state `lm_head`-readable. From scratch rather than grafted for two reasons: per-loop CE and
+  the convergence exit both read `lm_head` at every loop, so the coda has to sit in front of every
+  loop's readout (a final-loop-only coda would give the exit a different readout from the one
+  training supervised); and a zero-init graft trained at a finetune LR would understate it. Cost at
+  `hidden_size` 768: ~14M parameters per block, applied ~1.5 times per step under
+  `loop_ce_subsample`.
+- **Expert count only after a specialization measurement.** SMELT pays for extra loop passes by
+  narrowing the hidden size and adding experts back, which assumes experts specialize. Ours did not
+  measurably (aux loss at its balanced value from step 0, flat mean routed weight across all 35).
+  Before the shape adds experts, measure on the existing checkpoints whether `aux_loss_weight: 0.01`
+  is suppressing differentiation and whether the flat routed weight is an artefact of renormalizing
+  after top-k.
 - Token budget from 7a's measured throughput × purchased hours, schedule, eval cadence (the
   Phase 1b suite at every checkpoint sync), and the SFT/preference plan (Phase 6's recipe re-run
   at scale).
+
+### 7d. The LM head — stop buying parameters with rank
+
+**Recommendation for the next run: drop the block-diagonal factoring and tie the readout to the
+input embedding table, with one `hidden_size × hidden_size` adapter in front of it.** The current
+`SmallLMHead` is the one place in this model where a parameter saving was bought with a structural
+constraint on the *output distribution itself*, and unlike every other trade in this repo it was
+never measured. 7d puts a cheap number on the damage first, then changes the shape.
+
+#### What `SmallLMHead` actually constrains
+
+`SmallLMHead(768, 65536, factor=4)` is a full `768×768` projection `P` followed by four
+**independent** `192 → 16384` blocks. Written out, the logit for token `v` is
+
+```
+logit[v] = w_j[v] · (P h)[block j],      j = v // 16384
+```
+
+so every one of the 16,384 tokens in vocab quarter `j` has its output embedding confined to **the
+same 192-dimensional subspace** of the 768-d readout, and the four subspaces are disjoint. Three
+consequences, none of which are a parameter count:
+
+- **Rank 192 per quarter, not 768 over the vocab.** This is the softmax bottleneck (Yang et al.
+  2018) applied four times over at a quarter of the width. Nothing couples the quarters: a feature
+  that helps rank one common word against another is unavailable to three quarters of the vocab
+  unless `P` spends a second copy of it in their blocks.
+- **The partition is by *token id*, which is roughly frequency order.** `prune_vocab.py` renumbers
+  kept old ids ascending, and the source tokenizer's low ids are the byte alphabet plus the
+  earliest (most frequent) merges. So block 0 plausibly carries most of the corpus's probability
+  mass in 192 dimensions while block 3 carries the rare tail in another 192. Nobody has checked;
+  it is a histogram over `phase1.bin`, below.
+- **Cross-block logits have no shared calibration.** They are dot products in four different
+  subspaces, compared inside one softmax, with only training holding their scales together. A
+  systematic per-block offset is invisible to average CE and shows up as a specific error mode.
+
+The MTP head is the same construction, worse: `SmallLMHead(384, 65536, factor=8)` gives **rank 48**
+per 8192-token group. It drafts, so it matters less — but 48 is not a bottleneck, it is a wall.
+
+#### The proposed shape
+
+| | params | FLOP/token/application |
+|---|---|---|
+| `SmallLMHead(768, 65536, 4)` (now) | 13.17M | 26.3M |
+| dense `768 → 65536` | 50.33M | 100.7M |
+| **`norm(h) @ A @ E^T`, `A` = 768×768, `E` = `embed_tokens`** | **0.59M** | 101.8M |
+
+The adapter `A` is the `projection` that `SmallLMHead` already has; the four blocks are replaced by
+the input embedding table transposed. **Strictly more expressive than what it replaces and 22x
+cheaper in parameters** — full rank 768 over the whole vocab, one shared geometry, no partition.
+Tying is the right prior in exactly this regime: the benefit scales with `vocab / hidden`, which
+here is **85** (65536 / 768), and it is why Gemma, Qwen-0.5B, Llama-3.2-1B and SmolLM2 all tie at
+this size. It also deletes the four divisibility asserts in `TinyMoETransformer.__init__`, the
+`FP8_DIM_MULTIPLE` warning, and `lm_head_factor` from the config surface.
+
+**It is not free, and the cost is compute, not parameters.** A full softmax over 65536 at width 768
+is ~101 MFLOP/token however it is written; the current head buys a 3.8x discount on that and pays
+in rank. Four things reduce the bill, and the first two roughly cover it:
+
+- **Fused linear+CE in `_chunked_linear_ce`.** The chunked head is `checkpoint`ed, so it costs
+  fwd + recompute + bwd (**4x**, per the FLOP accounting in `transformer.py`). A fused
+  linear-cross-entropy kernel (Liger-style, or a `torch.compile`d chunk loop that keeps the
+  gradient without the recompute) computes `dL/dh` and `dL/dW` per chunk without materializing
+  `[chunk, 65536]` twice — **4x → 3x on precisely the term that grows.** Worth doing regardless of
+  whether the head is tied.
+- **Subsample the MTP heads' CE the way the non-final loops already are.** MTP costs *two full
+  applications at full token count* for a `lambda_mtp: 0.1` auxiliary, while the per-loop CE it
+  sits next to runs at `loop_ce_subsample: 0.25`. The argument is identical — a CE mean over a
+  uniform token subsample is an unbiased estimate of the full mean — and it is what makes a tied
+  MTP head (a `384 → 768` adapter, 0.29M, onto the same `E`) affordable: 2 applications × 6.6M
+  becomes 0.5 × 101.3M rather than 2 × 101.3M.
+- `loop_ce_subsample` already means the main head runs **1.5** effective applications per step, not
+  3. The published `flops_per_token_fwd` line charges 3; that number will jump ~227 MFLOP under
+  tying while real training compute moves ~113 MFLOP/token forward. Recompute the log line, and
+  read the real one.
+- Anything that shrinks the vocab GEMM further (hierarchical/adaptive softmax, candidate-set reads
+  of the kind `information_retrieval.py` already implements) changes the normalizer, and every
+  calibration number in this project — `p_max`, ECE, the benchmark suite's log-likelihood scoring —
+  assumes a flat softmax. **Parked**, not recommended.
+
+#### Two gotchas that will bite on the first attempt
+
+- **`embed_tokens` is `nn.Embedding`'s default `N(0, 1)` init, then scaled by `sqrt(768)` in
+  `Gemma4TextModel.forward`.** A raw `E^T` readout of a unit-RMS `norm(h)` would therefore produce
+  logits with std ~27.7 at step 0 — a saturated softmax before the first backward. Fix it on the
+  init, not with a fudge factor: init `E` at std `1/sqrt(hidden_size)` (the Gemma convention that
+  the existing `sqrt(H)` input scaling already assumes and this repo never supplied), and init `A`
+  as the identity or with `_torch_default_init`. Same class of bug as `_torch_default_init` itself.
+- **Weight decay.** `build_param_groups` decays `ndim >= 2`, so a tied table is decayed as an input
+  embedding *and* as an output embedding — which shrinks every logit globally, the same degenerate
+  direction `loop_scale` is excluded for. Decide it explicitly in the run spec; excluding the tied
+  table is the safer default.
+
+#### "Reusing the embeddings", taken all the way
+
+The head is not the only place this model keeps an independent per-token table. There are **four**,
+and they never share anything:
+
+| table | shape | params |
+|---|---|---|
+| `gemma_decoder.embed_tokens` | 65536 × 768 | 50.33M |
+| `gemma_decoder.ple` | 65536 × (32 × 8) | 16.78M |
+| `moe_embeddings` | 65536 × 32 | 2.10M |
+| `lm_head` + `mtp_head.lm_head` | — | 16.47M |
+| | | **85.67M** |
+
+That is **~26% of a 332M model spent on four unrelated views of "which token is this"**. Tying the
+two heads collapses the bottom row into `E` plus 0.88M of adapters. The obvious next step is to
+make `ple` and `moe_embeddings` projections of `E` too (`E @ W_ple`, `W_ple` = 768×256 = 0.20M;
+`E @ W_moe`, 0.02M), saving a further **18.65M** and making every token-identity signal in the model
+a view of one learned vector — which is what makes tying the head *coherent* rather than a fourth
+independent view.
+
+**The 26% is not itself the defect, and it should not be read as one.** A quarter to a third of a
+model this size sitting in vocab tables is ordinary — GPT-2 small is ~31% (50257 × 768, *tied*),
+Pythia-410M ~25% (untied, so two copies), SmolLM2-360M ~13% (tied at 960 wide). The fraction is
+mostly a statement about `vocab / hidden` = **85**, which is high but not an outlier. Two things
+follow:
+
+- **It is not 26% of the compute.** Lookups are not matmuls, which the construction-time line
+  already separates (`active=173.1M`, `excl. emb=103.9M`). What it *does* cost is optimizer state:
+  85.7M parameters carry an fp32 master plus two fp32 Adam moments, ~1.03GB of the fixed ~4.7GB
+  footprint the local finetunes are sized against.
+- **The peers at the low end of that range are the tied ones.** They spend the fraction on one
+  table doing double duty; this model spends it on four tables doing four jobs, 16.5M of which goes
+  to a head construction that is *worse than free tying*. That — not the percentage — is the thing
+  to be unhappy about.
+
+The fraction also self-corrects, in this order and for these reasons:
+
+| | vocab-attached | total | share |
+|---|---|---|---|
+| today | 85.67M | 332.3M | 26% |
+| tie both heads (7d) | 70.09M | 316.7M | 22% |
+| + `ple` / `moe_embeddings` as projections | 51.43M | 298.1M | 17% |
+| next run, ~500M at `hidden_size` 1024, one tied table | 67.1M | ~500M | **13%** |
+
+Most of the drop is the collapse from four tables to one; width does the rest. **Cutting the vocab
+is not on the table and does not need to be** — 65536 is the uint16 corpus contract, and the prune
+was already gated on fertility.
+
+**But that one is a capacity cut, not a re-parameterization**, and must not be done on assertion.
+Gemma 3n's per-layer embeddings exist precisely to hold capacity in a lookup that costs no matmul;
+converting them to a projection trades 16.8M of free-lookup parameters for 0.2M plus a small GEMM.
+Gate it on the ablation, which is cheap and read-only: zero the PLE contribution on `phase2_final`
+and read ΔCE on the standard held-out slice, exactly the way `eval_stage0.py` ablates the IR read.
+If it lands near the IR table's 0.0002 nats, the table is storing nothing and the projection is
+free money. If it costs real nats, keep it and only tie the heads.
+
+#### Measure the damage before changing the shape
+
+In order, cheapest first. None of these need a rented box.
+
+1. **Token frequency per vocab block** (minutes, no GPU). Histogram `phase1.bin` into the four
+   16384-id blocks. This says whether the 192-d bottleneck is sitting on the common tokens or on
+   the tail, and it is the whole reason to care about the id-order partition.
+2. **Cross-block error rate** (one eval pass). On the standard slice, report top-1 error split by
+   whether the argmax fell in the target's block, plus per-block mean top logit. A per-block scale
+   offset is the specific failure the construction invites and average CE cannot see.
+3. **The free tied-head reading — no training at all.** Materialize the current head's effective
+   output matrix `W = S @ P` (`[65536, 768]`, 201MB fp32; `S` is the block-diagonal stack of the
+   four `w_j`), then least-squares fit `A` so that `E A^T ≈ W` — a 768×768 solve. Score CE with
+   `norm(h) @ A @ E^T` against the real head on the held-out slice. **How much of the trained head
+   already lives in `E`'s geometry, for the price of one linear solve.** This also doubles as the
+   warm start if the existing checkpoint is ever wanted for a same-trunk A/B.
+4. **The oracle head — the number the whole section is about.** Freeze the trunk, train a *dense*
+   `768 → 65536` head (and only it) on frozen final-loop hidden states for ~100–200M tokens,
+   locally, BF16, 4×4096. `CE_factored − CE_oracle` on the standard slice **is** the damage the
+   factoring is doing, isolated from every other variable, using the same frozen-representation
+   pattern as `eval_probe.py`. A few hours on the 5090 for a number that decides a component of the
+   real run's shape.
+5. Only then the **matched-token A/B** at the next run's shape, if 4 leaves it genuinely open:
+   factored vs tied at ~2B tokens each, CE plus the Phase 1b suite, folded into 7a's calibration
+   run rather than bought separately.
+
+**Gate G9:** the oracle-head reading (4) is recorded, and the run spec names a head. Tie **iff**
+step 4 shows the factoring costing ≥ ~0.02 nats — the same bar G1 set for the IR read, on the same
+slice, for the same reason: a mechanism that cannot move CE by that much is not worth 13M
+parameters *or* the FLOPs to replace it. If it is below the bar, the factoring is vindicated and the
+13.17M stays — but then the four vocab tables above are still 26% of the model and step 3's reading
+still stands on its own.
 
 ---
 
@@ -856,13 +1172,22 @@ Written before anything is rented, containing:
 - **G3b** — groundedness AUROC ≥ 0.65 for unanswerable detection, against the trunk probe's
   **0.584** rather than `p_max`'s below-chance record (Phase 4).
 - **G4** — recall@k beats BM25 **and** the frozen-embedder baseline (Phase 5a).
+- **G2c** — loop input injection: loop 3's CE gain ≥ 0.01 nats above Arm C's at matched tokens,
+  later-loop updates measurably less aligned with the previous loop's, final-loop CE and benchmarks
+  within a finetune's noise of Arm C (Phase 3c). Failing moves the depth burden to 5c and 7c's coda;
+  it does not cut a loop.
 - **G5** — corpus-attached EM/F1 delta ≥3σ on NQ-open / TriviaQA / PopQA; depth ablation at
-  `n_loops` = 2, 3, 4, 6, 8. **Flat past 3 → ship 3 and don't rationalize it** (Phase 5b/5c).
+  `n_loops` = 1, 2, 3, 4, 6, 8 read on HotpotQA validation, ARC-Challenge and GSM8K, with the
+  knowledge sets reported but not gated. **Flat past 3 → ship 3 and don't rationalize it**; 3 not
+  beating 1 is an architecture or training defect fixed before Phase 7 (Phase 5b/5c).
 - **G6** — side-channel evidence beats the best 4096-token in-prompt packing when the evidence
   exceeds the context, at linear cost in evidence (Phase 5).
 - **G7** — final POC model: benchmarks within noise; abstention curve bent (false abstention
   < 10%, recall ≥ 0.5, precision ≥ 0.65); G5/G6 re-confirmed on the shipped checkpoint (Phase 6).
 - **G8** — ≥2x sustained tokens/s at equivalent shape; FP8 A/B loss-matched (Phase 7).
+- **G9** — the frozen-trunk oracle-head reading is recorded and the run spec names a head (7d). Tie
+  the readout to `embed_tokens` iff the block-diagonal factoring costs ≥ ~0.02 nats against a dense
+  head on the standard slice — G1's bar, same slice, same argument.
 - **P0** — head removal behaviorally neutral. **PASS** (2026-08-19,
   [record](../measurements/phase0_migration.md)).
 - **P2** — false abstention well below 78.4%, precision above base rate. **PASS** (2026-08-20:
@@ -906,8 +1231,24 @@ Written before anything is rented, containing:
   the weights on disk. (The inference-side half of this is fixed in Phase 1b.)
 - **Data prep at 100B+ tokens is a real job**, not a preamble — schedule it on the box with the
   same interruption-safety it was designed for, and budget its wall clock explicitly in RUN2.md.
+- **Looping below its published crossover.** Mixture-of-Recursions found a plain transformer beat
+  its looped variants at 135M; this model is 332M, and its third loop buys 0.008–0.021 nats.
+  Looping is a spec requirement, so there is no fallback to a non-looped model. The mitigations are
+  the things that give later loops something to do — input injection (3c), the evidence buffer and
+  loop-conditioned query (5c), a coda (7c) — and G5 reads depth on the tasks loops are supposed to
+  help.
+- **Grafted mechanisms measure as lower bounds.** Nanbeige found training a looped architecture from
+  scratch beat upcycling a trained dense one, and every POC mechanism is grafted onto a checkpoint
+  trained without it. A narrow gate miss on a graft is weak evidence against the component in a
+  from-scratch run, which is why 7c's go/no-go table records margins.
 
 ## Parked
+
+- **Learned halting / ponder head.** Parked on a structural condition, not a tuning one: a learned
+  depth mechanism is only trainable if halting skips real compute, so the ponder cost has a saving
+  to trade against. Phase 0's gate saturated because every expert ran whatever it said; Ouro's
+  released adaptive depth has the same property at inference. Unparks only after the exit / KV-cache
+  exclusion is fixed (7a) and a halt decision actually breaks the loop during training.
 
 - **Step 13 — self-labelled calibration set.** **Unparked into Phase 6b** — the repaired baseline
   is non-degenerate, so pass-rate labeling no longer re-encodes the collapse.
