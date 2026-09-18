@@ -210,3 +210,38 @@ ir: # The IR table's sharpening finetune, `python scripts/sft.py --ir`. Read by 
   conversation_loss_weighting: false # this is a pretraining-style pass over documents, not a
                                      # conversation-level policy fix
   hf_upload_repo: "" # local run
+evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence`. Read by
+          # config.py's EvidenceConfig, a third SUBCLASS of SFTConfig -- same trainer, same
+          # objective, a corpus that carries a second token stream per row. Seeded from the IR
+          # sharpening run's final checkpoint, migrated to carry the port.
+          # Runs LOCALLY on the 5090 in BF16 (do not set USE_FP8).
+  train_split: "evidence_train" # from `python scripts/prepare_evidence_data.py`
+  val_split: "evidence_val"
+  lr: 1.0e-5 # the trunk's rate. It carries 16B tokens plus three finetunes and this pass is not
+             # meant to move it -- the benchmark suite is the gate on whether it did
+  fresh_lr: 3.0e-4 # the evidence reader and the selector's two adapters plus its source scale.
+                   # Never trained, so at the trunk's rate they would sit at their init for the
+                   # whole run and the run would measure nothing. Deliberately does NOT cover the
+                   # IR key/value table, which carries a full sharpening run
+  num_epochs: 1 # one pass. The abstention targets come from a closed phrasing set and a second
+                # pass starts memorizing the strings instead of the policy
+  batch_size: 4 # 4 x 4096 stays resident on the 32GB card; 8 spills into shared memory at ~4x the
+                # throughput cost. The evidence axis adds to that peak, so this is not the place to
+                # economize
+  grad_accumulation_steps: 4 # ~65k prompt tokens per optimizer step
+  max_evidence_tokens: 12288 # cap on ONE ROW's evidence. Evidence is embedded and cross attended at
+                             # every loop, so without a cap peak memory would depend on which
+                             # conversations happened to pack together. 3x seq_length because that
+                             # is the corpus's measured evidence-to-prompt token ratio (2.93): a cap
+                             # below it closes every row on evidence long before the token budget
+                             # fills, and the row is then mostly padding -- a full width forward for
+                             # a handful of real tokens. Evidence tokens are far cheaper than prompt
+                             # tokens (an embedding lookup plus one k/v projection per loop, never
+                             # the decoder or the LM head), so balancing the two budgets here costs
+                             # little memory and is what keeps the rows dense
+  checkpoint_every_tokens: 25000000
+  eval_every_tokens: 10000000
+  conversation_loss_weighting: true # this is a policy change, and unweighted CE makes a six token
+                                    # refusal the cheapest loss reduction in the corpus -- the exact
+                                    # mechanism that collapsed the first SFT run onto one string
+  hf_upload_repo: "" # local run

@@ -116,6 +116,7 @@ def train_step(
     collect_metrics: bool = False,
     n_loops: int = None,
     loss_weights: torch.Tensor = None,
+    evidence=None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -130,6 +131,10 @@ def train_step(
         loss_weights: optional ``[B, S]`` per-token loss weights, aligned with ``labels``. Only SFT
             passes them (per-conversation weighting -- see ``modules/data/sft_dataset.py``);
             pretraining leaves them None, which is bit-for-bit the plain per-token mean.
+        evidence: optional ``EvidenceBatch`` for this micro batch, built in the trainer's thread by
+            ``modules.data.evidence_dataset.evidence_from_batch``. None -- every caller before the
+            evidence corpus existed -- is bit-for-bit the forward this function already ran, which is
+            what lets the evidence profile reuse it unchanged rather than forking it.
     """
     loop_ce_weights = (
         TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
@@ -149,6 +154,7 @@ def train_step(
                 return_aux_loss=True,
                 return_hidden=True,
                 n_loops=n_loops,
+                evidence=evidence,
             )
             else:
                 logits, aux_loss = model(
@@ -159,6 +165,7 @@ def train_step(
                     return_aux_loss=True,
                     return_hidden=True,
                     n_loops=n_loops,
+                    evidence=evidence,
                 )
                 extra_token_outputs = None
 

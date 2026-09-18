@@ -64,6 +64,7 @@ from accelerate import Accelerator
 import transformer_engine.pytorch as te
 
 from modules.data.dataset import Dataset
+from modules.data.evidence_dataset import EvidenceDataset, evidence_from_batch
 from modules.data.sft_dataset import SFTDataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.information_retrieval import is_rebuilt_ir_param
@@ -74,7 +75,7 @@ from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
 from modules.runtime.status import eta_seconds, format_duration, write_status
-from config import IRConfig, ModelConfig, RepairConfig, SFTConfig, TrainingConfig
+from config import EvidenceConfig, IRConfig, ModelConfig, RepairConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
     USE_LOW_PRECISION, chosen_recipe, log_precision_mode, sample_n_loops,
     save_expert_selection_graph, save_loss_graph, train_step,
@@ -100,6 +101,11 @@ REPAIR_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "repair")
 # temperature anneal, so its optimizer state means nothing to either other profile.
 IR_PHASE = "ir"
 IR_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "ir")
+# --evidence's counterparts. Same contract a fourth time, and here the separation matters most: this
+# profile's corpus carries a second token stream, so a checkpoint from it describes a model with
+# tensors the other three do not have.
+EVIDENCE_PHASE = "evidence"
+EVIDENCE_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "evidence")
 # --from-hub lands the pretrained checkpoint HERE, deliberately not in SFT_CHECKPOINT_DIR: it is
 # named checkpoint_phase2_final.pt, which matches ckpt_lib's "checkpoint_*.pt" resume scan, so a
 # second launch would offer pretraining's own optimizer/scheduler state to load_sft_checkpoint as
@@ -133,6 +139,16 @@ def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True
         shuffle: ignored for the LM reader, which reads in on-disk order on purpose (the corpus
             builder already baked the source mix into that order).
     """
+    if os.path.isfile(os.path.join(data_dir, f"{split}.ev")):
+        # a third reader, picked by the same rule: the evidence corpus carries a second token stream
+        # per row, so the presence of the file IS the statement that this split has evidence
+        return EvidenceDataset(
+            data_dir=data_dir, tokenizer=tokenizer, batch_size=cfg.Batch_size,
+            max_length=cfg.Seq_length, split=split,
+            num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
+            seed=cfg.seed, shuffle=shuffle,
+            max_evidence_tokens=getattr(cfg, "max_evidence_tokens", 12288),
+        )
     if os.path.isfile(os.path.join(data_dir, f"{split}.mask")):
         return SFTDataset(
             data_dir=data_dir, tokenizer=tokenizer, batch_size=cfg.Batch_size,
@@ -218,7 +234,8 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh
 
 
 def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
-                         split_documents: bool = False) -> int:
+                         split_documents: bool = False, evidx_path: str = None,
+                         max_evidence_tokens: int = 0, order=None, num_workers: int = 1) -> int:
     """How many packed rows the corpus yields, by replaying the packing rule over the index.
 
     The LR schedule needs a total step count up front, and "corpus tokens / (batch * seq)" is a bad
@@ -239,6 +256,19 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
             rows and therefore drops nothing and wastes only the separator slots. That reader also
             keeps documents longer than ``max_length`` (it splits them), so the length filter below
             would throw away most of a web corpus rather than a handful of over-long conversations.
+        evidx_path: ``{split}.evidx`` for the evidence reader, whose rows close on **either** budget.
+            Replaying only the token budget undercounts them, because a row that filled its evidence
+            first is shorter than the packing rule alone predicts -- which is the same failure this
+            function exists to avoid, one budget further in.
+        max_evidence_tokens: the evidence cap those rows close against. Ignored without ``evidx_path``.
+        order: the epoch's document permutation, when the reader shuffles. With ONE budget the row
+            count really does depend only on the length distribution, which is why the note above
+            says the on-disk order is good enough. With two it does not: the corpus is written
+            source by source under a weighted round robin, so on-disk order clusters documents whose
+            prompt and evidence lengths are correlated, and replaying that order closes rows on
+            evidence far more often than the shuffled stream does.
+        num_workers: how many workers share the stream. Each keeps its OWN partial row and flushes it
+            at the end of the epoch, so the count is per worker and the tail rows are real.
 
     Returns:
         Estimated number of packed rows for one epoch.
@@ -247,15 +277,37 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
     lengths = np.diff(offsets).astype(np.int64) + num_mtp_tokens
     if split_documents:
         return max(1, int(lengths.sum() // max_length) + 1)
-    lengths = lengths[lengths <= max_length]
 
-    rows, used = 1, 0
-    for length in lengths.tolist():
-        if used + length > max_length:
-            rows += 1
-            used = 0
-        used += length
-    return rows
+    ev_lengths = np.zeros_like(lengths)
+    if evidx_path and max_evidence_tokens:
+        ev_offsets = np.fromfile(evidx_path, dtype=np.uint64)
+        ev_lengths = np.diff(ev_offsets).astype(np.int64)
+
+    # the reader's own stream order, when it has one. Only the two budget case actually needs this
+    # (see the Args note), but running it for every profile keeps one code path
+    if order is not None:
+        lengths, ev_lengths = lengths[order], ev_lengths[order]
+
+    keep = lengths <= max_length
+    if max_evidence_tokens:
+        keep &= ev_lengths <= max_evidence_tokens
+
+    rows = 0
+    for shard in range(max(1, num_workers)):
+        # each worker packs its own stream and flushes its partial row at the end of the epoch, so
+        # the tail rows are real rows and the count is per worker rather than over the whole corpus
+        shard_keep = keep[shard::num_workers]
+        shard_len = lengths[shard::num_workers][shard_keep].tolist()
+        shard_ev = ev_lengths[shard::num_workers][shard_keep].tolist()
+        used, used_ev, open_row = 0, 0, False
+        for length, ev in zip(shard_len, shard_ev):
+            if open_row and (used + length > max_length
+                             or (max_evidence_tokens and used_ev + ev > max_evidence_tokens)):
+                rows += 1
+                used, used_ev = 0, 0
+            used, used_ev, open_row = used + length, used_ev + ev, True
+        rows += int(open_row)
+    return max(1, rows)
 
 
 @torch.no_grad()
@@ -503,6 +555,10 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
             out = model(
                 input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 return_aux_loss=True, return_hidden=True,
+                # the val split carries evidence too, and reading it WITHOUT is a different task:
+                # val CE would then be measuring the model answering from memory, which is not what
+                # is being trained and would drift away from the training curve for the wrong reason
+                evidence=evidence_from_batch(model, batch, cu_seqlens),
             )
             hidden = out[0]
             extra_token_outputs = out[2] if model.has_mtp else None
@@ -554,9 +610,13 @@ def sft(args):
     # one function, three profiles. --repair / --ir swap the config class, the phase label and the
     # checkpoint directory and nothing else: see this module's docstring for why the repair pass is
     # not a second script.
-    if args.repair and args.ir:
-        raise SystemExit("--repair and --ir are different profiles; pick one")
-    if args.ir:
+    chosen = [n for n, on in (("--repair", args.repair), ("--ir", args.ir),
+                              ("--evidence", args.evidence)) if on]
+    if len(chosen) > 1:
+        raise SystemExit(f"{' and '.join(chosen)} are different profiles; pick one")
+    if args.evidence:
+        cfg, phase, checkpoint_dir = EvidenceConfig, EVIDENCE_PHASE, EVIDENCE_CHECKPOINT_DIR
+    elif args.ir:
         cfg, phase, checkpoint_dir = IRConfig, IR_PHASE, IR_CHECKPOINT_DIR
     elif args.repair:
         cfg, phase, checkpoint_dir = RepairConfig, REPAIR_PHASE, REPAIR_CHECKPOINT_DIR
@@ -590,6 +650,11 @@ def sft(args):
     rows_per_epoch = estimate_packed_rows(
         train_dataset.idx_path, cfg.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
         split_documents=isinstance(train_dataset, Dataset),
+        evidx_path=getattr(train_dataset, "evidx_path", None),
+        max_evidence_tokens=getattr(train_dataset, "max_evidence_tokens", 0),
+        order=(train_dataset.document_order(train_dataset.num_docs)
+               if getattr(train_dataset, "shuffle", False) else None),
+        num_workers=NUM_DATA_WORKERS,
     )
     micro_steps = rows_per_epoch * cfg.num_epochs / cfg.Batch_size
     total_steps = max(1, int(micro_steps / cfg.grad_accumulation_steps))
@@ -846,6 +911,13 @@ def sft(args):
                     # not passing it is exactly the plain per-token objective.
                     loss_weights=(batch["loss_weights"].to(device)
                                   if cfg.conversation_loss_weighting else None),
+                    # built here rather than in the worker: numbering the evidence segments needs
+                    # the query side's cu_seqlens, which is itself built in-thread because it is
+                    # ragged and accelerate truncates a ragged dim 0 to the batch size. Returns None
+                    # for a batch that retrieved nothing, which is the bit-identical forward.
+                    evidence=evidence_from_batch(
+                        accelerator.unwrap_model(model), batch, cu_seqlens
+                    ),
                 )
 
                 if not is_log_step:
@@ -1006,6 +1078,11 @@ def main():
                         help="run NEXT.md Phase 2's abstention repair finetune instead: "
                              "config.yaml's repair: block, the repair_train/repair_val splits, and "
                              "ckpts/repair. Seed it with -c <an SFT checkpoint>")
+    parser.add_argument("--evidence", action="store_true",
+                        help="the evidence conditioned finetune: reads EvidenceConfig, writes into "
+                             "ckpts/evidence under phase 'evidence'. Needs a corpus from "
+                             "scripts/prepare_evidence_data.py and a seed checkpoint carrying the "
+                             "port (scripts/migrate_evidence_port.py)")
     parser.add_argument("--ir", action="store_true",
                         help="run the IR table's sharpening finetune instead: config.yaml's ir: "
                              "block, the ir_train/ir_val splits, ckpts/ir, a second learning rate "

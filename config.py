@@ -307,3 +307,65 @@ class IRConfig(SFTConfig):
             math.log(cls.temperature_start) * (1 - t) + math.log(cls.temperature_end) * t
         ))
 
+
+class EvidenceConfig(SFTConfig):
+    """The evidence-conditioned finetune, read from config.yaml's ``evidence:`` block.
+
+    A **subclass** for the third time and for the third time for the same reason: same trainer, same
+    objective, different corpus. What it adds is the one thing the other profiles have no notion of
+    -- a second token stream per row -- plus the from-scratch learning rate the port's new tensors
+    need, which it inherits the *shape* of from ``IRConfig`` without inheriting its table machinery.
+
+    Two numbers here are decisions rather than defaults:
+
+    - **``fresh_lr``.** The reader and the selector's adapters have never seen a gradient, and the
+      trunk has 16B tokens plus three finetunes in it. The same argument ``IRConfig.fresh_lr``
+      makes applies unchanged: one compromise rate either leaves the port at its init or damages the
+      trunk. What is NOT in the fresh group is the IR key/value table, which carries a full
+      sharpening run -- ``moe.is_fresh_loop_param`` matches the adapters by name for that reason.
+    - **``conversation_loss_weighting: true``.** This run is a policy change (when to abstain), and
+      an unweighted objective makes a six-token refusal the cheapest loss reduction in the corpus.
+      That is exactly the mechanism that collapsed the first SFT run onto one refusal string, and
+      turning it off here would re-run that experiment.
+
+    ``num_epochs`` is 1 on purpose. The abstention targets are drawn from a closed phrasing set, and
+    a second pass over them starts memorizing the strings rather than the policy -- the same reason
+    the repair profile is single-epoch.
+    """
+    _Block = Config.get("evidence", {}) or {}
+
+    train_split = str(_Block.get("train_split", "evidence_train"))
+    val_split = str(_Block.get("val_split", "evidence_val"))
+    lr = float(_Block.get("lr", 1.0e-5))
+    fresh_lr = float(_Block.get("fresh_lr", 3.0e-4))
+    num_epochs = int(_Block.get("num_epochs", 1))
+    weight_decay = float(_Block.get("weight_decay", SFTConfig.weight_decay))
+    dropout = float(_Block.get("dropout", SFTConfig.dropout))
+    Batch_size = int(_Block.get("batch_size", 4))
+    grad_accumulation_steps = int(_Block.get("grad_accumulation_steps", 4))
+    warmup_fraction = float(_Block.get("warmup_fraction", SFTConfig.warmup_fraction))
+    lr_min_factor = float(_Block.get("lr_min_factor", SFTConfig.lr_min_factor))
+    seed = int(_Block.get("seed", SFTConfig.seed))
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 25_000_000))
+    keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 10_000_000))
+    eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
+    conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", True))
+
+    # cap on ONE ROW's evidence tokens. They are embedded and cross attended at every loop, so this
+    # is the knob that keeps peak memory independent of which conversations happened to pack
+    # together -- a row is closed early when its evidence budget runs out, exactly as when its token
+    # budget does.
+    #
+    # It has to be set against the corpus's evidence-to-prompt token ratio, not picked for memory
+    # alone. At 2.93 evidence tokens per prompt token, a cap below ~3x the sequence length makes
+    # evidence the budget that always binds, and every row then closes with its token budget barely
+    # touched -- a full width forward and backward for a row that is mostly padding. Evidence tokens
+    # cost an embedding lookup and one k/v projection per loop; prompt tokens cost the decoder, the
+    # MoE block once per loop and the chunked LM head, so the two budgets are worth very different
+    # amounts of memory and balancing them is close to free.
+    max_evidence_tokens = int(_Block.get("max_evidence_tokens", 12288))
+
+    _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
+    hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)
+
