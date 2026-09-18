@@ -90,6 +90,7 @@ class TinyMoETransformer(nn.Module):
         mtp_num_extra_tokens: int = 0,
         lm_head_factor: int = 8,
         moe_intermediate_size: int = None,
+        loop_inject: bool = False,
     ):
         super().__init__()
 
@@ -150,6 +151,7 @@ class TinyMoETransformer(nn.Module):
             top_k=top_k,
             n_loops=n_loops,
             max_seq_len=max_seq_len,
+            loop_inject=loop_inject,
         )
         
         self.norm = RMSNorm(hidden_size)

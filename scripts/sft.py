@@ -67,6 +67,7 @@ from modules.data.dataset import Dataset
 from modules.data.sft_dataset import SFTDataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.information_retrieval import is_rebuilt_ir_param
+from modules.model.moe import is_fresh_loop_param
 from modules.model.mtp import compute_mtp_loss
 from modules.model.transformer import TinyMoETransformer
 from modules.runtime import checkpoints as ckpt_lib
@@ -79,7 +80,7 @@ from scripts.pretrain import (
     save_expert_selection_graph, save_loss_graph, train_step,
 )
 from utils import (BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, load_model_state,
-                   logger)
+                   logger, model_params_for_state_dict)
 
 # the phase label baked into checkpoint filenames and the run-state sidecar. Distinct from
 # ("phase1", "phase2") so ckpt_lib's newest-that-loads search can never pick up a pretraining
@@ -177,8 +178,9 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh
     Args:
         model: the (already bf16) model.
         weight_decay: applied to the ndim >= 2 groups only.
-        fresh_lr: when given, the rebuilt IR tensors (``is_rebuilt_ir_param``) go into their own
-            groups at this learning rate instead of sharing the run's. They are the only tensors in
+        fresh_lr: when given, the rebuilt IR tensors (``is_rebuilt_ir_param``) and any zero-init
+            loop tensor a migration added (``is_fresh_loop_param``) go into their own groups at this
+            learning rate instead of sharing the run's. They are the only tensors in
             the model with no training behind them: at the trunk's 1e-5 a from-scratch key table
             against an otherwise converged model never gets anywhere, and at a rate that would
             train it the 16B-token trunk moves too. The LR schedule still scales every group by the
@@ -192,7 +194,8 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        origin = "fresh" if (fresh_lr is not None and is_rebuilt_ir_param(name)) else "trunk"
+        is_fresh = is_rebuilt_ir_param(name) or is_fresh_loop_param(name)
+        origin = "fresh" if (fresh_lr is not None and is_fresh) else "trunk"
         buckets[(origin, param.ndim >= 2)].append(param)
 
     param_groups, master_pairs, summary = [], [], []
@@ -596,8 +599,20 @@ def sft(args):
         f"{cfg.grad_accumulation_steps}"
     )
 
-    # dropout override only; every other model hyperparameter must match the pretrained checkpoint
-    model = TinyMoETransformer(**cfg.model_params()).to(device).to(BF16).train()
+    # dropout override only; every other model hyperparameter must match the pretrained checkpoint.
+    # The shape-bearing ones are read off the SEED rather than the yaml, same rule the eval scripts
+    # follow: a seed is produced by a migration, and the yaml flip that matches it is a separate
+    # manual step that can be forgotten or done twice. Getting it from the file makes an arm and its
+    # control differ by what their seeds differ by, which is the comparison the run exists to make.
+    model_params = cfg.model_params()
+    if args.checkpoint:
+        seed_path = args.checkpoint if os.path.isabs(args.checkpoint) else os.path.join(BASE_DIR, args.checkpoint)
+        # mmap: only the tensors' metadata is read here, and the same file is loaded again in full
+        # by load_pretrained_weights below -- this must not cost a second 3.8GB read
+        seed_keys = torch.load(seed_path, map_location="cpu", mmap=True)["model_state_dict"]
+        model_params = model_params_for_state_dict(seed_keys, model_params)
+        del seed_keys
+    model = TinyMoETransformer(**model_params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
@@ -896,6 +911,12 @@ def sft(args):
                         f"IR temp: {ir_module.temperature.detach().item():.4f} | "
                         f"|g_proj|rms: {g_rms:.2e} | |y|row: {y_norm:.4f} | "
                     )
+                if unwrapped_model.moe.inject is not None:
+                    # same reason as |g_proj|rms above: the injection is migrated in at zero, so
+                    # "did it leave zero" is a fact about the run that has to be readable while the
+                    # run is still going, not reconstructed from the final checkpoint
+                    inj_rms = unwrapped_model.moe.inject.weight.detach().float().pow(2).mean().sqrt().item()
+                    ir_entropy_str += f"|inject|rms: {inj_rms:.2e} | "
 
                 def _metric(key):
                     value = metrics.get(key)

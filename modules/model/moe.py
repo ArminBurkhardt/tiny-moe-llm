@@ -161,6 +161,17 @@ class _ExpertTracking():
             self.post_skew_dist.zero_()
             self.choices.zero_()
 
+def is_fresh_loop_param(name: str) -> bool:
+    """True for a loop tensor a migration adds at zero, which needs the from-scratch rate.
+
+    Currently just the input injection. It carries no training at all, so at the trunk's rate it
+    would sit at its zero init for the whole run and the arm would measure nothing -- the same
+    reason ``is_rebuilt_ir_param`` exists, kept separate because that one is about the IR table's
+    reshape and these two lists must be free to disagree.
+    """
+    return name.endswith("moe.inject.weight") or name == "inject.weight"
+
+
 class LoopMixtureOfExperts(nn.Module):
     """a Mixture of Experts module that routes tokens to a mixture of attention and feedforward experts in multiple loops"""
     def __init__(
@@ -185,6 +196,7 @@ class LoopMixtureOfExperts(nn.Module):
         loop_scale_init: float = None,
         loop_enc_dim: int = 32,
         max_enc_loops: int = 64,
+        loop_inject: bool = False,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -216,6 +228,12 @@ class LoopMixtureOfExperts(nn.Module):
             max_enc_loops (int, optional): size of the precomputed loop-encoding table. Loop
                 indices past it reuse the last row, so running more loops at inference than were
                 trained still works. Defaults to 64.
+            loop_inject (bool, optional): re-present the block's input to every loop, as
+                ``hidden_states + inject(e)`` where ``e`` is what the dense decoder handed over.
+                Without it the only thing a later loop knows about the input is whatever survives
+                in the residual stream, which is also carrying every earlier loop's update. The
+                projection is zero-init, so turning it on is exactly neutral until it learns
+                something. Defaults to False.
         """
         super().__init__()
         self._num_mlp_experts = num_mlp_experts
@@ -326,6 +344,15 @@ class LoopMixtureOfExperts(nn.Module):
         self.loop_router_bias = nn.Linear(loop_enc_dim, self.num_experts, bias=False)
         nn.init.zeros_(self.loop_router_bias.weight)
 
+        # re-presents the block's input to every loop (see loop_inject in the docstring). Same
+        # zero-init neutrality as loop_router_bias above: it starts as an exact no-op, so a
+        # checkpoint migrated to carry it scores identically to the one it came from. Attribute
+        # always exists so the forward can branch on `is None` rather than hasattr.
+        self.inject = None
+        if loop_inject:
+            self.inject = nn.Linear(hidden_size, hidden_size, bias=False)
+            nn.init.zeros_(self.inject.weight)
+
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
         # one retrieval entropy tracker shared by every IR expert, so the trainer reads a single
@@ -399,9 +426,14 @@ class LoopMixtureOfExperts(nn.Module):
 
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None):
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None):
+        # what the router and the experts READ. The residual update at the bottom still adds to
+        # `hidden_states` itself, so the injection reaches a readout only through what the experts
+        # compute from it -- it re-presents the input, it does not write to the stream lm_head sees.
+        step_input = hidden_states if inject_bias is None else hidden_states + inject_bias
+
         topk_scores, topk_indices, load_balancing_loss = self.route(
-            hidden_states, temperature=self.temperature, loop_idx=loop_idx
+            step_input, temperature=self.temperature, loop_idx=loop_idx
         )
 
         # index placement in the scores would be:
@@ -409,8 +441,8 @@ class LoopMixtureOfExperts(nn.Module):
 
         # seed with the always-on shared experts (Step 2) before accumulating routed outputs
         shared_attn_cache = kv_cache.shared_attn if kv_cache is not None else None
-        output = self.shared_mlp(hidden_states) + self.shared_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
-        _other = other if other is not None else hidden_states
+        output = self.shared_mlp(step_input) + self.shared_attn(step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
+        _other = other if other is not None else step_input
 
         # compute each non-MLP expert exactly once per forward_step, then cache across k slots
         # (attention runs over the full sequence regardless of routing, so recomputing per k-slot wastes compute)
@@ -419,11 +451,11 @@ class LoopMixtureOfExperts(nn.Module):
             slot_cache = kv_cache.slots[i] if kv_cache is not None else None
             if isinstance(self.experts[i], InformationRetrievalExpert):
                 # loop_idx is passed for the entropy instrumentation only (see forward's docstring)
-                expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache, loop_idx=loop_idx))
+                expert_cache.append(self.experts[i](step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache, loop_idx=loop_idx))
             elif isinstance(self.experts[i], SelfAttention):
-                expert_cache.append(self.experts[i](hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
+                expert_cache.append(self.experts[i](step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
             elif isinstance(self.experts[i], CrossAttention):
-                expert_cache.append(self.experts[i](hidden_states, _other, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
+                expert_cache.append(self.experts[i](step_input, _other, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
 
         # accumulate the non-MLP experts' weighted outputs. still a mask multiply (never
         # mask.sum()/boolean indexing -- that's a per-expert device sync), but the per-(slot, expert)
@@ -451,7 +483,7 @@ class LoopMixtureOfExperts(nn.Module):
         mlp_scores = torch.where(mlp_mask, topk_scores, torch.zeros_like(topk_scores))
 
         parallel_output = self.parallel_experts(
-            hidden_states,
+            step_input,
             mlp_scores,
             mlp_indices
         )
@@ -533,13 +565,18 @@ class LoopMixtureOfExperts(nn.Module):
         else:
             position_embeddings = self.rotary_emb(hidden_states, seq_len=hidden_states.shape[1])
 
+        # the block's input, projected once and re-presented to every loop. Computed here rather
+        # than inside forward_step because `hidden_states` on entry IS that input and it does not
+        # change with the loop index -- one GEMM for the whole recurrence, not one per loop.
+        inject_bias = self.inject(hidden_states) if self.inject is not None else None
+
         loops_run = 0
         for loop in range(n_loops):
             loop_cache = kv_cache[loop] if kv_cache is not None else None
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias)
             total_load_balancing_loss += load_balancing_loss
             hidden_states_all.append(hidden_states)
             loops_run += 1
