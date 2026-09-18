@@ -15,6 +15,12 @@ tokens* than the queries, so three things stop being shared:
   * **causality.** A retrieved passage is not before or after the token reading it, so the read is
     bidirectional over the evidence and the query side keeps its own causal order intact.
 
+A document that retrieved **nothing** is the fourth case and needs no special handling: it
+contributes a zero length evidence segment, and flash returns exact zeros for a query whose segment
+has no keys (measured, not assumed -- the SDPA fallback is made to agree in ``attention.py``). So
+"no evidence" costs no sentinel token and no placeholder chunk, and reads as exactly the absence it
+is rather than as an empty string the model has to learn to ignore.
+
 **With no evidence attached the forward pass is bit-identical to the model without this module.**
 That is the property that lets one checkpoint serve both modes and makes the replay fraction of a
 finetune genuinely protect the trunk rather than train the port, so nothing here may touch a code
@@ -24,7 +30,7 @@ from dataclasses import dataclass
 
 import torch
 
-from modules.model.attention import _default_cu_seqlens, _segment_ids
+from modules.model.attention import _default_cu_seqlens, _segment_ids  # noqa: F401 (evidence_memory)
 
 
 @dataclass
@@ -43,16 +49,16 @@ class EvidenceBatch:
             side, and for the same no-host-sync reason).
         position_embeddings: ``(cos, sin)`` for the evidence axis, gathered at the per chunk
             positions rather than sliced from 0.
-        chunk_ids: ``[B, S_ev]``, which retrieved chunk each evidence token came from. Drives the
-            per chunk position restart, and indexes ``chunk_keys``. **Numbered globally over the
-            batch**, not per row: it is the join between the reader's token axis and the selector's
-            chunk axis, and a per-row numbering would make chunk 0 of row 0 and chunk 0 of row 1
-            index the same key.
+        chunk_ids: ``[B, S_ev]``, which retrieved chunk each evidence token came from. Read **only**
+            to restart positions at each chunk boundary, so any numbering works as long as adjacent
+            chunks differ; evidence padding carries -1 and simply forms one more run.
         chunk_keys: ``[num_chunks, embed_dim]`` external embedder vectors, one per retrieved chunk
             -- the selector's side of the port. ``None`` when only the reader is attached.
-        chunk_segments: ``[num_chunks]`` which query segment each chunk serves, in the same
-            numbering the reader's ``cu_seqlens`` pairing produces. Derived rather than supplied, so
-            the selector and the reader cannot disagree about which document owns a chunk.
+        chunk_segments: ``[num_chunks]`` which query segment each chunk serves, in the query side's
+            segment numbering. Supplied by whoever built the batch rather than re-derived here: the
+            reader's token stream and the selector's chunk list come out of the same packing loop,
+            and that loop is the only place both are known at once. Re-deriving it from the token
+            stream would look safer and would in fact be a second opinion that can disagree.
     """
 
     states: torch.Tensor
@@ -74,6 +80,14 @@ def chunk_position_ids(chunk_ids: torch.Tensor) -> torch.Tensor:
     Position within a chunk is the token's offset from that chunk's first token. Computed by
     subtracting a running start rather than by a Python loop over chunks: the chunk count is
     data dependent, and reading it on the host would cost a sync in the step path.
+
+    **Row padding is not a chunk and is given position 0.** It arrives as one contiguous run of the
+    negative id, so treating it as a chunk would number it 0..(padding length), and the padding run
+    is as long as the row's evidence budget -- far past the rotary cache, which is sized for the
+    model's context. That gather is unchecked, so the result is a device side assert: asynchronous,
+    so it surfaces as the process wedging with the GPU idle rather than as an exception anyone can
+    read. Padding is only ever attended to by the trailing pad query segment, whose output nothing
+    reads, so any in-range position is correct and 0 is the cheapest.
     """
     B, S = chunk_ids.shape
     device = chunk_ids.device
@@ -84,48 +98,38 @@ def chunk_position_ids(chunk_ids: torch.Tensor) -> torch.Tensor:
     starts[:, 1:] = torch.where(
         chunk_ids[:, 1:] != chunk_ids[:, :-1], pos[:, 1:], torch.zeros_like(pos[:, 1:])
     )
-    return pos - torch.cummax(starts, dim=1).values
+    within = pos - torch.cummax(starts, dim=1).values
+    return torch.where(chunk_ids >= 0, within, torch.zeros_like(within))
 
 
-def evidence_cu_seqlens(segment_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
-    """``cu_seqlens`` over a ``[B, S_ev]`` evidence segment id tensor.
+def evidence_cu_seqlens(segment_ids: torch.Tensor, num_segments: int) -> tuple[torch.Tensor, int]:
+    """``cu_seqlens`` for the evidence axis, from a ``[B, S_ev]`` map of token -> query segment.
 
-    Deliberately the same construction as ``attention.cu_seqlens_from_doc_ids`` -- including forcing
-    a break at every row seam -- so the two sides' segment numbering agrees by position. It is a
-    separate function only because the evidence axis is a different length than the query axis.
+    **Counted per segment, not derived from runs of equal ids.** The evidence side has segments the
+    query side does not: a document that retrieved nothing contributes ZERO evidence tokens, and a
+    run based construction cannot express a zero length segment at all -- it would simply omit it.
+    Omitting one is not a shorter list, because flash pairs the two sides *by position*: every later
+    document would silently read the document before it. The count is over ``num_segments``, which
+    comes from the query side, so the two lists are the same length by construction rather than by
+    the data happening to cooperate.
+
+    Requires the evidence tokens to be laid out sorted by segment over the flattened ``B * S_ev``
+    axis, which is what the dataset writes (row major, and within a row in conversation order).
+
+    Args:
+        segment_ids: ``[B, S_ev]``, each entry the index of the query segment that token serves.
+        num_segments: ``len(query cu_seqlens) - 1``.
+
+    Returns:
+        ``(cu_seqlens, max_seqlen)``. ``max_seqlen`` is ``S_ev``, a valid upper bound -- the true
+        maximum would cost a host sync every step, same trade as the query side's.
     """
-    B, S = segment_ids.shape
-    device = segment_ids.device
     flat = segment_ids.reshape(-1)
-    pos = torch.arange(B * S, device=device)
-    boundary = torch.ones(B * S, dtype=torch.bool, device=device)
-    boundary[1:] = flat[1:] != flat[:-1]
-    boundary |= (pos % S == 0)
-    starts = boundary.nonzero().flatten()
-    ends = torch.cat([starts[1:], torch.tensor([B * S], device=device, dtype=starts.dtype)])
-    cu = torch.zeros(starts.numel() + 1, dtype=torch.int32, device=device)
-    cu[1:] = (ends - starts).cumsum(0).to(torch.int32)
-    return cu, S
-
-
-def chunk_segment_ids(chunk_ids: torch.Tensor, cu_seqlens: torch.Tensor,
-                      num_chunks: int) -> torch.Tensor:
-    """Which query segment each retrieved chunk serves, ``[num_chunks]``.
-
-    Derived from the evidence side's own ``cu_seqlens`` rather than taken from the caller, so the
-    selector's notion of "this chunk belongs to document *i*" is by construction the same one the
-    reader's segment pairing uses. Two ways of saying which document owns a chunk is two ways for
-    them to disagree, and the disagreement is silent -- the reader would attend to the right
-    passage while the selector scored a different document's.
-
-    Requires ``chunk_ids`` to be numbered globally over the batch (see ``EvidenceBatch``): the
-    scatter indexes ``chunk_keys`` directly. Every token of a chunk writes its own segment, which is
-    the same value for all of them, so the duplicate writes are not order dependent.
-    """
-    B, S = chunk_ids.shape
-    token_segment = _segment_ids(cu_seqlens, B, S, chunk_ids.device).reshape(-1)
-    out = torch.zeros(num_chunks, dtype=token_segment.dtype, device=chunk_ids.device)
-    return out.scatter_(0, chunk_ids.reshape(-1), token_segment)
+    counts = torch.zeros(num_segments, dtype=torch.long, device=flat.device)
+    counts.scatter_add_(0, flat, torch.ones_like(flat))
+    cu = torch.zeros(num_segments + 1, dtype=torch.int32, device=flat.device)
+    cu[1:] = counts.cumsum(0).to(torch.int32)
+    return cu, int(segment_ids.shape[1])
 
 
 def evidence_memory(evidence: EvidenceBatch, cu_seqlens: torch.Tensor, B: int, S: int, device):

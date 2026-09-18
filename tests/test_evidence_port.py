@@ -71,7 +71,17 @@ def test_chunk_positions():
     expected = torch.tensor([[0, 1, 2, 0, 1, 0]])
     got = chunk_position_ids(chunk_ids)
     assert torch.equal(got, expected), f"per chunk positions wrong: {got.tolist()}"
-    print("6. per chunk positions restart at every chunk            PASS")
+
+    # row padding carries a negative id and arrives as ONE long run. Numbering it like a chunk walks
+    # its positions past the rotary cache, and that gather is unchecked -- the failure is a device
+    # side assert that wedges the process with the GPU idle instead of raising. Padding is only read
+    # by the trailing pad query segment, so 0 is correct as well as in range.
+    padded = torch.tensor([[0, 0, 1, -1, -1, -1, -1]])
+    got = chunk_position_ids(padded)
+    assert torch.equal(got, torch.tensor([[0, 1, 0, 0, 0, 0, 0]])), (
+        f"evidence padding is being numbered as a chunk: {got.tolist()}"
+    )
+    print("6. per chunk positions restart, and padding is not a chunk  PASS")
 
 
 def main():
@@ -104,13 +114,21 @@ def main():
     # evidence needs exactly two segments in the same order
     S_ev = 12
     ev_ids = torch.randint(1, P["vocab_size"], (B, S_ev), device="cuda")
-    # chunk ids are GLOBAL over the batch, not per row: they index chunk_keys, so row 1's first
-    # chunk must not be row 0's first chunk
+    # chunk ids only have to differ between adjacent chunks (they drive the position restart);
+    # chunk_segments below is what says which document owns a chunk
     ev_chunk = torch.tensor([[0] * 6 + [1] * 6, [2] * 6 + [3] * 6], device="cuda")
+    # input_ids is unpacked, so each ROW is one query segment: two segments, numbered 0 and 1
     ev_segment = torch.tensor([[0] * S_ev, [1] * S_ev], device="cuda")
-    NUM_CHUNKS = 4
+    NUM_SEGMENTS, NUM_CHUNKS = 2, 4
+    chunk_segments = torch.tensor([0, 0, 1, 1], device="cuda")
 
-    evidence = ported.build_evidence(ev_ids, ev_chunk, ev_segment)
+    def attach(keys=None):
+        return ported.build_evidence(
+            ev_ids, ev_chunk, ev_segment, NUM_SEGMENTS,
+            chunk_keys=keys, chunk_segments=None if keys is None else chunk_segments,
+        )
+
+    evidence = attach()
     with torch.inference_mode():
         zero_reader = ported(input_ids, skip_mtp=True, evidence=evidence)
     assert torch.equal(base, zero_reader), (
@@ -123,11 +141,7 @@ def main():
     # because the IR table started reading an external store, not because the reader woke up.
     ir = ported.moe.ir_modules[0]
     keys = torch.randn(NUM_CHUNKS, P["ir_dim"], device="cuda", dtype=BF16)
-    with_keys = ported.build_evidence(ev_ids, ev_chunk, ev_segment, chunk_keys=keys)
-    assert torch.equal(
-        with_keys.chunk_segments, torch.tensor([0, 0, 1, 1], device="cuda")
-    ), f"chunk to document map is wrong: {with_keys.chunk_segments.tolist()}"
-
+    with_keys = attach(keys)
     # the groundedness signal itself: a genuine fraction of ONE softmax's mass, and live under the
     # learned source scale rather than pinned by the two stores' score spreads
     with torch.inference_mode():
@@ -171,7 +185,7 @@ def main():
     # both the honest test and the quantity the groundedness gate actually reads.
     row1_keys = keys.clone()
     row1_keys[2:] = torch.randn(2, P["ir_dim"], device="cuda", dtype=BF16)
-    row1 = ported.build_evidence(ev_ids, ev_chunk, ev_segment, chunk_keys=row1_keys)
+    row1 = attach(row1_keys)
     with torch.inference_mode():
         ported(input_ids, skip_mtp=True, evidence=row1)
     row1_mass = ir.last_memory_mass
@@ -197,7 +211,7 @@ def main():
     print(f"3. a trained reader moves the logits (max |delta| = {delta:.4f})   PASS")
 
     other_ids = torch.randint(1, P["vocab_size"], (B, S_ev), device="cuda")
-    other_evidence = ported.build_evidence(other_ids, ev_chunk, ev_segment)
+    other_evidence = ported.build_evidence(other_ids, ev_chunk, ev_segment, NUM_SEGMENTS)
     with torch.inference_mode():
         other = ported(input_ids, skip_mtp=True, evidence=other_evidence)
     content_delta = (other - live).abs().max().item()
@@ -207,7 +221,7 @@ def main():
     # change only document 1's evidence; document 0's output must not move at all
     mixed_ids = ev_ids.clone()
     mixed_ids[1] = other_ids[1]
-    mixed_evidence = ported.build_evidence(mixed_ids, ev_chunk, ev_segment)
+    mixed_evidence = ported.build_evidence(mixed_ids, ev_chunk, ev_segment, NUM_SEGMENTS)
     with torch.inference_mode():
         mixed = ported(input_ids, skip_mtp=True, evidence=mixed_evidence)
     leak = (mixed[0] - live[0]).abs().max().item()

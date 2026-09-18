@@ -236,7 +236,14 @@ def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale,
     if Hkv != Hq:
         k = k.repeat_interleave(Hq // Hkv, dim=1)
         v = v.repeat_interleave(Hq // Hkv, dim=1)
+    # a query whose segment has NO keys at all -- a document that retrieved no evidence, packed
+    # beside one that did -- has an all-False mask row. flash returns exact zeros there; SDPA
+    # softmaxes over nothing and returns NaN, so the two paths would disagree on the one case the
+    # evidence corpus creates on purpose. Unmask the row and zero the output instead, which
+    # reproduces flash rather than approximating it.
+    empty = ~attn_mask.any(dim=-1, keepdim=True)                # [B, 1, S, 1]
     out = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=softmax_scale
+        q, k, v, attn_mask=attn_mask | empty, dropout_p=dropout_p, scale=softmax_scale
     )
+    out = out.masked_fill(empty, 0.0)                           # broadcasts over heads and dim
     return out.transpose(1, 2)  # [B, S, Hq, D]

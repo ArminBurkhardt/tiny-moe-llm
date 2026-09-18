@@ -84,6 +84,15 @@ class RotaryPositionEmbeddingsFrequency(nn.Module):
         geometry is absent, which is correct -- two chunks from different documents have no relative
         position, and giving them one would invent an ordering the retriever never meant.
         """
+        # clamped because this is an unchecked gather and an out of range index here does not raise:
+        # it trips a device side assert, which is reported asynchronously and leaves the process
+        # spinning against a dead CUDA context with no traceback and no error in the log. A position
+        # past the cache means a chunk longer than the model's whole context, which the corpus
+        # builder does not produce -- so the clamp never fires on real data, and when something does
+        # reach it a wrong position is a far cheaper failure than a run that hangs until someone
+        # notices the GPU is idle.
+        limit = self.cos_cached.shape[2] - 1
+        position_ids = position_ids.clamp(0, limit)
         cos = self.cos_cached[0, 0].to(dtype=dtype)[position_ids]   # [B, S, dim]
         sin = self.sin_cached[0, 0].to(dtype=dtype)[position_ids]
         return cos.unsqueeze(1), sin.unsqueeze(1)                   # broadcast over heads

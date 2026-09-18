@@ -6,9 +6,7 @@ from modules.model.moe import LoopMixtureOfExperts
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
-from modules.model.evidence import (
-    EvidenceBatch, chunk_position_ids, chunk_segment_ids, evidence_cu_seqlens,
-)
+from modules.model.evidence import EvidenceBatch, chunk_position_ids, evidence_cu_seqlens
 from utils import logger
 
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
@@ -293,7 +291,8 @@ class TinyMoETransformer(nn.Module):
         return moe_embeds
 
     def build_evidence(self, evidence_ids: torch.Tensor, evidence_chunk_ids: torch.Tensor,
-                       evidence_segment_ids: torch.Tensor, chunk_keys: torch.Tensor = None):
+                       evidence_segment_ids: torch.Tensor, num_segments: int,
+                       chunk_keys: torch.Tensor = None, chunk_segments: torch.Tensor = None):
         """Pack retrieved evidence into the form the MoE block reads.
 
         Evidence tokens go through **this model's own** embedding path, the same one ``_moe_ple``
@@ -305,33 +304,36 @@ class TinyMoETransformer(nn.Module):
 
         Args:
             evidence_ids: ``[B, S_ev]`` token ids of the retrieved chunks, packed end to end.
-            evidence_chunk_ids: ``[B, S_ev]`` which chunk each token came from, numbered **globally
-                over the batch**. Drives the per chunk position restart, so two chunks that happen
-                to be adjacent in the packing do not read as one continuous passage, and indexes
-                ``chunk_keys`` for the selector.
-            evidence_segment_ids: ``[B, S_ev]`` which *query* segment each evidence token serves.
-                Must produce the same number of segments as the query side's ``cu_seqlens``, in the
-                same order -- flash pairs the two by position, so a mismatch points a document at
-                another document's evidence silently rather than raising.
-            chunk_keys: ``[num_chunks, embed_dim]`` external embedder vectors, one per chunk, in
-                ``evidence_chunk_ids``' numbering. Optional -- the reader works without them, and
-                without them the selector simply never sees an external store.
+            evidence_chunk_ids: ``[B, S_ev]`` which chunk each token came from. Drives the per chunk
+                position restart, so two chunks that happen to be adjacent in the packing do not read
+                as one continuous passage. Only adjacency matters, so evidence padding may carry -1.
+            evidence_segment_ids: ``[B, S_ev]`` which *query* segment each evidence token serves, in
+                the query side's own segment numbering, sorted over the flattened axis. Flash pairs
+                the two sides by position, so a segment omitted here points every later document at
+                the wrong evidence silently rather than raising.
+            num_segments: how many segments the query side has (``len(cu_seqlens) - 1``). Passed in
+                rather than inferred: a document that retrieved nothing contributes no evidence
+                token to infer from, and that is the case the pairing must not lose.
+            chunk_keys: ``[num_chunks, embed_dim]`` external embedder vectors, one per chunk.
+                Optional -- the reader works without them, and without them the selector simply never
+                sees an external store.
+            chunk_segments: ``[num_chunks]`` which query segment each chunk serves. Required
+                whenever ``chunk_keys`` is given.
 
         Returns:
             An ``EvidenceBatch``, or None when this model has no evidence port.
         """
         if self.moe.shared_evidence is None:
             return None
+        assert chunk_keys is None or chunk_segments is not None, (
+            "chunk_keys without chunk_segments -- the selector would have no way to tell which "
+            "document owns a chunk, and would score every document against every chunk"
+        )
         states = self._moe_ple(evidence_ids)
         assert states is not None, "the evidence reader needs the MoE embedding path to embed with"
-        cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids)
+        cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids, num_segments)
         position_ids = chunk_position_ids(evidence_chunk_ids)
         cos, sin = self.moe.rotary_emb.gather(position_ids, states.dtype)
-        # derived from the evidence's OWN cu_seqlens rather than from evidence_segment_ids directly,
-        # so the selector's chunk-to-document map is the same one the reader's segment pairing uses
-        chunk_segments = None if chunk_keys is None else chunk_segment_ids(
-            evidence_chunk_ids, cu_seqlens, chunk_keys.shape[0]
-        )
         return EvidenceBatch(
             states=states,
             cu_seqlens=cu_seqlens,
