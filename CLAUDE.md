@@ -26,6 +26,22 @@ Two ways this bites: without `source env_init` nothing under `modules/model/` im
 has installed into the NGC image's system python and there is nothing to source
 (`TINY_LLM_ENV_INIT=/dev/null`).
 
+**Anything that trains runs in the background under a `Monitor` watch, always** — every
+`sft.py` / `pretrain.py` / `run_training.py` launch, however short it is expected to be. Two
+reasons, and the second is the one that costs real money: a run launched in the foreground blocks
+for its whole 70+ minutes and an unwatched background run is only read when someone remembers to
+look, so a stall, an OOM or a crash three minutes in burns the whole slot before it is noticed.
+The watch filter must match the failure signatures as well as the progress line
+(`Traceback|Error|Killed|OOM|assert` alongside `Step`/`Tokens/sec`) — a filter that greps only for
+progress is silent through a crash, and silence reads exactly like a healthy run.
+
+**Kill a run the moment its own instrumentation says it cannot pass**, rather than letting it reach
+the checkpoint the gate was going to be read at. The tensors these runs are built around are
+zero-init and logged per step for exactly this purpose (`|g_proj|rms`, `|inject|rms`): one that has
+stopped climbing by the first checkpoint is the answer, and the remaining hour only buys a
+control at matched tokens — which is worth having sometimes, and worth saying out loud rather than
+assuming either way.
+
 ## What this is
 
 `tiny-moe-llm`: an experimental 332M-param LM. A dense Gemma4-style decoder feeds a **single
@@ -425,11 +441,16 @@ divided by a learned `log_temperature`. `ir_num_clusters > 0` selects the **two 
 keeps the exact full-table softmax, and both live in the same module because the migration has to
 be able to produce either. Measurements in
 [docs/measurements/ir_reshape.md](docs/measurements/ir_reshape.md) (the reshape's cost and the probe
-budget) and [docs/measurements/ir_sharpening.md](docs/measurements/ir_sharpening.md) (what 208M
-tokens of training the reshaped table bought). **The short version of the second: the table
-sharpens on the first loop and the model still does not use what it retrieves** — zeroing the read
-costs 0.0002 nats, the same as before it was trained, on both key inits. Anything that tries again
-here has to move that number, not the entropy.
+budget), [docs/measurements/ir_sharpening.md](docs/measurements/ir_sharpening.md) (what 208M
+tokens of training the reshaped table bought) and
+[docs/measurements/ir_scale_fix.md](docs/measurements/ir_scale_fix.md) (the same 208M after the
+value side was normalized and the neutrality zero moved to `g_proj`). **The short version of all
+three: the table sharpens on the first loop and the model still does not use what it retrieves** —
+zeroing the read costs 0.0002 nats across three key inits and two table widths, trained or not.
+Normalizing the values raised the read off the table 4x and `g_proj` stalled at RMS 0.0047,
+re-attenuating it to the same magnitude; the valve moves, the number does not. Anything that tries
+again here has to move that number, not the entropy, and has to explain where content the trunk
+does not already hold is going to come from.
 
 - **Two stage read**: score `num_clusters` centroids, take the top `probe_clusters`, score only
   those clusters' keys exactly, take the global top `read_top_k`, softmax over *those* and gather

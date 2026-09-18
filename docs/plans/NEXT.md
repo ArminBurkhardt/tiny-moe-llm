@@ -581,6 +581,34 @@ If G2b passes, the parametric table is live and Phase 4 inherits a mechanism tha
 fails, Phase 3's branch stands: the table's size is frozen out of the real run spec and external
 memory carries the mechanism alone.
 
+### Outcome — G2b FAILS, and the attenuation relocated
+
+Run and numbers in [docs/measurements/ir_scale_fix.md](../measurements/ir_scale_fix.md). 208M
+tokens, `ir_val` CE 2.9355 → 2.9105, held-out per-loop CE 3.5517 / 3.4236 / 3.4112.
+
+**The read's content is worth 0.0002 nats**, the same figure the untrained seed and both earlier
+arms measured, against a 0.01 bar. Arms A, B and C agree to three or four decimals on every number
+the gate reads, across three key inits and two table widths.
+
+The scale fix worked on the stage it targeted and failed one stage downstream. `retrieved_y` is
+~4x larger (0.011–0.015 against 0.003–0.005), exactly as normalizing the value rows predicted — and
+`g_proj`, which took the neutrality zero, sits at RMS 0.0047 and re-attenuates the read to precisely
+the magnitude the earlier arms delivered. `g_proj` left zero at once and then stalled, moving 7x
+less than a random walk at `fresh_lr` would, with a relative gradient (3.2e-4) in the same range as
+a trunk attention weight's (7.0e-4). Not a vanishing gradient, not weight decay: the steps cancel.
+
+**So the zero's location was never the mechanism.** What the three arms jointly support is that LM
+cross-entropy supplies no consistent gradient toward a parametric read whose query is derived from
+the same hidden state the readout already has — the table cannot offer content the trunk does not
+hold, so nothing pays for opening whichever valve is nominally free. The changes are kept
+(normalized rows, gate-side zero, 384-d width are each correct on their own terms and are what the
+external path wants), but Phase 3's branch now stands: **the table's size is frozen out of the real
+run spec and the evidence pathway carries retrieval alone.**
+
+This does not generalize to retrieval over *external* evidence, which is the one condition arm C
+could not construct: evidence tokens carry content the trunk provably lacks. Phase 4 is where that
+is tested, and arm C is the seed it starts from.
+
 ---
 
 ## Phase 3c — Loop input injection
@@ -637,6 +665,33 @@ the design works.
 Pass: the injection is part of the trunk from here — Phases 4–6 seed from Arm D — and a component
 row in the real run spec. Fail: the residual-stream argument was right, and the depth burden moves
 to 5c's evidence and loop-conditioned query plus 7c's coda. **Neither branch cuts a loop.**
+
+### Outcome — G2c FAILS, stopped at 123M of 208M tokens
+
+Run and numbers in [docs/measurements/loop_injection.md](../measurements/loop_injection.md).
+
+Two matched-token readings against Arm C agreed, so the run was stopped rather than carried to
+208M. Loop 3's gain delta was **+0.0007 at 50M and +0.0009 at 100M** against a +0.01 bar, while
+both repetition measures moved monotonically the *wrong* way — the injection makes consecutive
+loops slightly more alike, on both transitions, at both readings. `|inject|rms` plateaued at
+4.2e-3 from 78M onward, the same ceiling `g_proj` reached, so the remaining 85M tokens would have
+trained a flat tensor.
+
+One reading kept the run going past its first checkpoint and deserves recording: the arm was
+uniformly ~0.022 nats behind its control at 50M, which is a lagging run rather than a loop defect,
+and it halved by 100M. The lag closed and bought nothing.
+
+**So the later loops' redundancy is not caused by their lacking the block's input.** They were
+given it, through 0.59M parameters at the fresh-parameter rate, and got marginally more redundant.
+The residual-stream argument was right. The depth burden moves to 5c and 7c's coda as this phase's
+fail branch says, and this closes the "cheap mechanism grafted onto the converged checkpoint" line
+of attack — that is now 0 for 2, on the same shape of result, and the remaining candidates are
+architecture changes that need a from-scratch comparison to mean anything.
+
+**Neither branch cuts a loop**, and nothing here licenses one: the depth is computing (every
+transition out to 8 loops still moves the stream and flips ~5% of top-1, and the oracle keeps
+finding tokens only deeper loops get right). It retains badly rather than idles, which is a defect
+to fix in the architecture, not a reason to run shallower.
 
 ---
 
@@ -1166,7 +1221,11 @@ still stands on its own.
   **> 0.01 nats**, CE and benchmarks within a finetune's noise, with IR selection rate per loop,
   `‖g_proj‖` against its zero init and `‖y_values‖` reported alongside so the cause is attributable
   (Phase 3b). Passing makes the parametric table live and hands Phase 4 a working mechanism; failing
-  freezes its size out of the real run spec.
+  freezes its size out of the real run spec. **Measured 2026-09-17: FAIL**
+  ([record](../measurements/ir_scale_fix.md)). The ablation held at 0.0002 nats. `retrieved_y` grew
+  4x as the normalization predicted and `g_proj` — stalled at RMS 0.0047, moving 7x less than a
+  random walk — re-attenuated it to the earlier arms' magnitude. The table's size is frozen out of
+  the real run spec; the evidence pathway carries retrieval alone.
 - **G3** — gold-vs-no-evidence CE gap ≥ ~0.3 nats; abstention under no-evidence ≫ under gold;
   benchmarks within noise (Phase 4).
 - **G3b** — groundedness AUROC ≥ 0.65 for unanswerable detection, against the trunk probe's
@@ -1175,7 +1234,10 @@ still stands on its own.
 - **G2c** — loop input injection: loop 3's CE gain ≥ 0.01 nats above Arm C's at matched tokens,
   later-loop updates measurably less aligned with the previous loop's, final-loop CE and benchmarks
   within a finetune's noise of Arm C (Phase 3c). Failing moves the depth burden to 5c and 7c's coda;
-  it does not cut a loop.
+  it does not cut a loop. **Measured 2026-09-18: FAIL**
+  ([record](../measurements/loop_injection.md)). Loop 3's gain delta read +0.0007 at 50M and +0.0009
+  at 100M tokens against a +0.01 bar, with both repetition measures moving the wrong way and
+  `‖inject‖` plateaued from 78M; the run was stopped at 123M rather than carried to 208M.
 - **G5** — corpus-attached EM/F1 delta ≥3σ on NQ-open / TriviaQA / PopQA; depth ablation at
   `n_loops` = 1, 2, 3, 4, 6, 8 read on HotpotQA validation, ARC-Challenge and GSM8K, with the
   knowledge sets reported but not gated. **Flat past 3 → ship 3 and don't rationalize it**; 3 not
