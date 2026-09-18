@@ -730,15 +730,25 @@ supply. Measure its effect separately from Phase 2's numbers.
 
 **Option A — IR reads external memory.** Add `memory=(K_ext, V_ext)` to
 `InformationRetrievalModule.forward`; concatenate `K = [z_keys ; K_ext]`,
-`V = [y_values ; V_ext]`. `K_ext`/`V_ext` come from the external embedder through two new
-384→256 adapters — the V-adapter zero-init so attaching an empty or irrelevant memory is neutral
-at step 0. Two properties fall out free: **no corpus attached → bit-identical to today** (one
-checkpoint serves both modes), and **softmax mass on external vs. parametric entries is a
-groundedness signal** — "I retrieved nothing relevant" becomes measurable instead of guessed.
-One added tensor, decided now: a **learned per-source logit scale on the external half** of the
-concatenated scores. Post-anneal `z_keys` and adapter-mapped bge keys land at different logit
-scales, and without the scale the mass split — the G3b signal itself — measures that mismatch
+`V = [y_values ; V_ext]` and take **one** softmax over the union. Two independently normalized reads
+summed would have no notion of which store won — both always contribute their full magnitude, so
+there is no split to measure and no way for irrelevant evidence to lose. `K_ext`/`V_ext` come from
+the external embedder through two new adapters. Two properties fall out free: **no corpus attached →
+bit-identical to today** (one checkpoint serves both modes), and **softmax mass on external vs.
+parametric entries is a groundedness signal** — "I retrieved nothing relevant" becomes measurable
+instead of guessed. One added tensor, decided now: a **learned per-source logit scale on the external
+half** of the concatenated scores. Post-anneal `z_keys` and adapter-mapped bge keys land at different
+logit scales, and without the scale the mass split — the G3b signal itself — measures that mismatch
 rather than relevance. Init to match the parametric scale; G3b is read after it.
+
+**The adapters are 384→384, not the 384→256 this plan said before 3a.** `ir_dim` was widened to
+bge-small's native 384 (see 3a's reasoning), so both adapters are square — **rotations, not
+compressions**, relocating one space into the other without discarding a third of the embedder's
+output on the way in. Orthogonal init for the same reason: the adapter's job is to move the chunk
+set into the query space, not to distort geometry the retriever already put it in. The V-adapter is
+**not** zero-init as originally written — with a square adapter and unit-normalized rows it starts
+meaningful, and a zero there would teach "ignore evidence" first while the neutrality guarantee it
+was meant to provide already lives on the reader's `o_proj`.
 
 **Option B — CrossAttention reads evidence tokens.** `other` in `transformer.py` is already a
 per-call injection port re-read at every loop. Swap `_moe_ple(input_ids)` for embedded retrieved
@@ -757,6 +767,65 @@ chunks. Three concrete blockers:
 cache valid mid-generation, hands multi-hop its accumulating state, and finally makes 0c's
 "evidence still arriving" depth criterion implementable.
 
+### What building it changed
+
+Three things the build established that the plan above did not anticipate. The first two are about
+the selector and change what to watch during the run rather than what to build; the third is about
+how this corpus fails, and is the reason the first smoke run had to be killed twice.
+
+**The selector is routed; the reader is not.** Option B's "evidence read is always-on, not routed"
+was written about the reader and it is implemented that way — `shared_evidence` seeds the
+accumulator alongside `shared_mlp`/`shared_attn` and is not in the router pool. The selector cannot
+be, because it *is* the IR expert, which is in the pool and whose removal from it would change the
+no-corpus forward and cost the bit-identity the whole port rests on. So a token the router did not
+send to the IR slot has its retrieved value multiplied by a zero gate and the read never reaches the
+residual stream.
+
+The mass split is unaffected by this: every non-MLP expert runs unconditionally once per step, so
+the split is computed for **every** token whether or not its gate is open. The consequence is
+asymmetric — the G3b readout covers the whole batch, while the gradient that trains the adapters
+only arrives through the routed fraction (~`top_k`/`num_experts` of tokens, held there by the aux
+loss). **So judge the selector by the split's AUROC, not by the adapters' norms.** A flat
+`|key_adapter|rms` is the expected reading here, not the stall signature it was in arms C and D,
+because a third of the tokens carrying the loss is still hundreds of millions of tokens over this
+phase.
+
+**The selector needed a different isolation assertion than the reader.** The reader gets its
+document isolation from flash pairing two `cu_seqlens` by position; the selector scores a dense
+`[tokens, chunks]` matrix and needs the same pairing written out as a mask, which is an independent
+second chance to point a document at another document's evidence. Asserting that on the model's
+**logits** passed vacuously: in the test model the router sends no row-1 token to the IR expert, so
+no chunk misassignment however wrong could have moved row 1's output, and the assertion would have
+gone green for the wrong reason (and then gone red later on a larger model, or worse, not). It is
+asserted on the **mass** instead, which is computed for every token regardless of routing and is
+also the quantity the gate reads. Leak is exactly 0.0 there. The general form of this is worth
+carrying into Phase 5: **an isolation assertion downstream of the router can be silenced by the
+router**, so assert at the mechanism's own output.
+
+**A second token stream fails in ways a loss curve cannot show, and one of them does not raise.**
+Both smoke runs died on the evidence axis and neither printed anything a watch could match.
+
+The first was the packing: an evidence budget below the corpus's evidence-to-prompt ratio makes
+evidence the budget that always closes a row, so rows closed after three short QA conversations with
+their 4096 token budget barely touched. Every step then paid a full width forward and backward for a
+row that was ~96% padding. The loss was fine — it is a mean over supervised tokens and does not know
+how many of them there were — and the only symptom was throughput falling to 221 tokens/sec with
+allocation spilling into system memory. `EvidenceDataset` now logs realized row fill and how many
+rows the evidence budget closed, which is the number that names it.
+
+The second was worse. Row padding on the evidence axis carries a negative chunk id as one contiguous
+run, and the per chunk position basis numbered that run like a chunk — so its positions ran the
+length of the whole padding tail, past the rotary cache, into an **unchecked gather**. That is a
+device side assert, which CUDA reports asynchronously: no exception, no traceback, nothing in the
+log. The process sat in `R (running)`, spinning against a dead context, GPU at 1% with its memory
+still held, looking exactly like a slow step. It was found by re-running one micro step outside the
+trainer, where the assert surfaced immediately. Two consequences worth carrying forward: **padding
+is not a chunk** and must be given an in-range position at the source, and `RotaryEmbedding.gather`
+now clamps, because a wrong position is a far cheaper failure than a run that hangs until someone
+notices the GPU is idle. The general form: **a watch filter cannot catch a failure that prints
+nothing** — for anything that indexes with data-dependent ids, the progress line going quiet has to
+be treated as the failure signature, not as a slow step.
+
 ### The eval flip
 
 `eval_abstention.py` gains an `--evidence-port` mode: the passage comes *out of the prompt* and
@@ -766,9 +835,25 @@ at the standard flags.
 
 ### Size and schedule
 
-300–500M tokens mixed across the four conditions plus replay, local on the 5090 (4 × 4096 ×
-accum 4, BF16), ~4–7h. Trunk at `lr=1e-5`; the new adapters get the fresh-param LR group from
-Phase 3. Conversation weighting on (it is what fixed the last policy collapse).
+**150M prompt tokens**, mixed across the four conditions plus ≥20% replay, local on the 5090
+(4 × 4096 × accum 4, BF16). That is the builder's default and it is below the 300–500M this plan
+originally asked for, for a reason the corpus only made visible once it existed: the prompt token is
+no longer the unit of work. Each one now arrives with ~2.9 evidence tokens attached, so 150M prompt
+tokens is ~590M tokens of text moving through the model, and the condition labels — which is what
+this phase is actually training — are per *conversation*, of which there are ~1.2M. Counting the
+budget in prompt tokens and then also carrying the evidence would have doubled the spend for no
+extra supervision. Trunk at `lr=1e-5`; the new adapters get the fresh-param LR group from Phase 3.
+Conversation weighting on (it is what fixed the last policy collapse).
+
+**The row's evidence cap has to be set against the corpus's evidence-to-prompt ratio, not for
+memory.** The two budgets close a packed row independently, so a cap below ~3× the sequence length
+makes evidence the one that always binds: rows close after a handful of short QA conversations with
+the token budget barely touched, and the run then pays a full 4096-wide forward and backward for a
+row that is ~96% padding. It is invisible in the loss and shows up only as throughput, which reads
+like a slow GPU rather than a corpus problem — the first smoke run collapsed from 2,747 to 221
+tokens/sec this way and pushed allocation into system memory. `max_evidence_tokens: 12288` is 3 ×
+`seq_length` against a measured ratio of 2.93, and `EvidenceDataset` now logs the realized row fill
+and how many rows the evidence budget closed, early enough to kill a run over.
 
 **Gate G3:** gold-vs-no-evidence CE gap ≥ ~0.3 nats on the answer span; abstention rate under
 no-evidence ≫ under gold; benchmark suite within noise.
