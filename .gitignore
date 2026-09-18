@@ -2,12 +2,16 @@ __pycache__
 venv
 data/datasets
 data/index
+data/prepared*
+data/archives
+data/benchmarks
 ckpts
 *.key
 *.cmd
 *.json
+*.log
 
-# environment for transformer-engine
+# wsl environment for transformer-engine
 env_init
 # sanity checks :)
-tests/
+# tests/
