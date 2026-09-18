@@ -3,6 +3,7 @@ from torch import nn
 import transformer_engine.pytorch as te
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextAttention as GroupedQueryAttention
 from modules.model.information_retrieval import InformationRetrievalModule
+from modules.model.evidence import EvidenceBatch
 
    
 class SelfAttention(nn.Module):
@@ -45,16 +46,38 @@ class CrossAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, other: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, evidence: EvidenceBatch = None) -> torch.Tensor:
+        """``evidence`` replaces ``other`` as the key/value side when a corpus is attached.
+
+        The two differ in more than content. ``other`` is one per-token tensor aligned with ``x``, so
+        it inherits the queries' segmentation, their position basis and causal masking. Evidence is a
+        different set of tokens entirely: its own segments (one evidence set per query segment), its
+        own per chunk position basis, and no causal order relative to the queries -- a retrieved
+        passage is not "before" or "after" the token reading it.
+        """
         x_norm = self.norm(x)
-        attn_output = self.attn(
-            hidden_states=x_norm,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            position_embeddings=position_embeddings,
-            other_states=other,
-            kv_cache=kv_cache,
-        )
+        if evidence is None:
+            attn_output = self.attn(
+                hidden_states=x_norm,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                other_states=other,
+                kv_cache=kv_cache,
+            )
+        else:
+            attn_output = self.attn(
+                hidden_states=x_norm,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                other_states=evidence.states,
+                kv_cache=None,
+                cu_seqlens_k=evidence.cu_seqlens,
+                max_seqlen_k=evidence.max_seqlen,
+                other_position_embeddings=evidence.position_embeddings,
+                causal=False,
+            )
         return self.dropout(attn_output)
 
 class InformationRetrievalExpert(nn.Module):

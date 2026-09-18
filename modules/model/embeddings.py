@@ -74,6 +74,20 @@ class RotaryPositionEmbeddingsFrequency(nn.Module):
             self.sin_cached[:, :, start:start + length, ...].to(dtype=dtype),
         )
 
+    def gather(self, position_ids: torch.Tensor, dtype: torch.dtype):
+        """cos/sin at ARBITRARY per token positions ``[B, S]`` -> ``[B, 1, S, dim]``.
+
+        ``slice`` covers every case where positions are one contiguous run. Retrieved evidence is
+        not such a case: each chunk gets a position basis restarting at 0, so the packed evidence
+        axis carries positions like ``[0,1,2,0,1,0,1,2,3]`` and has to be indexed rather than
+        sliced. Within-chunk order survives (a copied span still reads left to right); cross-chunk
+        geometry is absent, which is correct -- two chunks from different documents have no relative
+        position, and giving them one would invent an ordering the retriever never meant.
+        """
+        cos = self.cos_cached[0, 0].to(dtype=dtype)[position_ids]   # [B, S, dim]
+        sin = self.sin_cached[0, 0].to(dtype=dtype)[position_ids]
+        return cos.unsqueeze(1), sin.unsqueeze(1)                   # broadcast over heads
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -85,4 +99,13 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_single(x, cos, sin):
+    """``apply_rotary_pos_emb`` for one side only.
+
+    Cross attention over evidence rotates its keys on a different position basis than its queries
+    (see ``RotaryPositionEmbeddingsFrequency.gather``), so the two sides cannot share one call.
+    """
+    return (x * cos) + (rotate_half(x) * sin)
 

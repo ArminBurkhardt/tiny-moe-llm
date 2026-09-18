@@ -70,46 +70,68 @@ def varlen_attention(
     dropout_p: float = 0.0,
     softmax_scale: float | None = None,
     causal: bool = True,
+    cu_seqlens_k: torch.Tensor | None = None,
+    max_seqlen_k: int | None = None,
 ) -> torch.Tensor:
     """Document packed causal attention
 
     Args:
         q: queries, shape ``[B, Hq, S, D]``.
-        k, v: keys/values, shape ``[B, Hkv, S, D]`` (GQA: ``Hkv`` may divide ``Hq``, flash handles the head broadcast natively, so KV heads are not pre repeated)
+        k, v: keys/values, shape ``[B, Hkv, S_kv, D]`` (GQA: ``Hkv`` may divide ``Hq``, flash handles the head broadcast natively, so KV heads are not pre repeated). ``S_kv`` equals ``S`` unless ``cu_seqlens_k`` says otherwise
         cu_seqlens: int32 tensor ``[num_segments + 1]`` of cumulative segment lengths over the flattened ``B*S`` token axis (row major: all of sample 0s tokens, then sample 1, etc).
             ``None`` falls back to one segment per sample (plain causal attn)
         max_seqlen: longest segment length (int). Ignored when ``cu_seqlens`` is ``None``
         dropout_p: attention dropout probability
         softmax_scale: attention scale. Defaults to ``D ** -0.5``
         causal: apply causal masking within each segment
+        cu_seqlens_k: segment boundaries for the KEY side, when it is a different set of tokens than
+            the query side -- cross attention over retrieved evidence, where each query segment pairs
+            with an evidence segment of its own length. ``None`` (the default, and every call the
+            model made before the evidence port existed) reuses ``cu_seqlens`` for both sides, which
+            is what pins ``S_kv`` to ``S``. Must have the same number of segments as ``cu_seqlens``:
+            flash pairs them by position, so segment *i* of the queries attends to segment *i* of the
+            keys and nothing else
+        max_seqlen_k: longest key segment. Defaults to ``max_seqlen``
 
     Returns:
         Attention output, shape ``[B, S, Hq, D]``
 
-    Notes: 
-        - Hq: number of query heads 
+    Notes:
+        - Hq: number of query heads
         - Hkv: number of key/value heads
         - GQA: Hkv must divide Hq and Hq > Hkv
     """
     B, Hq, S, D = q.shape
-    Hkv = k.shape[1]
+    Hkv, S_kv = k.shape[1], k.shape[2]
     if softmax_scale is None:
         softmax_scale = D ** -0.5
 
     if cu_seqlens is None:
         cu_seqlens = _default_cu_seqlens(B, S, q.device)
         max_seqlen = S
+    if cu_seqlens_k is None:
+        # the self attention case: one set of tokens, so both sides index the same segmentation.
+        # asserted rather than broadcast -- a key set of a different length with no segmentation of
+        # its own would be silently mis-segmented by flash rather than rejected
+        assert S_kv == S, (
+            f"keys have {S_kv} positions against {S} queries -- pass cu_seqlens_k to attend over a "
+            f"different set of tokens"
+        )
+        cu_seqlens_k, max_seqlen_k = cu_seqlens, max_seqlen
+    if max_seqlen_k is None:
+        max_seqlen_k = max_seqlen
 
     if _HAS_FLASH:
         # flash wants [total_tokens, H, D], transpose+reshape forces contiguity
         qf = q.transpose(1, 2).reshape(B * S, Hq, D)
-        kf = k.transpose(1, 2).reshape(B * S, Hkv, D)
-        vf = v.transpose(1, 2).reshape(B * S, Hkv, D)
+        kf = k.transpose(1, 2).reshape(B * S_kv, Hkv, D)
+        vf = v.transpose(1, 2).reshape(B * S_kv, Hkv, D)
         cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
+        cu_k = cu_seqlens_k.to(device=q.device, dtype=torch.int32)
         out = flash_attn_varlen_func(
             qf, kf, vf,
-            cu, cu,
-            int(max_seqlen), int(max_seqlen),
+            cu, cu_k,
+            int(max_seqlen), int(max_seqlen_k),
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
@@ -117,7 +139,8 @@ def varlen_attention(
         return out.reshape(B, S, Hq, D)
 
     # fallback (no flash-attn): rebuild the block mask and use SDPA => slowwww
-    return _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal)
+    return _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal,
+                          cu_seqlens_k, S_kv)
 
 
 def cached_attention(
@@ -183,19 +206,32 @@ def cached_attention(
     return out.transpose(1, 2)  # [B, Lq, Hq, D]
 
 
-def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal):
-    # default scaled product attention with a block diagonal mask (one block per document segment)
-    device = q.device
-    # derive a per token segment id from the internal boundaries, then mask same segment pairs
+def _segment_ids(cu_seqlens, B, S, device):
+    # per token segment id, from the internal boundaries: mark each start and cumsum. The ids are
+    # global over the flattened B*S axis, so two tokens in different rows never compare equal
     seg_id = torch.zeros(B * S, dtype=torch.long, device=device)
     internal = cu_seqlens[1:-1].long()
     if internal.numel() > 0:
         seg_id[internal] = 1
-    seg_id = torch.cumsum(seg_id, dim=0).view(B, S)             # [B, S]
-    same = seg_id[:, :, None] == seg_id[:, None, :]             # [B, S, S]
+    return torch.cumsum(seg_id, dim=0).view(B, S)
+
+
+def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal,
+                   cu_seqlens_k=None, S_kv=None):
+    # default scaled product attention with a block diagonal mask (one block per document segment)
+    device = q.device
+    S_kv = S if S_kv is None else S_kv
+    seg_q = _segment_ids(cu_seqlens, B, S, device)                        # [B, S]
+    # both sides number their segments from 0 in the same order, so equal ids mean segment i of the
+    # queries against segment i of the keys -- the pairing flash does by position
+    seg_k = seg_q if cu_seqlens_k is None else _segment_ids(cu_seqlens_k, B, S_kv, device)
+    same = seg_q[:, :, None] == seg_k[:, None, :]               # [B, S, S_kv]
     if causal:
+        # only meaningful when the two sides are the same tokens; cross attention over evidence
+        # passes causal=False, because "before" has no meaning across two different token sets
+        assert S_kv == S, "causal masking needs the key and query sides to be the same tokens"
         same = same & torch.tril(torch.ones(S, S, dtype=torch.bool, device=device))
-    attn_mask = same[:, None, :, :]                             # [B, 1, S, S]
+    attn_mask = same[:, None, :, :]                             # [B, 1, S, S_kv]
 
     if Hkv != Hq:
         k = k.repeat_interleave(Hq // Hkv, dim=1)

@@ -101,23 +101,25 @@ def model_params_for_state_dict(state_dict, params: dict) -> dict:
     make an old checkpoint fail to load the moment the yaml is flipped, which is the wrong way
     round: the checkpoint is the authority on its own shape.
 
-    Reads three things off the state dict: the key table's ``[entries, dim]``, whether a
+    Reads four things off the state dict: the key table's ``[entries, dim]``, whether a
     ``centroids`` buffer exists at all (absent => the exact full-table path the old checkpoints
-    were trained under, so clusters are forced to 0), and whether the per-loop input injection is
-    present (absent => a checkpoint from before it existed, which must keep loading).
+    were trained under, so clusters are forced to 0), and whether the per-loop input injection and
+    the evidence reader are present (absent => a checkpoint from before they existed, which must
+    keep loading).
 
     Args:
         state_dict: the checkpoint's ``model_state_dict``.
         params: the yaml-derived kwargs to start from; not mutated.
 
     Returns:
-        A copy with ``num_ir_entries`` / ``ir_dim`` / ``ir_num_clusters`` / ``loop_inject`` set to
-        match.
+        A copy with ``num_ir_entries`` / ``ir_dim`` / ``ir_num_clusters`` / ``loop_inject`` /
+        ``evidence_port`` set to match.
     """
     out = dict(params)
-    # set before the no-IR-table early return below: the injection is independent of the table, and
-    # a checkpoint written before it existed has no `moe.inject.weight` to load into one
+    # set before the no-IR-table early return below: both are independent of the table, and a
+    # checkpoint written before they existed has no tensor to load into one
     out["loop_inject"] = any(k.endswith("moe.inject.weight") for k in state_dict)
+    out["evidence_port"] = any("moe.shared_evidence." in k for k in state_dict)
     keys = [k for k in state_dict if k.endswith("ir_module.z_keys")]
     if not keys:
         return out

@@ -4,7 +4,11 @@ import torch.nn.functional as F
 import math
 import transformer_engine.pytorch as te
 
-from modules.model.embeddings import RotaryPositionEmbeddingsFrequency, apply_rotary_pos_emb
+from modules.model.embeddings import (
+    RotaryPositionEmbeddingsFrequency,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_single,
+)
 from modules.model.utils import EncoderOutput
 from modules.model.attention import varlen_attention, cached_attention
 
@@ -61,6 +65,10 @@ class Gemma4TextAttention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         other_states: torch.Tensor | None = None,
         kv_cache=None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
+        other_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        causal: bool = True,
     ) -> torch.Tensor:
         bsz, q_len, _ = hidden_states.size()
 
@@ -78,7 +86,14 @@ class Gemma4TextAttention(nn.Module):
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if other_position_embeddings is None:
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            else:
+                # the key side sits on its own position basis (per chunk, restarting at 0), so the
+                # two sides cannot share one rotation -- see the evidence read in moe.py
+                other_cos, other_sin = other_position_embeddings
+                query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+                key_states = apply_rotary_pos_emb_single(key_states, other_cos, other_sin)
 
         if kv_cache is not None:
             # KV-cached incremental decoding (modules/model/kv_cache.py): hidden_states/other_states
@@ -103,7 +118,9 @@ class Gemma4TextAttention(nn.Module):
                 max_seqlen,
                 dropout_p=self.dropout_p if self.training else 0.0,
                 softmax_scale=self.scaling,
-                causal=True,
+                causal=causal,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seqlen_k,
             )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)

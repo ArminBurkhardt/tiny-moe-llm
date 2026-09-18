@@ -12,6 +12,7 @@ from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
 from modules.model.information_retrieval import RetrievalEntropyTracking
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
+from modules.model.evidence import EvidenceBatch
 
 
 
@@ -162,14 +163,23 @@ class _ExpertTracking():
             self.choices.zero_()
 
 def is_fresh_loop_param(name: str) -> bool:
-    """True for a loop tensor a migration adds at zero, which needs the from-scratch rate.
+    """True for a block tensor a migration adds fresh, which needs the from-scratch rate.
 
-    Currently just the input injection. It carries no training at all, so at the trunk's rate it
-    would sit at its zero init for the whole run and the arm would measure nothing -- the same
-    reason ``is_rebuilt_ir_param`` exists, kept separate because that one is about the IR table's
-    reshape and these two lists must be free to disagree.
+    The input injection and the whole evidence reader. Neither carries any training, so at the
+    trunk's rate they would sit at their init for the entire run and the run would measure nothing
+    -- the same reason ``is_rebuilt_ir_param`` exists, kept separate because that one is about the
+    IR table's reshape and these two lists must be free to disagree.
+
+    The evidence reader is matched as a whole subtree rather than tensor by tensor: it is one module
+    that arrives complete, and listing its four projections individually is a list that goes stale
+    the first time the module gains a norm.
     """
-    return name.endswith("moe.inject.weight") or name == "inject.weight"
+    return (
+        name.endswith("moe.inject.weight")
+        or name == "inject.weight"
+        or "shared_evidence." in name
+        or name.startswith("shared_evidence.")
+    )
 
 
 class LoopMixtureOfExperts(nn.Module):
@@ -197,6 +207,7 @@ class LoopMixtureOfExperts(nn.Module):
         loop_enc_dim: int = 32,
         max_enc_loops: int = 64,
         loop_inject: bool = False,
+        evidence_port: bool = False,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -234,6 +245,15 @@ class LoopMixtureOfExperts(nn.Module):
                 in the residual stream, which is also carrying every earlier loop's update. The
                 projection is zero-init, so turning it on is exactly neutral until it learns
                 something. Defaults to False.
+            evidence_port (bool, optional): add the always-on evidence reader -- a CrossAttention
+                that reads retrieved evidence tokens and seeds the accumulator alongside
+                ``shared_mlp``/``shared_attn``. **Deliberately not in the router pool**: the router
+                never specialized in the real run (the aux loss balanced it from step 0), so making
+                "does this token need a fact?" depend on the weakest measured component is a bad
+                bet, and the content is gated by retrieval scores instead. Its output projection is
+                zero-init, so attaching a corpus is neutral at step 0 the same way ``g_proj`` and
+                ``loop_router_bias`` are. With no evidence attached it does not run at all, which is
+                what keeps the no-corpus forward bit-identical. Defaults to False.
         """
         super().__init__()
         self._num_mlp_experts = num_mlp_experts
@@ -353,6 +373,19 @@ class LoopMixtureOfExperts(nn.Module):
             self.inject = nn.Linear(hidden_size, hidden_size, bias=False)
             nn.init.zeros_(self.inject.weight)
 
+        # the evidence reader (see evidence_port in the docstring). Always-on rather than routed,
+        # and re-read at every loop, so a later loop can return to the evidence with a query the
+        # earlier loops' updates have moved -- which is the one thing the diagnostics said later
+        # loops lack. Zero-init o_proj rather than leaving it at its default: a corpus attached to a
+        # freshly built port would otherwise inject noise into a converged trunk on step 0, and the
+        # whole point of the neutrality pattern is that migration is a no-op you can measure.
+        self.shared_evidence = None
+        if evidence_port:
+            self.shared_evidence = CrossAttention(
+                input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads
+            )
+            nn.init.zeros_(self.shared_evidence.attn.o_proj.weight)
+
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
         # one retrieval entropy tracker shared by every IR expert, so the trainer reads a single
@@ -426,7 +459,7 @@ class LoopMixtureOfExperts(nn.Module):
 
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None):
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None, evidence: EvidenceBatch = None):
         # what the router and the experts READ. The residual update at the bottom still adds to
         # `hidden_states` itself, so the injection reaches a readout only through what the experts
         # compute from it -- it re-presents the input, it does not write to the stream lm_head sees.
@@ -442,6 +475,13 @@ class LoopMixtureOfExperts(nn.Module):
         # seed with the always-on shared experts (Step 2) before accumulating routed outputs
         shared_attn_cache = kv_cache.shared_attn if kv_cache is not None else None
         output = self.shared_mlp(step_input) + self.shared_attn(step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
+        # the evidence read joins the always-on seed when a corpus is attached. Both conditions are
+        # structural, not a flag: a checkpoint without the port has no module, and a batch without
+        # evidence never enters this branch, so the no-corpus forward is the one that already ran.
+        if self.shared_evidence is not None and evidence is not None:
+            output = output + self.shared_evidence(
+                step_input, None, cu_seqlens, max_seqlen, position_embeddings, evidence=evidence
+            )
         _other = other if other is not None else step_input
 
         # compute each non-MLP expert exactly once per forward_step, then cache across k slots
@@ -512,9 +552,14 @@ class LoopMixtureOfExperts(nn.Module):
         kv_cache: list = None,
         position_offset: int = 0,
         exit_check=None,
+        evidence: EvidenceBatch = None,
     ):
         """
         Args:
+            evidence (EvidenceBatch, optional): retrieved evidence for this batch, read by the
+                always-on evidence port at **every** loop rather than consumed once -- a later loop
+                returns to the same evidence with a query the earlier loops have moved. Defaults to
+                None, which is the forward this model ran before the port existed, bit for bit.
             n_loops (int, optional): overrides the configured loop count for this call. Both the
                 per-loop router bias and ``loop_scale`` are indexed by absolute loop index (with
                 out-of-range indices reusing the last trained entry), so a checkpoint trained at
@@ -574,9 +619,9 @@ class LoopMixtureOfExperts(nn.Module):
         for loop in range(n_loops):
             loop_cache = kv_cache[loop] if kv_cache is not None else None
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=evidence)
             total_load_balancing_loss += load_balancing_loss
             hidden_states_all.append(hidden_states)
             loops_run += 1

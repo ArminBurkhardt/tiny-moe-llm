@@ -6,6 +6,7 @@ from modules.model.moe import LoopMixtureOfExperts
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
+from modules.model.evidence import EvidenceBatch, chunk_position_ids, evidence_cu_seqlens
 from utils import logger
 
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
@@ -91,6 +92,7 @@ class TinyMoETransformer(nn.Module):
         lm_head_factor: int = 8,
         moe_intermediate_size: int = None,
         loop_inject: bool = False,
+        evidence_port: bool = False,
     ):
         super().__init__()
 
@@ -152,6 +154,7 @@ class TinyMoETransformer(nn.Module):
             n_loops=n_loops,
             max_seq_len=max_seq_len,
             loop_inject=loop_inject,
+            evidence_port=evidence_port,
         )
         
         self.norm = RMSNorm(hidden_size)
@@ -286,7 +289,50 @@ class TinyMoETransformer(nn.Module):
         moe_embeds = self.moe_embeddings(input_ids)
         moe_embeds = self.moe_embed_proj(moe_embeds)
         return moe_embeds
-    
+
+    def build_evidence(self, evidence_ids: torch.Tensor, evidence_chunk_ids: torch.Tensor,
+                       evidence_segment_ids: torch.Tensor, chunk_keys: torch.Tensor = None):
+        """Pack retrieved evidence into the form the MoE block reads.
+
+        Evidence tokens go through **this model's own** embedding path, the same one ``_moe_ple``
+        uses for the injection port they replace. That is deliberate: the reader has to be able to
+        copy a span out of a retrieved passage, and a span is only copyable if the evidence arrives
+        in the token space the readout writes in. An external embedder's chunk vector cannot carry a
+        span -- it is a 384-d summary of a whole passage -- which is why the external embedder sits
+        on the *selector* side (``chunk_keys``) and never on this one.
+
+        Args:
+            evidence_ids: ``[B, S_ev]`` token ids of the retrieved chunks, packed end to end.
+            evidence_chunk_ids: ``[B, S_ev]`` which chunk each token came from. Drives the per chunk
+                position restart, so two chunks that happen to be adjacent in the packing do not
+                read as one continuous passage.
+            evidence_segment_ids: ``[B, S_ev]`` which *query* segment each evidence token serves.
+                Must produce the same number of segments as the query side's ``cu_seqlens``, in the
+                same order -- flash pairs the two by position, so a mismatch points a document at
+                another document's evidence silently rather than raising.
+            chunk_keys: ``[B, num_chunks, embed_dim]`` external embedder vectors for the selector.
+                Optional; the reader works without them.
+
+        Returns:
+            An ``EvidenceBatch``, or None when this model has no evidence port.
+        """
+        if self.moe.shared_evidence is None:
+            return None
+        states = self._moe_ple(evidence_ids)
+        assert states is not None, "the evidence reader needs the MoE embedding path to embed with"
+        cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids)
+        position_ids = chunk_position_ids(evidence_chunk_ids)
+        cos, sin = self.moe.rotary_emb.gather(position_ids, states.dtype)
+        return EvidenceBatch(
+            states=states,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_embeddings=(cos, sin),
+            chunk_ids=evidence_chunk_ids,
+            chunk_keys=chunk_keys,
+        )
+
+
     def _convergence_exit(self, tol: float, min_loops: int):
         """Build an ``exit_check`` that stops looping once the READOUT stops moving.
 
@@ -338,6 +384,7 @@ class TinyMoETransformer(nn.Module):
         converge_tol: float = None,
         min_loops: int = 1,
         skip_mtp: bool = False,
+        evidence: EvidenceBatch = None,
     ):
         """forward pass of the model
 
@@ -370,6 +417,11 @@ class TinyMoETransformer(nn.Module):
                 paid over the whole prefix on every generated token, and every caller that only
                 wants logits (greedy decode, the log-likelihood scorers, the calibration probes)
                 was throwing the result away. Defaults to False.
+            evidence (EvidenceBatch, optional): retrieved evidence for this batch, built by
+                ``build_evidence``. Read at every loop by the always-on evidence port. Defaults to
+                None, which reproduces the forward this model ran before the port existed, bit for
+                bit -- that property is what lets one checkpoint serve both modes and is asserted in
+                ``tests/test_evidence_port.py``.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -389,7 +441,7 @@ class TinyMoETransformer(nn.Module):
         if self.training and self.use_checkpointing:
             assert converge_tol is None, "converge_tol is inference-only"
             x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
-            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, use_reentrant=False)
+            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, None, 0, None, evidence, use_reentrant=False)
             # final RMSNorm applied at every loop, not just the last -- lm_head reads self.norm(x),
             # never the raw residual stream, so per-loop CE needs this too.
             x_all = self.norm(hidden_states_all)
@@ -403,7 +455,7 @@ class TinyMoETransformer(nn.Module):
             moe_cache = kv_cache.moe if kv_cache is not None else None
             exit_check = None if converge_tol is None else self._convergence_exit(converge_tol, min_loops)
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
-            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check)
+            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=False)
