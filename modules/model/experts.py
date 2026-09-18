@@ -93,6 +93,7 @@ class InformationRetrievalExpert(nn.Module):
         num_clusters: int = 0,
         probe_clusters: int = 4,
         read_top_k: int = 32,
+        memory_dim: int = 0,
     ):
         super().__init__()
         self.input_size = input_size
@@ -117,18 +118,36 @@ class InformationRetrievalExpert(nn.Module):
             num_clusters=num_clusters,
             probe_clusters=probe_clusters,
             read_top_k=read_top_k,
+            memory_dim=memory_dim,
         )
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, loop_idx: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, loop_idx: int = 0, memory=None) -> torch.Tensor:
+        """``memory`` is the external store the table is read alongside, or None for the table alone.
+
+        This expert is the SELECTOR half of the evidence port: it decides how much of a token's read
+        comes from outside the weights, and that decision is what the groundedness signal is. It
+        does not carry the evidence's text -- an external chunk vector is a summary of a whole
+        passage and no span can be copied out of it, which is why the reader is a separate module
+        over the evidence TOKENS.
+
+        Note what routing does and does not reach. This expert is in the router pool, so a token the
+        router did not select it for has its retrieved value multiplied by a zero gate and the read
+        never reaches the residual stream. The mass split is unaffected: every non-MLP expert runs
+        unconditionally once per step, so the split is computed for every token whether or not its
+        gate is open. So the groundedness readout covers the whole batch, while the gradient that
+        trains the adapters only arrives through the routed fraction -- which is the argument for
+        watching the split's AUROC rather than the adapters' norms when judging whether it is
+        learning.
+        """
         x_norm = self.norm(x)
 
         down = self.down_proj(x_norm)
         # loop_idx only buckets the retrieval entropy instrumentation (see RetrievalEntropyTracking);
         # the retrieval itself is loop independent, which is exactly what the Stage 0 query drift
         # measurement found and what NEXT.md's loop conditioned query is meant to change
-        ir_output = self.ir_module(down, loop_idx=loop_idx)
+        ir_output = self.ir_module(down, loop_idx=loop_idx, memory=memory)
         information = self.up_proj(ir_output)
 
         attn_output = self.attn(

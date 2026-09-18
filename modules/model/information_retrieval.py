@@ -295,6 +295,7 @@ class InformationRetrievalModule(nn.Module):
         read_top_k: int = 32,
         query_capacity_factor: float = 1.5,
         reservoir_size: int = 1024,
+        memory_dim: int = 0,
     ):
         """
         Args:
@@ -320,6 +321,10 @@ class InformationRetrievalModule(nn.Module):
                 capacity-limited MoE dispatch -- a token keeps its other probes.
             reservoir_size: how many recent queries are kept for the refresh diagnostics (candidate
                 recall) and for re-seeding dead entries.
+            memory_dim: width of the external embedder's chunk vectors, or 0 for no external
+                memory at all (which is every checkpoint written before the evidence port, and the
+                path that must stay bit-identical). Non-zero adds the two adapters and the learned
+                source scale described below.
         """
         super().__init__()
         self.num_entries = num_entries
@@ -366,6 +371,48 @@ class InformationRetrievalModule(nn.Module):
             out_features=output_dim,
             bias=False
         )
+
+        # external memory: a second backing store read by the SAME softmax as the table, so the two
+        # compete for one budget of read mass and the split between them is a measurable quantity
+        # rather than two independent reads summed. That split is the whole point -- it is what a
+        # groundedness signal reads off, and "how much of what I retrieved came from outside my own
+        # weights" only means something if the two were ranked against each other.
+        #
+        # Three tensors, and each one is doing a distinct job:
+        #   * key_adapter relocates the external embedder's space into the query's. The two spaces
+        #     are unrelated -- the queries were trained against z_keys, not against anything the
+        #     embedder produces -- so a cosine between them is meaningless until something learns
+        #     the map. Square (the table was widened to the embedder's native width for exactly this
+        #     reason), so it is a ROTATION rather than a compression, and orthogonal-init: the
+        #     adapter's job is to move the chunk set, not to distort the geometry the retriever
+        #     already put it in.
+        #   * value_adapter does the same on the read side. Its output is unit normalized like
+        #     _value_table, so one read mixes both stores on one scale with no constant to tune.
+        #   * log_memory_scale is the one free knob between the two score distributions. Trained
+        #     keys concentrate near the queries that trained them and external chunk vectors do not,
+        #     so their score SPREADS differ by construction; without a scale the mass split measures
+        #     that mismatch rather than relevance, i.e. it measures the wrong thing at the one place
+        #     the whole port is read. exp() keeps it positive, so the scale can never flip the
+        #     ranking of the external half, and log(1) = 0 starts it at parity.
+        # There is deliberately no additive bias: the key adapter is free to place the chunk keys
+        # anywhere relative to the query distribution, including shifting them along its mean, so a
+        # bias would be a second parameterization of the same degree of freedom.
+        self.memory_dim = int(memory_dim)
+        self.key_adapter = None
+        self.value_adapter = None
+        self.log_memory_scale = None
+        if self.memory_dim > 0:
+            self.key_adapter = te.Linear(self.memory_dim, latent_dim, bias=False)
+            self.value_adapter = te.Linear(self.memory_dim, output_dim, bias=False)
+            nn.init.orthogonal_(self.key_adapter.weight)
+            nn.init.orthogonal_(self.value_adapter.weight)
+            self.log_memory_scale = nn.Parameter(torch.zeros(()))
+        # per token fraction of the read mass that landed on the external half, [tokens], from the
+        # most recent forward -- so on the LAST loop, since the module is re-applied every loop and
+        # each one overwrites it. Instrumentation, so a plain fp32 attribute rather than a buffer,
+        # for the same reasons entry_usage is one: model.to(BF16) would cast a buffer, and this is a
+        # sample of the last batch rather than state a checkpoint should carry.
+        self.last_memory_mass = None
 
         if self.num_clusters > 0:
             assert num_entries % self.num_clusters == 0, (
@@ -456,6 +503,11 @@ class InformationRetrievalModule(nn.Module):
         wrong: ``z_keys`` and ``y_values`` are 33.5M parameters that a two stage read touches ~1.5%
         of. Billing them densely overstates the model's compute by ~67 MFLOP/token, which is more
         than the entire dense decoder -- and every throughput and MFU number is derived from this.
+
+        The external store is NOT counted: its size is a property of the batch, not of the module,
+        so it has no per token constant to report. At the tens-of-chunks scale a retrieval actually
+        returns it is ~2% of the candidate scoring below, which is within the noise of an MFU
+        number; a buffer that grew to thousands of chunks would not be, and would need billing here.
         """
         if self.num_clusters == 0:
             # score every key, then read a dense [num_entries] x [num_entries, out] combination
@@ -482,14 +534,18 @@ class InformationRetrievalModule(nn.Module):
         """
         self.temperature_scale.fill_(float(scale))
 
-    def forward(self, x: torch.Tensor, return_weights=False, loop_idx: int = 0, **kwargs) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
+    def forward(self, x: torch.Tensor, return_weights=False, loop_idx: int = 0, memory=None, **kwargs) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
         """
         x: input tensor of shape (batch, seq_len, latent_dim) or (batch, latent_dim)
         return_weights: if True, also returns the retrieval weights. On the two stage path these
             are the [tokens, read_top_k] read weights, NOT a full-table distribution -- there is no
-            full-table distribution to return.
+            full-table distribution to return. With external memory attached they are the
+            PARAMETRIC half, renormalized -- see ``_merge``.
         loop_idx: which loop of the MoE recurrence this call belongs to. Only used to bucket the
             entropy instrumentation per loop; the retrieval itself does not depend on it
+        memory: ``(chunk_keys [M, memory_dim], visible [tokens, M])`` external store to read
+            alongside the table, built by ``modules.model.evidence.evidence_memory``. None takes
+            the read path this module had before external memory existed, unchanged.
         """
         # handle 2D or 3D inputs
         original_shape = x.shape
@@ -502,10 +558,16 @@ class InformationRetrievalModule(nn.Module):
         # for Cosine Similarity (via dot product)
         x_norm = F.normalize(x_flat, p=2, dim=-1)
 
+        if self.key_adapter is None:
+            memory = None  # no adapters to read it with; a checkpoint without the port ignores it
+        if memory is None:
+            # cleared rather than left alone, so a reader of the mass signal cannot pick up the
+            # last evidence-bearing batch's value on a batch that carried no evidence
+            self.last_memory_mass = None
         if self.num_clusters > 0:
-            retrieved_y, weights = self._two_stage_read(x_norm)
+            retrieved_y, weights = self._two_stage_read(x_norm, memory)
         else:
-            retrieved_y, weights = self._exact_read(x_norm)
+            retrieved_y, weights = self._exact_read(x_norm, memory)
 
         # instrumentation only: no grad, throttled, and reading the weights that already exist here
         # rather than recomputing them (which is what eval_stage0.py has to do from outside)
@@ -526,7 +588,7 @@ class InformationRetrievalModule(nn.Module):
             return out, weights
         return out
 
-    def _exact_read(self, x_norm: torch.Tensor):
+    def _exact_read(self, x_norm: torch.Tensor, memory=None):
         """full-table softmax read. [T, D] -> ([T, out], [T, num_entries])."""
         z_norm = F.normalize(self.z_keys, p=2, dim=-1)
 
@@ -536,6 +598,13 @@ class InformationRetrievalModule(nn.Module):
             logits = -logits  # flip to find the minimum dot product
         logits = logits / self.temperature
 
+        if memory is not None:
+            weights, ext_weights = self._merge(logits, x_norm, memory)
+            dtype = x_norm.dtype
+            read = torch.matmul(weights.to(dtype), self._value_table(dtype))
+            read = read + torch.matmul(ext_weights.to(dtype), self._memory_values(memory[0], dtype))
+            return read, self._tracker_weights(weights).to(dtype)
+
         # 3. retrieval process
         weights = F.softmax(logits, dim=-1)
 
@@ -543,7 +612,67 @@ class InformationRetrievalModule(nn.Module):
         # [T, num_entries] @ [num_entries, output_dim] -> [T, output_dim]
         return torch.matmul(weights, self._value_table(self.y_values.dtype)), weights
 
-    def _two_stage_read(self, q: torch.Tensor):
+    def _memory_scores(self, x_norm: torch.Tensor, memory) -> torch.Tensor:
+        """external chunk scores, on the same temperature scale as the table's. [T, M], fp32.
+
+        Masked to the querying token's own document. The reader gets that isolation for free from
+        flash's positional pairing of two ``cu_seqlens``; here it has to be written out, and it is
+        built from the same segment numbering so the two halves of the port cannot disagree about
+        which document owns a chunk.
+        """
+        keys, visible = memory
+        # unit rows on the adapted keys, so this is a cosine in the same units as the table's score
+        # and the ONLY thing standing between the two distributions is the learned scale
+        adapted = F.normalize(self.key_adapter(keys.to(x_norm.dtype)), p=2, dim=-1)  # [M, latent]
+        scores = torch.matmul(x_norm, adapted.t()).float()
+        scores = scores * self.log_memory_scale.exp().float() / self.temperature.float()
+        # finite, not -inf: a token whose document retrieved nothing has every external entry masked,
+        # and -inf would give it a NaN the moment the parametric half were also fully masked
+        return scores.masked_fill(~visible, -1e4)
+
+    def _merge(self, logits: torch.Tensor, x_norm: torch.Tensor, memory):
+        """ONE softmax over [parametric ; external]. -> ([T, parametric], [T, M]), both fp32.
+
+        Concatenated rather than two softmaxes summed, because a sum of two independently
+        normalized reads has no notion of which store won -- both always contribute their full
+        magnitude, so there is no split to measure and no way for irrelevant evidence to lose.
+
+        fp32 throughout: post-anneal the scores are divided by ~0.05, so the masked entries sit at
+        -1e4/T, which underflows cleanly in fp32 and not always in bf16. The two stage path already
+        took its softmax in fp32 for that reason; the exact path's bf16 softmax is preserved on its
+        own no-memory branch so that path stays bit-identical to what it was.
+        """
+        ext = self._memory_scores(x_norm, memory)                       # [T, M]
+        n = logits.shape[-1]
+        joint = F.softmax(torch.cat([logits.float(), ext], dim=-1), dim=-1)
+        parametric, external = joint[:, :n], joint[:, n:]
+        # the signal the groundedness readout is taken from: how much of this token's one budget of
+        # read mass the external store won. Detached and stashed rather than returned, because the
+        # expert's return value is consumed positionally by the MoE accumulator.
+        self.last_memory_mass = external.detach().sum(dim=-1)
+        return parametric, external
+
+    def _memory_values(self, keys: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """the external store's value rows, unit normalized like ``_value_table``. [M, out].
+
+        Read through their own adapter rather than reused as their own values: a retrieval key and
+        the content read off it are different jobs (the table keeps them as two separate tables for
+        the same reason), and tying them would make relevance and content one vector.
+        """
+        return F.normalize(self.value_adapter(keys.to(dtype)), p=2, dim=-1).to(dtype)
+
+    def _tracker_weights(self, parametric: torch.Tensor) -> torch.Tensor:
+        """the parametric half renormalized, which is what the entropy instrumentation means.
+
+        The tracker reports ``E / ln(width)`` over the table read: a measure of how SHARP the table
+        read is, compared across runs and against ``eval_stage0.py``. With an external store in the
+        same softmax the parametric half no longer sums to 1, and feeding it raw would report a read
+        as sharper simply because the evidence outcompeted it -- conflating the two things the port
+        is meant to separate. Read magnitude is reported by the mass split instead.
+        """
+        return parametric / parametric.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def _two_stage_read(self, q: torch.Tensor, memory=None):
         """centroid probe then exact candidate scoring. [T, D] -> ([T, out], [T, read_top_k])."""
         num_tokens = q.shape[0]
         num_clusters, capacity = self.cluster_members.shape
@@ -598,15 +727,28 @@ class InformationRetrievalModule(nn.Module):
 
         # fp32 softmax: post-anneal the scores are divided by ~0.05, and the masked-out candidates
         # sit at -1e4/T, which underflows cleanly in fp32 and not always in bf16
-        weights = F.softmax(top_scores.float() / self.temperature.float(), dim=-1).to(q.dtype)
+        logits = top_scores.float() / self.temperature.float()
+        ext_weights = None
+        if memory is None:
+            weights = F.softmax(logits, dim=-1).to(q.dtype)
+            tracker_weights = weights
+        else:
+            weights, ext_weights = self._merge(logits, q, memory)
+            weights = weights.to(q.dtype)
+            tracker_weights = self._tracker_weights(weights)
 
+        # the usage EMA takes the UNRENORMALIZED weights on purpose, unlike the entropy tracker: an
+        # entry that keeps losing its mass to the external store really is being read less, and
+        # recycling it is the correct response. Renormalizing here would hide exactly that.
         self._track_usage(q, entry_ids, weights)
 
         # normalize the TABLE and then gather, not the other way round: the gathered rows are
         # [T, read_top_k, out], an order of magnitude more elements than the table itself
         values = F.embedding(entry_ids, self._value_table(q.dtype))             # [T, read_top_k, out]
         read = torch.einsum("tk,tko->to", weights, values)
-        return read, weights
+        if ext_weights is not None:
+            read = read + torch.matmul(ext_weights.to(q.dtype), self._memory_values(memory[0], q.dtype))
+        return read, tracker_weights
 
     def _value_table(self, dtype: torch.dtype) -> torch.Tensor:
         """``y_values`` with unit rows -- the table as the read actually sees it.

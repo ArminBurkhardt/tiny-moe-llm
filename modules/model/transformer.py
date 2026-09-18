@@ -6,7 +6,9 @@ from modules.model.moe import LoopMixtureOfExperts
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
-from modules.model.evidence import EvidenceBatch, chunk_position_ids, evidence_cu_seqlens
+from modules.model.evidence import (
+    EvidenceBatch, chunk_position_ids, chunk_segment_ids, evidence_cu_seqlens,
+)
 from utils import logger
 
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
@@ -303,15 +305,17 @@ class TinyMoETransformer(nn.Module):
 
         Args:
             evidence_ids: ``[B, S_ev]`` token ids of the retrieved chunks, packed end to end.
-            evidence_chunk_ids: ``[B, S_ev]`` which chunk each token came from. Drives the per chunk
-                position restart, so two chunks that happen to be adjacent in the packing do not
-                read as one continuous passage.
+            evidence_chunk_ids: ``[B, S_ev]`` which chunk each token came from, numbered **globally
+                over the batch**. Drives the per chunk position restart, so two chunks that happen
+                to be adjacent in the packing do not read as one continuous passage, and indexes
+                ``chunk_keys`` for the selector.
             evidence_segment_ids: ``[B, S_ev]`` which *query* segment each evidence token serves.
                 Must produce the same number of segments as the query side's ``cu_seqlens``, in the
                 same order -- flash pairs the two by position, so a mismatch points a document at
                 another document's evidence silently rather than raising.
-            chunk_keys: ``[B, num_chunks, embed_dim]`` external embedder vectors for the selector.
-                Optional; the reader works without them.
+            chunk_keys: ``[num_chunks, embed_dim]`` external embedder vectors, one per chunk, in
+                ``evidence_chunk_ids``' numbering. Optional -- the reader works without them, and
+                without them the selector simply never sees an external store.
 
         Returns:
             An ``EvidenceBatch``, or None when this model has no evidence port.
@@ -323,6 +327,11 @@ class TinyMoETransformer(nn.Module):
         cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids)
         position_ids = chunk_position_ids(evidence_chunk_ids)
         cos, sin = self.moe.rotary_emb.gather(position_ids, states.dtype)
+        # derived from the evidence's OWN cu_seqlens rather than from evidence_segment_ids directly,
+        # so the selector's chunk-to-document map is the same one the reader's segment pairing uses
+        chunk_segments = None if chunk_keys is None else chunk_segment_ids(
+            evidence_chunk_ids, cu_seqlens, chunk_keys.shape[0]
+        )
         return EvidenceBatch(
             states=states,
             cu_seqlens=cu_seqlens,
@@ -330,6 +339,7 @@ class TinyMoETransformer(nn.Module):
             position_embeddings=(cos, sin),
             chunk_ids=evidence_chunk_ids,
             chunk_keys=chunk_keys,
+            chunk_segments=chunk_segments,
         )
 
 

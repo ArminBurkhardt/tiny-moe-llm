@@ -24,6 +24,8 @@ from dataclasses import dataclass
 
 import torch
 
+from modules.model.attention import _default_cu_seqlens, _segment_ids
+
 
 @dataclass
 class EvidenceBatch:
@@ -41,10 +43,16 @@ class EvidenceBatch:
             side, and for the same no-host-sync reason).
         position_embeddings: ``(cos, sin)`` for the evidence axis, gathered at the per chunk
             positions rather than sliced from 0.
-        chunk_ids: ``[B, S_ev]``, which retrieved chunk each evidence token came from. Read by the
-            selector to gate a chunk's tokens by its relevance, and by nothing else.
-        chunk_keys: ``[B, num_chunks, embed_dim]`` external embedder vectors, one per retrieved
-            chunk -- the selector's side of the port. ``None`` when only the reader is attached.
+        chunk_ids: ``[B, S_ev]``, which retrieved chunk each evidence token came from. Drives the
+            per chunk position restart, and indexes ``chunk_keys``. **Numbered globally over the
+            batch**, not per row: it is the join between the reader's token axis and the selector's
+            chunk axis, and a per-row numbering would make chunk 0 of row 0 and chunk 0 of row 1
+            index the same key.
+        chunk_keys: ``[num_chunks, embed_dim]`` external embedder vectors, one per retrieved chunk
+            -- the selector's side of the port. ``None`` when only the reader is attached.
+        chunk_segments: ``[num_chunks]`` which query segment each chunk serves, in the same
+            numbering the reader's ``cu_seqlens`` pairing produces. Derived rather than supplied, so
+            the selector and the reader cannot disagree about which document owns a chunk.
     """
 
     states: torch.Tensor
@@ -53,6 +61,7 @@ class EvidenceBatch:
     position_embeddings: tuple[torch.Tensor, torch.Tensor]
     chunk_ids: torch.Tensor = None
     chunk_keys: torch.Tensor = None
+    chunk_segments: torch.Tensor = None
 
     @property
     def num_tokens(self) -> int:
@@ -97,3 +106,46 @@ def evidence_cu_seqlens(segment_ids: torch.Tensor) -> tuple[torch.Tensor, int]:
     cu = torch.zeros(starts.numel() + 1, dtype=torch.int32, device=device)
     cu[1:] = (ends - starts).cumsum(0).to(torch.int32)
     return cu, S
+
+
+def chunk_segment_ids(chunk_ids: torch.Tensor, cu_seqlens: torch.Tensor,
+                      num_chunks: int) -> torch.Tensor:
+    """Which query segment each retrieved chunk serves, ``[num_chunks]``.
+
+    Derived from the evidence side's own ``cu_seqlens`` rather than taken from the caller, so the
+    selector's notion of "this chunk belongs to document *i*" is by construction the same one the
+    reader's segment pairing uses. Two ways of saying which document owns a chunk is two ways for
+    them to disagree, and the disagreement is silent -- the reader would attend to the right
+    passage while the selector scored a different document's.
+
+    Requires ``chunk_ids`` to be numbered globally over the batch (see ``EvidenceBatch``): the
+    scatter indexes ``chunk_keys`` directly. Every token of a chunk writes its own segment, which is
+    the same value for all of them, so the duplicate writes are not order dependent.
+    """
+    B, S = chunk_ids.shape
+    token_segment = _segment_ids(cu_seqlens, B, S, chunk_ids.device).reshape(-1)
+    out = torch.zeros(num_chunks, dtype=token_segment.dtype, device=chunk_ids.device)
+    return out.scatter_(0, chunk_ids.reshape(-1), token_segment)
+
+
+def evidence_memory(evidence: EvidenceBatch, cu_seqlens: torch.Tensor, B: int, S: int, device):
+    """The selector's view of the corpus: ``(chunk_keys [M, embed_dim], visible [B*S, M])``.
+
+    The reader gets its isolation from flash's positional pairing of two ``cu_seqlens``; the
+    selector scores a dense ``[tokens, chunks]`` matrix instead, so it needs the pairing written out
+    as a mask. Both are built from the same segment numbering, which is what keeps them consistent.
+
+    Dense over the whole batch's chunks rather than gathered per row: ``M`` is tens, so the masked
+    out entries cost ~2% of what the parametric candidate scoring already costs, and a flat chunk
+    axis is the shape an append only buffer grows along.
+
+    Returns None when there is nothing to select over, which is the signal the IR module uses to
+    take its original read path unchanged.
+    """
+    if evidence is None or evidence.chunk_keys is None or evidence.chunk_segments is None:
+        return None
+    if cu_seqlens is None:
+        cu_seqlens = _default_cu_seqlens(B, S, device)
+    token_segment = _segment_ids(cu_seqlens, B, S, device).reshape(-1)          # [B*S]
+    visible = evidence.chunk_segments.unsqueeze(0) == token_segment.unsqueeze(1)
+    return evidence.chunk_keys, visible

@@ -12,7 +12,7 @@ from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
 from modules.model.information_retrieval import RetrievalEntropyTracking
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
-from modules.model.evidence import EvidenceBatch
+from modules.model.evidence import EvidenceBatch, evidence_memory
 
 
 
@@ -173,12 +173,20 @@ def is_fresh_loop_param(name: str) -> bool:
     The evidence reader is matched as a whole subtree rather than tensor by tensor: it is one module
     that arrives complete, and listing its four projections individually is a list that goes stale
     the first time the module gains a norm.
+
+    The selector's three tensors are matched by name instead, and deliberately NOT as the whole
+    ``ir_module`` subtree: the key/value tables in that same module carry a full sharpening run and
+    would be wrecked by a from-scratch rate, while the adapters and the source scale have never seen
+    a gradient. This is the one place in the block where fresh and trained tensors share a module.
     """
     return (
         name.endswith("moe.inject.weight")
         or name == "inject.weight"
         or "shared_evidence." in name
         or name.startswith("shared_evidence.")
+        or ".key_adapter." in name
+        or ".value_adapter." in name
+        or name.endswith("log_memory_scale")
     )
 
 
@@ -300,6 +308,10 @@ class LoopMixtureOfExperts(nn.Module):
                 num_clusters=ir_num_clusters,
                 probe_clusters=ir_probe_clusters,
                 read_top_k=ir_read_top_k,
+                # the external store arrives at the embedder's native width, which is what ir_dim
+                # was widened to -- so the adapters are square rotations rather than compressions,
+                # and no information is thrown away relocating one space into the other
+                memory_dim=ir_dim if evidence_port else 0,
             ) for _ in range(num_ir_experts)
         ])
         self.experts = nn.ModuleList(experts)
@@ -459,7 +471,7 @@ class LoopMixtureOfExperts(nn.Module):
 
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None, evidence: EvidenceBatch = None):
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None, evidence: EvidenceBatch = None, memory=None):
         # what the router and the experts READ. The residual update at the bottom still adds to
         # `hidden_states` itself, so the injection reaches a readout only through what the experts
         # compute from it -- it re-presents the input, it does not write to the stream lm_head sees.
@@ -491,7 +503,7 @@ class LoopMixtureOfExperts(nn.Module):
             slot_cache = kv_cache.slots[i] if kv_cache is not None else None
             if isinstance(self.experts[i], InformationRetrievalExpert):
                 # loop_idx is passed for the entropy instrumentation only (see forward's docstring)
-                expert_cache.append(self.experts[i](step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache, loop_idx=loop_idx))
+                expert_cache.append(self.experts[i](step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache, loop_idx=loop_idx, memory=memory))
             elif isinstance(self.experts[i], SelfAttention):
                 expert_cache.append(self.experts[i](step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
             elif isinstance(self.experts[i], CrossAttention):
@@ -615,13 +627,21 @@ class LoopMixtureOfExperts(nn.Module):
         # change with the loop index -- one GEMM for the whole recurrence, not one per loop.
         inject_bias = self.inject(hidden_states) if self.inject is not None else None
 
+        # the selector's view of the same evidence, built once for the whole recurrence: the chunk
+        # set and the token-to-document mask do not change with the loop index, only the query that
+        # scores them does. None whenever there is no external store to read, which is what keeps
+        # every IR expert on the exact read path it had before the port existed.
+        memory = evidence_memory(
+            evidence, cu_seqlens, hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
+        )
+
         loops_run = 0
         for loop in range(n_loops):
             loop_cache = kv_cache[loop] if kv_cache is not None else None
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, memory, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=evidence)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=evidence, memory=memory)
             total_load_balancing_loss += load_balancing_loss
             hidden_states_all.append(hidden_states)
             loops_run += 1
