@@ -120,6 +120,11 @@ def model_params_for_state_dict(state_dict, params: dict) -> dict:
     # checkpoint written before they existed has no tensor to load into one
     out["loop_inject"] = any(k.endswith("moe.inject.weight") for k in state_dict)
     out["evidence_port"] = any("moe.shared_evidence." in k for k in state_dict)
+    # the IR expert's output stage, inferred the same way and for the same reason: a checkpoint
+    # written before the direct read existed has no direct_gate to load into one, and its values
+    # were trained against the averaged stage, so reading it back through a different stage would
+    # score a model nobody trained. A migration is what moves a checkpoint onto the direct path.
+    out["ir_direct_read"] = any(".direct_gate." in k for k in state_dict)
     keys = [k for k in state_dict if k.endswith("ir_module.z_keys")]
     if not keys:
         return out
@@ -135,15 +140,30 @@ def model_params_for_state_dict(state_dict, params: dict) -> dict:
 
 
 IR_TEMPERATURE_KEYS = ("ir_module.log_temperature", "ir_module.temperature_scale")
+# the loop conditioning on the two evidence queries, and the reader's per-loop gain. Same argument
+# as the temperature above and no weaker: a zero bias IS the unconditioned query every earlier
+# checkpoint was trained with, and a gain of 1.0 IS the single loop_scale the reader used to be
+# scaled by alone -- so an old checkpoint loads as exactly itself, not approximately.
+NEUTRAL_LOOP_KEYS = (
+    "ir_module.loop_query_bias.weight",
+    "moe.evidence_query_bias.weight",
+    "moe.evidence_loop_scale",
+    # the reader/selector coupling gate: zero scale IS the ungated reader every earlier checkpoint
+    # ran, so the same argument applies. direct_gate is deliberately NOT here -- its absence changes
+    # which output stage the expert runs, which model_params_for_state_dict infers instead.
+    "moe.evidence_gate_scale",
+)
 
 
 def load_model_state(model, state_dict):
-    """``model.load_state_dict`` with the IR temperature's absence tolerated, and nothing else.
+    """``model.load_state_dict`` with a few neutrally-initialized tensors' absence tolerated.
 
     ``log_temperature`` and ``temperature_scale`` both appeared when the retrieval temperature
     stopped being a hardcoded 1.0. Their inits ARE that 1.0 (log(1.0) = 0, scale 1.0), so a
     checkpoint written before they existed is exactly reproduced by leaving the freshly initialized
     values in place -- there is no information to recover and no ambiguity about what it was.
+    ``NEUTRAL_LOOP_KEYS`` is the same case for the loop conditioned queries and the evidence
+    reader's per-loop gain.
 
     Kept as a named exception rather than ``strict=False`` for the reason ``load_checkpoint``'s
     docstring gives: a blanket non-strict load is how a trunk tensor stays randomly initialized
@@ -152,7 +172,7 @@ def load_model_state(model, state_dict):
     state = dict(state_dict)
     own = model.state_dict()
     for key in own:
-        if key.endswith(IR_TEMPERATURE_KEYS) and key not in state:
+        if key.endswith(IR_TEMPERATURE_KEYS + NEUTRAL_LOOP_KEYS) and key not in state:
             state[key] = own[key]
     model.load_state_dict(state)
     return model

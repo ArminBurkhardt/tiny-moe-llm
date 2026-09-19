@@ -24,7 +24,10 @@ that, and it only applies when a corpus is attached at all.
 Which tensors are FRESH is a real distinction here, because the port's new tensors share a module
 with the IR key/value table -- which carries a full sharpening run and would be wrecked by a
 from-scratch rate. ``moe.is_fresh_loop_param`` matches the adapters and the source scale by name for
-that reason, and not the ``ir_module`` subtree.
+that reason, and not the ``ir_module`` subtree. ``scripts/sft.py``'s ``--evidence`` profile passes
+this same predicate, alone, as its fresh group -- unlike ``--ir``, which also passes
+``is_rebuilt_ir_param`` for its own (genuinely rebuilt) table. The two profiles need different
+predicates precisely because they share this module at different points in its life.
 
 Optimizer state is dropped: AdamW's moments are indexed by param-group position and this adds
 tensors, so they cannot be paired back up. The output is a finetune seed, like every other migration
@@ -79,6 +82,11 @@ def main():
             f"{os.path.basename(src)} already carries the evidence port -- nothing to migrate."
         )
     params["evidence_port"] = True
+    # the IR expert's direct read stage comes with the port rather than in a migration of its own:
+    # its gate is zero-init, so the seed is still bit-identical to its source, and leaving the
+    # source's averaged stage in place would keep every token reading the prefix's mean retrieval
+    # however well the selector learns to pick a chunk
+    params["ir_direct_read"] = True
 
     model = TinyMoETransformer(**params).to(args.device).to(BF16)
     model.set_checkpointing(False, False)
@@ -97,6 +105,15 @@ def main():
     stray = [k for k in added if not (
         "shared_evidence." in k or ".key_adapter." in k or ".value_adapter." in k
         or k.endswith("log_memory_scale")
+        # the loop conditioning on the two evidence queries and the reader's per-loop gain are born
+        # here too: zero-init biases and a gain of 1.0, so adding them changes no output, and a seed
+        # that carries them explicitly is one fewer tensor relying on a tolerated absence later
+        or "loop_query_bias." in k or "evidence_query_bias." in k
+        or k.endswith("evidence_loop_scale")
+        # the reader/selector coupling gate, and the IR expert's direct read gate -- both zero-init,
+        # so the seed still scores exactly as its source, and the direct gate is what moves the
+        # expert off the output stage that averaged every read over the prefix
+        or k.endswith("evidence_gate_scale") or "direct_gate." in k
     )]
     if stray:
         raise SystemExit(f"these added tensors are not part of the port: {stray}")
@@ -138,7 +155,8 @@ def main():
     print(f"                  with a corpus attached or without one")
     print(f"  NOT neutral:    the selector's adapters are orthogonal, not zero (see the docstring);")
     print(f"                  bounded by the 0.0002 nats the whole IR read is worth on this trunk")
-    print(f"  fresh LR group: {n_fresh / 1e6:.2f}M parameters, and NOT the IR table")
+    print(f"  fresh LR group: {n_fresh / 1e6:.2f}M parameters (is_fresh_loop_param), and NOT the IR")
+    print(f"                  table -- 'scripts/sft.py --evidence' must pass this same predicate")
     print(f"  optimizer/scheduler state dropped -- finetune seed, not a resume point")
     print(f"  wrote {out_path}")
 

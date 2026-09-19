@@ -205,7 +205,10 @@ def main():
 
     fresh = model.state_dict()
     carried = {k: v for k, v in state.items() if not is_ir_tensor(k)}
-    rebuilt = sorted(k for k in fresh if is_ir_tensor(k))
+    # the IR expert's direct read gate counts as rebuilt here, not as a missing trunk tensor: it is
+    # zero-init, so the expert's value stream is zero through it exactly as it is through a zeroed
+    # g_proj, and a source written before that output stage existed has nothing to carry over
+    rebuilt = sorted(k for k in fresh if is_ir_tensor(k) or ".direct_gate." in k)
     missing = sorted(set(fresh) - set(carried) - set(rebuilt))
     if missing:
         raise SystemExit(
