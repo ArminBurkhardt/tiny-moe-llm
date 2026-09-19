@@ -33,9 +33,19 @@ Batches carry, on top of the SFT keys:
     evidence_doc_slot   [B, S_ev]      which conversation of this row the token serves (-1 = padding)
     chunk_keys          [B, C, 384]    external embedder vectors
     chunk_slot          [B, C]         which conversation of this row each chunk serves (-1 = unused)
+    chunk_gold          [B, C]         1 = gold chunk, 0 = distractor or unused slot -- aligned with
+                                        chunk_keys/chunk_slot exactly, same shape and same slots
+    condition_ids       [B, S]         per QUERY token (the packed row, not the evidence axis): which
+                                        of prepare_evidence_data.CONDITIONS the token's own
+                                        conversation was built under, -1 on row padding
 
-A batch in which nothing retrieved anything omits all five, which is how a pure replay batch takes
-the bit-identical no-evidence forward rather than an all-padding one.
+A batch in which nothing retrieved anything omits the first five of those (``evidence_ids`` through
+``chunk_gold``), which is how a pure replay batch takes the bit-identical no-evidence forward rather
+than an all-padding one. ``condition_ids`` does not follow that rule -- it describes the QUERY side,
+which every row has whether or not it retrieved anything (a replay row is condition "none") -- but it
+is corpus wide rather than per batch: a corpus built before ``.evgold``/``.cond`` existed omits both
+``chunk_gold`` and ``condition_ids`` from every batch, never some, and ``EvidenceDataset`` warns once
+at load time rather than failing, so an older corpus keeps training without the labels.
 """
 import os
 from typing import Iterator, List
@@ -66,6 +76,7 @@ class EvidenceDataset(SFTDataset):
         epoch: int = 0,
         shuffle: bool = True,
         max_evidence_tokens: int = 12288,
+        loss_weight_floor_tokens: int = 64,
     ) -> None:
         """
         Args:
@@ -78,6 +89,17 @@ class EvidenceDataset(SFTDataset):
                 ``max_length`` it becomes the budget that always binds, and rows close with their
                 token budget nearly untouched. ``fill`` in the packing log line is what says whether
                 it is set high enough.
+            loss_weight_floor_tokens: caps each conversation's per-token weight at ``1 / floor``
+                instead of ``1 / n_supervised``. A plain per-conversation weighting makes a
+                conversation's total pull on the gradient exactly 1 regardless of length, which is
+                right for the QA-vs-QA comparison it was built for but inverts a mixed corpus: a
+                five-token SQuAD answer (weight 0.2) then outweighs an 800-token web continuation
+                (weight 0.00125) 160 to 1 per token, even though the corpus is token-majority web
+                text. Flooring the denominator leaves every conversation already longer than the
+                floor untouched (``n >= floor`` keeps ``1 / n`` exactly) and caps a short
+                conversation's total weight at ``n / floor < 1`` instead of exactly 1 -- it reduces a
+                short conversation's pull, it does not restore parity by inflating the long ones. See
+                the arithmetic where it is applied, below.
             (everything else: see ``SFTDataset``.)
         """
         super().__init__(
@@ -86,11 +108,14 @@ class EvidenceDataset(SFTDataset):
             start_doc_idx=start_doc_idx, seed=seed, epoch=epoch, shuffle=shuffle,
         )
         self.max_evidence_tokens = max_evidence_tokens
+        self.loss_weight_floor_tokens = loss_weight_floor_tokens
         self.ev_path = os.path.join(data_dir, f"{split}.ev")
         self.evidx_path = os.path.join(data_dir, f"{split}.evidx")
         self.evchunk_path = os.path.join(data_dir, f"{split}.evchunk")
         self.evkey_path = os.path.join(data_dir, f"{split}.evkey")
         self.evkeyidx_path = os.path.join(data_dir, f"{split}.evkeyidx")
+        self.evgold_path = os.path.join(data_dir, f"{split}.evgold")
+        self.cond_path = os.path.join(data_dir, f"{split}.cond")
         for path in (self.ev_path, self.evidx_path, self.evchunk_path,
                      self.evkey_path, self.evkeyidx_path):
             if not os.path.isfile(path):
@@ -111,6 +136,38 @@ class EvidenceDataset(SFTDataset):
         if os.path.getsize(self.evchunk_path) != os.path.getsize(self.ev_path):
             raise ValueError(f"{split}.evchunk and {split}.ev disagree -- rebuild the corpus")
         n_chunks = os.path.getsize(self.evkey_path) // (EMBED_DIM * 2)
+
+        # the gold flag and the condition label are a later addition to the on-disk format. A corpus
+        # built before they existed simply has neither file, and that has to be a warning, not a
+        # crash, or every corpus already on disk stops loading. Exactly one existing is a different
+        # failure -- the writer always appends both together, so a mismatch means an interrupted or
+        # hand edited build, which deserves the same hard failure the five-file checks above give.
+        gold_exists, cond_exists = os.path.isfile(self.evgold_path), os.path.isfile(self.cond_path)
+        if gold_exists != cond_exists:
+            raise ValueError(
+                f"{split}.evgold and {split}.cond disagree on whether they exist -- the corpus "
+                f"writer always writes both together, so this means an interrupted build"
+            )
+        self.has_condition_labels = gold_exists and cond_exists
+        if self.has_condition_labels:
+            if os.path.getsize(self.evgold_path) != n_chunks:
+                raise ValueError(
+                    f"{split}.evgold has {os.path.getsize(self.evgold_path):,} entries but "
+                    f"{split}.evkey has {n_chunks:,} chunks -- the corpus is out of sync, rebuild it"
+                )
+            if os.path.getsize(self.cond_path) != self.num_docs:
+                raise ValueError(
+                    f"{split}.cond has {os.path.getsize(self.cond_path):,} entries but "
+                    f"{split}.idx has {self.num_docs:,} documents -- the corpus is out of sync, "
+                    f"rebuild it"
+                )
+        else:
+            logger.warning(
+                f"EvidenceDataset[{split}]: no {split}.evgold/{split}.cond -- this corpus predates "
+                f"the gold flag and condition label, so chunk_gold/condition_ids will be omitted "
+                f"from every batch. Rebuild with scripts/prepare_evidence_data.py to get them."
+            )
+
         logger.info(
             f"EvidenceDataset[{split}]: {os.path.getsize(self.ev_path) // 2:,} evidence tokens, "
             f"{n_chunks:,} chunks"
@@ -125,6 +182,12 @@ class EvidenceDataset(SFTDataset):
         evchunk_mmap = np.memmap(self.evchunk_path, dtype=np.uint16, mode="r")
         evkey_mmap = np.memmap(self.evkey_path, dtype=np.float16, mode="r").reshape(-1, EMBED_DIM)
         evkeyidx_mmap = np.memmap(self.evkeyidx_path, dtype=np.uint64, mode="r")
+        # only opened when the corpus actually has them -- see the has_condition_labels check in
+        # __init__, which is also what makes every downstream reference in this function safe
+        evgold_mmap = (np.memmap(self.evgold_path, dtype=np.uint8, mode="r")
+                      if self.has_condition_labels else None)
+        cond_mmap = (np.memmap(self.cond_path, dtype=np.uint8, mode="r")
+                    if self.has_condition_labels else None)
 
         num_docs = idx_mmap.shape[0] - 1
         order = self.document_order(num_docs)
@@ -143,7 +206,8 @@ class EvidenceDataset(SFTDataset):
         usable = self.max_length - 1
 
         rows: List[dict] = []
-        current = {"seq": [], "labels": [], "weights": [], "sections": [], "evidence": []}
+        current = {"seq": [], "labels": [], "weights": [], "sections": [], "evidence": [],
+                   "conditions": []}
         committed_position = first - num_workers
         skipped_too_long = 0
         # how full the rows actually come out. A row costs a full width forward whatever fraction of
@@ -169,11 +233,26 @@ class EvidenceDataset(SFTDataset):
                 doc_ids.append(seg)
                 seg += 1
 
+            # per QUERY token condition label, expanded over the same blocks as doc_ids above but
+            # filled with -1 rather than a fresh segment id past the last real block -- padding
+            # belongs to no conversation and no condition. None entirely when the corpus has no
+            # .cond file, so a batch built from it never carries a column of meaningless -1s.
+            condition_ids = None
+            if self.has_condition_labels:
+                condition_ids, cstart = [], 0
+                for block_len, cond_idx in zip(current["sections"], current["conditions"]):
+                    cend = min(cstart + block_len, self.max_length)
+                    if cend > cstart:
+                        condition_ids.extend([cond_idx] * (cend - cstart))
+                    cstart = cend
+                condition_ids.extend([-1] * (self.max_length - len(condition_ids)))
+
             rows.append({
                 "input_ids": padded, "document_ids": doc_ids,
                 "labels": torch.tensor(labels, dtype=torch.long),
                 "loss_weights": torch.tensor(weights, dtype=torch.float32),
                 "evidence": list(current["evidence"]),
+                "condition_ids": condition_ids,
                 "num_segments": seg,
             })
             packed["rows"] += 1
@@ -187,7 +266,7 @@ class EvidenceDataset(SFTDataset):
                     f"evidence {ev_fill:.0%} of its cap, {packed['closed_by_evidence']} row(s) "
                     f"closed by the evidence budget"
                 )
-            for key in ("seq", "labels", "weights", "sections", "evidence"):
+            for key in ("seq", "labels", "weights", "sections", "evidence", "conditions"):
                 current[key].clear()
 
         def yield_batch():
@@ -199,6 +278,10 @@ class EvidenceDataset(SFTDataset):
                 "doc_idx": torch.full((len(rows),), committed_position, dtype=torch.long),
                 "worker_id": torch.full((len(rows),), worker_id, dtype=torch.long),
             }
+            if self.has_condition_labels:
+                batch["condition_ids"] = torch.tensor(
+                    [r["condition_ids"] for r in rows], dtype=torch.long
+                )
             batch.update(_pack_evidence(rows))
             rows.clear()
             return batch
@@ -219,6 +302,10 @@ class EvidenceDataset(SFTDataset):
             ev_tokens = ev_mmap[ev_start:ev_end].tolist()
             ev_chunks = evchunk_mmap[ev_start:ev_end].tolist()
             ev_keys = np.asarray(evkey_mmap[key_start:key_end], dtype=np.float32)
+            # None on a corpus with no .evgold/.cond, which is what keeps chunk_gold/condition_ids
+            # out of every batch downstream rather than filling them with meaningless placeholders
+            ev_gold = evgold_mmap[key_start:key_end].tolist() if self.has_condition_labels else None
+            condition_idx = int(cond_mmap[doc]) if self.has_condition_labels else -1
 
             block_len = len(tokens) + self.num_mtp_tokens
             if block_len > usable or len(ev_tokens) > self.max_evidence_tokens:
@@ -237,7 +324,18 @@ class EvidenceDataset(SFTDataset):
                     yield yield_batch()
 
             n_supervised = sum(supervised)
-            per_token_weight = 1.0 / n_supervised if n_supervised else 0.0
+            # capped at 1/floor rather than 1/n: a five-token SQuAD answer would otherwise get
+            # weight 0.2 against an 800-token web continuation's 0.00125, which is what let QA
+            # dominate the gradient on the smoke corpus despite being a minority of tokens by count.
+            # A conversation already longer than the floor is untouched (n >= floor keeps 1/n
+            # exactly); one shorter than it has its total weight (n / floor) capped below 1 instead
+            # of restored to exactly 1 -- this reduces a short conversation's pull, it does not
+            # inflate the long ones. The floor only changes each source's SHARE of the gradient:
+            # _chunked_linear_ce still normalizes by sum(w) downstream, so the objective stays a
+            # mean CE either way, just over a differently weighted set of conversations.
+            per_token_weight = (
+                1.0 / max(n_supervised, self.loss_weight_floor_tokens) if n_supervised else 0.0
+            )
             current["seq"].extend(tokens)
             current["labels"].extend(t if f else -100 for t, f in zip(tokens, supervised))
             current["weights"].extend(per_token_weight if f else 0.0 for f in supervised)
@@ -245,7 +343,10 @@ class EvidenceDataset(SFTDataset):
             current["labels"].extend([-100] * self.num_mtp_tokens)
             current["weights"].extend([0.0] * self.num_mtp_tokens)
             current["sections"].append(block_len)
-            current["evidence"].append({"ids": ev_tokens, "chunks": ev_chunks, "keys": ev_keys})
+            current["evidence"].append(
+                {"ids": ev_tokens, "chunks": ev_chunks, "keys": ev_keys, "gold": ev_gold}
+            )
+            current["conditions"].append(condition_idx)
             committed_position = position
 
             if len(current["seq"]) >= usable:
@@ -266,7 +367,8 @@ class EvidenceDataset(SFTDataset):
 
 
 def _pack_evidence(rows: List[dict]) -> dict:
-    """Rows' per-conversation evidence -> the five batch-aligned tensors. ``{}`` when there is none.
+    """Rows' per-conversation evidence -> the batch-aligned evidence tensors. ``{}`` when there is
+    none. ``chunk_gold`` rides along as a sixth tensor whenever the corpus carries gold flags.
 
     ``doc_slot`` and ``chunk_slot`` say which conversation *of this row* each entry serves, which is
     all a worker can know: the global segment numbering depends on how many segments the earlier
@@ -288,6 +390,12 @@ def _pack_evidence(rows: List[dict]) -> dict:
     doc_slot = np.full((B, S_ev), -1, dtype=np.int64)
     keys = np.zeros((B, C, EMBED_DIM), dtype=np.float32)
     chunk_slot = np.full((B, C), -1, dtype=np.int64)
+    # gold flags travel on the same axis as chunk_slot/chunk_keys. None whenever the corpus predates
+    # the .evgold sidecar (EvidenceDataset already warned about that at load time), in which case
+    # every evidence dict's "gold" entry is None and there is nothing to fill -- checked once here
+    # rather than per chunk, since the corpus-wide flag can only be uniformly on or off
+    has_gold = any(e.get("gold") is not None for row in rows for e in row["evidence"])
+    chunk_gold = np.zeros((B, C), dtype=np.uint8) if has_gold else None
 
     for r, row in enumerate(rows):
         token_at, chunk_at = 0, 0
@@ -304,15 +412,20 @@ def _pack_evidence(rows: List[dict]) -> dict:
             if k:
                 keys[r, chunk_at:chunk_at + k] = ev["keys"]
                 chunk_slot[r, chunk_at:chunk_at + k] = slot
+                if chunk_gold is not None and ev.get("gold") is not None:
+                    chunk_gold[r, chunk_at:chunk_at + k] = ev["gold"]
                 chunk_at += k
 
-    return {
+    out = {
         "evidence_ids": torch.from_numpy(ids),
         "evidence_chunk_ids": torch.from_numpy(chunk_ids),
         "evidence_doc_slot": torch.from_numpy(doc_slot),
         "chunk_keys": torch.from_numpy(keys),
         "chunk_slot": torch.from_numpy(chunk_slot),
     }
+    if chunk_gold is not None:
+        out["chunk_gold"] = torch.from_numpy(chunk_gold)
+    return out
 
 
 def evidence_from_batch(model, batch: dict, cu_seqlens: torch.Tensor):
@@ -352,6 +465,12 @@ def evidence_from_batch(model, batch: dict, cu_seqlens: torch.Tensor):
     valid = chunk_slot >= 0
     chunk_segments = (row_first + chunk_slot)[valid]                  # [M], row major
     chunk_keys = batch["chunk_keys"].to(device)[valid]                # [M, 384], same order
+    # flattened with the SAME mask, so the gold flag keeps naming the chunk it was written for. A
+    # corpus built before the flag existed simply has no column here, and the selection loss has
+    # nothing to train on -- which is a missing label, not a mislabelled chunk.
+    chunk_gold = None
+    if "chunk_gold" in batch:
+        chunk_gold = batch["chunk_gold"].to(device)[valid]            # [M], same order
 
     return model.build_evidence(
         batch["evidence_ids"].to(device),
@@ -360,4 +479,5 @@ def evidence_from_batch(model, batch: dict, cu_seqlens: torch.Tensor):
         int(cu_seqlens.numel() - 1),
         chunk_keys=chunk_keys,
         chunk_segments=chunk_segments,
+        chunk_gold=chunk_gold,
     )

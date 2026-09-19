@@ -6,7 +6,7 @@ same order. Nothing in the forward can check that -- a shifted list produces a p
 that is learning the wrong association -- so it is checked here, on a corpus small enough to state
 the expected answer by hand.
 
-Five assertions:
+Nine assertions:
 
 1. **The two segment lists have the same length.** One evidence segment per query segment, including
    the empty ones.
@@ -15,11 +15,21 @@ Five assertions:
 3. **A document that retrieved nothing gets a zero length segment in its own position**, rather than
    being skipped -- skipping it would shift every later document by one.
 4. **Chunks land on their document too**, on the selector's side, which numbers them independently.
-5. **Evidence padding lands on a trailing pad segment**, never on a real conversation, so no
+5. **Gold flags line up with chunk_keys/chunk_slot row by row** -- the same alignment as (4), one
+   axis further: a document's chunks can disagree with each other on gold, so each chunk carries its
+   own within-document index as a second marker rather than reusing (4)'s per-document one.
+6. **Evidence padding lands on a trailing pad segment**, never on a real conversation, so no
    supervised token can attend to another row's leftovers.
+7. **condition_ids matches each document's own condition across its whole query-side span**
+   (including its BOS and separator pad, which belong to the same segment).
+8. **A corpus missing ``.evgold``/``.cond`` still loads**, with both columns simply absent from every
+   batch, rather than crashing -- the compatibility path for the corpus already on disk.
+9. **The loss weight floor caps a short conversation's per-token weight at ``1/floor``** while
+   leaving a conversation already at or past the floor at exactly ``1/n_supervised``.
 
-The first four are pure index arithmetic and run anywhere; assertion 5 and the end-to-end isolation
-check at the bottom need a GPU.
+All nine are pure index arithmetic (no model, no CUDA call) and run anywhere; only the end-to-end
+isolation check at the bottom needs a GPU, and it is printed as its own final check rather than
+numbered above, since it runs only when CUDA is available.
 """
 import os, sys, shutil, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -31,40 +41,47 @@ import torch
 from modules.data.evidence_dataset import EvidenceDataset, evidence_from_batch, EMBED_DIM
 from modules.model.attention import cu_seqlens_from_doc_ids, _segment_ids
 from modules.model.evidence import evidence_cu_seqlens
-from scripts.prepare_evidence_data import EvidenceWriter
+from scripts.prepare_evidence_data import CONDITIONS, EvidenceWriter
 
 BOS, PAD = 0, 1
 # small enough that these five documents pack into TWO rows, which is what makes the batch's evidence
-# widths unequal and therefore makes row padding exist at all -- assertion 5 has nothing to check on
+# widths unequal and therefore makes row padding exist at all -- assertion 6 has nothing to check on
 # a single-row batch
 MAX_LEN = 16
 
-# (prompt tokens, evidence tokens, chunk lengths). Token ranges are disjoint per document so an
-# evidence token identifies the document it belongs to on sight -- which is what assertion 2 reads.
+# (prompt tokens, evidence tokens, chunk lengths, per-chunk gold flags, condition name). Token ranges
+# are disjoint per document so an evidence token identifies the document it belongs to on sight --
+# which is what assertion 2 reads. Every entry of CONDITIONS appears at least once, and the prompt
+# token counts (3, 2, 4, 3, 2) deliberately straddle assertion 9's floor (3): two documents sit
+# exactly at it, one above, two below.
 DOCS = [
-    ([10, 11, 12], [100, 101], [2]),
-    ([20, 21], [], []),                      # retrieved nothing: the zero length segment case
-    ([30, 31, 32, 33], [300, 301, 302], [2, 1]),
-    ([40, 41, 42], [400, 401, 402, 403], [4]),
-    ([50, 51], [500, 501, 502], [3]),
+    ([10, 11, 12], [100, 101], [2], [1], "gold"),
+    ([20, 21], [], [], [], "none"),           # retrieved nothing: the zero length segment case
+    ([30, 31, 32, 33], [300, 301, 302], [2, 1], [1, 0], "mixed"),
+    ([40, 41, 42], [400, 401, 402, 403], [4], [0], "distractors"),
+    ([50, 51], [500, 501, 502], [3], [1], "many"),
 ]
 
 
 def build_corpus(data_dir, split="evidence_train"):
     state = {}
     writer = EvidenceWriter(data_dir, split, state)
-    for tokens, ev, chunk_lens in DOCS:
+    for tokens, ev, chunk_lens, chunk_gold, condition in DOCS:
         ids = [BOS] + tokens
         mask = [0] + [1] * len(tokens)
         ev_chunk = []
         for chunk_idx, length in enumerate(chunk_lens):
             ev_chunk.extend([chunk_idx] * length)
         assert len(ev_chunk) == len(ev), "the fixture's chunk lengths do not cover its evidence"
+        assert len(chunk_gold) == len(chunk_lens), "the fixture's gold flags do not cover its chunks"
         keys = np.zeros((len(chunk_lens), EMBED_DIM), dtype=np.float32)
-        # first component identifies the chunk's document, so assertion 4 can read it back
         for chunk_idx in range(len(chunk_lens)):
+            # first component identifies the chunk's document, so assertion 4 can read it back;
+            # second identifies which of that document's OWN chunks this is, which assertion 5 needs
+            # because a document's chunks can disagree with each other on gold (see "mixed" above)
             keys[chunk_idx, 0] = ev[0] if ev else 0.0
-        writer.write(ids, mask, ev, ev_chunk, keys)
+            keys[chunk_idx, 1] = chunk_idx
+        writer.write(ids, mask, ev, ev_chunk, keys, chunk_gold, CONDITIONS.index(condition))
     writer.sync()
     writer.close()
     return state
@@ -79,6 +96,7 @@ def main():
             tmp, tokenizer, batch_size=2, max_length=MAX_LEN, split="evidence_train",
             num_mtp_tokens=1, shuffle=False,
         )
+        assert dataset.has_condition_labels, "the fixture wrote .evgold/.cond, they should be found"
         batches = list(iter(dataset))
         assert batches, "the dataset yielded nothing"
         batch = batches[0]
@@ -102,13 +120,15 @@ def main():
 
         # walk the flattened evidence axis segment by segment and compare against the fixture
         flat_ev = batch["evidence_ids"].reshape(-1).tolist()
-        # which fixture document each conversation slot holds, in packing order
-        expected = [ev for _, ev, _ in DOCS]
-        conv_segments = []
+        # which fixture document each conversation slot holds, in packing order, alongside which
+        # ROW it packed into -- assertion 7 needs the row as well as the segment
+        expected = [ev for _, ev, _, _, _ in DOCS]
+        conv_segments, conv_rows = [], []
         for r in range(B):
             n_conv = int((doc_slot[r] >= 0).any()) and int(doc_slot[r].max()) + 1
             base = int(seg[r, 0])
             conv_segments.extend(base + j for j in range(n_conv))
+            conv_rows.extend([r] * n_conv)
 
         checked, empties = 0, 0
         for local_idx, global_seg in enumerate(conv_segments):
@@ -143,6 +163,21 @@ def main():
             )
         print(f"4. every chunk lands on its own document ({len(marker)} chunks)         PASS")
 
+        # gold flags ride the identical [M] axis as (4)'s marker/chunk_keys, so the same flattening
+        # applies -- only the lookup (per document AND per that document's own chunk index) is new
+        assert "chunk_gold" in batch, "the batch carries no chunk_gold even though .evgold exists"
+        chunk_gold_flat = batch["chunk_gold"][valid].tolist()
+        chunk_idx_marker = chunk_keys[:, 1].tolist()
+        gold_by_doc = {ev[0]: gold for _, ev, _, gold, _ in DOCS if ev}
+        assert len(chunk_gold_flat) == len(marker), "chunk_gold and chunk_keys disagree on count"
+        for doc_marker, idx_marker, got in zip(marker, chunk_idx_marker, chunk_gold_flat):
+            want = gold_by_doc[int(doc_marker)][int(idx_marker)]
+            assert got == want, (
+                f"chunk {int(idx_marker)} of the document marked {int(doc_marker)} has gold={got}, "
+                f"the fixture wrote {want}"
+            )
+        print(f"5. gold flags line up with chunk_keys/chunk_slot ({len(marker)} chunks)  PASS")
+
         # padding must go to a trailing pad segment. Its query token is a pad, so nothing supervised
         # can see it; landing it on a real conversation would be silent contamination.
         labels = batch["labels"]
@@ -156,9 +191,85 @@ def main():
                 assert bool((labels[r][positions] == -100).all()), (
                     "evidence padding was assigned to a segment carrying supervised tokens"
                 )
-            print("5. evidence padding lands on a trailing pad segment       PASS")
+            print("6. evidence padding lands on a trailing pad segment       PASS")
         else:
-            print("5. evidence padding lands on a trailing pad segment       SKIP (none in batch)")
+            print("6. evidence padding lands on a trailing pad segment       SKIP (none in batch)")
+
+        # condition_ids is a QUERY side column: it has to hold constant over a document's WHOLE
+        # block (its BOS, its supervised tokens and its trailing separator pad all belong to the
+        # same query segment), not just the supervised span
+        assert "condition_ids" in batch, "the batch carries no condition_ids even though .cond exists"
+        condition_ids = batch["condition_ids"]
+        checked_cond = 0
+        for local_idx, (r, global_seg) in enumerate(zip(conv_rows, conv_segments)):
+            cond_name = DOCS[local_idx][4]
+            want = CONDITIONS.index(cond_name)
+            positions = (seg[r] == global_seg).nonzero().flatten()
+            got = condition_ids[r][positions].unique().tolist()
+            assert got == [want], (
+                f"document {local_idx} (condition {cond_name!r}) reads condition_ids {got} over its "
+                f"own segment, want [{want}]"
+            )
+            checked_cond += 1
+        assert checked_cond == len(DOCS), f"only checked {checked_cond} of {len(DOCS)} documents"
+        print(f"7. condition_ids matches each document's own condition ({checked_cond} docs)  PASS")
+
+        # a corpus predating .evgold/.cond has to load anyway, just without the two columns --
+        # simulated by building the same fixture and then removing the two sidecar files, mirroring
+        # the corpus that is already on disk
+        no_labels_dir = tempfile.mkdtemp(prefix="evidence_corpus_nolabels_")
+        try:
+            build_corpus(no_labels_dir)
+            os.remove(os.path.join(no_labels_dir, "evidence_train.evgold"))
+            os.remove(os.path.join(no_labels_dir, "evidence_train.cond"))
+            legacy = EvidenceDataset(
+                no_labels_dir, tokenizer, batch_size=2, max_length=MAX_LEN, split="evidence_train",
+                num_mtp_tokens=1, shuffle=False,
+            )
+            assert not legacy.has_condition_labels, "should have detected the missing sidecar files"
+            legacy_batches = list(iter(legacy))
+            assert legacy_batches, "the legacy dataset yielded nothing"
+            assert "condition_ids" not in legacy_batches[0], (
+                "a corpus with no .cond file must not carry condition_ids"
+            )
+            assert "chunk_gold" not in legacy_batches[0], (
+                "a corpus with no .evgold file must not carry chunk_gold"
+            )
+            assert "evidence_ids" in legacy_batches[0], (
+                "the legacy corpus still has real evidence -- only the two new columns should be gone"
+            )
+            print("8. a corpus missing .evgold/.cond loads and omits the labels    PASS")
+        finally:
+            shutil.rmtree(no_labels_dir, ignore_errors=True)
+
+        # the weight floor: 1/max(n_supervised, floor). floor=3 sits exactly at two documents' own
+        # token count (3), above two more (2, 2) and below the last (4) -- the fixture was picked so
+        # this single floor value exercises "below", "at" and "above" all at once. Packing decisions
+        # never depend on the floor, so this reuses `seg`/`conv_segments` computed from the
+        # default-floor dataset above rather than re-deriving them.
+        floor = 3
+        floored = EvidenceDataset(
+            tmp, tokenizer, batch_size=2, max_length=MAX_LEN, split="evidence_train",
+            num_mtp_tokens=1, shuffle=False, loss_weight_floor_tokens=floor,
+        )
+        floored_weights = list(iter(floored))[0]["loss_weights"]
+        checked_weight = 0
+        for local_idx, (r, global_seg) in enumerate(zip(conv_rows, conv_segments)):
+            n_supervised = len(DOCS[local_idx][0])
+            want = 1.0 / max(n_supervised, floor)
+            positions = (seg[r] == global_seg).nonzero().flatten()
+            row_weights = floored_weights[r][positions]
+            nonzero = row_weights[row_weights > 0]
+            assert nonzero.numel() == n_supervised, (
+                f"document {local_idx} has {nonzero.numel()} nonzero weight(s), want {n_supervised}"
+            )
+            assert torch.allclose(nonzero, torch.full_like(nonzero, want), atol=1e-6), (
+                f"document {local_idx} (n_supervised={n_supervised}, floor={floor}) has weight(s) "
+                f"{nonzero.tolist()}, want {want}"
+            )
+            checked_weight += 1
+        assert checked_weight == len(DOCS), f"only checked {checked_weight} of {len(DOCS)} documents"
+        print(f"9. the loss weight floor caps short conversations at 1/floor ({checked_weight} docs)  PASS")
 
         if not torch.cuda.is_available():
             print("   (GPU absent -- skipping the end to end isolation check)")
@@ -211,9 +322,9 @@ def _end_to_end(batch, cu):
     leaked = (after[0][others] - before[0][others]).abs().max().item() if bool(others.any()) else 0.0
     assert moved > 0.0, "the document did not move when its own evidence changed"
     assert leaked == 0.0, f"an earlier document moved when another's evidence changed ({leaked})"
-    print(f"6. end to end: only the owning document moves (own {moved:.4f}, leak {leaked})  PASS")
+    print(f"end to end: only the owning document moves (own {moved:.4f}, leak {leaked})  PASS")
     # and the whole thing is actually reading: attaching the corpus has to differ from not attaching
-    # it, or assertions 1-5 would be describing a pairing nothing consumes
+    # it, or the assertions above would be describing a pairing nothing consumes
     assert not torch.equal(base, before), "attaching the corpus changed nothing at all"
 
 

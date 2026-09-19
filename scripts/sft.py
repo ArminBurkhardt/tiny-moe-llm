@@ -45,6 +45,7 @@ Run from the repo root:
     python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
 """
 import os
+import re
 import sys
 import time
 import math
@@ -80,6 +81,9 @@ from scripts.pretrain import (
     USE_LOW_PRECISION, chosen_recipe, log_precision_mode, sample_n_loops,
     save_expert_selection_graph, save_loss_graph, train_step,
 )
+# imported rather than restated, so the condition index -> name mapping used for validation and
+# training logs can never drift from what the corpus builder actually wrote into `.cond`
+from scripts.prepare_evidence_data import CONDITIONS
 from utils import (BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, load_model_state,
                    logger, model_params_for_state_dict)
 
@@ -148,6 +152,7 @@ def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True
             num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
             seed=cfg.seed, shuffle=shuffle,
             max_evidence_tokens=getattr(cfg, "max_evidence_tokens", 12288),
+            loss_weight_floor_tokens=getattr(cfg, "loss_weight_floor_tokens", 64),
         )
     if os.path.isfile(os.path.join(data_dir, f"{split}.mask")):
         return SFTDataset(
@@ -163,7 +168,14 @@ def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True
     )
 
 
-def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh_lr: float = None):
+def _fresh_family(name: str) -> str:
+    """collapse a fresh parameter's name to its family for a short log line -- e.g. two IR experts'
+    ``z_keys`` collapse to one entry instead of printing once per expert index."""
+    return re.sub(r"\.\d+\.", ".N.", name)
+
+
+def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh_lr: float = None,
+                           is_fresh_param=None):
     """Split parameters into decayed / undecayed groups, **all** shadowed by fp32 masters.
 
     The decay split is the same one ``pretrain.build_param_groups`` makes and for the same reasons
@@ -194,25 +206,30 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh
     Args:
         model: the (already bf16) model.
         weight_decay: applied to the ndim >= 2 groups only.
-        fresh_lr: when given, the rebuilt IR tensors (``is_rebuilt_ir_param``) and any zero-init
-            loop tensor a migration added (``is_fresh_loop_param``) go into their own groups at this
-            learning rate instead of sharing the run's. They are the only tensors in
-            the model with no training behind them: at the trunk's 1e-5 a from-scratch key table
-            against an otherwise converged model never gets anywhere, and at a rate that would
-            train it the 16B-token trunk moves too. The LR schedule still scales every group by the
-            same factor, so this sets two *base* rates, not two shapes.
+        fresh_lr: when given, whatever ``is_fresh_param`` matches goes into its own groups at this
+            learning rate instead of sharing the run's. Ignored (nothing is fresh) when ``None``.
+        is_fresh_param: which tensors ``fresh_lr`` applies to, **per profile, not a fixed union**.
+            The IR profile rebuilt the whole ``ir_module`` subtree from scratch and needs all of it
+            at the fresh rate (``is_rebuilt_ir_param(name) or is_fresh_loop_param(name)``). The
+            evidence profile grafts its reader onto a table that already carries a full sharpening
+            run, so only the port's own zero-init tensors qualify (``is_fresh_loop_param`` alone) --
+            the table stays at the trunk's rate like every other converged tensor. Passing the wrong
+            one silently retrains a converged table from scratch, or leaves a genuinely fresh tensor
+            stuck at its init for the whole run.
 
     Returns:
         ``(param_groups, master_pairs)`` where ``master_pairs`` is ``[(bf16_param, fp32_master)]``
         covering every trainable parameter.
     """
     buckets = {("trunk", True): [], ("trunk", False): [], ("fresh", True): [], ("fresh", False): []}
+    fresh_names = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_fresh = is_rebuilt_ir_param(name) or is_fresh_loop_param(name)
-        origin = "fresh" if (fresh_lr is not None and is_fresh) else "trunk"
-        buckets[(origin, param.ndim >= 2)].append(param)
+        is_fresh = fresh_lr is not None and is_fresh_param is not None and is_fresh_param(name)
+        if is_fresh:
+            fresh_names.append(name)
+        buckets[("fresh" if is_fresh else "trunk", param.ndim >= 2)].append(param)
 
     param_groups, master_pairs, summary = [], [], []
     for (origin, decayed), params in buckets.items():
@@ -230,6 +247,11 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh
         + (f", fresh lr={fresh_lr:.1e}" if fresh_lr is not None else "")
         + f"; all {len(master_pairs)} stepped via fp32 masters"
     )
+    if fresh_names:
+        # names, not just a count: a table's tensors and a reader's tensors can sum to the same
+        # total either way, so the count line above cannot tell a correct split from the union bug
+        # it replaces -- only naming what actually landed in the fresh group can
+        logger.info(f"fresh group tensors: {sorted(set(_fresh_family(n) for n in fresh_names))}")
     return param_groups, master_pairs
 
 
@@ -529,6 +551,12 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
             number is not comparable to a run with it off. ``p_max``/top-1 stay token-level either
             way (``_chunked_linear_ce`` never weights them), so those two remain comparable across
             every checkpoint this repo has measured.
+
+    When a batch carries ``condition_ids`` (the evidence corpus, if it was built with the ``.cond``
+    sidecar), the returned dict also has ``per_condition_ce``: the same final-loop CE term the
+    overall ``ce`` is built from, restricted to one condition's tokens at a time. This is the
+    gold-vs-none gap the run is killed on, so it has to be readable from the same pass rather than a
+    separate script -- see the call site below for how it is computed without a second forward.
     """
     was_training = model.training
     model.eval()
@@ -540,6 +568,8 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     ce_sum, ce_weight_sum, token_sum = 0.0, 0.0, 0
     signal_sums = {"p_max": 0.0, "top1_acc": 0.0}
     n_batches = 0
+    cond_ce_sum = {c: 0.0 for c in CONDITIONS}
+    cond_weight_sum = {c: 0.0 for c in CONDITIONS}
 
     for batch in dataset:
         if n_batches >= max_batches:
@@ -575,6 +605,35 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 loss_weights=loss_weights,
             )
 
+            condition_ids = batch.get("condition_ids")
+            if condition_ids is not None:
+                condition_ids = condition_ids.to(device)
+                # the same per-token weight the overall CE uses (the conversation weight when that
+                # objective is on, else a plain supervised mask), so restricting it to one
+                # condition's tokens and re-running ONLY the lm_head + chunked CE (no second model
+                # forward -- `hidden` is already computed above) gives the exact quantity `loss_ce`
+                # would read if the batch had contained only that condition's tokens. mtp_outputs is
+                # deliberately omitted here: loss_ce never depends on the MTP term (see
+                # compute_mtp_loss), so skipping it halves the cost of this per-condition pass for
+                # nothing lost.
+                base_weight = loss_weights if loss_weights is not None else (labels != -100).float()
+                for idx, cond in enumerate(CONDITIONS):
+                    cond_weight = base_weight * (condition_ids == idx).float()
+                    weight_total = float(cond_weight[:, 1:].sum().item())
+                    if weight_total <= 0.0:
+                        continue
+                    _, cond_ce = compute_mtp_loss(
+                        hidden, labels,
+                        lambda_mtp=TrainingConfig.lambda_mtp,
+                        main_lm_head=model.lm_head,
+                        pad_mask=pad_mask,
+                        loop_ce_weights=TrainingConfig.loop_ce_weights,
+                        loop_ce_subsample=1.0,
+                        loss_weights=cond_weight,
+                    )
+                    cond_ce_sum[cond] += cond_ce.item() * weight_total
+                    cond_weight_sum[cond] += weight_total
+
         # weight each batch by its supervised token count: rows differ a lot in how much of them
         # is prompt, so an unweighted mean over batches is not the corpus mean. Under
         # conversation weighting the batch's CE is a per-conversation mean, so its denominator is
@@ -603,6 +662,12 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     result = {"ce": ce_sum / ce_weight_sum, "tokens": token_sum, "batches": n_batches}
     result.update({key: total / token_sum for key, total in signal_sums.items()})
     result["ppl"] = math.exp(min(result["ce"], 20.0))
+    per_condition = {
+        cond: cond_ce_sum[cond] / cond_weight_sum[cond]
+        for cond in CONDITIONS if cond_weight_sum[cond] > 0.0
+    }
+    if per_condition:
+        result["per_condition_ce"] = per_condition
     return result
 
 
@@ -684,8 +749,19 @@ def sft(args):
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
 
+    # the two profiles that set fresh_lr disagree on what "fresh" means: the IR profile rebuilt the
+    # whole ir_module subtree from scratch, but the evidence profile's table is that same subtree
+    # carrying a full sharpening run, not a rebuild -- only its own new reader/adapter tensors are
+    # fresh there. Neither of the other two profiles sets fresh_lr, so the predicate is never read.
+    if args.ir:
+        fresh_predicate = lambda name: is_rebuilt_ir_param(name) or is_fresh_loop_param(name)
+    elif args.evidence:
+        fresh_predicate = is_fresh_loop_param
+    else:
+        fresh_predicate = None
     param_groups, master_pairs = build_sft_param_groups(
         model, cfg.weight_decay, fresh_lr=getattr(cfg, "fresh_lr", None),
+        is_fresh_param=fresh_predicate,
     )
     optimizer = optim.AdamW(param_groups, lr=cfg.lr)
     scheduler = build_sft_scheduler(optimizer, total_steps, cfg)
@@ -843,21 +919,34 @@ def sft(args):
                 f"validation pass produced no supervised tokens -- is {cfg.val_split} empty?"
             )
             return
+        per_condition = stats.get("per_condition_ce")
+        # the gold-vs-none gap is what the run is killed on early -- printed in the same line the
+        # overall CE already gets, so nobody has to re-run anything to read it
+        cond_str = (
+            " | per-condition CE: {" + ", ".join(f"{c}: {v:.4f}" for c, v in per_condition.items())
+            + "}" if per_condition else ""
+        )
         logger.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
             f"p_max: {stats['p_max']:.4f} | top1_acc: {stats['top1_acc']:.4f} | "
-            f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches"
+            f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches{cond_str}"
         )
 
     sft_tokens = token_count - start_token_count
     next_checkpoint = sft_tokens + cfg.checkpoint_every_tokens
     next_eval = sft_tokens + cfg.eval_every_tokens
-    # the IR profile's two extra schedules. Both are driven from the log block, which already
-    # syncs the token counter -- neither adds a host sync of its own, and LOG_INTERVAL is ~160k
-    # tokens here, far finer than either cadence needs.
+    # the IR and evidence profiles' extra schedule (the temperature anneal is --ir only, the refresh
+    # is whichever profile's config sets cluster_refresh_tokens). Both are driven from the log block,
+    # which already syncs the token counter -- neither adds a host sync of its own, and LOG_INTERVAL
+    # is ~160k tokens here, far finer than either cadence needs.
     total_micro_steps = max(1, total_steps * cfg.grad_accumulation_steps)
     next_refresh = sft_tokens + getattr(cfg, "cluster_refresh_tokens", 0)
     ir_refresh_stats = []
+    # the evidence stream's own tally, kept separate from _token_tracker's prompt-token count (which
+    # anchors the LR schedule / token target / checkpoint cadence and must not change meaning). Same
+    # on-device-accumulate-then-drain-at-log-cadence shape as TokenTracker, for the same reason: this
+    # runs in the per-micro-step path and must not force a sync there.
+    evidence_token_count, evidence_token_pending = 0, None
     # bound before the try: the interrupt handler saves a checkpoint using both, and a Ctrl-C
     # during the very first batch must not turn into a NameError that loses the save
     step, epoch = step_offset, start_epoch
@@ -885,6 +974,16 @@ def sft(args):
                 document_ids = batch["document_ids"].to(device)
                 cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
                 pad_mask = input_ids == tokenizer.pad_token_id
+
+                if "evidence_chunk_ids" in batch:
+                    # a real evidence token has a chunk id >= 0; the batch's padding out to its
+                    # widest row does not, which mirrors _token_tracker's own non-pad rule without a
+                    # second definition of "padding" -- kept on-device and only summed into the
+                    # pending scalar, never .item()-ed here
+                    ev_count = (batch["evidence_chunk_ids"].to(device) >= 0).sum()
+                    if evidence_token_pending is None or evidence_token_pending.device != ev_count.device:
+                        evidence_token_pending = torch.zeros((), dtype=torch.long, device=ev_count.device)
+                    evidence_token_pending += ev_count
 
                 # log steps pinned to full depth so the recorded loss curve is always read at one
                 # operating point (same reasoning as pretrain.py)
@@ -928,6 +1027,9 @@ def sft(args):
                 losses.append(val_loss)
                 token_count = unwrapped_model._token_tracker.sync()
                 sft_tokens = token_count - start_token_count
+                if evidence_token_pending is not None:
+                    evidence_token_count += int(evidence_token_pending.item())
+                    evidence_token_pending.zero_()
                 now = time.time()
                 interval_s = max(now - last_log_time, 1e-6)
                 tokens_per_sec = (token_count - last_token_count) / interval_s
@@ -942,21 +1044,35 @@ def sft(args):
                 if args.ir:
                     # anneal the retrieval temperature on MICRO-step progress, not on tokens: the
                     # token target is only estimable once training has run, and the anneal has to
-                    # be a known function of position from step 0 to be reproducible.
+                    # be a known function of position from step 0 to be reproducible. Evidence trains
+                    # the table at the trunk's rate rather than annealing it -- the values were never
+                    # rebuilt, so there is no near-uniform read to sharpen out of.
                     scale = cfg.temperature_scale(step / total_micro_steps)
                     unwrapped_model.moe.set_ir_temperature_scale(scale)
-                    if sft_tokens >= next_refresh:
-                        ir_refresh_stats = apply_ir_refresh(
-                            unwrapped_model, optimizer, master_pairs,
-                            unwrapped_model.moe.refresh_ir_clusters(dead_quantile=cfg.dead_quantile),
-                        )
-                        next_refresh = sft_tokens + cfg.cluster_refresh_tokens
-                        # logged as its own line so a loss step at a refresh boundary is
-                        # attributable to the refresh rather than to the data
-                        logger.info(
-                            f"IR cluster refresh at {sft_tokens / 1e6:.1f}M {phase} tokens "
-                            f"(temperature scale {scale:.4f}): {ir_refresh_stats}"
-                        )
+
+                # gated on the CONFIG carrying a refresh cadence, not on --ir: any profile that
+                # trains the IR keys needs its centroids to keep tracking them, and the evidence
+                # profile now does (at the trunk's rate, not the fresh one, but "slow" is not
+                # "frozen") -- SFTConfig/RepairConfig have no cluster_refresh_tokens, so this is a
+                # no-op there exactly as before.
+                refresh_tokens = getattr(cfg, "cluster_refresh_tokens", 0)
+                if refresh_tokens and sft_tokens >= next_refresh:
+                    ir_refresh_stats = apply_ir_refresh(
+                        unwrapped_model, optimizer, master_pairs,
+                        unwrapped_model.moe.refresh_ir_clusters(
+                            dead_quantile=getattr(cfg, "dead_quantile", 0.0)
+                        ),
+                    )
+                    next_refresh = sft_tokens + refresh_tokens
+                    # logged as its own line so a loss step at a refresh boundary is attributable to
+                    # the refresh rather than to the data; candidate recall (the number that says
+                    # whether the partition is still covering what the read wants) is already inside
+                    # ir_refresh_stats, reported identically regardless of which profile triggered it
+                    logger.info(
+                        f"IR cluster refresh at {sft_tokens / 1e6:.1f}M {phase} tokens"
+                        + (f" (temperature scale {scale:.4f})" if args.ir else "")
+                        + f": {ir_refresh_stats}"
+                    )
 
                 per_loop_ce = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
                 loop_scale = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
@@ -989,18 +1105,55 @@ def sft(args):
                     # run is still going, not reconstructed from the final checkpoint
                     inj_rms = unwrapped_model.moe.inject.weight.detach().float().pow(2).mean().sqrt().item()
                     ir_entropy_str += f"|inject|rms: {inj_rms:.2e} | "
+                if args.evidence:
+                    evidence_module = unwrapped_model.moe.shared_evidence
+                    if evidence_module is not None:
+                        # the reader's own neutrality zero, same reason as |g_proj|rms above: if
+                        # this never leaves zero the port never wrote anything to the residual
+                        # whatever the selector's mass split says
+                        o_rms = (
+                            evidence_module.attn.o_proj.weight.detach().float().pow(2).mean()
+                            .sqrt().item()
+                        )
+                        ir_entropy_str += f"|shared_evidence.o_proj|rms: {o_rms:.2e} | "
+                    # the G3b signal, bucketed by the condition that produced the query: how much of
+                    # the read mass the external store won, on this step's (full-depth, since this
+                    # is a log step) forward. Read from the IR module's own instrumentation rather
+                    # than recomputed -- last_memory_mass is None whenever this step's batch carried
+                    # no evidence at all, or the module has no external store attached, so both are
+                    # guarded with getattr/None checks rather than assumed present.
+                    ir_modules = unwrapped_model.moe.ir_modules
+                    mass = getattr(ir_modules[0], "last_memory_mass", None) if ir_modules else None
+                    if mass is not None and "condition_ids" in batch:
+                        cond_ids_flat = batch["condition_ids"].to(mass.device).reshape(-1)
+                        mass_by_cond = [
+                            f"{cond}: {mass[cond_ids_flat == idx].mean().item():.3f}"
+                            for idx, cond in enumerate(CONDITIONS)
+                            if bool((cond_ids_flat == idx).any())
+                        ]
+                        if mass_by_cond:
+                            ir_entropy_str += f"external mass: {{{', '.join(mass_by_cond)}}} | "
 
                 def _metric(key):
                     value = metrics.get(key)
                     return value.item() if value is not None else float("nan")
 
                 eta = eta_seconds(sft_tokens, target_tokens or 0, tokens_per_sec) if target_tokens else None
+                # a separate field from "{phase} tokens", never folded into it: that counter anchors
+                # the LR schedule, the token target and the checkpoint cadence, and the evidence
+                # stream (~3x its size on the smoke corpus) is not part of what any of those read.
+                # Without its own field the log makes an evidence-conditioned step look as cheap as
+                # a plain SFT one at the same "{phase} tokens" reading.
+                evidence_field = (
+                    f" | evidence tokens: {evidence_token_count / 1e6:.2f}M" if args.evidence else ""
+                )
                 logger.info(
                     f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
                     f"Aux: {aux_loss.item():.4f} | loop_scale: [{loop_scale}] | "
                     f"p_max: {_metric('p_max'):.4f} | top1_acc: {_metric('top1_acc'):.4f} | "
                     f"per-loop CE: [{per_loop_ce}] | {ir_entropy_str}"
-                    f"LR: {scheduler.get_last_lr()[0]:.3e} | {phase} tokens: {sft_tokens / 1e6:.2f}M | "
+                    f"LR: {scheduler.get_last_lr()[0]:.3e} | {phase} tokens: {sft_tokens / 1e6:.2f}M"
+                    f"{evidence_field} | "
                     f"Tokens/sec: {tokens_per_sec:.0f} | "
                     f"Peak Mem: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB | "
                     f"Time: {(now - timer) / 60:.2f} min"
