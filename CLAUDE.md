@@ -42,6 +42,23 @@ stopped climbing by the first checkpoint is the answer, and the remaining hour o
 control at matched tokens — which is worth having sometimes, and worth saying out loud rather than
 assuming either way.
 
+## Subagents
+
+**Every subagent runs on Sonnet, and every subagent runs in caveman mode** (`/caveman:caveman full`,
+or `ultra` for a pure lookup). Say so in the spawn prompt — a subagent does not inherit this
+session's mode, so it has to be told, and it has to invoke the skill itself rather than be asked to
+"write tersely". The reason is token cost: a subagent's report is injected back into the main
+thread's context verbatim, and an uncompressed one is roughly 2-3x the size of what it actually
+says. A long session here dies of context exhaustion long before it runs out of things to do.
+
+Caveman applies to the **report**, not to what the subagent writes into the repo: code, comments,
+docstrings, docs and commit messages stay normal prose, which is what this file's Conventions
+section already requires.
+
+One subagent per task, and combine tasks that share a file — two agents editing one file in
+parallel is how an edit gets clobbered. Group by file ownership, state the owned files in the
+prompt, and run groups that touch disjoint files at the same time.
+
 ## What this is
 
 `tiny-moe-llm`: an experimental 332M-param LM. A dense Gemma4-style decoder feeds a **single

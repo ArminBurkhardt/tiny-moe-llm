@@ -13,7 +13,7 @@ positive, and the reason it did is structural rather than lucky.
 
 ## 1. The reading
 
-`.evidence_ceiling_probe.py`, on the answerable half of the standard SQuAD v2 slice, 1,500
+[`scripts/evidence_ceiling_probe.py`](../../scripts/evidence_ceiling_probe.py), on the answerable half of the standard SQuAD v2 slice, 1,500
 questions, `checkpoint_repair_final.pt`. Three conditions over the same rows in the same order; CE
 restricted to the answer span, teacher-forced.
 
