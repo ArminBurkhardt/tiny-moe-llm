@@ -49,6 +49,25 @@ model:
                        # measuring the recall and the trainer warns below 0.9.
   ir_read_top_k: 32
 
+  # each IR expert's output stage. true (default): a token's own read reaches the output through a
+  # learned gate alone, no attention over any other token's read. false: the original inner
+  # attention, kept only for comparison -- it measurably averages a document's reads over its whole
+  # prefix rather than carrying any per token content (see InformationRetrievalExpert's docstring).
+  # A checkpoint keeps both sets of weights regardless of this flag; only which one forward_step
+  # calls changes. NOT inferred from the state dict the way evidence_port/loop_inject are below --
+  # a checkpoint trained before this flag existed has no direct_gate tensor, so flipping this to
+  # true for one requires adding that tensor first (a migration script's job).
+  ir_direct_read: true
+
+  # how the evidence reader's retrieved chunks are embedded, when the checkpoint carries the port
+  # at all (evidence_port itself is inferred from the checkpoint, never read from here). true runs
+  # every dense decoder layer over the evidence tokens so the reader's keys carry context instead of
+  # raw token identity; an integer N runs only the first N layers (a cheaper variant); false falls
+  # back to the original uncontextualized per-token embedding, kept for the encoded-vs-raw
+  # comparison this flag exists to make possible. Adds no parameters, so it applies to every
+  # checkpoint regardless of when it was trained.
+  evidence_encoder: true
+
   # mtp
   mtp_num_extra_tokens: 2
   lm_head_factor: 4
@@ -222,7 +241,9 @@ evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence
   fresh_lr: 3.0e-4 # the evidence reader and the selector's two adapters plus its source scale.
                    # Never trained, so at the trunk's rate they would sit at their init for the
                    # whole run and the run would measure nothing. Deliberately does NOT cover the
-                   # IR key/value table, which carries a full sharpening run
+                   # IR key/value table, which carries a full sharpening run -- scripts/sft.py passes
+                   # a different fresh predicate for this profile than for `ir:` below for that
+                   # reason, so the table trains at `lr` above instead
   num_epochs: 1 # one pass. The abstention targets come from a closed phrasing set and a second
                 # pass starts memorizing the strings instead of the policy
   batch_size: 4 # 4 x 4096 stays resident on the 32GB card; 8 spills into shared memory at ~4x the
@@ -244,4 +265,16 @@ evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence
   conversation_loss_weighting: true # this is a policy change, and unweighted CE makes a six token
                                     # refusal the cheapest loss reduction in the corpus -- the exact
                                     # mechanism that collapsed the first SFT run onto one string
+  loss_weight_floor_tokens: 64 # caps a conversation's per-token weight at 1/floor instead of
+                               # 1/n_supervised. Per-conversation weighting alone gives a five-token
+                               # SQuAD answer (weight 0.2) 160x an 800-token web continuation's
+                               # weight (0.00125) per token, even though the corpus is
+                               # token-majority web text -- this is what let QA dominate the
+                               # gradient on the smoke corpus. A conversation already longer than
+                               # the floor is unaffected (n >= floor keeps 1/n exactly)
+  cluster_refresh_tokens: 20000000 # same knob as `ir:` below: the table trains at `lr` here rather
+                                   # than sitting frozen, so its two stage read's centroids still need
+                                   # to keep tracking the keys, just on the same cadence a from-scratch
+                                   # sharpening run used
+  dead_quantile: 0.02 # a cap on recycling, not a target -- see `ir:` below for what it means
   hf_upload_repo: "" # local run

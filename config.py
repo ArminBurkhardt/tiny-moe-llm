@@ -28,12 +28,26 @@ class ModelConfig:
         "ir_num_clusters": int(Config["model"].get("ir_num_clusters", 0)),
         "ir_probe_clusters": int(Config["model"].get("ir_probe_clusters", 4)),
         "ir_read_top_k": int(Config["model"].get("ir_read_top_k", 32)),
+        # each IR expert's output stage: True (default) writes a token's own read straight to the
+        # output through a learned gate; False keeps the original inner attention, which averages a
+        # document's reads over its whole prefix and was measured to carry no per token content
+        # (see the IR expert's own docstring). A checkpoint keeps both sets of weights regardless of
+        # this flag -- only which one the forward calls changes -- so switching it back and forth is
+        # safe on the SAME checkpoint family; it is not (yet) inferred from the state dict the way
+        # loop_inject/evidence_port are, so a checkpoint trained before this flag existed has no
+        # direct_gate tensor and needs one added before this can be set True for it.
+        "ir_direct_read": bool(Config["model"].get("ir_direct_read", True)),
         "dropout": float(Config["model"]["dropout"]),
         "top_k": int(Config["model"]["top_k"]),
         "n_loops": int(Config["model"]["n_loops"]),
         "ple_embeddings_size": int(Config["model"]["per_layer_embeddings_size"]),
         "mtp_num_extra_tokens": int(Config["model"]["mtp_num_extra_tokens"]),
         "lm_head_factor": int(Config["model"]["lm_head_factor"]),
+        # how build_evidence embeds retrieved evidence: true (default) runs it through every dense
+        # decoder layer, an int runs only the first N, false falls back to the original uncontextualized
+        # per-token embedding. Adds no parameters -- it reuses the decoder's weights -- so this is
+        # read for every checkpoint regardless of when it was trained, not inferred from the state dict.
+        "evidence_encoder": Config["model"].get("evidence_encoder", True),
     }
     
     Forward = {}
@@ -316,21 +330,36 @@ class EvidenceConfig(SFTConfig):
     -- a second token stream per row -- plus the from-scratch learning rate the port's new tensors
     need, which it inherits the *shape* of from ``IRConfig`` without inheriting its table machinery.
 
-    Two numbers here are decisions rather than defaults:
+    Three numbers here are decisions rather than defaults:
 
     - **``fresh_lr``.** The reader and the selector's adapters have never seen a gradient, and the
       trunk has 16B tokens plus three finetunes in it. The same argument ``IRConfig.fresh_lr``
       makes applies unchanged: one compromise rate either leaves the port at its init or damages the
       trunk. What is NOT in the fresh group is the IR key/value table, which carries a full
-      sharpening run -- ``moe.is_fresh_loop_param`` matches the adapters by name for that reason.
+      sharpening run -- ``scripts/sft.py`` passes ``moe.is_fresh_loop_param`` alone as this
+      profile's fresh predicate, not ``is_rebuilt_ir_param``'s whole ``ir_module`` subtree the way
+      the IR profile does, so the table trains at ``lr`` (the trunk's rate) like everything else
+      that converged before this run started.
     - **``conversation_loss_weighting: true``.** This run is a policy change (when to abstain), and
       an unweighted objective makes a six-token refusal the cheapest loss reduction in the corpus.
       That is exactly the mechanism that collapsed the first SFT run onto one refusal string, and
       turning it off here would re-run that experiment.
+    - **``loss_weight_floor_tokens``.** Per-conversation weighting alone still inverts this corpus,
+      which mixes short QA turns with long web continuations -- a five-token answer's conversation
+      outweighs an 800-token continuation's 160 to 1 per token even though the corpus is
+      token-majority web text. Flooring the denominator caps a short conversation's total pull
+      instead of restoring long ones to parity; see ``EvidenceDataset``'s docstring for the
+      arithmetic. The floor is read only by ``EvidenceDataset``, not ``SFTDataset``, so plain SFT
+      and ``--repair``/``--ir`` (which reuse ``SFTDataset`` unchanged) are unaffected.
 
     ``num_epochs`` is 1 on purpose. The abstention targets are drawn from a closed phrasing set, and
     a second pass over them starts memorizing the strings rather than the policy -- the same reason
     the repair profile is single-epoch.
+
+    ``cluster_refresh_tokens`` / ``dead_quantile`` are the same cadence knobs ``IRConfig`` has, given
+    to this profile for the same underlying reason: the table still trains here (at ``lr``, not
+    ``fresh_lr`` -- see above), and the two stage read's candidate set is only exact while the
+    centroids track keys that are moving, however slowly.
     """
     _Block = Config.get("evidence", {}) or {}
 
@@ -365,6 +394,27 @@ class EvidenceConfig(SFTConfig):
     # MoE block once per loop and the chunked LM head, so the two budgets are worth very different
     # amounts of memory and balancing them is close to free.
     max_evidence_tokens = int(_Block.get("max_evidence_tokens", 12288))
+
+    # caps a conversation's per-token weight at 1/floor instead of 1/n_supervised. Per-conversation
+    # weighting alone makes every conversation's TOTAL pull on the gradient exactly 1 regardless of
+    # length, which inverts a corpus mixing short QA turns with long web continuations: a five-token
+    # SQuAD answer (weight 0.2) then outweighs an 800-token web continuation (weight 0.00125) 160 to
+    # 1 per token, even where the corpus is token-majority web text. The floor leaves any
+    # conversation already longer than it untouched (n >= floor keeps 1/n exactly) and caps a
+    # shorter one's total weight at n/floor < 1 -- it reduces the short conversation's pull rather
+    # than restoring the long ones to parity. This only reweights which conversations the gradient
+    # favors; `_chunked_linear_ce` still normalizes by sum(w), so the objective stays a mean CE.
+    loss_weight_floor_tokens = int(_Block.get("loss_weight_floor_tokens", 64))
+
+    # same cadence knob as IRConfig, and for the same reason: the IR keys are still training here
+    # (at lr, since they are NOT in this profile's fresh group -- see the docstring), so the two
+    # stage read's centroids need to keep tracking them. 0 disables the refresh entirely.
+    cluster_refresh_tokens = int(_Block.get("cluster_refresh_tokens", 20_000_000))
+    # fraction of entries eligible for recycling at each refresh; 0.0 disables recycling. Trunk-rate
+    # training moves the keys far more slowly than IRConfig's fresh-rate sharpening run did, so fewer
+    # entries are expected to go dead over one profile's corpus -- the quantile is a cap, not a
+    # target, either way (see refresh_clusters).
+    dead_quantile = float(_Block.get("dead_quantile", 0.02))
 
     _raw_upload_repo = _Block.get("hf_upload_repo", SFTConfig.hf_upload_repo)
     hf_upload_repo = None if _raw_upload_repo is None else str(_raw_upload_repo)

@@ -118,6 +118,71 @@ def is_rebuilt_ir_param(name: str) -> bool:
     return "experts." in name and (name.endswith("down_proj.weight") or name.endswith("up_proj.weight"))
 
 
+def evidence_selection_loss(
+    external_weights: torch.Tensor,
+    visible: torch.Tensor,
+    chunk_gold: torch.Tensor,
+    supervised: torch.Tensor = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """BCE between the selector's own per chunk read share and the corpus's gold flag.
+
+    Nothing in this file currently trains the selector toward RELEVANCE: the aux loss only pins its
+    routed selection FRACTION, and the read reaches the residual through a ~200x attenuated valve
+    (see ``ir_scale_fix.md``). This is the direct fix -- a loss computed straight from the mass
+    split, on positions the corpus actually supervises.
+
+    Args:
+        external_weights: ``[T, M]``, the per (token, chunk) share of read mass BEFORE it is summed
+            and detached (``InformationRetrievalModule.last_memory_weights`` /
+            ``_merge``'s own ``external`` -- NOT ``last_memory_mass``, which has already lost both
+            the per chunk breakdown and the gradient this loss needs).
+        visible: ``[T, M]`` bool, which chunks belong to each token's own document
+            (``evidence_memory``'s second return value).
+        chunk_gold: ``[M]`` bool/float, the corpus's per chunk gold flag, aligned with the SAME
+            chunk axis ``visible``/``chunk_keys``/``chunk_segments`` index (a trainer flattens the
+            dataset's per row ``chunk_gold [B, C]`` the same way ``evidence_from_batch`` flattens
+            ``chunk_keys`` -- see this repo's evidence data pipeline).
+        supervised: optional ``[T]`` bool/float mask restricting the loss to specific query
+            positions (e.g. ``labels != -100``); every position counts when omitted.
+        eps: numerical floor for the renormalizing division and the row mask.
+
+    Returns:
+        Scalar loss. BCE, not InfoNCE: a document's evidence buffer can hold zero gold chunks (a
+        distractor only or empty condition) or more than one (a multi hop row keeps two gold
+        chunks), and InfoNCE's softmax cross entropy assumes exactly one positive class per row --
+        every one of those needs a special case to even define the loss. BCE instead asks, of EACH
+        visible chunk independently, "is this the gold one", which is well defined with zero, one or
+        several positives with no branching.
+
+        Renormalized to the token's own visible chunks before the BCE, not the raw joint softmax
+        weights over the whole batch's chunk axis: the raw weights also encode HOW MUCH of a read
+        went external at all (the parametric/external split), a magnitude the reader's own gate
+        already reads (see ``moe.py``'s ``forward_step``) and not what this loss should move.
+        Dividing it out asks only "of the mass that DID go external, did it land on the gold chunk"
+        -- pure ranking, with no incentive to push the overall split itself up or down.
+
+        Numerically safe by construction rather than by a branch: with nothing visible or nothing
+        supervised, every row of ``per_token * row_mask`` is exactly zero and the division is by a
+        clamped, non-zero constant, so the result is a genuine zero tensor with a live graph back to
+        ``external_weights`` (not a freshly constructed, disconnected zero) rather than a NaN.
+    """
+    visible_f = visible.to(external_weights.dtype)
+    weights = external_weights * visible_f
+    denom = weights.sum(dim=-1)
+    p = weights / denom.clamp_min(eps).unsqueeze(-1)
+
+    target = chunk_gold.to(external_weights.dtype).unsqueeze(0).expand_as(p)
+    per_chunk = F.binary_cross_entropy(p.clamp(eps, 1.0 - eps), target, reduction="none") * visible_f
+    per_token = per_chunk.sum(dim=-1) / visible_f.sum(dim=-1).clamp_min(1.0)
+
+    row_mask = (denom > eps).to(per_token.dtype)
+    if supervised is not None:
+        row_mask = row_mask * supervised.to(per_token.dtype)
+    total = row_mask.sum().clamp_min(eps)
+    return (per_token * row_mask).sum() / total
+
+
 def _group_starts(group_ids: torch.Tensor, num_groups: int) -> torch.Tensor:
     """exclusive prefix sum of the per group counts of an already sorted ``group_ids``.
 
@@ -296,6 +361,8 @@ class InformationRetrievalModule(nn.Module):
         query_capacity_factor: float = 1.5,
         reservoir_size: int = 1024,
         memory_dim: int = 0,
+        loop_enc_dim: int = 32,
+        max_enc_loops: int = 64,
     ):
         """
         Args:
@@ -325,6 +392,12 @@ class InformationRetrievalModule(nn.Module):
                 memory at all (which is every checkpoint written before the evidence port, and the
                 path that must stay bit-identical). Non-zero adds the two adapters and the learned
                 source scale described below.
+            loop_enc_dim: width of the sinusoidal loop-index encoding that biases the query per
+                loop (see ``loop_query_bias`` below). Matches
+                ``LoopMixtureOfExperts``'s own default so the two encodings agree numerically,
+                though each module keeps its own buffer rather than sharing one.
+            max_enc_loops: size of the precomputed loop-encoding table. Loop indices past it reuse
+                the last row, same convention as ``LoopMixtureOfExperts.loop_enc``.
         """
         super().__init__()
         self.num_entries = num_entries
@@ -372,6 +445,24 @@ class InformationRetrievalModule(nn.Module):
             bias=False
         )
 
+        # per-loop query bias: without it the retrieval query barely moves across loops (measured
+        # cos(q2, q3) = 0.99 on the trained trunk), so re-reading the table at every loop was in
+        # practice re-reading whatever loop 1 already read. Mirrors
+        # ``LoopMixtureOfExperts.loop_router_bias`` exactly: sinusoidal in the ABSOLUTE loop index
+        # rather than a learned [n_loops, latent_dim] table, so the loop count stays a runtime
+        # choice and any index has a defined encoding; zero-init, so a checkpoint that gains this
+        # tensor scores identically until it learns something. Added to the query BEFORE
+        # normalization in forward() -- not to the raw ``x`` the residual branch concatenates when
+        # ``residual=True``, which must stay whatever the caller actually passed in.
+        loop_enc_dim = int(loop_enc_dim) // 2 * 2  # sin/cos halves
+        inv_freq = 1.0 / (100.0 ** (torch.arange(0, loop_enc_dim, 2).float() / loop_enc_dim))
+        angles = torch.arange(max_enc_loops).float().unsqueeze(1) * inv_freq.unsqueeze(0)
+        self.register_buffer(
+            "loop_enc", torch.cat([angles.sin(), angles.cos()], dim=-1), persistent=False
+        )  # [max_enc_loops, loop_enc_dim]
+        self.loop_query_bias = nn.Linear(loop_enc_dim, latent_dim, bias=False)
+        nn.init.zeros_(self.loop_query_bias.weight)
+
         # external memory: a second backing store read by the SAME softmax as the table, so the two
         # compete for one budget of read mass and the split between them is a measurable quantity
         # rather than two independent reads summed. That split is the whole point -- it is what a
@@ -413,6 +504,19 @@ class InformationRetrievalModule(nn.Module):
         # for the same reasons entry_usage is one: model.to(BF16) would cast a buffer, and this is a
         # sample of the last batch rather than state a checkpoint should carry.
         self.last_memory_mass = None
+        # every loop's mass, keyed by absolute loop index, so a caller can read loop 1's split
+        # alongside the final one instead of only whatever overwrote last_memory_mass last. Cleared
+        # once per recurrence by begin_forward(), not per call -- this module runs once PER LOOP, so
+        # nothing here can tell a new recurrence has started on its own.
+        self.memory_mass_by_loop = {}
+        # the per (token, chunk) weights BEFORE the sum-and-detach that produces last_memory_mass,
+        # [tokens, M]. last_memory_mass is what the loggers and the mass split readout want (a
+        # detached scalar per token, safe to hold across a whole training loop); a selection loss
+        # trained against the corpus's per chunk gold flag needs the per CHUNK breakdown and a live
+        # graph to it, neither of which that summary carries. Same lifetime and same "cleared, not
+        # stale, on a batch with no evidence" rule as last_memory_mass -- see forward().
+        self.last_memory_weights = None
+        self.memory_weights_by_loop = {}
 
         if self.num_clusters > 0:
             assert num_entries % self.num_clusters == 0, (
@@ -534,6 +638,23 @@ class InformationRetrievalModule(nn.Module):
         """
         self.temperature_scale.fill_(float(scale))
 
+    def begin_forward(self):
+        """clear the per loop memory-mass log at the start of a new recurrence.
+
+        Called once per model forward (``LoopMixtureOfExperts.forward``, before its loop starts),
+        the same place the expert and retrieval-entropy trackers reset their own per forward
+        counters. This module runs once PER LOOP, so nothing here can tell a new recurrence has
+        started on its own -- without an external reset, ``memory_mass_by_loop`` would keep
+        accumulating stale entries from every earlier batch that touched a given loop index.
+        """
+        self.memory_mass_by_loop = {}
+        self.memory_weights_by_loop = {}
+
+    def _loop_query_bias(self, loop_idx: int, dtype: torch.dtype) -> torch.Tensor:
+        """per-loop additive bias on the query, shape ``[latent_dim]``. See ``__init__``."""
+        row = min(int(loop_idx), self.loop_enc.size(0) - 1)
+        return self.loop_query_bias(self.loop_enc[row].to(dtype))
+
     def forward(self, x: torch.Tensor, return_weights=False, loop_idx: int = 0, memory=None, **kwargs) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
         """
         x: input tensor of shape (batch, seq_len, latent_dim) or (batch, latent_dim)
@@ -541,8 +662,9 @@ class InformationRetrievalModule(nn.Module):
             are the [tokens, read_top_k] read weights, NOT a full-table distribution -- there is no
             full-table distribution to return. With external memory attached they are the
             PARAMETRIC half, renormalized -- see ``_merge``.
-        loop_idx: which loop of the MoE recurrence this call belongs to. Only used to bucket the
-            entropy instrumentation per loop; the retrieval itself does not depend on it
+        loop_idx: which loop of the MoE recurrence this call belongs to. Biases the query (see
+            ``loop_query_bias`` in ``__init__``) and buckets the entropy instrumentation; the
+            retrieval MECHANISM itself (the tables, the softmax) does not depend on it.
         memory: ``(chunk_keys [M, memory_dim], visible [tokens, M])`` external store to read
             alongside the table, built by ``modules.model.evidence.evidence_memory``. None takes
             the read path this module had before external memory existed, unchanged.
@@ -554,6 +676,11 @@ class InformationRetrievalModule(nn.Module):
         else:
             x_flat = x
 
+        # per-loop query conditioning, added BEFORE normalization so it can also rotate the query's
+        # direction and not just rescale it. zero-init, so this is an exact no-op until it learns
+        # something; the raw `x` used by the residual branch further down is untouched.
+        x_flat = x_flat + self._loop_query_bias(loop_idx, x_flat.dtype)
+
         # 1. normalization
         # for Cosine Similarity (via dot product)
         x_norm = F.normalize(x_flat, p=2, dim=-1)
@@ -564,6 +691,7 @@ class InformationRetrievalModule(nn.Module):
             # cleared rather than left alone, so a reader of the mass signal cannot pick up the
             # last evidence-bearing batch's value on a batch that carried no evidence
             self.last_memory_mass = None
+            self.last_memory_weights = None
         if self.num_clusters > 0:
             retrieved_y, weights = self._two_stage_read(x_norm, memory)
         else:
@@ -573,6 +701,13 @@ class InformationRetrievalModule(nn.Module):
         # rather than recomputing them (which is what eval_stage0.py has to do from outside)
         if self.tracker is not None:
             self.tracker.update(weights, loop_idx)
+
+        # keep every loop's mass readable rather than only whichever call happened last --
+        # last_memory_mass itself stays the final loop's, which is what always overwriting it
+        # already gave existing callers
+        if self.last_memory_mass is not None:
+            self.memory_mass_by_loop[int(loop_idx)] = self.last_memory_mass
+            self.memory_weights_by_loop[int(loop_idx)] = self.last_memory_weights
 
         # restore original shape (batch, seq_len, output_dim)
         if len(original_shape) == 3:
@@ -650,6 +785,11 @@ class InformationRetrievalModule(nn.Module):
         # read mass the external store won. Detached and stashed rather than returned, because the
         # expert's return value is consumed positionally by the MoE accumulator.
         self.last_memory_mass = external.detach().sum(dim=-1)
+        # the SAME per chunk breakdown, kept live (no detach): a selection loss supervising this
+        # against the corpus's gold flag needs a graph back to the query/keys/adapters, which the
+        # summary above cannot carry once detached. Does not change what is returned or read
+        # downstream in this function -- purely an extra reference to a tensor already computed.
+        self.last_memory_weights = external
         return parametric, external
 
     def _memory_values(self, keys: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

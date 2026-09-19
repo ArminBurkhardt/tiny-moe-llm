@@ -94,11 +94,15 @@ class InformationRetrievalExpert(nn.Module):
         probe_clusters: int = 4,
         read_top_k: int = 32,
         memory_dim: int = 0,
+        direct_read: bool = True,
     ):
         super().__init__()
         self.input_size = input_size
         self.dropout = nn.Dropout(dropout)
         self.norm = RMSNorm(input_size)
+        # kept unconditionally, even when direct_read makes it unused compute: a checkpoint trained
+        # under the averaging path keeps these weights loadable if direct_read is ever switched back
+        # off for an A/B, rather than the state dict silently dropping a whole trained submodule.
         self.attn = GroupedQueryAttention(
             hidden_size=input_size,
             num_attention_heads=num_heads,
@@ -106,7 +110,7 @@ class InformationRetrievalExpert(nn.Module):
             head_dim=input_size // num_heads,
             dropout=dropout,
         )
-        
+
         # operate on the per-head dimension for more efficient retrieval
         self.ir_module = InformationRetrievalModule(
             num_entries=num_entries,
@@ -122,6 +126,18 @@ class InformationRetrievalExpert(nn.Module):
         )
         self.down_proj = te.Linear(input_size, ir_dim, bias=False)
         self.up_proj = te.Linear(ir_dim, input_size, bias=False)
+
+        # the direct read path (see forward()'s docstring for the failure it fixes). Zero-init, for
+        # the same reason g_proj is zeroed by the reshape migration: turning this on for a checkpoint
+        # that has never trained it must be measurable as the "read zeroed" ablation this file
+        # already reports at 0.0002 nats, not as an untrained transform injecting noise into a
+        # converged trunk. A full projection rather than a bare scalar gate, so it can learn WHICH
+        # output channels of a token's own read matter, not just how loud the read is overall.
+        self.direct_read = bool(direct_read)
+        self.direct_gate = None
+        if self.direct_read:
+            self.direct_gate = te.Linear(input_size, input_size, bias=False)
+            nn.init.zeros_(self.direct_gate.weight)
 
     def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, loop_idx: int = 0, memory=None) -> torch.Tensor:
         """``memory`` is the external store the table is read alongside, or None for the table alone.
@@ -140,6 +156,19 @@ class InformationRetrievalExpert(nn.Module):
         trains the adapters only arrives through the routed fraction -- which is the argument for
         watching the split's AUROC rather than the adapters' norms when judging whether it is
         learning.
+
+        Two output stages, selected by ``direct_read`` at construction:
+
+        - ``direct_read=True`` (default): each token's own retrieved vector (``information`` below)
+          reaches the output through ``direct_gate`` alone -- no attention over any other token's
+          read.
+        - ``direct_read=False``: the ORIGINAL path, an inner ``GroupedQueryAttention`` with queries
+          from the residual and keys/values from every position's own retrieved vector, causal over
+          the document. This measurably does not do what it looks like it does: with ``information``
+          at RMS 0.004-0.008 and a default-init ``k_proj``, the attention logits' std is on the order
+          of 1e-3, so the softmax is uniform to a fraction of a percent and the expert emits
+          ``v_proj`` of the running MEAN of the prefix's reads -- a per document constant, not a per
+          token one. Kept only so the two paths stay A/B comparable on the same checkpoint family.
         """
         x_norm = self.norm(x)
 
@@ -149,6 +178,13 @@ class InformationRetrievalExpert(nn.Module):
         # measurement found and what NEXT.md's loop conditioned query is meant to change
         ir_output = self.ir_module(down, loop_idx=loop_idx, memory=memory)
         information = self.up_proj(ir_output)
+
+        if self.direct_read:
+            # each position's own read, gated straight to the output -- no mixing across the
+            # document (see the class docstring for why the alternative measurably does not do what
+            # it looks like it does). kv_cache is accepted but unused here: there is no attention to
+            # cache against, so a generation loop simply never populates this expert's slot.
+            return self.dropout(self.direct_gate(information))
 
         attn_output = self.attn(
             hidden_states=x_norm,

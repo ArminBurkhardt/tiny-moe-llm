@@ -7,6 +7,7 @@ from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
 from modules.model.evidence import EvidenceBatch, chunk_position_ids, evidence_cu_seqlens
+from modules.model.attention import cu_seqlens_from_doc_ids
 from utils import logger
 
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
@@ -93,8 +94,23 @@ class TinyMoETransformer(nn.Module):
         moe_intermediate_size: int = None,
         loop_inject: bool = False,
         evidence_port: bool = False,
+        evidence_encoder: bool | int = True,
+        ir_direct_read: bool = True,
     ):
         super().__init__()
+
+        # how build_evidence embeds retrieved evidence, resolved once here rather than re-branched
+        # on every call. True/None -> every decoder layer; an explicit int -> only the first N
+        # (0 counts as "every layer", so an absent yaml key and an explicit 0 mean the same thing);
+        # False -> skip the decoder entirely and fall back to the original per-token PLE embedding.
+        # That fallback exists for the encoded-vs-raw comparison this flag was added to make
+        # possible, not because it is a design worth keeping -- see _encode_evidence.
+        if evidence_encoder is False:
+            self.evidence_encoder_layers = None
+        elif evidence_encoder is True or evidence_encoder is None:
+            self.evidence_encoder_layers = 0
+        else:
+            self.evidence_encoder_layers = int(evidence_encoder)
 
         # construction-time invariants (PLAN.md Step 5) -- SmallLMHead chunks both dims into
         # `factor` pieces, so a bad vocab/hidden/lm_head_factor combo would silently truncate
@@ -155,6 +171,7 @@ class TinyMoETransformer(nn.Module):
             max_seq_len=max_seq_len,
             loop_inject=loop_inject,
             evidence_port=evidence_port,
+            ir_direct_read=ir_direct_read,
         )
         
         self.norm = RMSNorm(hidden_size)
@@ -248,6 +265,29 @@ class TinyMoETransformer(nn.Module):
         self.lm_head_flops_per_token = 2 * lm_head_params            # per application (once per loop)
         self.mtp_flops_per_token = 2 * (mtp_body_params + mtp_num_extra_tokens * mtp_lm_head_params)
 
+        # evidence encoding: linear in the number of EVIDENCE tokens, which is a property of the
+        # batch (a buffer that can hold zero chunks or thousands), not of max_seq_len -- exactly the
+        # reason the external IR memory read above has no fixed per-token constant either. Folding
+        # it into flops_per_token_fwd below would misreport every step that doesn't happen to run at
+        # the corpus's average evidence count, so it is exposed as its own per-evidence-token
+        # coefficient instead, mirroring attn_flops_per_seqsq's contract: whoever has the batch's
+        # real evidence token count multiplies by it to get the true cost. Standard "2N" per layer,
+        # embeddings excluded (a lookup, not a matmul); num_layers assumed uniform in shape, true for
+        # every config this model runs.
+        if num_layers > 0:
+            decoder_layer_params = sum(p.numel() for p in self.gemma_decoder.layers[0].parameters())
+        else:
+            decoder_layer_params = 0
+        # meaningless (and never run) without the port at all -- build_evidence short-circuits to
+        # None the moment self.moe.shared_evidence is None, so _encode_evidence never executes
+        if self.moe.shared_evidence is None or self.evidence_encoder_layers is None:
+            encoder_layers_run = 0
+        elif self.evidence_encoder_layers == 0:
+            encoder_layers_run = num_layers
+        else:
+            encoder_layers_run = min(self.evidence_encoder_layers, num_layers)
+        self.evidence_encoder_flops_per_token = 2 * decoder_layer_params * encoder_layers_run
+
         # aggregates at the configured loop count, for the log line / anything not tracking depth
         self.body_flops_per_token = self.dense_flops_per_token + n_loops * self.loop_flops_per_token
         self.attn_flops_per_seqsq = self.dense_attn_flops_per_seqsq + n_loops * self.loop_attn_flops_per_seqsq
@@ -269,6 +309,13 @@ class TinyMoETransformer(nn.Module):
             f"{(n_loops * self.lm_head_flops_per_token + self.mtp_flops_per_token)/1e6:.0f}M + attn "
             f"{self.attn_flops_per_seqsq * max_seq_len/1e6:.0f}M @ seq_len={max_seq_len})"
         )
+        if self.evidence_encoder_flops_per_token > 0:
+            # NOT part of the figure above on purpose -- see the comment where this is computed
+            logger.info(
+                f"evidence encoder: ~= {self.evidence_encoder_flops_per_token/1e6:.1f}M/evidence-token "
+                f"over {encoder_layers_run} decoder layer(s), not counted in forward FLOP/token above "
+                f"(scales with the batch's real evidence token count, not max_seq_len)"
+            )
     
     @property
     def token_count(self):
@@ -290,17 +337,92 @@ class TinyMoETransformer(nn.Module):
         moe_embeds = self.moe_embed_proj(moe_embeds)
         return moe_embeds
 
+    def _encode_evidence(self, evidence_ids: torch.Tensor, evidence_chunk_ids: torch.Tensor,
+                         position_ids: torch.Tensor) -> torch.Tensor:
+        """Embed evidence tokens and, unless disabled, run them through the dense decoder.
+
+        A bag of per-token PLE embeddings can copy a token it already expects but cannot find "the
+        token after *born in*" -- no decoder layer had touched it, so no key carries any context.
+        Reusing the SAME embedding table and decoder layers that contextualize the real token stream
+        fixes that with no new parameters: this is a forward-path choice, not a learned addition, so
+        a checkpoint that predates it needs nothing migrated to use it.
+
+        Attention here must never cross a retrieved chunk's own boundary, which is a FINER grouping
+        than ``evidence_cu_seqlens`` builds for the reader (that one groups by query segment, so a
+        document's several chunks share one segment). So this derives its own chunk-level
+        ``cu_seqlens`` from ``evidence_chunk_ids`` via ``cu_seqlens_from_doc_ids`` -- the identical
+        construction already used for the main token stream's document packing, and it fits here for
+        the same reason: ``modules/data/evidence_dataset.py`` restarts its chunk-id counter at 0 for
+        every row, so two different rows' chunks can share a numeric id, and forcing a boundary at
+        every row start (which that function already does) is exactly what keeps them from merging.
+
+        Positions restart at 0 per chunk (``chunk_position_ids``, computed by the caller so it is
+        not derived twice) rather than counting globally over the packed evidence axis. RoPE's dot
+        product depends only on the relative offset between two positions, so this is exactly
+        equivalent to a global count AS LONG AS a chunk never attends past its own boundary -- which
+        the cu_seqlens above guarantees -- and it is what keeps a long evidence axis (many short
+        chunks concatenated end to end) from running past the rotary cache sized for one document's
+        worth of positions.
+
+        Args:
+            evidence_ids: ``[B, S_ev]`` token ids of the retrieved chunks, packed end to end.
+            evidence_chunk_ids: ``[B, S_ev]`` which chunk each token came from.
+            position_ids: ``[B, S_ev]`` per chunk positions, from ``chunk_position_ids``.
+
+        Returns:
+            ``[B, S_ev, H]`` evidence states in the block's hidden space.
+        """
+        if self.evidence_encoder_layers is None:
+            # legacy path: kept for the encoded-vs-raw comparison this flag exists to make, not
+            # because uncontextualized embeddings are a design worth keeping on their own
+            states = self._moe_ple(evidence_ids)
+            assert states is not None, "the evidence reader needs the MoE embedding path to embed with"
+            return states
+
+        decoder = self.gemma_decoder
+        B, S_ev = evidence_ids.shape
+        hidden_states = decoder.embed_tokens(evidence_ids) * (decoder.hidden_size ** 0.5)
+        hidden_states = decoder.dropout(hidden_states)
+
+        chunk_cu_seqlens, chunk_max_seqlen = cu_seqlens_from_doc_ids(evidence_chunk_ids)
+        position_embeddings = decoder.rotary_emb.gather(position_ids, hidden_states.dtype)
+
+        if decoder.ple is not None:
+            ple_emb = decoder.ple(evidence_ids)
+            ple_emb = ple_emb.view(
+                B, S_ev, -1, ple_emb.shape[-1] // len(decoder.layers)
+            ).transpose(1, 2)
+        else:
+            ple_emb = None
+
+        num_layers = len(decoder.layers)
+        n_run = num_layers if self.evidence_encoder_layers == 0 else min(self.evidence_encoder_layers, num_layers)
+        for i in range(n_run):
+            hidden_states = decoder.layers[i](
+                hidden_states,
+                chunk_cu_seqlens,
+                chunk_max_seqlen,
+                position_embeddings,
+                per_layer_embeddings=ple_emb[:, i] if ple_emb is not None else None,
+                kv_cache=None,
+            )
+        # same final norm the full decoder applies -- a truncated depth still reads out through it,
+        # matching how the MoE block's own readout reuses self.norm regardless of loops actually run
+        return decoder.norm(hidden_states)
+
     def build_evidence(self, evidence_ids: torch.Tensor, evidence_chunk_ids: torch.Tensor,
                        evidence_segment_ids: torch.Tensor, num_segments: int,
-                       chunk_keys: torch.Tensor = None, chunk_segments: torch.Tensor = None):
+                       chunk_keys: torch.Tensor = None, chunk_segments: torch.Tensor = None,
+                       chunk_gold: torch.Tensor = None):
         """Pack retrieved evidence into the form the MoE block reads.
 
-        Evidence tokens go through **this model's own** embedding path, the same one ``_moe_ple``
-        uses for the injection port they replace. That is deliberate: the reader has to be able to
-        copy a span out of a retrieved passage, and a span is only copyable if the evidence arrives
-        in the token space the readout writes in. An external embedder's chunk vector cannot carry a
-        span -- it is a 384-d summary of a whole passage -- which is why the external embedder sits
-        on the *selector* side (``chunk_keys``) and never on this one.
+        Evidence tokens are embedded and contextualized through **this model's own** dense decoder
+        (see ``_encode_evidence``), the same weights that contextualize the real token stream. That
+        is deliberate: the reader has to be able to find "the token after *born in*", and a key only
+        carries that if something has already looked at the chunk's own neighbouring tokens -- a raw
+        per-token embedding cannot. An external embedder's chunk vector cannot substitute either: it
+        is a 384-d summary of a whole passage with no span to copy, which is why the external
+        embedder sits on the *selector* side (``chunk_keys``) and never on this one.
 
         Args:
             evidence_ids: ``[B, S_ev]`` token ids of the retrieved chunks, packed end to end.
@@ -319,6 +441,12 @@ class TinyMoETransformer(nn.Module):
                 sees an external store.
             chunk_segments: ``[num_chunks]`` which query segment each chunk serves. Required
                 whenever ``chunk_keys`` is given.
+            chunk_gold: ``[num_chunks]`` bool/uint8 gold flag, aligned with ``chunk_keys``/
+                ``chunk_segments`` exactly. Purely a passenger -- nothing in the forward reads it,
+                it only rides along so a trainer computing
+                ``information_retrieval.evidence_selection_loss`` finds it on the same object as
+                the weights and the ``visible`` mask that loss needs. Optional even when
+                ``chunk_keys`` is given: a corpus built before the gold flag existed has none.
 
         Returns:
             An ``EvidenceBatch``, or None when this model has no evidence port.
@@ -329,10 +457,13 @@ class TinyMoETransformer(nn.Module):
             "chunk_keys without chunk_segments -- the selector would have no way to tell which "
             "document owns a chunk, and would score every document against every chunk"
         )
-        states = self._moe_ple(evidence_ids)
-        assert states is not None, "the evidence reader needs the MoE embedding path to embed with"
-        cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids, num_segments)
+        # computed once and handed to the encoder too, rather than derived twice: the reader's own
+        # RoPE (below) and the encoder's internal RoPE (inside _encode_evidence) are two different
+        # attention modules with two different head dims, but they rotate the SAME per chunk
+        # positions
         position_ids = chunk_position_ids(evidence_chunk_ids)
+        states = self._encode_evidence(evidence_ids, evidence_chunk_ids, position_ids)
+        cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids, num_segments)
         cos, sin = self.moe.rotary_emb.gather(position_ids, states.dtype)
         return EvidenceBatch(
             states=states,
@@ -342,6 +473,7 @@ class TinyMoETransformer(nn.Module):
             chunk_ids=evidence_chunk_ids,
             chunk_keys=chunk_keys,
             chunk_segments=chunk_segments,
+            chunk_gold=chunk_gold,
         )
 
 

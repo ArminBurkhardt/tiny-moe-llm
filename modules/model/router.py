@@ -48,19 +48,49 @@ class Router(nn.Module):
         return expert_scores
 
 
-def compute_aux_loss(indices: torch.Tensor, router_probs: torch.Tensor, num_experts: int) -> torch.Tensor:
-    """computes a load balancing auxiliary loss to prevent routing collapse"""
-    num_tokens = indices.numel()
-    
-    # f_i: Hard fraction of tokens routed to expert i
-    # flatten assignments and count frequencies using a one-hot vector
-    flat_indices = indices.view(-1)
-    hard_counts = torch.zeros(num_experts, device=indices.device)
-    hard_counts.scatter_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float))
-    f_i = hard_counts / num_tokens
+def compute_aux_loss(
+    indices: torch.Tensor, router_probs: torch.Tensor, num_experts: int, token_mask: torch.Tensor = None
+) -> torch.Tensor:
+    """computes a load balancing auxiliary loss to prevent routing collapse
 
-    # P_i: Soft average probability assigned to expert i across the batch
-    P_i = router_probs.view(-1, num_experts).mean(dim=0)
+    Args:
+        indices: [.., top_k] selected expert ids, e.g. [B, S, top_k].
+        router_probs: [.., num_experts] the router's softmax, e.g. [B, S, num_experts].
+        num_experts: size of the expert pool both of the above index into.
+        token_mask: optional [B, S] (broadcastable to ``indices``/``router_probs`` minus their last
+            axis), True/1 for a real (non pad) token. None reproduces today's numerics exactly,
+            shape derived denominators and all -- every position counts, padding included, which is
+            a REAL and measured distortion, not a theoretical one: a packed batch that is mostly
+            padding reads a near uniform routing signal for the pad rows regardless of what the real
+            tokens did, moving the aux loss purely with row fill (step 0 measured 3.06 with one
+            packing bug and 1.22 with it fixed, on an otherwise identical batch). When given, both
+            terms are weighted by it and their denominators become the mask's own (device tensor,
+            clamped) sum instead of the tensor's raw element count, with no host sync either way.
+    """
+    top_k = indices.shape[-1]
+    flat_indices = indices.reshape(-1)
+
+    if token_mask is None:
+        # f_i: Hard fraction of tokens routed to expert i
+        # flatten assignments and count frequencies using a one-hot vector
+        num_tokens = indices.numel()
+        hard_counts = torch.zeros(num_experts, device=indices.device)
+        hard_counts.scatter_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float))
+        f_i = hard_counts / num_tokens
+
+        # P_i: Soft average probability assigned to expert i across the batch
+        P_i = router_probs.reshape(-1, num_experts).mean(dim=0)
+    else:
+        # each token contributes top_k (token, slot) events; every slot inherits its own token's
+        # mask so a padded token's top_k selections do not count toward any expert's hard fraction
+        mask_flat = token_mask.reshape(-1).to(router_probs.dtype)                       # [T]
+        slot_weight = mask_flat.unsqueeze(-1).expand(-1, top_k).reshape(-1)              # [T * top_k]
+        hard_counts = torch.zeros(num_experts, device=indices.device, dtype=router_probs.dtype)
+        hard_counts.scatter_add_(0, flat_indices, slot_weight)
+        f_i = hard_counts / slot_weight.sum().clamp_min(1.0)
+
+        P_i = (router_probs.reshape(-1, num_experts) * mask_flat.unsqueeze(-1)).sum(dim=0)
+        P_i = P_i / mask_flat.sum().clamp_min(1.0)
 
     # Dot product optimization function minimizes when vectors are uniform
     aux_loss = num_experts * torch.dot(f_i.type_as(P_i), P_i)

@@ -54,6 +54,13 @@ P = dict(
     top_k=2, n_loops=3, num_ir_experts=1, num_ir_entries=256, ir_dim=64,
     dropout=0.0, ple_embeddings_size=32, mtp_num_extra_tokens=2,
     lm_head_factor=4,
+    # pinned to the IR expert's ORIGINAL output stage (see InformationRetrievalExpert's docstring
+    # for what changed and why): this file's assertions 7-9 read the selector's effect through the
+    # logits, and the new default direct read stage's own gate is zero-init, i.e. the expert's
+    # WHOLE output is exactly zero regardless of what the selector retrieves until that gate is
+    # separately trained -- exactly like this test already handles the reader's zero-init o_proj.
+    # tests/test_evidence_selector.py is what exercises the direct read path itself.
+    ir_direct_read=False,
 )
 
 
@@ -92,7 +99,13 @@ def main():
     # same weights on both sides, so the port is the ONLY difference. The port is two halves and
     # both are new tensors: the reader over evidence tokens, and the selector's adapters plus its
     # source scale inside the IR module.
-    port_only = ("shared_evidence", "key_adapter", "value_adapter", "log_memory_scale")
+    port_only = ("shared_evidence", "key_adapter", "value_adapter", "log_memory_scale",
+                 # the reader's loop conditioned query and its per-loop gain exist only with the
+                 # port, and are zero/one init so they do not break the neutrality checks below
+                 "evidence_query_bias", "evidence_loop_scale",
+                 # the reader/selector coupling gate: also port-only (see moe.py's __init__), also
+                 # zero-init, for the identical reason
+                 "evidence_gate_scale")
     missing = ported.load_state_dict(plain.state_dict(), strict=False).missing_keys
     assert all(any(p in k for p in port_only) for k in missing), (
         f"unexpected extra tensors: {[k for k in missing if not any(p in k for p in port_only)]}"

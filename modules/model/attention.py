@@ -209,11 +209,18 @@ def cached_attention(
 def _segment_ids(cu_seqlens, B, S, device):
     # per token segment id, from the internal boundaries: mark each start and cumsum. The ids are
     # global over the flattened B*S axis, so two tokens in different rows never compare equal
-    seg_id = torch.zeros(B * S, dtype=torch.long, device=device)
+    # sized past the token axis, and accumulated rather than assigned, because the EVIDENCE axis has
+    # zero length segments -- a document that retrieved nothing contributes one, and it shows up
+    # here as a repeated boundary (two segments starting at the same token) or as a boundary sitting
+    # at B*S itself (every trailing segment empty). Assignment would collapse a repeat into a single
+    # increment and mis-number every later token, and indexing at B*S is a device side assert. The
+    # overflow slots are dropped by the slice below; the query side has neither case, so its ids are
+    # bit-identical to what this returned before.
     internal = cu_seqlens[1:-1].long()
+    seg_id = torch.zeros(B * S + internal.numel() + 1, dtype=torch.long, device=device)
     if internal.numel() > 0:
-        seg_id[internal] = 1
-    return torch.cumsum(seg_id, dim=0).view(B, S)
+        seg_id.index_add_(0, internal, torch.ones_like(internal))
+    return torch.cumsum(seg_id, dim=0)[:B * S].view(B, S)
 
 
 def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal,

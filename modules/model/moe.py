@@ -12,7 +12,7 @@ from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
 from modules.model.information_retrieval import RetrievalEntropyTracking
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
-from modules.model.evidence import EvidenceBatch, evidence_memory
+from modules.model.evidence import EvidenceBatch, evidence_memory, chunk_mean_mass, apply_chunk_gate
 
 
 
@@ -178,6 +178,16 @@ def is_fresh_loop_param(name: str) -> bool:
     ``ir_module`` subtree: the key/value tables in that same module carry a full sharpening run and
     would be wrecked by a from-scratch rate, while the adapters and the source scale have never seen
     a gradient. This is the one place in the block where fresh and trained tensors share a module.
+
+    Three more tensors, all born the same way: the loop-conditioned query biases on the IR module
+    and the evidence reader, and the reader's own per-loop gain. None of them existed before any
+    checkpoint currently on disk, all are zero- or one-init neutral, and all would sit at that init
+    for a whole run at the trunk's rate for the identical reason the tensors above do.
+
+    Two more, added with the direct IR read path and the reader/selector coupling: each IR expert's
+    ``direct_gate`` (zero-init, matched by name rather than folded into the ``ir_module`` subtree
+    check above -- it lives on the EXPERT, like ``down_proj``/``up_proj``, not inside the table
+    module) and ``evidence_gate_scale`` (the reader's per chunk gate, also zero-init).
     """
     return (
         name.endswith("moe.inject.weight")
@@ -187,6 +197,11 @@ def is_fresh_loop_param(name: str) -> bool:
         or ".key_adapter." in name
         or ".value_adapter." in name
         or name.endswith("log_memory_scale")
+        or name.endswith("loop_query_bias.weight")
+        or name.endswith("evidence_query_bias.weight")
+        or name.endswith("evidence_loop_scale")
+        or name.endswith("direct_gate.weight")
+        or name.endswith("evidence_gate_scale")
     )
 
 
@@ -216,6 +231,7 @@ class LoopMixtureOfExperts(nn.Module):
         max_enc_loops: int = 64,
         loop_inject: bool = False,
         evidence_port: bool = False,
+        ir_direct_read: bool = True,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -261,7 +277,18 @@ class LoopMixtureOfExperts(nn.Module):
                 bet, and the content is gated by retrieval scores instead. Its output projection is
                 zero-init, so attaching a corpus is neutral at step 0 the same way ``g_proj`` and
                 ``loop_router_bias`` are. With no evidence attached it does not run at all, which is
-                what keeps the no-corpus forward bit-identical. Defaults to False.
+                what keeps the no-corpus forward bit-identical. Also adds ``evidence_query_bias``
+                (a zero-init per-loop bias on the reader's query, reusing ``loop_enc``) and
+                ``evidence_loop_scale`` (a one-init per-loop gain on the read alone, independent of
+                ``loop_scale``'s own shrinkage) -- without them the reader reads the same query at
+                every loop and the read reaches the residual weaker on later loops regardless of
+                what it learns. Defaults to False.
+            ir_direct_read (bool, optional): give every IR expert a direct, per token output stage
+                instead of the inner attention that averages a document's reads over its whole
+                prefix (see ``InformationRetrievalExpert``'s docstring for why the averaged path
+                measurably degenerates to a per document constant). Selectable so the averaged path
+                stays runnable for comparison; a checkpoint keeps BOTH sets of weights regardless of
+                this flag, since it only changes which one ``forward_step`` calls. Defaults to True.
         """
         super().__init__()
         self._num_mlp_experts = num_mlp_experts
@@ -312,6 +339,7 @@ class LoopMixtureOfExperts(nn.Module):
                 # was widened to -- so the adapters are square rotations rather than compressions,
                 # and no information is thrown away relocating one space into the other
                 memory_dim=ir_dim if evidence_port else 0,
+                direct_read=ir_direct_read,
             ) for _ in range(num_ir_experts)
         ])
         self.experts = nn.ModuleList(experts)
@@ -392,11 +420,48 @@ class LoopMixtureOfExperts(nn.Module):
         # freshly built port would otherwise inject noise into a converged trunk on step 0, and the
         # whole point of the neutrality pattern is that migration is a no-op you can measure.
         self.shared_evidence = None
+        self.evidence_query_bias = None
+        self.evidence_loop_scale = None
         if evidence_port:
             self.shared_evidence = CrossAttention(
                 input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads
             )
             nn.init.zeros_(self.shared_evidence.attn.o_proj.weight)
+
+            # per-loop query conditioning for the reader, same problem and same fix as the IR
+            # module's loop_query_bias: without it shared_evidence reads step_input directly at
+            # every loop, so its three reads are near-copies of each other (Stage 0 measured the
+            # identical symptom on the IR query). Reuses this module's own loop_enc buffer rather
+            # than building a second one -- zero-init, so a checkpoint that gains this tensor reads
+            # identically until it learns something.
+            self.evidence_query_bias = nn.Linear(loop_enc_dim, hidden_size, bias=False)
+            nn.init.zeros_(self.evidence_query_bias.weight)
+
+            # a gain on the evidence read ALONE, separate from loop_scale: loop_scale already
+            # shrinks the WHOLE accumulator every loop (measured [0.63, 0.32, 0.11] on a migrated
+            # checkpoint), so without this a later loop's re-read would reach the residual at a
+            # fraction of loop 1's gain no matter what the reader learns. Init 1.0, not
+            # 1/sqrt(n_loops): shared_evidence's o_proj is zero-init, so the value being scaled is
+            # exactly zero at step 0 and ANY finite init is neutral there -- 1.0 is simply the
+            # natural starting point once o_proj moves off zero, rather than stacking a second
+            # shrinkage on top of loop_scale's own. One entry per loop, indices past n_loops - 1
+            # reuse the last one, same convention as loop_scale. ndim 1, so build_param_groups'
+            # existing decay rule already excludes it from weight decay without any change there --
+            # decaying a gate toward 0 is decaying the read toward "off", same argument as loop_scale.
+            self.evidence_loop_scale = nn.Parameter(torch.ones(n_loops))
+
+            # couples the reader to the selector: a per chunk multiplicative gate on the evidence
+            # STATES, from that same loop's own selector chunk scores (see forward_step and
+            # evidence.apply_chunk_gate). `1 + evidence_gate_scale * sigmoid(chunk_mass)` rather than
+            # a bare `sigmoid(...)`, so that a ZERO-INIT scale alone makes the gate exactly 1.0 for
+            # every chunk regardless of the sigmoid term -- a plain sigmoid can only approach 1
+            # asymptotically, never reach it exactly, and this module's whole neutrality convention
+            # is an EXACT no-op at step 0, not an approximate one. Gives the selector a dense,
+            # always-on gradient through the reader (complementary to, not a replacement for, the
+            # supervised selection loss over the mass split -- see information_retrieval.py).
+            self.evidence_gate_scale = nn.Parameter(torch.zeros(()))
+        else:
+            self.evidence_gate_scale = None
 
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
@@ -425,6 +490,15 @@ class LoopMixtureOfExperts(nn.Module):
         """index of the first MLP expert in the flat router pool: [self-attn x A | cross-attn x A | IR x I | MLP x M]."""
         return self._num_attn_experts + self._num_ir_experts
     
+    def _loop_enc_row(self, loop_idx: int, dtype: torch.dtype) -> torch.Tensor:
+        """the raw sinusoidal loop encoding row, shared by every per-loop bias in this block.
+
+        Indices past the precomputed table reuse its last row, so ``n_loops`` stays a runtime
+        choice rather than something baked into a weight shape.
+        """
+        row = min(int(loop_idx), self.loop_enc.size(0) - 1)
+        return self.loop_enc[row].to(dtype)
+
     def loop_bias(self, loop_idx: int) -> torch.Tensor:
         """per-loop additive bias on the router logits, shape [num_experts].
 
@@ -432,10 +506,9 @@ class LoopMixtureOfExperts(nn.Module):
         index -- ``n_loops`` is a runtime choice, not something baked into the weight shapes.
         Indices past the precomputed table reuse its last row.
         """
-        row = min(int(loop_idx), self.loop_enc.size(0) - 1)
-        return self.loop_router_bias(self.loop_enc[row].to(self.loop_router_bias.weight.dtype))
+        return self.loop_router_bias(self._loop_enc_row(loop_idx, self.loop_router_bias.weight.dtype))
 
-    def route(self, hidden_states: torch.Tensor, temperature: float = 1.0, loop_idx: int = 0):
+    def route(self, hidden_states: torch.Tensor, temperature: float = 1.0, loop_idx: int = 0, token_mask: torch.Tensor = None):
         """routes tokens to experts and computes the load balancing loss
 
         Args:
@@ -443,6 +516,9 @@ class LoopMixtureOfExperts(nn.Module):
             temperature (float, optional): temperature for the router. Defaults to 1.0.
             loop_idx (int, optional): which loop this call belongs to, used for the per-loop router
                 bias so consecutive loops do not all select the same experts. Defaults to 0.
+            token_mask (torch.Tensor, optional): [batch_size, seq_len], True/1 for a real (non pad)
+                token. Forwarded to ``compute_aux_loss`` unchanged -- see its docstring. None (the
+                default) reproduces today's aux loss exactly, pad rows included.
 
         Returns:
             topk_scores (torch.Tensor): [batch_size, seq_len, top_k] normalized scores for the selected experts
@@ -461,7 +537,7 @@ class LoopMixtureOfExperts(nn.Module):
         # one topk, reused for both the aux loss and the selection (the aux loss only needs the
         # indices, which the score normalization below does not change)
         topk_scores, topk_indices = torch.topk(expert_scores, self.top_k, dim=-1) # [batch_size, seq_len, top_k], [batch_size, seq_len, top_k]
-        load_balancing_loss = compute_aux_loss(topk_indices, expert_scores, self.num_experts)
+        load_balancing_loss = compute_aux_loss(topk_indices, expert_scores, self.num_experts, token_mask=token_mask)
 
         # normalize the topk scores
         topk_scores = topk_scores / torch.sum(topk_scores, dim=-1, keepdim=True)
@@ -471,33 +547,43 @@ class LoopMixtureOfExperts(nn.Module):
 
         return topk_scores, topk_indices, load_balancing_loss
 
-    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None, evidence: EvidenceBatch = None, memory=None):
+    def _selector_chunk_mass(self, memory) -> torch.Tensor:
+        """this loop's selector chunk scores, ``[M]``, averaged over however many IR experts exist.
+
+        Reads ``InformationRetrievalModule.last_memory_weights``, which the non-MLP expert loop in
+        ``forward_step`` just populated for every IR expert in the pool (this method is only called
+        after that loop runs). Returns None when nothing retrieved this loop -- there is no IR
+        expert in the pool at all -- which the caller treats identically to no selector attached.
+        Averaging rather than picking one expert also means this does not have to change if
+        ``num_ir_experts`` ever grows past 1.
+        """
+        weights = [m.last_memory_weights for m in self.ir_modules if m.last_memory_weights is not None]
+        if not weights:
+            return None
+        visible = memory[1]
+        return torch.stack([chunk_mean_mass(w, visible) for w in weights], dim=0).mean(dim=0)
+
+    def forward_step(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, other: torch.Tensor = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, loop_idx: int = 0, kv_cache=None, inject_bias: torch.Tensor = None, evidence: EvidenceBatch = None, memory=None, token_mask: torch.Tensor = None):
         # what the router and the experts READ. The residual update at the bottom still adds to
         # `hidden_states` itself, so the injection reaches a readout only through what the experts
         # compute from it -- it re-presents the input, it does not write to the stream lm_head sees.
         step_input = hidden_states if inject_bias is None else hidden_states + inject_bias
 
         topk_scores, topk_indices, load_balancing_loss = self.route(
-            step_input, temperature=self.temperature, loop_idx=loop_idx
+            step_input, temperature=self.temperature, loop_idx=loop_idx, token_mask=token_mask
         )
 
         # index placement in the scores would be:
         # [attn_experts..., num_ir_experts..., ff_experts...]
-
-        # seed with the always-on shared experts (Step 2) before accumulating routed outputs
-        shared_attn_cache = kv_cache.shared_attn if kv_cache is not None else None
-        output = self.shared_mlp(step_input) + self.shared_attn(step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
-        # the evidence read joins the always-on seed when a corpus is attached. Both conditions are
-        # structural, not a flag: a checkpoint without the port has no module, and a batch without
-        # evidence never enters this branch, so the no-corpus forward is the one that already ran.
-        if self.shared_evidence is not None and evidence is not None:
-            output = output + self.shared_evidence(
-                step_input, None, cu_seqlens, max_seqlen, position_embeddings, evidence=evidence
-            )
         _other = other if other is not None else step_input
 
         # compute each non-MLP expert exactly once per forward_step, then cache across k slots
-        # (attention runs over the full sequence regardless of routing, so recomputing per k-slot wastes compute)
+        # (attention runs over the full sequence regardless of routing, so recomputing per k-slot
+        # wastes compute). Run BEFORE the always-on shared experts below -- deliberately, not just
+        # incidentally: the evidence reader's per chunk gate (further down) reads THIS loop's own
+        # selector output, and the selector is one of these experts. Moving WHEN they are computed
+        # does not move the ORDER `output`'s summation happens in further below, so this changes
+        # nothing about a step without evidence, or without an IR expert at all.
         expert_cache = []
         for i in range(self.first_mlp_index):
             slot_cache = kv_cache.slots[i] if kv_cache is not None else None
@@ -508,6 +594,39 @@ class LoopMixtureOfExperts(nn.Module):
                 expert_cache.append(self.experts[i](step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
             elif isinstance(self.experts[i], CrossAttention):
                 expert_cache.append(self.experts[i](step_input, _other, cu_seqlens, max_seqlen, position_embeddings, kv_cache=slot_cache))
+
+        # seed with the always-on shared experts (Step 2) before accumulating routed outputs
+        shared_attn_cache = kv_cache.shared_attn if kv_cache is not None else None
+        output = self.shared_mlp(step_input) + self.shared_attn(step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
+        # the evidence read joins the always-on seed when a corpus is attached. Both conditions are
+        # structural, not a flag: a checkpoint without the port has no module, and a batch without
+        # evidence never enters this branch, so the no-corpus forward is the one that already ran.
+        if self.shared_evidence is not None and evidence is not None:
+            reader_evidence = evidence
+            # gate the reader's evidence states by THIS loop's own selector chunk scores (the IR
+            # experts computed above), segment level -- the mean over the document's own tokens of
+            # that chunk's external read mass -- mapped through a learned scalar and a sigmoid. See
+            # evidence_gate_scale's docstring in __init__ for why a zero-init scale makes this exactly
+            # 1.0 for every chunk, not merely close to it, until the scale learns something. This
+            # gives the selector a dense, always-on gradient through the reader, complementary to
+            # (not a replacement for) a supervised loss on the mass split itself.
+            #
+            # None when there is nothing to gate by: no IR expert in the pool, or this batch's
+            # memory carried no external store at all -- both leave the reader untouched, which is
+            # every configuration this repo has trained before this gate existed.
+            chunk_mass = self._selector_chunk_mass(memory) if memory is not None else None
+            if chunk_mass is not None:
+                gate = 1.0 + self.evidence_gate_scale * torch.sigmoid(chunk_mass)
+                reader_evidence = apply_chunk_gate(evidence, gate)
+            # per-loop conditioned query (see evidence_query_bias's docstring in __init__) and a
+            # separate per-loop gain on the read alone, so loop_scale's own shrinkage of the whole
+            # accumulator does not also stunt the evidence re-read on later loops. Both zero/one-
+            # init neutral, so this is a no-op until either learns something.
+            evidence_query = step_input + self.evidence_query_bias(self._loop_enc_row(loop_idx, step_input.dtype))
+            evidence_gain = self.evidence_loop_scale[min(int(loop_idx), self.evidence_loop_scale.numel() - 1)]
+            output = output + evidence_gain * self.shared_evidence(
+                evidence_query, None, cu_seqlens, max_seqlen, position_embeddings, evidence=reader_evidence
+            )
 
         # accumulate the non-MLP experts' weighted outputs. still a mask multiply (never
         # mask.sum()/boolean indexing -- that's a per-expert device sync), but the per-(slot, expert)
@@ -565,6 +684,7 @@ class LoopMixtureOfExperts(nn.Module):
         position_offset: int = 0,
         exit_check=None,
         evidence: EvidenceBatch = None,
+        token_mask: torch.Tensor = None,
     ):
         """
         Args:
@@ -590,6 +710,11 @@ class LoopMixtureOfExperts(nn.Module):
                 here is learned and nothing can saturate. Never set during training: the returned
                 ``hidden_states_all`` would then be shorter than ``loop_ce_weights``. Defaults to
                 None (always run the full depth).
+            token_mask (torch.Tensor, optional): [batch_size, seq_len], True/1 for a real (non pad)
+                token. Forwarded to ``route`` (hence ``compute_aux_loss``) at every loop unchanged.
+                None (the default) reproduces today's aux loss exactly, over every position
+                including padding -- see ``compute_aux_loss``'s own docstring for why that is a
+                real, measured distortion and not just a theoretical one.
         """
         n_loops = self.n_loops if n_loops is None else int(n_loops)
         if kv_cache is not None:
@@ -615,6 +740,9 @@ class LoopMixtureOfExperts(nn.Module):
         if self.ir_tracker is not None:
             # one update per (loop, IR expert) pair, which is the cap the recompute guard needs
             self.ir_tracker.begin_forward(n_loops * self._num_ir_experts)
+        # clear last recurrence's per-loop memory-mass log, not just its final entry
+        for module in self.ir_modules:
+            module.begin_forward()
 
         # rotary cos/sin for the expert attention, computed once and reused across loops/experts
         if kv_cache is not None:
@@ -639,9 +767,9 @@ class LoopMixtureOfExperts(nn.Module):
         for loop in range(n_loops):
             loop_cache = kv_cache[loop] if kv_cache is not None else None
             if self.training and use_checkpointing:
-                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, memory, use_reentrant=False)
+                hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, memory, token_mask, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=evidence, memory=memory)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=evidence, memory=memory, token_mask=token_mask)
             total_load_balancing_loss += load_balancing_loss
             hidden_states_all.append(hidden_states)
             loops_run += 1
