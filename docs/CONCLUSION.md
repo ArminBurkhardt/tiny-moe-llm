@@ -186,7 +186,14 @@ unanswerable, greedy, `--max-new-tokens 32`) shows the model learned to **refuse
 
 ## Information-retrieval expert — extension path
 
-**Current state.** One IR expert: `down_proj` 768→128, a learned table of 8192 key/value pairs at
+> **Superseded.** Items 1–3 below were built (learned, annealed temperature; a two stage top-32
+> read; a 65536 × 384 table) and item 5 was run as three arms. None of it moved the read's
+> contribution off 0.0002 nats: see [measurements/ir_sharpening.md](measurements/ir_sharpening.md)
+> and [measurements/ir_scale_fix.md](measurements/ir_scale_fix.md), and
+> [plans/NEXT.md](plans/NEXT.md) for what replaced this line of work (an external evidence store
+> read by the same module). The section is kept as the record of what the 16B run suggested.
+
+**Current state (as of the 16B run).** One IR expert: `down_proj` 768→128, a learned table of 8192 key/value pairs at
 `ir_dim=128`, cosine-similarity softmax over the whole table, `up_proj` 128→768. ~2.3M parameters,
 ~5% of forward FLOPs (the config notes it was halved from 16384 entries pre-run, where it was
 ~11%). It runs densely on every token, every loop; the router only weights its contribution.

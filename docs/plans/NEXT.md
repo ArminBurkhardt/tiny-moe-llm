@@ -1,12 +1,37 @@
 # NEXT.md
 
-The plan. The record of how we got here is [docs/CONCLUSION.md](../CONCLUSION.md) (the 16B-token
-run and everything it measured); read [CLAUDE.md](../../CLAUDE.md) first, it is authoritative for
-everything already built. Phases 0, 1 and 2 are **done** — their headline results are under
-"Where this stands" below and the full measurement records live in
-[docs/measurements/](../measurements/). Published work on looped transformers, and where this model
-agrees or disagrees with it, is in [docs/looped-transformers.md](../looped-transformers.md); what it
-changed in this plan is under "What the looped-transformer literature changed" below.
+The plan (this file is what older notes and commit messages call `PLAN.md`). The record of how we
+got here is [docs/CONCLUSION.md](../CONCLUSION.md) (the 16B-token run and everything it measured);
+read [CLAUDE.md](../../CLAUDE.md) first, it is authoritative for everything already built. Phases
+0, 1, 1b, 2, 3, 3b and 3c are **done** — their headline results are under "Where this stands"
+below and the full measurement records live in [docs/measurements/](../measurements/). Published
+work on looped transformers, and where this model agrees or disagrees with it, is in
+[docs/looped-transformers.md](../looped-transformers.md); what it changed in this plan is under
+"What the looped-transformer literature changed" below. The pre-Phase-4 codebase review is
+[docs/review_2026-09-18.md](../review_2026-09-18.md); what it changed and what it left open is
+folded into Phase 4 and Phase 7 below.
+
+## Now (2026-09-19)
+
+Phase 4's port, corpus builder, trainer profile and eval are built and smoke-tested; the real
+corpus is not. In order:
+
+1. **Delete the smoke artifacts** — `data/prepared/evidence_*` (the 5M-token smoke corpus, built
+   before the gold flag, the condition label, the windowed web text and the shuffled shard order
+   existed) and `ckpts/evidence_smoke/` (trained off the arm C lineage, which is no longer the
+   seed).
+2. **Build the real corpus:** `python scripts/prepare_evidence_data.py --target-tokens 150000000`.
+   ~150M prompt tokens carrying ~440M evidence tokens; ~11 hours at the measured ~400 docs/s,
+   resumable, unattended. Read the per-source `too_long` counts and the conversation-vs-token
+   share the builder prints at the end before training on it.
+3. **While it builds, wire the two losses that exist but nothing calls** — see "Before the run"
+   under Phase 4. Neither blocks the corpus build; both should be in before the run.
+4. **Run:** `python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt`,
+   under a watch, and **kill at 10M tokens if the per-condition val CE gap (gold vs none) is under
+   ~0.1 nats**. The smoke measured 22.8k prompt tok/s before evidence was routed through the dense
+   decoder; expect less, and read the real figure off the first log lines.
+5. **Read G3 and G3b** with `eval_abstention.py --evidence-port` (both passes), then the benchmark
+   suite. The migrated seed reads a gold-vs-none gap of exactly 0.0000 nats, which is the baseline.
 
 **The plan in one line:** prove every mechanism against its own ablation on a fixed benchmark
 suite — reshape the IR expert, feed the IR/CrossAttention pair real external evidence, align the
@@ -72,10 +97,30 @@ ship in the real run. "Flat past 3 → ship 3 and don't rationalize it" generali
 | final POC model | **One consolidation SFT + preference pass** (Phase 6), not the current stack of narrow repairs on an SFT that predates everything learned since. |
 | real run | **500M-class, ≤5k H100-hours, target ~1k.** FP8 recipe and MFU work are validated on short runs *before* any long-run tokens are spent (Phase 7) — the 16B run left FP8 unused at MFU ~11%, and throughput multiplies the budget directly. |
 | trunk objective | **AR LoopLM, POC and real run.** A masked-diffusion trunk is parked with an explicit unpark condition (see Parked): swapping the objective replaces the measurement instruments, not just the model, and its one real advantage here is already installed by 5c item 1. |
+| Phase 4 seed | **The repair checkpoint, reshaped and ported** (`ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt`), not the arm C lineage. The arm C lineage has never seen the chat template (step 0 CE 6.57 on chat data), and G3/G3b are read through the chat template against numbers measured on the repair checkpoint. The table stores nothing, so the reshape is free (review §1.2). |
+| evidence encoding | **Through the dense decoder, once per forward, chunk-causal, cached across loops** (`evidence_encoder: true`). A reader over raw per-token embeddings cannot find "the token after *born in*"; every published side channel encodes its neighbours. Costs ~118 MFLOP per evidence token, linear in evidence; `false`/an int are kept only for the encoded-vs-raw A/B (review §1.1). |
+| objective deviations | **Three accepted, all labelled from the corpus, none from the model's own outputs:** a supervised selection loss on the mass split, a groundedness head on the reader's output, and the reader's per chunk gate driven by the selector. "One objective through `train_step`" still holds for every profile that is not `--evidence` (review §1.4, §1.5, §1.12). |
+| parametric memory in the real run | **Must earn its place in a from-scratch A/B, measured by the lookup-off ablation, not by CE.** If kept, it is a Memory+ style layer (from scratch, in the residual path, always-on, value dim = hidden, product-key exact top-k) — not this repo's routed, attenuated IR expert. The accuracy claim rests on the external store either way (review §2.1). |
+| real run ordering | **Retrieval-augmented pretraining from token 0**, not plain pretraining plus a grafted port. Every graft so far measured as a lower bound and 0 for 4 on gates; LMLM's recipe is the precedent (review §2.2). |
 
 ---
 
-## Where this stands (Phases 0–2 and 1b ✅)
+## Where this stands (Phases 0–3c ✅)
+
+Later phases, in one line each; the full records are linked from each phase's Outcome section:
+
+- **Phase 3 (reshape + sharpening, G2 FAIL)** — the table sharpened on loop 1 and the read-zeroed
+  ablation stayed at 0.0002 nats on both key inits ([ir_sharpening.md](../measurements/ir_sharpening.md)).
+- **Phase 3b (scale fix, G2b FAIL)** — normalized value rows raised the read 4x and `g_proj`
+  stalled at RMS 0.0047, re-attenuating it; the table's size is frozen out of the real run spec
+  ([ir_scale_fix.md](../measurements/ir_scale_fix.md)).
+- **Phase 3c (loop input injection, G2c FAIL)** — later loops got marginally *more* redundant; the
+  graft line of attack is closed ([loop_injection.md](../measurements/loop_injection.md)).
+- **The evidence ceiling** — in-context gold evidence is worth **+3.23 nats** on the answer span,
+  ten times G3's bar, and a distractor passage costs **0.63 nats more than nothing**
+  ([evidence_ceiling.md](../measurements/evidence_ceiling.md)). Phase 4 has headroom arms A–D never had.
+- **Phase 4 build + review** — port, corpus, profile and eval built; 5M-token smoke ran; the
+  2026-09-18 review's thirteen findings acted on (see Phase 4's "The pre-run review").
 
 - **Phase 0 — heads out.** Both learned heads deleted; the halt gate's *measured* per-loop mean
   folded into `loop_scale` (`scripts/migrate_phase0.py`). Gate P0 passed on both checkpoints —
@@ -826,12 +871,75 @@ notices the GPU is idle. The general form: **a watch filter cannot catch a failu
 nothing** — for anything that indexes with data-dependent ids, the progress line going quiet has to
 be treated as the failure signature, not as a slow step.
 
-### The eval flip
+### The eval flip ✅ (built 2026-09-19)
 
-`eval_abstention.py` gains an `--evidence-port` mode: the passage comes *out of the prompt* and
-in through the evidence port, so the eval measures the port doing the reading rather than
-in-context attention. The in-prompt form is kept unchanged — it is G6's baseline — and both run
-at the standard flags.
+`eval_abstention.py --evidence-port`: the passage comes *out of the prompt* and in through the
+evidence port, so the eval measures the port doing the reading rather than in-context attention.
+The in-prompt form is kept unchanged — it is G6's baseline — and both run at the standard flags.
+`--evidence-condition gold,none,distractors,mixed` scores any subset over the **same** slice in
+one pass; each condition reports generation (precision/recall/false abstention/EM) and a
+teacher-forced pass, plus the external-mass AUROC at the last prompt position **per loop**.
+
+**The gold-vs-none gap needs a fixed target.** The forced target legitimately changes with the
+condition (`none`/`distractors` force an abstention), so a gap built on it compares "say the
+answer" against "say a refusal" and the refusal wins whatever the port does (−3.25 nats, the wrong
+sign, on a seed whose reader is provably zero). The mode therefore runs a second teacher-forced
+pass with the **real answer as the target under every condition**, over the natively answerable
+rows, and G3 is read there. On the migrated seed it is exactly **0.0000 nats** (the neutrality
+guarantee as a measurement); on the smoke-trained port **−0.0136**, i.e. the port read nothing —
+the IR arms' verdict, now readable on the evidence pathway.
+
+`inference.py --evidence FILE` attaches a buffer interactively. `eval_benchmarks.py`,
+`eval_calibration.py` and `eval_stage0.py` still have no evidence path.
+
+### The pre-run review (2026-09-18) — what changed, what is still open
+
+[docs/review_2026-09-18.md](../review_2026-09-18.md) §1 found thirteen structural reasons the run
+as first built would miss G3/G3b. All were acted on (its §2b table is the record); the ones that
+changed *what to build* are already reflected in the code and the sections above. What matters
+here is the residue — things that exist but are not attached, or were named and not built:
+
+**Before the run** (neither blocks the corpus build):
+
+- **Wire `evidence_selection_loss` into the `--evidence` profile.** The loss exists
+  ([information_retrieval.py](../../modules/model/information_retrieval.py)), is tested
+  (`tests/test_evidence_selector.py`), and the corpus carries the gold flag it needs — but
+  `train_step` never calls it. Without it nothing trains the selector toward relevance except the
+  reader gate's indirect gradient (review §1.4). BCE over the per-token external weights before the
+  sum-and-detach (`last_memory_weights`), renormalized to the token's visible chunks, on supervised
+  positions; add it to the evidence profile's loss with its own weight, and log it.
+- **Wire `GroundednessHead` + `groundedness_loss`** ([evidence.py](../../modules/model/evidence.py))
+  at the last prompt position of each conversation, target "gold present AND answerable" from the
+  corpus's `.evgold`/`.cond` labels. Built, tested nowhere, attached nowhere. G3b is read on this
+  head *and* on the mass split separately (review §1.5); the mass split alone cannot separate
+  SQuAD v2's adversarial unanswerables from answerables because both retrieve a relevant passage.
+- **Pass the aux loss's token mask.** `compute_aux_loss(token_mask=...)` exists and `None` is
+  bit-identical; `TinyMoETransformer.forward` does not plumb it, so the aux loss is still read
+  over pads and moves 3x with row fill (review §1.13). Plumb `input_ids != pad` through.
+- **Optional, cheap:** the 5M-token encoded-vs-raw evidence A/B (`evidence_encoder: true` vs
+  `false`) the review asked for as the de-risk of §1.1. The encoder is now the default on the
+  strength of the argument, not a measurement; a smoke reading of the gold-vs-none val gap under
+  each is the measurement.
+
+**During the run:** kill at 10M tokens if the per-condition val CE gap (gold vs none) is under
+~0.1 nats. Watch `|shared_evidence.o_proj|rms` (must leave zero), the `external mass` per
+condition (gold/mixed above distractors/none), and `IR E/ln32` per loop.
+
+**Not built, and not needed for G3/G3b:**
+
+- **The append-only evidence buffer** (5c item 2, and the "evidence still arriving" depth
+  criterion). Phase 5's plumbing; nothing in Phase 4's oracle corpus accumulates across loops.
+- **A KV-cache slot for the reader.** `CrossAttention.forward` passes `kv_cache=None` on the
+  evidence branch, so a cached decode recomputes the evidence cross attention every generated
+  token against fixed states. Correct, just slower; and the cached and uncached paths can diverge
+  after several tokens because the reader runs at a different shape per step under caching (the
+  same reduction-order non-determinism `m_splits` already has). Documented in `inference.py`, not
+  blocked; `--no-kv-cache` when exact reproducibility with evidence matters.
+- **Evidence in `eval_benchmarks.py` / `eval_calibration.py` / `eval_stage0.py`.** Phase 5's G5/G6
+  need an index-backed inference path anyway; the benchmark suite runs without evidence, which is
+  what "within noise of the seed" means for this phase.
+
+Findings that changed the *real run* rather than this phase (review §2) are folded into Phase 7.
 
 ### Size and schedule
 
@@ -842,8 +950,20 @@ no longer the unit of work. Each one now arrives with ~2.9 evidence tokens attac
 tokens is ~590M tokens of text moving through the model, and the condition labels — which is what
 this phase is actually training — are per *conversation*, of which there are ~1.2M. Counting the
 budget in prompt tokens and then also carrying the evidence would have doubled the spend for no
-extra supervision. Trunk at `lr=1e-5`; the new adapters get the fresh-param LR group from Phase 3.
-Conversation weighting on (it is what fixed the last policy collapse).
+extra supervision. Trunk at `lr=1e-5`; the port's own zero-init tensors get the fresh-param LR
+group (`is_fresh_loop_param` alone — **not** the IR table, which carries a full sharpening run and
+trains at the trunk's rate here, with its cluster refresh still running on the config's cadence).
+Conversation weighting on, **floored at 1/64 per token**: plain per-conversation weighting gave a
+five-token SQuAD answer 160x an 800-token web continuation's per-token weight and put ~88% of the
+gradient on QA in a corpus that is 36% QA by token (review §1.6). The builder prints each
+source's conversation share next to its token share; retune against those.
+
+Five conditions, not four: `many` (gold among 16–32 distractors, QA only, 8% of the QA mix) puts a
+buffer the size G5/G6 evaluate at into training, since `mixed`'s three distractors never exceed
+~6 chunks. Web text holds out a fixed 384-token span and windows long documents rather than
+dropping them (a third of the web rows were being dropped as too long, review §1.9). Shard order
+is shuffled from `(seed, source)` so the replay slice is not smoltalk2's 64k-context split, and the
+smoltalk2 holdout is honoured by import from `prepare_sft_data.py` (review §1.11).
 
 **The row's evidence cap has to be set against the corpus's evidence-to-prompt ratio, not for
 memory.** The two budgets close a packed row independently, so a cap below ~3× the sequence length
@@ -861,9 +981,13 @@ no-evidence ≫ under gold; benchmark suite within noise.
 **Gate G3b (the discrimination gate):** AUROC of the external-mass groundedness signal for
 detecting unanswerable questions **≥ 0.65** on the standard SQuAD v2 slice. The bar to beat is
 **not** `p_max`'s 0.462–0.478 (that is chance) but the **0.584** a free linear probe of the
-existing trunk already reads (1b.3) — 0.65 clears it by 0.066, which is why the threshold stands. First reading of the bent curve: precision above
-0.578 by ≥3σ at recall ≥ 0.5 (the hard bar lands at G7). If the groundedness signal *also* fails
-to discriminate, Phase 6's probe + preference pass is the only lever left and the Phase 7
+existing trunk already reads (1b.3) — 0.65 clears it by 0.066, which is why the threshold stands.
+**Read on two signals separately, same bar:** the external-mass split (per loop, which
+`--evidence-port` already prints) and the groundedness head on the reader's output (review §1.5 —
+SQuAD v2's unanswerables were written against a *relevant* passage, so the mass split alone
+separates "evidence attached" from "none", not "answerable" from "not"). First reading of the bent
+curve: precision above 0.578 by ≥3σ at recall ≥ 0.5 (the hard bar lands at G7). If both signals
+fail to discriminate, Phase 6's probe + preference pass is the only lever left and the Phase 7
 go/no-go table says so explicitly.
 
 ---
@@ -928,12 +1052,16 @@ differ, and re-executed retrieval with a moving query is that reason. `max_enc_l
 sinusoidal loop encoding already make `forward(n_loops=8)` run today — nothing structural blocks
 depth, only training does.
 
-1. **Loop-conditioned IR query.** Zero-init per-loop bias, mirroring `loop_router_bias` exactly
-   (sinusoidal in absolute loop index, clamped past the last entry). No-op at init → the
-   checkpoint loads unchanged. **Required** — Stage 0 measured `cos(q2, q3) = 0.99`: the query
-   stops moving after loop 1, so this is a precondition for the rest of this list.
+1. **Loop-conditioned IR query.** ✅ Built 2026-09-19 (`ir_module.loop_query_bias`, plus the
+   reader's own `evidence_query_bias` and a per-loop `evidence_loop_scale` so `loop_scale`'s
+   `[0.63, 0.32, 0.11]` shrinkage does not stunt a later re-read): zero-init per-loop bias,
+   mirroring `loop_router_bias` exactly (sinusoidal in absolute loop index, clamped past the last
+   entry). No-op at init → the checkpoint loads unchanged. **Required** — Stage 0 measured
+   `cos(q2, q3) = 0.99`: the query stops moving after loop 1, so this is a precondition for the
+   rest of this list. Per-loop mass is kept (`memory_mass_by_loop`) so G3b can be read per loop.
 2. **Loop L reads the union of retrievals from loops 1..L** (the append-only buffer). Makes depth
-   monotonically informative.
+   monotonically informative. **Not built** — nothing in Phase 4's oracle corpus accumulates across
+   loops, so it lands here with the index.
 3. **Novelty pressure** — mask already-retrieved ids from the next loop's ANN result, or an MMR
    term. Without it three loops fetch the same top-1 three times.
 4. **Extend `sample_n_loops` upward** (max 6–8) on retrieval-augmented batches, with a
@@ -1038,9 +1166,23 @@ spends a little compute to multiply the big spend, then writes the run down befo
 
 ### 7a. Throughput engineering (measured, on a short rented-box calibration)
 
-- **FP8 via Transformer Engine** — the machinery already exists in-repo and went unused. Validate
-  with an A/B at 332M: ~2B tokens BF16 vs FP8, loss curves within ~1%. A recipe that diverges at
-  2B tokens does not get 5,000 hours of trust.
+**Order matters, and the review corrected it (§2.8).** The H100's 11% of 990 TFLOPS is ~109
+TFLOPS achieved against the local 5090's ~66 at 31.8% MFU on the same shape — the H100 ran the
+*same kernels at half the utilization*, so the step is overhead-bound (35-expert routing with host
+syncs through `m_splits` every loop, four attention passes per loop, a chunked and checkpointed
+head at 4x, no `torch.compile`, no CUDA graphs), not GEMM-width-bound. FP8 cannot fix launch and
+sync overhead. So:
+
+1. **Profile the step first.** Dataloader, aux/metric overhead, checkpointing levels, TE fused paths.
+2. **`torch.compile` the dense decoder and the shared MLP**; remove the per-loop host syncs.
+3. **Bigger micro-batch on the 80GB card** (the local 4×4096 finding: same tokens per step, 3x
+   throughput, says the defaults are not to be trusted).
+4. **The head** — fused linear-CE (4x → 3x on the term that grows), subsample the MTP heads' CE
+   the way the non-final loops already are, and the 7d oracle reading. The heads are 100 of 502
+   MFLOP forward at 4x cost, the largest single win.
+5. **Then FP8 via Transformer Engine** — the machinery already exists in-repo and went unused.
+   Validate with an A/B at 332M: ~2B tokens BF16 vs FP8, loss curves within ~1%. A recipe that
+   diverges at 2B tokens does not get 5,000 hours of trust.
 - Micro-batch / packing / grad-accum retune at the real shape (the local 4×4096 finding — same
   tokens per step, 3x throughput — says the defaults are not to be trusted).
 - Profile the step: dataloader, aux/metric overhead, checkpointing levels, TE fused paths.
@@ -1067,6 +1209,8 @@ the 1k-hour floor is ~20x the POC's pretraining data. Consequences:
   cap repetition at ~4 epochs — the repeated-data literature puts up to ~4 epochs at near-fresh
   value, and beyond that the returns decay. Corpus prep is its own budgeted, interruption-safe
   job (`prepare_data.py` was designed for exactly this).
+- **The corpus carries evidence from token 0** (review §2.2; see 7e). This is not a post-hoc
+  addition to the plain corpus — it is the corpus.
 - **Keep the two-phase curriculum.** The phase-2 step change (CE 3.359 → 3.046 in 200M tokens)
   was a real distribution effect; the real run keeps a reasoning-weighted tail phase and the
   cosine that spans both.
@@ -1098,13 +1242,78 @@ Written before anything is rented, containing:
   `loop_ce_subsample`.
 - **Expert count only after a specialization measurement.** SMELT pays for extra loop passes by
   narrowing the hidden size and adding experts back, which assumes experts specialize. Ours did not
-  measurably (aux loss at its balanced value from step 0, flat mean routed weight across all 35).
-  Before the shape adds experts, measure on the existing checkpoints whether `aux_loss_weight: 0.01`
-  is suppressing differentiation and whether the flat routed weight is an artefact of renormalizing
-  after top-k.
+  measurably (aux loss at its balanced value from step 0). **But the flat mean routed weight is an
+  artefact** (review §2.9): top-2 scores are renormalized to sum to 1, so two near-equal logits
+  give ~0.5 each whatever the router learned; the selection *fractions* did spread (0.03–0.24),
+  which is the real signal. Measure `aux_loss_weight` sensitivity on the existing checkpoint
+  before the shape is set; prefer fewer, larger experts or a bias-based balancing that does not
+  push the non-MLP slots toward 1/35.
+- **Shape: most of the compute in the recurrent core, not the prelude** (review §2.4). Today eight
+  dense prelude layers feed one looped block and the recurrent core is ~140 of ~500 MFLOP per
+  token; Geiping, Mixture-of-Recursions and SMELT all invert that. The 7c A/B compares
+  "4 prelude + a 2-block looped core × 3 + 2 coda" at matched compute, not only "coda vs none".
+- **Ablate the two attention modules with no published analogue and no measured value** (review
+  §2.3): the cross-attention over token-identity PLE embeddings and the IR expert's inner
+  attention (already off by default via `ir_direct_read`, kept loadable for this A/B). Attention
+  is 126 of 502 MFLOP forward and each loop runs four to five attention passes.
+- **Per-loop CE may be manufacturing the loop-3 redundancy** (review §2.5). `[0.2, 0.3, 1.0]` plus
+  30% sampled depth trains loop 1 and loop 2 as full-weight readouts on 15% of steps each, so the
+  objective asks for a good 1-, 2- and 3-loop model at once and loop 3's marginal value is small
+  *by construction*. Consistent with everything measured (loop 2 ≈ loop 3 CE, `cos(Δ3, Δ2)` 0.63–
+  0.73, arm D making loops more alike) and a training cause, not an architecture one. **Test:** two
+  from-scratch runs at reduced width, ~1B tokens, local — the current weights and sampling against
+  final-depth-only supervision with a 10% sampled-depth fraction and a coda. Read loop 3's gain and
+  the depth curve at 1, 2, 3, 4, 6. Folds into the LR sweep runs.
+- **Log `‖h‖` per loop** (review §2.6, the readout blind spot): RMSNorm readouts hide the state norm
+  from per-loop CE while the recurrence amplifies it. `‖Δh‖/‖h‖` falls 0.87 / 0.36 / 0.10 across
+  loops here; for any depth curriculum past 3 either normalize the state at loop entry or make the
+  scale visible to the loss.
+- **The parametric memory row** (decisions table): if the run keeps one, it is a Memory+ style
+  layer measured by the lookup-off ablation, sized at Engram's 20–25% of the sparse budget, in a
+  from-scratch A/B against none. The IR expert as built is not the candidate.
 - Token budget from 7a's measured throughput × purchased hours, schedule, eval cadence (the
   Phase 1b suite at every checkpoint sync), and the SFT/preference plan (Phase 6's recipe re-run
   at scale).
+- **The gate table for "separation"** (review §2.10) — CE cannot see any of this, so the run's own
+  gates are the five listed under **R1–R5** in Acceptance below, written into RUN2.md before
+  anything is rented.
+
+### 7e. Retrieval-augmented pretraining corpus (from token 0)
+
+The project's end goal — facts in the retrieval pathway, language and reasoning in the trunk,
+outputs accurate because they copy from evidence or abstain — is a **pretraining property**
+(review §2). LMLM's 382M model matches LLaMA2-7B on FactScore with lookups on and drops 31.9 →
+12.8 with them off; that drop is the number that proves the facts live outside the trunk. This
+repo's trunk was trained with no lookup and full loss on every fact, and three finetunes did not
+move its answerability representation. A next run that pretrains plain and grafts afterwards
+inherits all of that. Affordable at ≤5k hours, in order of cost:
+
+1. **The same-document held-out span, for free.** `prepare_evidence_data.py`'s web-text
+   construction needs no index. Apply it to 30–50% of pretraining documents, held span fixed at
+   256–512 tokens, with 1–3 other documents' spans as distractors. RETRO's regime without the
+   index; trains the reader and "irrelevant evidence costs nothing" at pretraining scale.
+2. **A real index for the QA-shaped and Wikipedia slices.** KILT's 21M passages embed with
+   bge-small in hours on one GPU; one query per document (first 256 tokens) against IVF-PQ is
+   ~100M queries for 100B tokens, a day on CPU. Attach the top 4, excluding the document itself.
+3. **An LMLM-style masked slice.** On Wikipedia/QA, mask the answer or fact span out of the loss
+   when it appears verbatim in an attached chunk, so the trunk is never rewarded for storing it.
+   This is what makes R1's lookup-off ablation a real measurement.
+4. **Multi-hop data with the second hop in the candidate set** (review §2.7): HotpotQA bridge
+   questions, 2WikiMultiHopQA, MuSiQue. Retrieval at every loop is the project's differentiated
+   claim and the only reason the loops exist (loops buy computation, not storage); without hop-2
+   data the depth curve is flat for a data reason. Candidates fetched once per sequence (k = 32–64),
+   each loop *selects* within them with the loop-conditioned query, the append-only buffer is the
+   union.
+
+The reader is part of the trunk from step 0 (Nanbeige's from-scratch-beats-upcycling applies to the
+port as much as to the loop), so the encoder question is answered by construction: evidence is
+encoded by the same dense decoder, once, with its own `cu_seqlens`. Budget the corpus prep as its
+own job in RUN2.md.
+
+Two things to say plainly in the spec: *"perfectly accurate" is a property of a system, not a
+weight file* — the mechanism is "copy from evidence or abstain" plus an inference-time check that
+the emitted span is supported by the attached chunks; and the *external* store is what the accuracy
+claim rests on, because a parametric store is neither auditable nor editable.
 
 ### 7d. The LM head — stop buying parameters with rank
 
@@ -1335,6 +1544,15 @@ still stands on its own.
 - **G9** — the frozen-trunk oracle-head reading is recorded and the run spec names a head (7d). Tie
   the readout to `embed_tokens` iff the block-diagonal factoring costs ≥ ~0.02 nats against a dense
   head on the standard slice — G1's bar, same slice, same argument.
+- **R1–R5 — the real run's separation gates** (7c/7e, from review §2.10; none readable on the
+  POC): **R1** lookup-off ablation — closed-book factual EM and FactScore-style precision with the
+  evidence pathway disabled vs enabled, LMLM's 19% relative drop the floor to beat (a run whose
+  accuracy barely moves with retrieval off stored the facts in the trunk); **R2** grounded
+  precision — fraction of emitted answer spans present in the attached evidence, under gold, mixed
+  and distractor separately; **R3** abstention curve — precision ≥ 0.65 at recall ≥ 0.5, passage in
+  the port; **R4** distractor cost — CE and EM under distractors-only not worse than under no
+  evidence (the 0.63-nat penalty driven to zero); **R5** editability — change a fact in the store
+  and the answer changes.
 - **P0** — head removal behaviorally neutral. **PASS** (2026-08-19,
   [record](../measurements/phase0_migration.md)).
 - **P2** — false abstention well below 78.4%, precision above base rate. **PASS** (2026-08-20:
@@ -1387,7 +1605,15 @@ still stands on its own.
 - **Grafted mechanisms measure as lower bounds.** Nanbeige found training a looped architecture from
   scratch beat upcycling a trained dense one, and every POC mechanism is grafted onto a checkpoint
   trained without it. A narrow gate miss on a graft is weak evidence against the component in a
-  from-scratch run, which is why 7c's go/no-go table records margins.
+  from-scratch run, which is why 7c's go/no-go table records margins. The graft trajectory is now
+  0 for 4 (G1, G2, G2b, G2c), which is why the real run pretrains with retrieval from token 0 (7e).
+- **Per-loop CE itself may be the cause of the loop-3 redundancy** (7c). If the from-scratch A/B
+  says so, the POC's depth numbers were read under an objective that caps what a later loop can
+  add, and the real run's supervision changes shape before its depth does.
+- **Phase 4's selector is trained through ~6% of tokens** unless the selection loss is wired in
+  (Phase 4, "Before the run"): the IR expert is routed, the aux loss pins it at 1/35, and the
+  reader gate is the only always-on gradient to the adapters. Judge the selector by the mass
+  split's AUROC, not the adapters' norms — but do not run without the loss.
 
 ## Parked
 

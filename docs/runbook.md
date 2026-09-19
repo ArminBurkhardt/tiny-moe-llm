@@ -68,9 +68,10 @@ Run phase 1 by hand for ~200 steps and check the log line before committing to t
 - FP8 should actually be active. **`te.autocast(enabled=True)` raises if the device rejects the
   recipe — it does not silently fall back.** `log_precision_mode()`'s log line at startup states
   the resolved recipe either way, so check that instead of assuming a missing warning means BF16.
-- `IR E/lnN:` is the IR table's retrieval entropy over `ln(num_ir_entries)`, one entry per loop,
-  in the same units as [stage0_diagnostics.md](measurements/stage0_diagnostics.md). At init it sits
-  at ~1.0 (a uniform read over the table). It falling is the table learning to store something;
+- `IR E/ln32:` is the IR table's retrieval entropy over `ln(width)` — the width of the softmax the
+  module actually takes (`ir_read_top_k` on the two stage path, the table size on the exact one) —
+  one entry per loop, in the same units as [stage0_diagnostics.md](measurements/stage0_diagnostics.md).
+  At init it sits at ~1.0 (a uniform read). It falling is the table learning to store something;
   staying pinned at 1.0 is the failure the 16B run had, and is worth catching in the first hour
   rather than at the end.
 
@@ -279,7 +280,7 @@ All of `ckpts/` and `data/prepared/` are gitignored, as is every `*.json` — `r
 
 ---
 
-## 10. Running SFT (PLAN.md Step 12) on a rented box
+## 10. Running SFT on a rented box
 
 SFT is written for the local dev GPU, but it runs unattended on vast.ai. It is a *different shape*
 of job from pretraining: ~300M tokens x 2 epochs, so **1-3 hours, not 40**, and there is no
@@ -415,3 +416,49 @@ python scripts/eval_abstention.py -c ckpts/repair/checkpoint_repair_final.pt \
 - Checkpoints land in `ckpts/repair/` under phase `repair`, on the same rolling/final naming and the
   same stop contract. `eval_abstention.py`'s default `--checkpoint` still searches `ckpts/sft`, so
   pass `-c` explicitly here.
+
+## 12. The IR sharpening and evidence finetunes ([NEXT.md](plans/NEXT.md) Phases 3–4)
+
+Same script, same objective, same stop contract, same rules as §11 (local, BF16, seed with `-c`,
+fixed eval flags). Two things are new and both are instrumented for the same reason: a
+migrated-in tensor starts at zero, and "did it leave zero" has to be readable while the run is
+going rather than reconstructed from the final checkpoint.
+
+```bash
+# IR sharpening (Phase 3 / 3b): rebuild the table, then anneal it on a general LM mix
+python scripts/prepare_data.py --phases ir --ir-tokens 210000000 --val-tokens 2000000 --manifest-key ir_prep
+python scripts/migrate_ir_reshape.py -c ckpts/trained/checkpoint_phase2_final_phase0.pt --arm random
+python scripts/sft.py --ir -c ckpts/trained/checkpoint_phase2_final_phase0_irrandom.pt
+
+# evidence (Phase 4): port the seed, build the oracle-evidence corpus, train, read the gates
+python scripts/migrate_evidence_port.py -c ckpts/repair/checkpoint_repair_final_irrandom.pt
+python scripts/prepare_evidence_data.py --target-tokens 150000000         # ~11 h at ~400 docs/s, resumable
+python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt
+python scripts/eval_abstention.py -c ckpts/evidence/checkpoint_evidence_final.pt --evidence-port \
+    --evidence-condition gold,none,distractors,mixed --max-examples 2000 --batch-size 16
+python scripts/eval_benchmarks.py -c ckpts/evidence/checkpoint_evidence_final.pt --compare docs/measurements/benchmarks/*.json
+```
+
+- **Every training launch runs in the background under a watch** whose filter matches
+  `Traceback|Error|Killed|OOM|assert` as well as the progress line. A filter that greps only for
+  progress is silent through a crash. And **a failure that prints nothing looks like a slow
+  step**: a device-side assert (an out-of-range gather on a data-dependent id) leaves the process
+  in `R` with the GPU at 1%, forever. If the progress line goes quiet, reproduce one micro step
+  outside the trainer.
+- **Kill a run the moment its own instrumentation says it cannot pass.** `|g_proj|rms` (`--ir`),
+  `|inject|rms`, `|shared_evidence.o_proj|rms` (`--evidence`) are the zero-init tensors; one that
+  has stopped climbing by the first checkpoint is the answer, and the remaining hour only buys a
+  control at matched tokens — worth having sometimes, worth saying out loud either way.
+- **The `--evidence` early kill is the per-condition `[eval]` line**: kill at 10M tokens if
+  `gold` minus `none` CE is under ~0.1 nats. Also watch `external mass: {gold: …, none: …}`
+  (gold/mixed should rise above distractors/none) and the packing line's `fill` (below ~75%, the
+  evidence cap is closing rows early — see `max_evidence_tokens` in `config.yaml`).
+- **Throughput is the first thing to read.** 4 × 4096 stays resident on the 5090 (~21–27GB peak);
+  8 × 4096 spills into shared system memory at a ~3–4x throughput cost and does not OOM. Do not
+  wait out a slow run; fix the batch.
+- `IR cluster refresh at …` lines report candidate recall@32; below 0.9 the centroid stage is
+  dropping entries the read wanted — raise `ir_probe_clusters` before blaming the anneal.
+- The `--evidence-port` eval prints two teacher-forced numbers per condition. **G3 is the
+  answer-span CE with the real answer as the target under every condition** (the "gold vs none,
+  answer-span CE gap" block at the end), not the condition-target CE, which compares "say the
+  answer" against "say a refusal". G3b is the `external memory mass … AUROC` line, per loop.
