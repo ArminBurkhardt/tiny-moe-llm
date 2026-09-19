@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import argparse
 from typing import Iterator
 
@@ -10,6 +11,7 @@ import torch
 from transformers import AutoTokenizer
 
 from modules.model.transformer import TinyMoETransformer
+from modules.model.evidence import EvidenceBatch
 from modules.model.kv_cache import KVCache
 from modules.data.chat import ChatTemplate
 from config import ModelConfig
@@ -27,6 +29,70 @@ def load_model(checkpoint_path: str, device: str):
     load_model_state(model, state_dict)
     model.eval()
     return model
+
+
+def load_evidence_chunks(path: str) -> list[str]:
+    """Read ``--evidence``'s file: a JSON list of strings, or plain text with one chunk per line.
+
+    Whichever it is, the result is already split into chunks the way a real retriever would hand
+    them to the port -- unlike ``prepare_evidence_data.py``'s corpus builder or
+    ``eval_abstention.py``'s passage chunker, both of which start from one long passage, this does
+    no further splitting of its own.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    chunks = [str(c) for c in parsed] if isinstance(parsed, list) else text.splitlines()
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def build_evidence_batch(model: TinyMoETransformer, tokenizer, chunks: list[str], device: str) -> EvidenceBatch:
+    """Attach a fixed list of chunks through the port for one interactive session.
+
+    Single sequence (batch size 1, exactly what this CLI ever decodes), so the query side is one
+    segment -- segment 0 -- and every chunk serves it. Built ONCE, before generation starts, and
+    reused at every step: the evidence CONTENT never changes as tokens are generated, only the query
+    reading it does, which is why ``stream_generate`` takes an already-built ``EvidenceBatch``
+    rather than raw chunks (contrast ``eval_abstention.py``'s batched decode, which has no KV cache
+    at all and so rebuilds its evidence batch every step anyway).
+
+    Requires a checkpoint built by ``scripts/migrate_evidence_port.py`` -- raises rather than
+    silently generating without evidence when the checkpoint has no port, the same way
+    ``--converge-tol`` on a checkpoint that predates it would fail loudly instead of quietly doing
+    nothing.
+    """
+    if model.moe.shared_evidence is None:
+        raise SystemExit(
+            "this checkpoint has no evidence port -- build one with scripts/migrate_evidence_port.py "
+            "before passing --evidence"
+        )
+    # loads bge-small-en-v1.5, so this import only happens when --evidence is actually used
+    from scripts.prepare_evidence_data import ChunkEmbedder
+
+    ids: list[int] = []
+    chunk_ids: list[int] = []
+    for local_idx, text in enumerate(chunks):
+        piece = tokenizer(text, add_special_tokens=False)["input_ids"]
+        ids.extend(piece)
+        chunk_ids.extend([local_idx] * len(piece))
+    if not ids:
+        raise SystemExit(f"--evidence produced no usable chunks (every chunk tokenized to nothing)")
+
+    embedder = ChunkEmbedder(device=device)
+    keys = embedder.encode(chunks)
+
+    evidence_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    evidence_chunk_ids = torch.tensor([chunk_ids], dtype=torch.long, device=device)
+    evidence_segment_ids = torch.zeros_like(evidence_ids)  # one session, one query segment: 0
+    chunk_keys = torch.as_tensor(keys, dtype=torch.float32, device=device)
+    chunk_segments = torch.zeros(len(chunks), dtype=torch.long, device=device)
+    return model.build_evidence(
+        evidence_ids, evidence_chunk_ids, evidence_segment_ids, 1,
+        chunk_keys=chunk_keys, chunk_segments=chunk_segments,
+    )
 
 
 def _apply_repetition_penalty(next_logits: torch.Tensor, generated_ids: torch.Tensor, penalty: float) -> torch.Tensor:
@@ -90,6 +156,7 @@ def stream_generate(
     use_kv_cache: bool = True,
     converge_tol: float | None = None,
     min_loops: int = 1,
+    evidence: EvidenceBatch | None = None,
 ) -> Iterator[str]:
     """Generate tokens one step at a time, yielding the newly decoded text after each step.
 
@@ -111,6 +178,28 @@ def stream_generate(
     over a cache with a hole in it. Whether that trade is worth it depends on the checkpoint;
     ``scripts/eval_calibration.py`` prints the per-transition agreement/log-prob-gap numbers that
     say what threshold to use and what stopping early costs.
+
+    ``evidence`` (optional), built once by ``build_evidence_batch`` before generation starts, attaches
+    retrieved evidence through the port at every loop. Structurally it composes with ``use_kv_cache``
+    -- unlike ``converge_tol`` below, which the model itself asserts cannot combine with a cache
+    because an exited loop leaves an actual hole in it, there is no such hole here:
+    ``CrossAttention.forward`` hardcodes ``kv_cache=None`` on the evidence branch, so the reader
+    recomputes its cross attention over the evidence in full on every step regardless of caching
+    elsewhere, always against the current query and the SAME fixed evidence states. **That recompute
+    is not, however, guaranteed bit-identical to the ``--no-kv-cache`` reference the way the rest of
+    a cached decode is** -- checked by running the same prompt and evidence through both paths with a
+    live (non-zero) reader: they matched for the first several tokens and then a greedy pick flipped.
+    The cached step processes one new token (``S=1``) against the evidence while the reference
+    recomputes the whole growing prefix (``S`` = however long generation has run) in one call; both
+    computations are mathematically the same causal read, but TE's kernels are free to tile a GEMM
+    differently for different input shapes, so bf16 rounding is not obliged to agree between them --
+    the identical, better-known case of this in the codebase is ``ParallelSparseMoELayer``'s
+    ``m_splits`` tiling changing with batch composition (see CLAUDE.md). Under greedy decoding a
+    rounding-level difference in one step's logits can flip which token wins a close argmax, and once
+    one token differs every later one can too. This is a reproducibility caveat, not a correctness
+    one: nothing here reads stale state or the wrong document's evidence, and with a freshly migrated
+    (reader still zero) checkpoint the two paths matched exactly, in and past the tested range. Use
+    ``--no-kv-cache`` when exact reproducibility with evidence attached matters more than speed.
 
     Text is streamed by re-decoding the full generated id sequence each step and yielding only the
     new suffix, rather than decoding each step's tokens in isolation -- a lone step's tokens can
@@ -135,6 +224,8 @@ def stream_generate(
             kwargs["min_loops"] = min_loops
         if kv_cache is not None:
             kwargs["kv_cache"] = kv_cache
+        if evidence is not None:
+            kwargs["evidence"] = evidence
         if use_mtp:
             x_all, extra = model(ids, return_hidden=True, **kwargs)
             logits = model.lm_head(x_all[-1])
@@ -231,7 +322,7 @@ def prepend_bos(tokenizer, ids: list[int]) -> list[int]:
     return ids
 
 
-def interactive_loop(model, tokenizer, args, device):
+def interactive_loop(model, tokenizer, args, device, evidence: EvidenceBatch | None = None):
     print("TinyMoE inference — type your prompt and press Enter. Ctrl-C or 'quit' to exit.\n")
     while True:
         try:
@@ -249,7 +340,7 @@ def interactive_loop(model, tokenizer, args, device):
             repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
             top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
             use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
-            min_loops=args.min_loops,
+            min_loops=args.min_loops, evidence=evidence,
         ):
             print(chunk, end="", flush=True)
         print("\n")
@@ -372,6 +463,15 @@ def main():
         default=None,
         help="Optional system prompt, only used with --chat.",
     )
+    parser.add_argument(
+        "--evidence",
+        default=None,
+        help="Attach evidence through the port: a file that is either a JSON list of chunk "
+             "strings or plain text with one chunk per line. Needs a checkpoint built by "
+             "scripts/migrate_evidence_port.py. Composes structurally with the KV cache and "
+             "with --converge-tol, but is not bit-exact against --no-kv-cache once the reader is "
+             "trained -- see stream_generate's docstring.",
+    )
     args = parser.parse_args()
 
     print(f"Loading tokenizer from {args.tokenizer} …")
@@ -381,6 +481,14 @@ def main():
     model = load_model(args.checkpoint, args.device)
     print(f"Model loaded on {args.device} ({sum(p.numel() for p in model.parameters()):,} params)\n")
 
+    evidence = None
+    if args.evidence:
+        chunks = load_evidence_chunks(args.evidence)
+        if not chunks:
+            raise SystemExit(f"{args.evidence} produced no usable chunks")
+        evidence = build_evidence_batch(model, tokenizer, chunks, args.device)
+        print(f"Attached {len(chunks)} evidence chunk(s) from {args.evidence}\n")
+
     if args.prompt is not None:
         prompt_ids = build_prompt_ids(tokenizer, args.prompt, args)
         for chunk in stream_generate(
@@ -388,12 +496,12 @@ def main():
             repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
             top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
             use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
-            min_loops=args.min_loops,
+            min_loops=args.min_loops, evidence=evidence,
         ):
             print(chunk, end="", flush=True)
         print()
     else:
-        interactive_loop(model, tokenizer, args, args.device)
+        interactive_loop(model, tokenizer, args, args.device, evidence=evidence)
 
 
 if __name__ == "__main__":

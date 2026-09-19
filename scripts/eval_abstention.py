@@ -58,7 +58,7 @@ import random
 import string
 import argparse
 import collections
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
@@ -70,17 +70,22 @@ import pandas as pd
 from transformers import AutoTokenizer
 
 from modules.model.transformer import TinyMoETransformer
-from modules.model.attention import cu_seqlens_from_doc_ids
+from modules.model.attention import cu_seqlens_from_doc_ids, _segment_ids
 from modules.data import abstention
 from modules.data.chat import ChatTemplate
+from modules.data.evidence_dataset import EMBED_DIM
 from config import ModelConfig, SFTConfig
 from scripts.eval_calibration import expected_calibration_error, roc_auc
 from scripts.prepare_sft_data import SQUAD_INSTRUCTION
+from scripts.prepare_evidence_data import ChunkEmbedder, EVIDENCE_SQUAD_INSTRUCTION, evidence_prompt
 from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, load_model_state, logger, model_params_for_state_dict
 
 SQUAD_REPO = "rajpurkar/squad_v2"
 SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
 CE_CHUNK_SIZE = 2048
+# the port's four conditions this script can attach on the eval side ("many" is corpus-only -- it
+# exists to put a large buffer in TRAINING somewhere, which an eval slice this small has no use for)
+EVIDENCE_CONDITIONS = ("gold", "none", "distractors", "mixed")
 
 
 # ---------------------------------------------------------------------------- data
@@ -260,7 +265,8 @@ def load_model(checkpoint_path: str, device: str) -> TinyMoETransformer:
     return model
 
 
-def _final_hidden(model: TinyMoETransformer, input_ids: torch.Tensor, document_ids: torch.Tensor) -> torch.Tensor:
+def _final_hidden(model: TinyMoETransformer, input_ids: torch.Tensor, document_ids: torch.Tensor,
+                  evidence=None) -> torch.Tensor:
     """One forward pass, returning the final loop's post-norm hidden states ``[B, S, H]``.
 
     ``return_hidden=True`` is what keeps this affordable: the alternative returns
@@ -270,14 +276,107 @@ def _final_hidden(model: TinyMoETransformer, input_ids: torch.Tensor, document_i
     ``skip_mtp=True`` for the same reason one step further out: nothing here reads the drafted
     tokens, and the head would otherwise run over the whole prefix on every decode step of a
     cache-free generation loop.
+
+    ``evidence`` (optional) is an ``EvidenceBatch`` built by ``_pack_evidence_batch``, read by the
+    port at every loop exactly as training reads it. ``None`` (the default, and every call site that
+    predates ``--evidence-port``) reproduces the forward this function always ran, bit for bit.
     """
     cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(document_ids)
     out = model(
         input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_hidden=True,
-        skip_mtp=True,
+        skip_mtp=True, evidence=evidence,
     )
     hidden_all = out[0] if isinstance(out, tuple) else out
     return hidden_all[-1]
+
+
+# ------------------------------------------------------------------------ evidence attachment
+
+
+def _pack_evidence_batch(model, real_segment: torch.Tensor, dump_segment: torch.Tensor,
+                         evidence_rows: List[Optional[dict]], num_segments: int, device: str):
+    """Build the ``EvidenceBatch`` for one forward call from per-row evidence dicts.
+
+    ``real_segment``/``dump_segment`` are THIS call's global segment ids (from this call's own
+    ``cu_seqlens``) for, respectively, the row's real query content and a segment whose output
+    nothing reads. A row's own evidence tokens are attributed to its real segment; whatever extra
+    width the shared rectangular ``[B, S_ev]`` tensor needs beyond that row's own evidence is
+    attributed to the dump segment instead -- the same trick ``modules/data/evidence_dataset.py``
+    uses for its trailing pad segment, generalized because the caller decides which of a row's two
+    segments plays which role: ``generate_batch`` pads on the left (so the dump is the row's FIRST
+    segment) and ``teacher_forced_calibration`` pads on the right (so the dump is its LAST), and both
+    need a genuine second segment to exist -- see each caller's ``extra_pad`` reservation.
+
+    Args:
+        evidence_rows: one entry per row, ``{"ids": [...], "chunk_ids": [...], "keys": [C, 384] or
+            None}``, or ``None``/``{}`` for a row with nothing attached.
+        num_segments: the WHOLE batch's segment count (``len(cu_seqlens) - 1``), passed rather than
+            derived from ``real_segment``/``dump_segment`` alone -- both are per-row [B] slices and
+            cannot see segments neither of them names.
+
+    Returns:
+        An ``EvidenceBatch``, or ``None`` when no row has anything attached (the bit-identical
+        no-evidence forward).
+    """
+    B = len(evidence_rows)
+    widths = [len(r["ids"]) if r and r.get("ids") else 0 for r in evidence_rows]
+    chunk_counts = [(r["keys"].shape[0] if r and r.get("keys") is not None else 0) for r in evidence_rows]
+    S_ev, C = max(widths, default=0), max(chunk_counts, default=0)
+    if S_ev == 0 or C == 0:
+        return None
+
+    real_list, dump_list = real_segment.tolist(), dump_segment.tolist()
+    ids = torch.zeros((B, S_ev), dtype=torch.long)
+    chunk_ids = torch.full((B, S_ev), -1, dtype=torch.long)
+    ev_segments = torch.tensor([[dump_list[i]] * S_ev for i in range(B)], dtype=torch.long)
+    keys = torch.zeros((B, C, EMBED_DIM), dtype=torch.float32)
+    chunk_segments_local = torch.full((B, C), -1, dtype=torch.long)
+
+    for i, row in enumerate(evidence_rows):
+        if not row or not row.get("ids"):
+            continue
+        n = len(row["ids"])
+        ids[i, :n] = torch.tensor(row["ids"], dtype=torch.long)
+        chunk_ids[i, :n] = torch.tensor(row["chunk_ids"], dtype=torch.long)
+        ev_segments[i, :n] = real_list[i]
+        keys_row = row.get("keys")
+        k = keys_row.shape[0] if keys_row is not None else 0
+        if k:
+            keys[i, :k] = torch.as_tensor(keys_row, dtype=torch.float32)
+            chunk_segments_local[i, :k] = real_list[i]
+
+    valid = chunk_segments_local >= 0
+    chunk_segments = chunk_segments_local[valid].to(device)
+    chunk_keys = keys[valid].to(device)
+    return model.build_evidence(
+        ids.to(device), chunk_ids.to(device), ev_segments.to(device), num_segments,
+        chunk_keys=chunk_keys, chunk_segments=chunk_segments,
+    )
+
+
+def _capture_memory_mass(model, batch: int, seq_len: int, mass_out: List[Optional[dict]]) -> None:
+    """Fill ``mass_out`` in place with the IR table's external-mass fraction at each row's LAST
+    position of the just-completed forward -- read right after it, since the module overwrites
+    ``last_memory_mass`` on every call.
+
+    ``None`` per row where the checkpoint carries no IR module, or the forward carried no evidence
+    at all (the module clears its own mass then, rather than leaving a stale value from an earlier
+    batch, which is exactly what lets this tell the two cases apart).
+    """
+    ir_modules = getattr(model.moe, "ir_modules", [])
+    ir_module = ir_modules[0] if ir_modules else None
+    if ir_module is None or ir_module.last_memory_mass is None:
+        for i in range(batch):
+            mass_out[i] = None
+        return
+    last = ir_module.last_memory_mass.view(batch, seq_len)[:, -1].float().cpu().tolist()
+    by_loop = getattr(ir_module, "memory_mass_by_loop", None) or {}
+    loop_last = {
+        loop_idx: tensor.view(batch, seq_len)[:, -1].float().cpu().tolist()
+        for loop_idx, tensor in by_loop.items()
+    }
+    for i in range(batch):
+        mass_out[i] = {"last": last[i], "by_loop": {idx: vals[i] for idx, vals in loop_last.items()}}
 
 
 # ------------------------------------------------------------------------ generation
@@ -285,7 +384,9 @@ def _final_hidden(model: TinyMoETransformer, input_ids: torch.Tensor, document_i
 
 @torch.inference_mode()
 def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, temperature: float,
-                   top_k: int, eos_id: int, pad_id: int, device: str, max_seq_len: int):
+                   top_k: int, eos_id: int, pad_id: int, device: str, max_seq_len: int,
+                   evidence_rows: Optional[List[Optional[dict]]] = None,
+                   mass_out: Optional[List[Optional[dict]]] = None):
     """Greedy/top-k decode for a batch of variable-length prompts.
 
     **Left-padded and varlen-segmented.** Left padding puts every row's last real token at the same
@@ -300,13 +401,32 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
     output for the real tokens is bit-identical when the pad region's contents change), but *not*
     bit-exact through the MoE -- see this module's docstring on ``m_splits``.
 
+    ``evidence_rows`` (optional) attaches retrieved evidence through the port, one entry per row
+    (see ``_pack_evidence_batch``). There is no KV cache on this path at all, so a decode step
+    already re-runs the whole prefix; attaching evidence adds one more thing rebuilt from scratch
+    every step, because the evidence batch's segment ids are only valid against THIS step's
+    ``cu_seqlens`` -- the query side grows by one token every step, which renumbers every segment
+    past the first. The evidence CONTENT never changes across steps, only its packaging, so this is
+    pure waste rather than a correctness requirement, and is the reason this mode should be run with
+    a small ``--max-new-tokens``. When given, an extra pad column is reserved on the left even for
+    the longest prompt, so every row keeps a real (if length-1) pad segment distinct from its query
+    content -- the segment ``_pack_evidence_batch`` dumps another row's extra evidence width into.
+
+    ``mass_out`` (optional, only meaningful with ``evidence_rows``): filled in place, one entry per
+    row, with the IR table's external-memory-mass fraction at the row's LAST PROMPT position --
+    read at the very first step, before any token has been generated, which left padding is what
+    makes a plain ``[:, -1]`` slice.
+
     Returns:
         ``(texts, p_max_mean, n_generated)`` -- the decoded completions plus, per row, ``p_max``
         averaged over the tokens actually generated (the terminating EOS included; padding after a
-        finished row excluded).
+        finished row excluded). Unchanged in shape and meaning from before evidence support existed;
+        ``mass_out`` is filled as a side effect rather than added to this tuple, so every existing
+        caller (this module's own default path, ``eval_benchmarks.py``) is untouched.
     """
     batch = len(prompt_ids)
-    width = max(len(p) for p in prompt_ids)
+    extra_pad = 1 if evidence_rows is not None else 0
+    width = max(len(p) for p in prompt_ids) + extra_pad
     ids = torch.full((batch, width), pad_id, dtype=torch.long, device=device)
     doc = torch.zeros((batch, width), dtype=torch.long, device=device)
     for i, prompt in enumerate(prompt_ids):
@@ -318,10 +438,22 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
     p_max_sum = torch.zeros(batch, dtype=torch.float32, device=device)
     counts = torch.zeros(batch, dtype=torch.float32, device=device)
 
-    for _ in range(max_new_tokens):
+    for step in range(max_new_tokens):
         window_ids = ids[:, -max_seq_len:]
         window_doc = doc[:, -max_seq_len:]
-        hidden = _final_hidden(model, window_ids, window_doc)
+        evidence_batch = None
+        if evidence_rows is not None:
+            cu_seqlens, _ = cu_seqlens_from_doc_ids(window_doc)
+            seg = _segment_ids(cu_seqlens, batch, window_doc.shape[1], device)
+            # left padded: the row's real content is its LAST segment, the pad run (guaranteed to
+            # exist by extra_pad above) is its FIRST -- see _pack_evidence_batch's docstring
+            evidence_batch = _pack_evidence_batch(
+                model, seg[:, -1], seg[:, 0], evidence_rows,
+                num_segments=int(cu_seqlens.numel() - 1), device=device,
+            )
+        hidden = _final_hidden(model, window_ids, window_doc, evidence=evidence_batch)
+        if step == 0 and mass_out is not None:
+            _capture_memory_mass(model, batch, window_doc.shape[1], mass_out)
         h_last = hidden[:, -1, :]                       # [B, H]
         logits = model.lm_head(h_last).float()          # [B, vocab] -- one position, not the row
 
@@ -358,28 +490,40 @@ def generate_batch(model, prompt_ids: List[List[int]], *, max_new_tokens: int, t
 
 
 def run_generation(model, tokenizer, template: ChatTemplate, records: List[dict], *, batch_size: int,
-                   max_new_tokens: int, temperature: float, top_k: int, device: str) -> None:
+                   max_new_tokens: int, temperature: float, top_k: int, device: str,
+                   attach_evidence: bool = False) -> None:
     """Fill in ``completion``/``p_max`` on every record, in place.
 
     Records are length-sorted into batches (and restored to their original order by writing back
     through the record objects): padding is what a batched, cache-free decoder wastes most compute
     on, and SQuAD passages vary by an order of magnitude in length.
+
+    ``attach_evidence`` (``--evidence-port`` mode) reads each record's ``evidence_row`` (set by
+    ``attach_condition`` for whichever condition is currently being scored) and also fills in
+    ``memory_mass``/``memory_mass_by_loop`` -- the external store's share of the read at the row's
+    last prompt position, read by ``generate_batch``'s ``mass_out``.
     """
     max_seq_len = ModelConfig.Params["max_seq_len"]
     order = sorted(range(len(records)), key=lambda i: len(records[i]["prompt_ids"]))
     done = 0
     for start in range(0, len(order), batch_size):
         chunk = [records[i] for i in order[start:start + batch_size]]
+        evidence_rows = [r.get("evidence_row") for r in chunk] if attach_evidence else None
+        mass_out = [None] * len(chunk) if attach_evidence else None
         texts, p_max, counts = generate_batch(
             model, [r["prompt_ids"] for r in chunk],
             max_new_tokens=max_new_tokens, temperature=temperature, top_k=top_k,
             eos_id=template.eos_id, pad_id=tokenizer.pad_token_id, device=device,
-            max_seq_len=max_seq_len,
+            max_seq_len=max_seq_len, evidence_rows=evidence_rows, mass_out=mass_out,
         )
         for record, token_ids, pm, n in zip(chunk, texts, p_max, counts):
             record["completion"] = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
             record["p_max"] = float(pm)
             record["n_generated"] = int(n)
+        if mass_out is not None:
+            for record, mass in zip(chunk, mass_out):
+                record["memory_mass"] = mass["last"] if mass else None
+                record["memory_mass_by_loop"] = mass["by_loop"] if mass else {}
         done += len(chunk)
         if done % (batch_size * 10) < batch_size:
             logger.info(f"[eval_abstention] generated {done:,}/{len(records):,} answers")
@@ -391,7 +535,7 @@ def run_generation(model, tokenizer, template: ChatTemplate, records: List[dict]
 @torch.inference_mode()
 def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict], *,
                                pad_id: int, batch_size: int, device: str, max_seq_len: int,
-                               n_bins: int = 15) -> dict:
+                               n_bins: int = 15, use_evidence: bool = False) -> dict:
     """Per-token CE and confidence over the reference answers, forced.
 
     This is ``scripts/eval_calibration.py``'s measurement (same ECE/AUROC functions, same ``p_max``
@@ -399,6 +543,12 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
     comparable across two checkpoints that cannot both be *generated* from. Unanswerable rows are
     forced onto the same fixed abstention phrasing the SFT corpus used, so "was the model confident
     about the abstention" is part of the number rather than excluded from it.
+
+    ``use_evidence`` (``--evidence-port`` mode) reads each record's ``evidence_row`` (set by
+    ``attach_condition``) and attaches it through the port instead of leaving the prompt as is --
+    the caller is responsible for having rendered ``forced_ids``/``forced_mask`` from a prompt that
+    never had a passage in it (see ``attach_condition``/``build_evidence_records``). Off by default,
+    which reproduces every number this function reported before evidence support existed.
     """
     p_max_parts, is_correct_parts = [], []
     ce_sum, n_tokens = 0.0, 0
@@ -407,6 +557,12 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
     for start in range(0, len(order), batch_size):
         chunk = [records[i] for i in order[start:start + batch_size]]
         width = max(len(r["forced_ids"]) for r in chunk)
+        # one guaranteed trailing pad column so the evidence packer always has a real segment to
+        # dump another row's extra evidence width into (see _pack_evidence_batch) -- harmless when
+        # width is already below max_seq_len, and in the rare case a forced sequence fills the whole
+        # context this simply reverts to the pre-evidence truncation, same as the line below
+        if use_evidence:
+            width += 1
         if width > max_seq_len:
             width = max_seq_len
         ids = torch.full((len(chunk), width), pad_id, dtype=torch.long, device=device)
@@ -420,7 +576,18 @@ def teacher_forced_calibration(model, template: ChatTemplate, records: List[dict
             doc[i, :n] = 1
             labels[i, :n] = torch.where(supervised, row, torch.full_like(row, -100))
 
-        hidden = _final_hidden(model, ids, doc)
+        evidence_batch = None
+        if use_evidence:
+            evidence_rows = [r.get("evidence_row") for r in chunk]
+            cu_seqlens, _ = cu_seqlens_from_doc_ids(doc)
+            seg = _segment_ids(cu_seqlens, len(chunk), width, device)
+            # right padded here (unlike generate_batch): the row's real content is its FIRST
+            # segment, the trailing pad run is its LAST -- see _pack_evidence_batch's docstring
+            evidence_batch = _pack_evidence_batch(
+                model, seg[:, 0], seg[:, -1], evidence_rows,
+                num_segments=int(cu_seqlens.numel() - 1), device=device,
+            )
+        hidden = _final_hidden(model, ids, doc, evidence=evidence_batch)
         # position t predicts token t+1, so the supervised label tensor shifts left against hidden
         h = hidden[:, :-1, :].reshape(-1, hidden.size(-1))
         target = labels[:, 1:].reshape(-1)
@@ -533,6 +700,395 @@ def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: 
     return kept
 
 
+# ------------------------------------------------------------------------ evidence-port records
+
+
+def chunk_passage_ids(tokenizer, text: str, chunk_tokens: int) -> List[List[int]]:
+    """Split a passage into fixed-size token chunks, matching the corpus builder's chunk size.
+
+    ``prepare_evidence_data.py`` only chunks this way for the web text arm's held-out span -- a
+    SQuAD passage there is written as ONE chunk however long. Chunking every passage here instead
+    exercises the selector's split over several candidates per question, closer to what a real
+    multi-chunk retrieval buffer looks like than the single always-picked chunk the training corpus
+    gives this source.
+    """
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    chunks = [ids[i:i + chunk_tokens] for i in range(0, len(ids), chunk_tokens)]
+    return [c for c in chunks if c]
+
+
+def build_evidence_records(frame: pd.DataFrame, template: ChatTemplate, tokenizer, *,
+                           max_examples: Optional[int], max_prompt_tokens: int, chunk_tokens: int,
+                           max_evidence_tokens: int, seed: int, offset: int = 0) -> List[dict]:
+    """Render the validation split for ``--evidence-port`` mode.
+
+    Same seeded shuffle as ``build_records`` (same ``seed``, same ``random.Random`` call), so the
+    two modes draw from the same ordering -- but kept as its own function rather than a branch
+    inside ``build_records``, because the two render genuinely different prompts
+    (``EVIDENCE_SQUAD_INSTRUCTION`` with no passage vs ``SQUAD_INSTRUCTION`` with one inline) and
+    keep genuinely different per-row state (chunked passage token ids here, nothing there); a single
+    function branching on a flag would make every reader work out which fields exist under which
+    mode. The forced target and the evidence actually attached are NOT built here -- they depend on
+    the condition, which is only known once ``attach_condition`` is called per condition.
+    """
+    rows = frame.to_dict("records")
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+
+    records, dropped_long, dropped_bad, dropped_evidence, skipped = [], 0, 0, 0, 0
+    for row in rows:
+        if max_examples is not None and len(records) >= max_examples:
+            break
+        context = str(row.get("context") or "").strip()
+        question = str(row.get("question") or "").strip()
+        if not context or not question:
+            dropped_bad += 1
+            continue
+        prompt_text = evidence_prompt(question)
+        prompt_ids = template.encode_prompt([{"role": "user", "content": prompt_text}])
+        if len(prompt_ids) > max_prompt_tokens:
+            dropped_long += 1
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        gold_ids = chunk_passage_ids(tokenizer, context, chunk_tokens)
+        if sum(len(c) for c in gold_ids) > max_evidence_tokens:
+            # dropped, not truncated -- truncating removes whichever chunk landed last, which under
+            # `mixed` is the gold one some of the time, mislabelling the condition rather than
+            # shortening it (the same reason prepare_evidence_data.py drops instead of truncating)
+            dropped_evidence += 1
+            continue
+        gold_texts = [tokenizer.decode(c, skip_special_tokens=True) for c in gold_ids]
+        references = squad_references(row)
+        records.append({
+            "id": str(row.get("id", "")),
+            "question": question,
+            "references": references,
+            "unanswerable": not references,
+            "prompt_ids": prompt_ids,
+            "evidence_prompt_text": prompt_text,
+            "gold_chunks": list(zip(gold_texts, gold_ids)),
+        })
+
+    for i, record in enumerate(records):
+        record["index"] = i  # this slice's position, used to exclude a row's own chunks as its distractors
+
+    logger.info(
+        f"{len(records):,} questions for --evidence-port "
+        f"({sum(r['unanswerable'] for r in records):,} unanswerable), "
+        f"skipped {skipped:,} by --example-offset, dropped {dropped_long:,} over "
+        f"{max_prompt_tokens} prompt tokens, {dropped_evidence:,} over {max_evidence_tokens} "
+        f"evidence tokens, {dropped_bad:,} unusable"
+    )
+    return records
+
+
+def _build_distractor_pool(records: List[dict]) -> List[Tuple[int, str, List[int]]]:
+    """Every record's own gold chunks, flattened and tagged with the record that owns them.
+
+    Built once and shared by every condition: a record's own chunks are excluded when IT draws a
+    distractor (see ``_sample_distractors``), by the ``index`` tag, not by identity, so this stays a
+    plain list rather than needing per-record bookkeeping.
+    """
+    return [(r["index"], text, ids) for r in records for text, ids in r["gold_chunks"]]
+
+
+def _sample_distractors(pool: List[Tuple[int, str, List[int]]], own_index: int, k: int,
+                        rng: random.Random) -> List[Tuple[str, List[int]]]:
+    """``k`` chunks drawn from other records' gold chunks -- the eval-side reservoir.
+
+    Scans the whole pool per call rather than indexing into it, which costs O(slice size) per
+    record; fine at the slice sizes this script runs at (hundreds to low thousands of questions),
+    and simpler than maintaining a live exclusion index for a one-shot eval pass.
+    """
+    candidates = [(text, ids) for idx, text, ids in pool if idx != own_index]
+    if not candidates:
+        return []
+    if len(candidates) <= k:
+        return candidates
+    return rng.sample(candidates, k)
+
+
+def attach_condition(records: List[dict], condition: str, template: ChatTemplate, embedder,
+                     pool: List[Tuple[int, str, List[int]]], *, num_distractors: int,
+                     rng: random.Random) -> None:
+    """Fill in, per record, the evidence this CONDITION attaches and the target it forces.
+
+    Mutates records in place rather than returning a copy: scoring a second condition over the same
+    slice only needs ``evidence_row``/``forced_ids``/``forced_mask``/``condition_unanswerable`` to
+    change, not the (unchanged) prompt side, so re-tokenizing the question every condition is the
+    only repeated cost.
+
+    Mirrors ``prepare_evidence_data.apply_condition``'s target rule for a QA row: ``gold``/``mixed``
+    target the real answer unless the row is natively unanswerable (its passage is gold-shaped and
+    still does not answer -- the one case that forces abstention under every condition, and the only
+    supervision that separates "retrieved something relevant" from "can answer"); ``distractors``/
+    ``none`` force abstention even when the row is answerable, because the point of those two
+    conditions is that the BUFFER, not the question, decides whether an answer exists.
+    """
+    conversations = []
+    for record in records:
+        gold = record["gold_chunks"]
+        if condition == "gold":
+            chosen = [(t, i, True) for t, i in gold]
+        elif condition == "none":
+            chosen = []
+        elif condition == "distractors":
+            chosen = [
+                (t, i, False)
+                for t, i in _sample_distractors(pool, record["index"], num_distractors, rng)
+            ]
+        else:  # mixed
+            distract = _sample_distractors(pool, record["index"], num_distractors, rng)
+            chosen = [(t, i, True) for t, i in gold] + [(t, i, False) for t, i in distract]
+            rng.shuffle(chosen)
+
+        record["condition_unanswerable"] = record["unanswerable"] or condition in ("distractors", "none")
+        use_real_answer = condition in ("gold", "mixed") and not record["condition_unanswerable"]
+        target = (
+            record["references"][0] if use_real_answer
+            else abstention.pick(abstention.ABSTENTIONS_PASSAGE, rng)
+        )
+
+        ev_ids: List[int] = []
+        ev_chunk_ids: List[int] = []
+        for local_idx, (_, ids, _is_gold) in enumerate(chosen):
+            ev_ids.extend(ids)
+            ev_chunk_ids.extend([local_idx] * len(ids))
+        keys = embedder.encode([t for t, _, _ in chosen]) if chosen else None
+        record["evidence_row"] = (
+            {"ids": ev_ids, "chunk_ids": ev_chunk_ids, "keys": keys} if ev_ids else None
+        )
+        conversations.append([
+            {"role": "user", "content": record["evidence_prompt_text"]},
+            {"role": "assistant", "content": target},
+        ])
+
+    # the SAME target under every condition, and always the real answer: the CE gap between gold and
+    # none is only a reading of what the evidence is worth if both sides score the identical span.
+    # The forced target above deliberately changes with the condition (that is what makes the
+    # abstention numbers mean something), so a gap built on it compares "say the answer" against
+    # "say a refusal" -- two different, differently-priced targets, and the refusal wins on CE
+    # whatever the port does. Natively unanswerable rows have no answer span to score and are left
+    # without one; the gap is read over the rest.
+    answer_conversations, answer_records = [], []
+    for record in records:
+        if record["unanswerable"] or not record["references"]:
+            record["answer_forced"] = None
+            continue
+        answer_records.append(record)
+        answer_conversations.append([
+            {"role": "user", "content": record["evidence_prompt_text"]},
+            {"role": "assistant", "content": record["references"][0]},
+        ])
+    for record, pair in zip(answer_records, template.encode_batch(answer_conversations)):
+        record["answer_forced"] = pair
+
+    for record, pair in zip(records, template.encode_batch(conversations)):
+        if pair is None:
+            # practically unreachable here -- the user turn already tokenized cleanly when
+            # prompt_ids was built, and the target is either a known-good reference or a fixed
+            # abstention phrasing -- but a record has to end up with SOMETHING forced rather than a
+            # stale value from the previous condition, so fall back to an empty (unsupervised) turn
+            record["forced_ids"], record["forced_mask"] = [template.bos_id, template.eos_id], [0, 0]
+            continue
+        record["forced_ids"], record["forced_mask"] = pair
+
+
+def report_evidence_condition(condition: str, records: List[dict], forced: dict, n_bins: int) -> dict:
+    """Print and return one condition's numbers -- the per-condition analogue of ``report``.
+
+    ``unanswerable_effective`` (``condition_unanswerable``) is what abstention correctness is scored
+    against: under ``distractors``/``none`` the model is right to abstain even on a natively
+    answerable question, because the buffer -- not the question -- decides whether an answer exists
+    under those two conditions. The external-mass AUROC is scored against the NATIVE label instead
+    (whether SQuAD calls the question unanswerable), because that is the one signal the port's
+    selector could plausibly carry regardless of which condition supplied the evidence.
+    """
+    abstained = np.array([r["abstained"] for r in records], dtype=bool)
+    unanswerable_native = np.array([r["unanswerable"] for r in records], dtype=bool)
+    unanswerable_effective = np.array([r["condition_unanswerable"] for r in records], dtype=bool)
+    em = np.array([r["em"] for r in records], dtype=np.float64)
+    f1 = np.array([r["f1"] for r in records], dtype=np.float64)
+    is_correct = np.array([r["is_correct"] for r in records], dtype=np.float64)
+    p_max = np.array([r["p_max"] for r in records], dtype=np.float64)
+
+    scores = abstention_scores(abstained, unanswerable_effective)
+    answerable = ~unanswerable_effective
+
+    print(f"\n=== SQuAD v2 validation, evidence port, condition '{condition}' ===")
+    print(f"  questions: {len(records):,}  ({int(unanswerable_effective.sum()):,} unanswerable "
+          f"under this condition, {int(unanswerable_native.sum()):,} natively)")
+    print(f"  abstention precision: {scores['precision']:.4f}   "
+          f"({scores['tp']} correct abstentions / {scores['tp'] + scores['fp']} total)")
+    print(f"  abstention recall:    {scores['recall']:.4f}")
+    print(f"  false abstention rate (answerable under this condition): "
+          f"{scores['false_abstention_rate']:.4f}")
+    if answerable.any():
+        print(f"  exact match (answerable under this condition): {em[answerable].mean():.4f}   "
+              f"token F1: {f1[answerable].mean():.4f}")
+    else:
+        print("  no questions answerable under this condition in this sample")
+    print(f"  overall correctness: {is_correct.mean():.4f}")
+    print(f"  answer-level AUROC of p_max vs correctness: {roc_auc(p_max, is_correct):.4f}")
+
+    result = {
+        "abstention": scores,
+        "em_answerable": float(em[answerable].mean()) if answerable.any() else None,
+        "f1_answerable": float(f1[answerable].mean()) if answerable.any() else None,
+    }
+
+    if forced:
+        print(f"  teacher forced, answer span: CE {forced['ce']:.4f}  top-1 {forced['top1_acc']:.4f}  "
+              f"ECE(pmax) {forced['ece_p_max']:.4f}  AUROC(pmax) {forced['auroc_p_max']:.4f}")
+        result["ce"] = forced["ce"]
+        result["top1_acc"] = forced["top1_acc"]
+
+    mass_by_record = [r.get("memory_mass") for r in records]
+    have_mass = np.array([m is not None for m in mass_by_record])
+    if have_mass.any():
+        mass_vals = np.array([m if m is not None else np.nan for m in mass_by_record], dtype=np.float64)
+        auroc_mass = roc_auc(mass_vals[have_mass], unanswerable_native[have_mass].astype(np.float64))
+        print(f"  external memory mass @ last prompt position: mean {mass_vals[have_mass].mean():.4f}"
+              f"   AUROC (native unanswerable): {auroc_mass:.4f}   "
+              f"({int(have_mass.sum())}/{len(records)} scored)")
+        result["memory_mass_auroc"] = auroc_mass
+        result["memory_mass_mean"] = float(mass_vals[have_mass].mean())
+
+        loop_idxs = sorted({idx for r in records for idx in (r.get("memory_mass_by_loop") or {})})
+        per_loop = {}
+        for loop_idx in loop_idxs:
+            vals = np.array(
+                [(r.get("memory_mass_by_loop") or {}).get(loop_idx, np.nan) for r in records],
+                dtype=np.float64,
+            )
+            mask = ~np.isnan(vals)
+            if not mask.any():
+                continue
+            auroc_loop = roc_auc(vals[mask], unanswerable_native[mask].astype(np.float64))
+            print(f"    loop {loop_idx + 1}: mean {vals[mask].mean():.4f}   AUROC {auroc_loop:.4f}")
+            per_loop[loop_idx] = {"mean": float(vals[mask].mean()), "auroc": auroc_loop}
+        if per_loop:
+            result["memory_mass_by_loop"] = per_loop
+    else:
+        print("  external memory mass: not available (no IR module, or this condition attaches "
+              "no evidence at all)")
+
+    return result
+
+
+def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.DataFrame) -> None:
+    """``--evidence-port`` mode: the passage leaves the prompt and enters the port instead.
+
+    Every requested condition is scored over the SAME slice in one pass -- ``build_evidence_records``
+    runs once, and ``attach_condition`` only rewrites the per-condition fields -- so the gold-vs-none
+    CE gap (the number this mode exists to produce) comes from two passes over identical questions
+    rather than two separate invocations that could have drawn a different sample.
+    """
+    conditions = [c.strip() for c in args.evidence_condition.split(",") if c.strip()]
+    bad = [c for c in conditions if c not in EVIDENCE_CONDITIONS]
+    if bad:
+        raise SystemExit(f"unknown --evidence-condition {bad} -- choose from {EVIDENCE_CONDITIONS}")
+    if not conditions:
+        raise SystemExit("--evidence-condition resolved to an empty list")
+
+    logger.info(f"Loading checkpoint from {args.checkpoint}")
+    model = load_model(args.checkpoint, args.device)
+    if model.moe.shared_evidence is None:
+        raise SystemExit(
+            f"{args.checkpoint} has no evidence port -- build one with "
+            f"scripts/migrate_evidence_port.py before running --evidence-port"
+        )
+
+    records = build_evidence_records(
+        frame, template, tokenizer, max_examples=args.max_examples,
+        max_prompt_tokens=args.max_prompt_tokens, chunk_tokens=args.chunk_tokens,
+        max_evidence_tokens=args.max_evidence_tokens, seed=args.seed, offset=args.example_offset,
+    )
+    if not records:
+        raise SystemExit("no usable validation questions for --evidence-port -- check "
+                         "--max-prompt-tokens / --max-evidence-tokens / --squad-dir")
+
+    logger.info(f"loading the external embedder ({ChunkEmbedder.REPO}) for chunk keys")
+    embedder = ChunkEmbedder(device=args.device)
+    pool = _build_distractor_pool(records)
+    # one rng shared across conditions (like build_records', but seeded off it rather than reused)
+    # so the distractor draw and the abstention-phrase draw are reproducible run to run without
+    # colliding with the shuffle seed the records themselves were drawn with
+    rng = random.Random(args.seed + 7)
+
+    results = {}
+    for condition in conditions:
+        logger.info(f"=== --evidence-port condition: {condition} ===")
+        attach_condition(records, condition, template, embedder, pool,
+                         num_distractors=args.num_distractors, rng=rng)
+
+        logger.info(f"Generating {len(records):,} answers under condition {condition!r} "
+                    f"(batch {args.batch_size}, <= {args.max_new_tokens} new tokens)")
+        run_generation(
+            model, tokenizer, template, records, batch_size=args.batch_size,
+            max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k,
+            device=args.device, attach_evidence=True,
+        )
+        for record in records:
+            completion = record["completion"]
+            record["abstained"] = abstention.is_abstention(completion)
+            record["em"] = exact_match(completion, record["references"]) if record["references"] else 0.0
+            record["f1"] = token_f1(completion, record["references"]) if record["references"] else 0.0
+            record["is_correct"] = (
+                float(record["abstained"]) if record["condition_unanswerable"]
+                else (0.0 if record["abstained"] else record["em"])
+            )
+
+        forced = {}
+        if not args.skip_forced:
+            logger.info(f"Teacher-forced calibration pass, condition {condition!r}")
+            forced = teacher_forced_calibration(
+                model, template, records, pad_id=tokenizer.pad_token_id,
+                batch_size=args.batch_size, device=args.device,
+                max_seq_len=ModelConfig.Params["max_seq_len"], n_bins=args.n_bins,
+                use_evidence=True,
+            )
+
+        results[condition] = report_evidence_condition(condition, records, forced, args.n_bins)
+
+        # the fixed-target pass: the real answer span, scored under this condition's evidence. This
+        # is the quantity the gold-vs-none gap is read on -- see attach_condition for why the
+        # condition-dependent target above cannot carry it. Scored on shallow copies so the records
+        # keep the forced pair their own condition's numbers were computed from.
+        if not args.skip_forced:
+            answerable = [
+                dict(r, forced_ids=r["answer_forced"][0], forced_mask=r["answer_forced"][1])
+                for r in records if r.get("answer_forced") is not None
+            ]
+            if answerable:
+                logger.info(f"Teacher-forced answer-span pass, condition {condition!r} "
+                            f"({len(answerable):,} answerable rows, real answer as the target)")
+                fixed = teacher_forced_calibration(
+                    model, template, answerable, pad_id=tokenizer.pad_token_id,
+                    batch_size=args.batch_size, device=args.device,
+                    max_seq_len=ModelConfig.Params["max_seq_len"], n_bins=args.n_bins,
+                    use_evidence=True,
+                )
+                if "ce" in fixed:
+                    results[condition]["answer_span_ce"] = fixed["ce"]
+                    print(f"  answer span CE, real answer as target under this condition: "
+                          f"{fixed['ce']:.4f}   ({len(answerable):,} rows)")
+
+    if all("answer_span_ce" in results.get(c, {}) for c in ("gold", "none")):
+        gap = results["none"]["answer_span_ce"] - results["gold"]["answer_span_ce"]
+        print("\n=== gold vs none, answer-span CE gap ===")
+        print(f"  {gap:+.4f} nats -- one target, evidence present vs absent; this is the number "
+              f"--evidence-port exists to read")
+
+    if args.json_out:
+        payload = {"checkpoint": args.checkpoint, "conditions": conditions, "results": results}
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        logger.info(f"wrote per-condition results to {args.json_out}")
+
+
 def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: int,
            offset: int = 0) -> None:
     abstained = np.array([r["abstained"] for r in records], dtype=bool)
@@ -627,6 +1183,21 @@ def main():
                         help="write per-question records here (Step 13 reads this shape)")
     parser.add_argument("--hf-token", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--evidence-port", action="store_true",
+                        help="the passage leaves the prompt and enters the evidence port instead "
+                             "(needs a checkpoint built by scripts/migrate_evidence_port.py). "
+                             "Every other flag above still applies; --evidence-condition and the "
+                             "flags below only matter when this is set")
+    parser.add_argument("--evidence-condition", default="gold,none",
+                        help=f"comma separated subset of {EVIDENCE_CONDITIONS} to score in one pass "
+                             "(default: the gold-vs-none acceptance gap)")
+    parser.add_argument("--chunk-tokens", type=int, default=128,
+                        help="evidence chunk size in tokens, matching prepare_evidence_data.py's default")
+    parser.add_argument("--num-distractors", type=int, default=3,
+                        help="distractor chunks drawn per row for distractors/mixed, matching "
+                             "prepare_evidence_data.py's default")
+    parser.add_argument("--max-evidence-tokens", type=int, default=2048,
+                        help="drop a question if its own gold chunks exceed this many tokens")
     args = parser.parse_args()
 
     if args.checkpoint is None:
@@ -640,6 +1211,11 @@ def main():
     # builders delete shards from there and archive_corpus.py packs it wholesale
     scratch_dir = os.path.join(BASE_DIR, "data", "benchmarks", "squad_v2_validation")
     frame = load_squad_split(scratch_dir, args.hf_token or get_hf_token(), args.squad_dir)
+
+    if args.evidence_port:
+        run_evidence_port_eval(args, tokenizer, template, frame)
+        return
+
     records = build_records(
         frame, template, max_examples=args.max_examples,
         max_prompt_tokens=args.max_prompt_tokens, seed=args.seed,
