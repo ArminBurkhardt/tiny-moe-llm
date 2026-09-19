@@ -1,11 +1,11 @@
-"""Build the evidence-conditioned corpus: four conditions plus replay.
+"""Build the evidence-conditioned corpus: five conditions plus replay.
 
 The trick this corpus exists to exploit is that **relevance can be known before any retriever
 exists**. For QA the gold passage ships with the dataset; for web text a held-out span of the same
 document is relevant by construction. So the port can be trained against an oracle retriever now,
 and Phase 5 only has to replace the oracle with a real index later.
 
-What makes it four conditions rather than one is a measurement, not thoroughness. The in-context
+What makes it several conditions rather than one is a measurement, not thoroughness. The in-context
 ceiling probe (``docs/measurements/evidence_ceiling.md``) found that handing this model a passage
 from *another question* costs **0.628 nats more than handing it no passage at all** -- it reads
 whatever it is given, uncritically, and is slightly more confident while doing it. A port trained
@@ -16,8 +16,13 @@ handed it something irrelevant, which is what a real retriever mostly does.
 |---|---|---|
 | ``gold`` | the relevant chunk(s) | the real answer |
 | ``mixed`` | gold shuffled among distractors | the real answer -- select, then read |
+| ``many`` | gold shuffled among 16-32 distractors | the real answer -- select at eval-scale buffers |
 | ``distractors`` | distractors only | abstain: the answer is not in the buffer |
 | ``none`` | nothing at all | abstain: grounded in retrieval, not memorized |
+
+``many`` exists because ``mixed``'s few distractors never come close to the buffer sizes the later
+retrieval evals run at -- it is QA-only (drawn from ``QA_CONDITIONS``, not the web text mix), so the
+selector sees a large buffer somewhere in training rather than only at eval time.
 
 A natively unanswerable SQuAD v2 row is a fifth case that falls out free and is the hardest one:
 its passage is gold-*shaped* (right topic, retrieved for the right reason) and still does not
@@ -36,14 +41,18 @@ in-context attention, which already works, and leave the port untrained.
 
 ### On-disk format
 
-Five files beyond the usual ``{split}.{bin,idx,mask}`` triple, all indexed by the same document
-number so a row and its evidence cannot drift apart:
+Seven files beyond the usual ``{split}.{bin,idx,mask}`` triple. The first five are indexed by the
+same document number (or, for the two chunk-level ones, the same chunk axis) so a row and its
+evidence cannot drift apart; the last two add a document-level and a chunk-level label to that same
+pair of axes:
 
     {split}.ev        uint16   evidence token stream
     {split}.evidx     uint64   per document offsets into .ev (doc_count + 1 entries)
     {split}.evchunk   uint16   per evidence token, its chunk index WITHIN that document
     {split}.evkey     float16  [total chunks, 384] external embedder vectors, flat
     {split}.evkeyidx  uint64   per document offsets into the chunk axis (doc_count + 1 entries)
+    {split}.evgold    uint8    per chunk (same axis as .evkey/.evkeyidx): 1 = gold, 0 = distractor
+    {split}.cond      uint8    per document (same axis as .idx/.evidx): index into CONDITIONS
 
 A document with no evidence writes nothing and leaves both offsets equal to the previous entry.
 That is a genuinely empty evidence segment at train time, which flash answers with exact zeros --
@@ -53,6 +62,13 @@ Distractor chunks are written per occurrence rather than referenced, so a chunk 
 distractor by five documents costs five copies of its 384 floats. Deduplicating would need a global
 chunk table and a second level of indirection; at ~0.8 KB a copy the duplication is cheaper than the
 machinery, and it keeps a document's evidence contiguous on disk.
+
+``evgold`` exists because ``apply_condition`` shuffles the gold chunk(s) into the distractors for
+``mixed``/``many`` and, by design, forgets which one it was -- a selection loss needs the label back,
+and it has to live on the chunk axis because the mix itself is what makes selection a real task.
+``cond`` exists so validation loss (and any other per-row statistic) can be split by condition without
+re-deriving it from the evidence buffer's shape, which is ambiguous for a row where the draw happened
+to produce an empty or gold-only buffer under more than one condition.
 
 ### Token accounting
 
@@ -87,12 +103,14 @@ from huggingface_hub import HfApi, hf_hub_download
 
 from modules.data import abstention
 from modules.data.chat import ChatTemplate
-from scripts.prepare_data import load_state, save_state_atomic
-from scripts.prepare_sft_data import SQUAD_INSTRUCTION, is_unanswerable_squad
+from scripts.prepare_data import doc_hash, load_state, render_pretrain_chat, save_state_atomic
+from scripts.prepare_sft_data import is_unanswerable_squad
 from utils import BASE_DIR, TOKENIZER_DIR, get_hf_token, logger
 
+MANIFEST_PATH = os.path.join(BASE_DIR, "manifest.json")
+
 EMBED_DIM = 384          # bge-small-en-v1.5, which is also ir_dim -- see the adapters in moe.py
-CONDITIONS = ("gold", "mixed", "distractors", "none")
+CONDITIONS = ("gold", "mixed", "many", "distractors", "none")
 
 
 @dataclass
@@ -131,22 +149,27 @@ class EvidenceSource:
     file_prefix: str = ""
     file_suffix: tuple = (".parquet",)
     render: str = ""
-    # conditions this source draws from, and their relative frequency. QA sources carry all four;
+    # conditions this source draws from, and their relative frequency. QA sources carry all five;
     # replay carries none at all and is the >=20% of the corpus that protects the trunk.
     condition_weights: dict = field(default_factory=dict)
     local_bin: str = ""              # web text reads the prepared corpus instead of the Hub
     qa: bool = False
+    holdout: bool = False            # check each row against the pretraining holdout hashes
 
 
 # Condition mix. ``mixed`` is the largest share because it is the only condition that matches what a
 # real retriever delivers -- the others are its endpoints. ``distractors`` and ``none`` together take
 # a third, which is what has to carry the abstention policy: Phase 2 established that no data ratio
 # of in-prompt refusals moves discrimination, so these two are the replacement lever and a token
-# share that made them a rounding error would be testing nothing.
-QA_CONDITIONS = {"gold": 0.25, "mixed": 0.40, "distractors": 0.20, "none": 0.15}
+# share that made them a rounding error would be testing nothing. ``many`` is carved out of
+# ``mixed``/``distractors`` rather than added on top, so the four endpoints still sum to 1.0 -- it
+# exists to put a buffer size near what the retrieval evals run at somewhere in training, not to
+# change how much of the corpus is gold/abstain.
+QA_CONDITIONS = {"gold": 0.25, "mixed": 0.36, "many": 0.08, "distractors": 0.16, "none": 0.15}
 # web text has no abstention target, so ``none`` is pure replay-with-a-question-shape and earns
 # less; the distractor share is higher because "irrelevant evidence must not cost anything" is the
-# lesson this source exists to teach at scale.
+# lesson this source exists to teach at scale. No ``many`` entry -- the large-buffer condition is
+# QA-only, where a real answer/abstain target makes "select among many" a task worth training.
 LM_CONDITIONS = {"gold": 0.40, "mixed": 0.30, "distractors": 0.20, "none": 0.10}
 
 SOURCES = [
@@ -158,8 +181,10 @@ SOURCES = [
                    local_bin="ir"),
     # >=20% replay, no evidence attached at all. With no corpus attached the forward pass is
     # bit-identical to the model before the port existed, so these tokens genuinely protect the
-    # trunk rather than quietly training the port on general chat.
-    EvidenceSource("smoltalk2", 0.12, "HuggingFaceTB/smoltalk2", "SFT/", render="messages"),
+    # trunk rather than quietly training the port on general chat. smoltalk2 alone carries the
+    # holdout check: it is the one replay source phase-2 pretraining also drew from.
+    EvidenceSource("smoltalk2", 0.12, "HuggingFaceTB/smoltalk2", "SFT/", render="messages",
+                   holdout=True),
     EvidenceSource("ultrachat", 0.08, "HuggingFaceH4/ultrachat_200k", "data/train_sft",
                    render="messages"),
     EvidenceSource("no_robots", 0.05, "HuggingFaceH4/no_robots", "data/train", render="messages"),
@@ -175,15 +200,25 @@ FILE_FILTERS = {"smoltalk2": _no_think_sft_split}
 
 # --------------------------------------------------------------------------------------- rendering
 
+# SQUAD_INSTRUCTION says "using only the passage below", which is simply false here -- there is no
+# passage below, it arrives through the evidence port instead. Not edited in place: eval_abstention.py
+# forces that exact string as a teacher forced reference, and its CE has to stay comparable across
+# every checkpoint it scores, so the shared constant has to keep saying what it has always said. This
+# is the same instruction otherwise, so abstention is licensed the same way.
+EVIDENCE_SQUAD_INSTRUCTION = (
+    "Answer the question using only the passage attached as retrieved evidence. If the evidence "
+    "does not contain the answer, say so."
+)
+
+
 def evidence_prompt(question: str) -> str:
     """The user turn: instruction and question, no passage.
 
-    ``SQUAD_INSTRUCTION`` is imported rather than restated for the reason every other script in this
-    repo imports it -- the instruction is what licenses abstention at all, and a copy that drifted by
-    a word would train the model on a prompt the evals never send it. The passage block is simply
-    absent; the evidence arrives through the port instead.
+    Uses ``EVIDENCE_SQUAD_INSTRUCTION`` rather than the shared ``SQUAD_INSTRUCTION`` -- see the
+    comment above it. The passage block is simply absent; the evidence arrives through the port
+    instead.
     """
-    return f"{SQUAD_INSTRUCTION}\n\nQuestion: {question}"
+    return f"{EVIDENCE_SQUAD_INSTRUCTION}\n\nQuestion: {question}"
 
 
 def render_squad_row(row: dict) -> Optional[EvidenceRow]:
@@ -258,6 +293,7 @@ def render_messages_row(row: dict) -> Optional[List[dict]]:
 
 
 def split_webtext_document(ids: Sequence[int], rng: random.Random, chunk_tokens: int,
+                           max_doc_tokens: int, held_tokens: int = 384,
                            min_tokens: int = 384) -> Optional[Tuple[List[int], List[int], List[List[int]]]]:
     """One document -> (prefix, supervised continuation, held-out evidence chunks).
 
@@ -267,16 +303,42 @@ def split_webtext_document(ids: Sequence[int], rng: random.Random, chunk_tokens:
     something already visible. Placing the held-out span BETWEEN the two, rather than at the tail,
     is what makes it relevant: it is the text the continuation immediately follows from.
 
-    Returns None for a document too short to cut three ways.
+    The held span is a FIXED token count (``held_tokens``), not a fraction of the document -- a
+    percentage span grows without bound on a long document, and it is exactly the long tail where the
+    port needs to carry content the prompt can no longer hold. For a document long enough that
+    prefix+continuation would still overflow ``max_doc_tokens`` even with a small fixed span, a
+    bounded WINDOW is taken instead of the whole document -- a slice of the prefix ENDING at the held
+    span, and a slice of the continuation starting right after it -- so the long tail survives as a
+    shorter row instead of being dropped outright.
+
+    Returns None for a document too short to cut three ways, or one the windowing leaves with no
+    usable continuation.
     """
     n = len(ids)
     if n < min_tokens:
         return None
-    a = int(n * 0.25)
-    b = a + max(chunk_tokens, int(n * 0.25))
-    if b >= n - 32:
+    held_len = min(held_tokens, max(16, n - 64))
+    if held_len < 16:
         return None
-    prefix, held, cont = list(ids[:a]), list(ids[a:b]), list(ids[b:])
+    a = int(n * 0.25)
+    b = a + held_len
+    if b > n - 32:
+        # push the span left so at least 32 tokens of continuation remain after it
+        b = n - 32
+        a = b - held_len
+        if a < 0:
+            return None
+
+    # prefix + continuation is the prompt (plus one BOS the caller prepends by hand); a long
+    # document can overflow the cap even with a small fixed span, so window it down rather than
+    # drop it -- most of the budget goes to the continuation, since that is the supervised half and
+    # the reason the row exists, with only a quarter reserved for prefix context
+    budget = max(0, max_doc_tokens - 1)
+    prefix_len = min(a, budget // 4)
+    cont_len = min(n - b, budget - prefix_len)
+    if cont_len < 32:
+        return None
+    prefix, held, cont = list(ids[a - prefix_len:a]), list(ids[a:b]), list(ids[b:b + cont_len])
     chunks = [held[i:i + chunk_tokens] for i in range(0, len(held), chunk_tokens)]
     chunks = [c for c in chunks if len(c) >= 16]
     if not chunks:
@@ -342,17 +404,20 @@ class ChunkEmbedder:
 
 # ---------------------------------------------------------------------------------------- the writer
 
-EVIDENCE_SUFFIXES = ("bin", "idx", "mask", "ev", "evidx", "evchunk", "evkey", "evkeyidx")
+EVIDENCE_SUFFIXES = ("bin", "idx", "mask", "ev", "evidx", "evchunk", "evkey", "evkeyidx",
+                     "evgold", "cond")
 
 
 def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
-    """Drop bytes past the last confirmed checkpoint, in all eight files at once.
+    """Drop bytes past the last confirmed checkpoint, in all ten files at once.
 
-    They are indexed by the same document number, so they have to be trimmed together or a resume
-    would pair document *i*'s prompt with document *i+1*'s evidence -- which is not an error any
-    length check catches, because both files would still be self-consistent.
+    They are indexed by the same document number (or the same chunk axis for the two chunk-level
+    files), so they have to be trimmed together or a resume would pair document *i*'s prompt with
+    document *i+1*'s evidence -- which is not an error any length check catches, because both files
+    would still be self-consistent.
     """
     docs = split_state.get("doc_count", 0)
+    chunks = split_state.get("chunks_written", 0)
     targets = {
         "bin": split_state.get("tokens_written", 0) * 2,
         "idx": (docs + 1) * 8,
@@ -360,8 +425,10 @@ def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
         "ev": split_state.get("ev_tokens", 0) * 2,
         "evidx": (docs + 1) * 8,
         "evchunk": split_state.get("ev_tokens", 0) * 2,
-        "evkey": split_state.get("chunks_written", 0) * EMBED_DIM * 2,
+        "evkey": chunks * EMBED_DIM * 2,
         "evkeyidx": (docs + 1) * 8,
+        "evgold": chunks,
+        "cond": docs,
     }
     for suffix, target in targets.items():
         path = os.path.join(data_dir, f"{split}.{suffix}")
@@ -373,7 +440,7 @@ def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
 
 
 class EvidenceWriter:
-    """Append-only writer for one split's eight files."""
+    """Append-only writer for one split's ten files."""
 
     def __init__(self, data_dir: str, split: str, state: dict):
         self.split = split
@@ -386,23 +453,28 @@ class EvidenceWriter:
             for suffix in EVIDENCE_SUFFIXES
         }
         # the three offset files each carry a leading 0 so a document's span is always
-        # offsets[i]..offsets[i+1], with no special case for document 0
+        # offsets[i]..offsets[i+1], with no special case for document 0. evgold/cond need no
+        # leading entry -- they hold one value per chunk/document directly, not an offset pair
         for suffix in ("idx", "evidx", "evkeyidx"):
             if os.path.getsize(os.path.join(data_dir, f"{split}.{suffix}")) == 0:
                 self.files[suffix].write(np.array([0], dtype=np.uint64).tobytes())
                 self.files[suffix].flush()
 
-    def write(self, ids: Sequence[int], mask: Sequence[int],
-              ev_ids: Sequence[int], ev_chunk: Sequence[int], keys: np.ndarray) -> None:
+    def write(self, ids: Sequence[int], mask: Sequence[int], ev_ids: Sequence[int],
+              ev_chunk: Sequence[int], keys: np.ndarray, ev_gold: Sequence[int],
+              condition_idx: int) -> None:
         assert len(ids) == len(mask), "prompt ids and mask disagree"
         assert len(ev_ids) == len(ev_chunk), "evidence ids and chunk ids disagree"
         assert keys.shape[0] == 0 or keys.shape[1] == EMBED_DIM, f"bad key width {keys.shape}"
+        assert keys.shape[0] == len(ev_gold), "chunk keys and gold flags disagree"
 
         self.files["bin"].write(np.asarray(ids, dtype=np.uint16).tobytes())
         self.files["mask"].write(np.asarray(mask, dtype=np.uint8).tobytes())
         self.files["ev"].write(np.asarray(ev_ids, dtype=np.uint16).tobytes())
         self.files["evchunk"].write(np.asarray(ev_chunk, dtype=np.uint16).tobytes())
         self.files["evkey"].write(np.asarray(keys, dtype=np.float16).tobytes())
+        self.files["evgold"].write(np.asarray(ev_gold, dtype=np.uint8).tobytes())
+        self.files["cond"].write(np.asarray([condition_idx], dtype=np.uint8).tobytes())
 
         self.state["tokens_written"] += len(ids)
         self.state["ev_tokens"] += len(ev_ids)
@@ -424,15 +496,31 @@ class EvidenceWriter:
 
 # ------------------------------------------------------------------------------------ condition mix
 
-def apply_condition(row: EvidenceRow, condition: str, reservoir: deque,
-                    rng: random.Random, num_distractors: int) -> Tuple[List[str], str]:
-    """Turn one row plus a condition into ``(chunk texts, target answer)``.
+def _shuffle_paired(chunks: List[str], gold_flags: List[bool],
+                    rng: random.Random) -> Tuple[List[str], List[bool]]:
+    """Shuffle chunk texts and their gold flags together, so the flag still names the right chunk."""
+    if not chunks:
+        return [], []
+    paired = list(zip(chunks, gold_flags))
+    rng.shuffle(paired)
+    shuffled_chunks, shuffled_flags = zip(*paired)
+    return list(shuffled_chunks), list(shuffled_flags)
+
+
+def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: random.Random,
+                    num_distractors: int,
+                    many_distractors: Tuple[int, int] = (16, 32)) -> Tuple[List[str], List[bool], str]:
+    """Turn one row plus a condition into ``(chunk texts, per-chunk gold flags, target answer)``.
 
     The abstention targets are the load-bearing part. Under ``distractors`` and ``none`` the answer
     is replaced even for a row whose answer is perfectly well known -- that is the point: the model
     must learn that answerability is a property of *the buffer*, not of the question. A corpus that
     kept the real answer whenever it happened to know it would teach exactly the memorization Phase 2
     proved cannot be fixed by ratios.
+
+    The gold flags are returned alongside the (possibly shuffled) chunks rather than left for the
+    caller to re-derive, because ``mixed``/``many`` shuffle gold in among the distractors and forget
+    which one it was -- the flag is the only place that distinction survives.
     """
     unanswerable = not row.answer
 
@@ -446,24 +534,34 @@ def apply_condition(row: EvidenceRow, condition: str, reservoir: deque,
         return picked
 
     if condition == "gold":
-        chunks = list(row.gold)
+        chunks, gold_flags = list(row.gold), [True] * len(row.gold)
     elif condition == "mixed":
-        chunks = list(row.gold) + distractors(num_distractors)
-        rng.shuffle(chunks)
+        gold, distract = list(row.gold), distractors(num_distractors)
+        chunks, gold_flags = _shuffle_paired(
+            gold + distract, [True] * len(gold) + [False] * len(distract), rng,
+        )
+    elif condition == "many":
+        # same shape as `mixed`, at the buffer sizes the retrieval evals actually run at
+        k = rng.randint(*many_distractors)
+        gold, distract = list(row.gold), distractors(k)
+        chunks, gold_flags = _shuffle_paired(
+            gold + distract, [True] * len(gold) + [False] * len(distract), rng,
+        )
     elif condition == "distractors":
         chunks = distractors(max(1, num_distractors))
+        gold_flags = [False] * len(chunks)
     else:
-        chunks = []
+        chunks, gold_flags = [], []
 
     if row.lm:
         # no abstention target exists for language modeling: the continuation is the continuation
         # whether or not the buffer helps. What the unanswerable conditions teach here is that
         # unusable evidence must not COST anything, which is the finding the ceiling probe made.
-        return chunks, row.answer
+        return chunks, gold_flags, row.answer
 
     if condition in ("distractors", "none") or unanswerable:
-        return chunks, abstention.pick(abstention.ABSTENTIONS_PASSAGE_TRAIN, rng)
-    return chunks, row.answer
+        return chunks, gold_flags, abstention.pick(abstention.ABSTENTIONS_PASSAGE_TRAIN, rng)
+    return chunks, gold_flags, row.answer
 
 
 def pick_condition(weights: dict, rng: random.Random) -> str:
@@ -535,13 +633,16 @@ def build_corpus(
     max_doc_tokens: int = 4094,
     max_evidence_tokens: int = 1536,
     num_distractors: int = 3,
+    many_distractors: Tuple[int, int] = (16, 32),
     chunk_tokens: int = 128,
+    webtext_held_tokens: int = 384,
     reservoir_size: int = 4096,
     render_batch: int = 512,
     val_fraction: float = 0.01,
     seed: int = 42,
     checkpoint_docs: int = 2000,
     split_prefix: str = "evidence",
+    holdout_hashes: Optional[set] = None,
 ) -> dict:
     """Interleave sources, apply conditions, embed chunks, write both splits.
 
@@ -549,7 +650,8 @@ def build_corpus(
     ``prepare_sft_data.build_corpus`` and ``prepare_data.run_phase`` are.
 
     Args:
-        source_entries: ``[{"key", "weight", "render", "condition_weights", "row_factory"}]``.
+        source_entries: ``[{"key", "weight", "render", "condition_weights", "row_factory",
+            "holdout"}]``.
         target_tokens: PROMPT tokens across both splits. Evidence tokens are counted separately.
         embedder: supplies the chunk vectors; any object with ``.encode(list[str]) -> [N, 384]``.
         max_evidence_tokens: rows whose evidence exceeds this are dropped rather than truncated --
@@ -557,13 +659,19 @@ def build_corpus(
             mislabel the condition rather than shorten it.
         num_distractors: how many distractors ``mixed`` and ``distractors`` draw when the row does
             not ship its own.
+        many_distractors: ``(min, max)`` distractor count sampled per row for the ``many`` condition.
+        webtext_held_tokens: fixed size of the span a web text document gives up as evidence (see
+            ``split_webtext_document``), rather than a fraction of the document.
         render_batch: rows rendered before the tokenizer and the external embedder are called. Both
             are near flat in batch size and were the whole cost at one row per call.
+        holdout_hashes: pretraining conversation hashes to exclude from sources marked
+            ``entry["holdout"]`` (smoltalk2 only, currently) -- see ``main``'s manifest check.
 
     Returns:
         The final resume state, with per-source realized counts and per-condition document counts.
     """
     train_split, val_split = f"{split_prefix}_train", f"{split_prefix}_val"
+    holdout_hashes = holdout_hashes or set()
     state = load_state(state_path)
     state.setdefault("sources", {})
     state.setdefault("splits", {})
@@ -576,7 +684,9 @@ def build_corpus(
             entry["key"], {"file_idx": 0, "row_idx": 0, "tokens": 0, "ev_tokens": 0,
                            "docs": 0, "done": False},
         )
-        state["skipped"].setdefault(entry["key"], {"too_long": 0, "unrenderable": 0, "no_evidence": 0})
+        state["skipped"].setdefault(
+            entry["key"], {"too_long": 0, "unrenderable": 0, "no_evidence": 0, "holdout": 0},
+        )
 
     writers = {s: EvidenceWriter(data_dir, s, state["splits"][s]) for s in (train_split, val_split)}
     split_rng = random.Random(seed)
@@ -651,7 +761,9 @@ def build_corpus(
 
             rendered = _render_row(
                 raw, slot["entry"], template, state, reservoirs[pick], cond_rng, chunk_rng,
-                num_distractors=num_distractors, chunk_tokens=chunk_tokens,
+                num_distractors=num_distractors, many_distractors=many_distractors,
+                chunk_tokens=chunk_tokens, max_doc_tokens=max_doc_tokens,
+                webtext_held_tokens=webtext_held_tokens, holdout_hashes=holdout_hashes,
             )
             if rendered is not None:
                 rendered["source"] = pick
@@ -669,7 +781,8 @@ def build_corpus(
                 continue
             split = val_split if split_rng.random() < val_fraction else train_split
             writers[split].write(rendered["ids"], rendered["mask"], rendered["ev_ids"],
-                                 rendered["ev_chunk"], rendered["keys"])
+                                 rendered["ev_chunk"], rendered["keys"], rendered["ev_gold"],
+                                 CONDITIONS.index(rendered["condition"]))
             source_state = state["sources"][rendered["source"]]
             source_state["tokens"] += len(rendered["ids"])
             source_state["ev_tokens"] += len(rendered["ev_ids"])
@@ -701,7 +814,8 @@ def build_corpus(
 
 
 def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
-                num_distractors, chunk_tokens):
+                num_distractors, many_distractors, chunk_tokens, max_doc_tokens,
+                webtext_held_tokens, holdout_hashes):
     """One raw row -> a pending record, or None if it is unusable.
 
     Everything that has to happen **in row order** lives here: the condition draw, and the distractor
@@ -716,12 +830,21 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
         if conversation is None:
             state["skipped"][key]["unrenderable"] += 1
             return None
-        return {"conversation": conversation, "chunks": [], "condition": "none", "key": key}
+        if entry.get("holdout") and holdout_hashes:
+            # reproduces prepare_data.py's holdout hash byte for byte (import, not reimplement),
+            # so a conversation phase-2 pretraining already saw does not also leak into replay
+            msgs = raw.get("messages")
+            if msgs is not None and doc_hash(render_pretrain_chat(msgs)) in holdout_hashes:
+                state["skipped"][key]["holdout"] += 1
+                return None
+        return {"conversation": conversation, "chunks": [], "gold_flags": [],
+                "condition": "none", "key": key}
 
     condition = pick_condition(entry["condition_weights"], cond_rng)
 
     if render == "webtext":
-        pieces = split_webtext_document(raw, chunk_rng, chunk_tokens)
+        pieces = split_webtext_document(raw, chunk_rng, chunk_tokens, max_doc_tokens,
+                                        held_tokens=webtext_held_tokens)
         if pieces is None:
             state["skipped"][key]["unrenderable"] += 1
             return None
@@ -731,18 +854,21 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
         ids = [template.bos_id] + prefix + cont
         mask = [0] * (len(prefix) + 1) + [1] * len(cont)
         gold_texts = [template.tokenizer.decode(c, skip_special_tokens=True) for c in held]
-        chunk_texts, _ = apply_condition(
-            EvidenceRow(gold=gold_texts, lm=True), condition, reservoir, cond_rng, num_distractors
+        chunk_texts, gold_flags, _ = apply_condition(
+            EvidenceRow(gold=gold_texts, lm=True), condition, reservoir, cond_rng, num_distractors,
+            many_distractors=many_distractors,
         )
         reservoir.extend(gold_texts)
-        record = {"conversation": None, "ids": ids, "mask": mask,
-                  "chunks": chunk_texts, "condition": condition, "key": key}
+        record = {"conversation": None, "ids": ids, "mask": mask, "chunks": chunk_texts,
+                  "gold_flags": gold_flags, "condition": condition, "key": key}
     else:
         row = (render_squad_row if render == "squad_v2" else render_hotpot_row)(raw)
         if row is None:
             state["skipped"][key]["unrenderable"] += 1
             return None
-        chunk_texts, answer = apply_condition(row, condition, reservoir, cond_rng, num_distractors)
+        chunk_texts, gold_flags, answer = apply_condition(
+            row, condition, reservoir, cond_rng, num_distractors, many_distractors=many_distractors,
+        )
         reservoir.extend(row.gold)
         reservoir.extend(row.near)
         record = {
@@ -750,7 +876,7 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
                 {"role": "user", "content": evidence_prompt(row.question)},
                 {"role": "assistant", "content": answer},
             ],
-            "chunks": chunk_texts, "condition": condition, "key": key,
+            "chunks": chunk_texts, "gold_flags": gold_flags, "condition": condition, "key": key,
         }
 
     if condition != "none" and not chunk_texts:
@@ -797,13 +923,14 @@ def _encode_batch(renders, template, max_doc_tokens, max_evidence_tokens, state)
         # renumbered as they are kept, so a chunk whose text tokenized to nothing does not leave a
         # hole. A hole would be a chunk the SELECTOR can score and win mass on while the READER has
         # no tokens for it -- the two halves of the port disagreeing about what was retrieved.
-        ev_ids, ev_chunk, kept = [], [], []
-        for text, piece in zip(record["chunks"], pieces[start:end]):
+        ev_ids, ev_chunk, kept, kept_gold = [], [], [], []
+        for text, gold, piece in zip(record["chunks"], record["gold_flags"], pieces[start:end]):
             if not piece:
                 continue
             ev_chunk.extend([len(kept)] * len(piece))
             ev_ids.extend(piece)
             kept.append(text)
+            kept_gold.append(gold)
         if len(ev_ids) > max_evidence_tokens:
             # dropped, never truncated: truncation removes whichever chunk happened to land last,
             # which is the gold one a third of the time under `mixed` -- that mislabels the
@@ -811,7 +938,8 @@ def _encode_batch(renders, template, max_doc_tokens, max_evidence_tokens, state)
             state["skipped"][record["key"]]["too_long"] += 1
             record["dropped"] = True
             continue
-        record["ev_ids"], record["ev_chunk"], record["chunks"] = ev_ids, ev_chunk, kept
+        record["ev_ids"], record["ev_chunk"] = ev_ids, ev_chunk
+        record["chunks"], record["ev_gold"] = kept, kept_gold
 
 
 def _embed_batch(renders, embedder):
@@ -833,6 +961,25 @@ def _embed_batch(renders, embedder):
                           else np.zeros((0, EMBED_DIM), dtype=np.float32))
 
 
+def _shuffled_shard_order(files: List[str], seed: int, source_key: str) -> List[str]:
+    """Reproducibly shuffle a source's sorted shard list, from the seed alone.
+
+    Consuming ``sorted()`` order in file-name order handed the first N shards of a source to
+    whatever happened to be alphabetically first -- for smoltalk2 that is a 64k-context split, so a
+    partial build's kept rows were the shortest conversations of a long-context split rather than a
+    representative sample. Shuffling fixes that, but only if it does not itself introduce a new
+    resume hazard: the resume state records a ``file_idx`` INTO this list, so the order has to be a
+    pure function of ``(seed, source_key)`` and the sorted input -- never of how many shards a prior,
+    interrupted run already consumed -- or a resumed run would silently point ``file_idx`` at a
+    different file than the one it left off on.
+    """
+    digest = hashlib.sha1(f"{source_key}:shard-order".encode("utf-8")).digest()
+    rng = random.Random(seed ^ int.from_bytes(digest[:4], "big"))
+    shuffled = list(files)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build the evidence-conditioned corpus")
     parser.add_argument("--data-dir", default=os.path.join(BASE_DIR, "data", "prepared"))
@@ -842,7 +989,15 @@ def main():
     parser.add_argument("--max-doc-tokens", type=int, default=4094)
     parser.add_argument("--max-evidence-tokens", type=int, default=1536)
     parser.add_argument("--num-distractors", type=int, default=3)
+    parser.add_argument("--many-distractors", type=int, nargs=2, default=[16, 32],
+                        metavar=("MIN", "MAX"),
+                        help="distractor count range sampled per row for the 'many' condition")
     parser.add_argument("--chunk-tokens", type=int, default=128)
+    parser.add_argument("--webtext-held-tokens", type=int, default=384,
+                        help="fixed size of the span a web text document gives up as evidence, "
+                             "clamped to the document (replaces a 25%% held-out fraction, which let "
+                             "a long document's held span -- and the prompt either side of it -- "
+                             "grow without bound)")
     parser.add_argument("--val-fraction", type=float, default=0.01)
     parser.add_argument("--checkpoint-docs", type=int, default=2000)
     parser.add_argument("--render-batch", type=int, default=512,
@@ -854,6 +1009,9 @@ def main():
                         help="which prepared {phase}.bin/.idx the web text arm reads")
     parser.add_argument("--no-webtext", action="store_true",
                         help="skip the web text arm (QA and replay only)")
+    parser.add_argument("--ignore-holdout", action="store_true",
+                        help="build even if manifest.json has no smoltalk2 holdout hashes (unsafe: "
+                             "phase-2 pretraining conversations may leak into the replay arm)")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -864,6 +1022,23 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
     template = ChatTemplate(tokenizer)
     hf_token = get_hf_token()
+
+    # same manifest and hash function prepare_sft_data.py checks the smoltalk2 replay/SFT overlap
+    # against -- imported rather than reimplemented, so a rendering drift can't silently exclude
+    # nothing (see render_pretrain_chat's docstring)
+    manifest = {}
+    if os.path.exists(MANIFEST_PATH):
+        with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    holdout_hashes = set(manifest.get("data_prep", {}).get("smoltalk2_holdout_hashes", []))
+    if not holdout_hashes and not args.ignore_holdout:
+        raise SystemExit(
+            "manifest.json has no data_prep.smoltalk2_holdout_hashes -- pull it from the "
+            "pretraining mirror repo (see scripts/prepare_sft_data.py --pull-manifest; "
+            "manifest.json is gitignored, so a fresh clone never has it), or pass --ignore-holdout "
+            "to build the replay arm without the exclusion."
+        )
+    logger.info(f"smoltalk2 holdout: {len(holdout_hashes):,} conversations excluded")
 
     sources = [s for s in SOURCES if not (args.no_webtext and s.render == "webtext")]
     hf_api = HfApi(token=hf_token)
@@ -887,11 +1062,17 @@ def main():
             )
             if not all_files:
                 raise RuntimeError(f"no files matched {spec.key} under {spec.file_prefix!r}")
+            # shuffled AFTER sorting, not instead of it: sorting first makes the shuffle a pure
+            # function of the file set (independent of whatever order the Hub API happened to list
+            # them in), and the shuffle itself is what stops a partial build from only ever seeing
+            # the alphabetically first shard
+            all_files = _shuffled_shard_order(all_files, args.seed, spec.key)
             logger.info(f"source {spec.key}: {len(all_files)} files (revision {info.sha[:10]})")
             factory = hub_row_factory(spec, all_files, scratch_dir, hf_token, args.seed, info.sha)
         entries.append({
             "key": spec.key, "weight": spec.weight, "render": spec.render,
             "condition_weights": spec.condition_weights, "row_factory": factory, "qa": spec.qa,
+            "holdout": spec.holdout,
         })
 
     total_w = sum(e["weight"] for e in entries)
@@ -907,24 +1088,35 @@ def main():
     final = build_corpus(
         entries, args.target_tokens, template, embedder, args.data_dir, state_path,
         max_doc_tokens=args.max_doc_tokens, max_evidence_tokens=args.max_evidence_tokens,
-        num_distractors=args.num_distractors, chunk_tokens=args.chunk_tokens,
+        num_distractors=args.num_distractors, many_distractors=tuple(args.many_distractors),
+        chunk_tokens=args.chunk_tokens, webtext_held_tokens=args.webtext_held_tokens,
         render_batch=args.render_batch, val_fraction=args.val_fraction, seed=args.seed,
         checkpoint_docs=args.checkpoint_docs, split_prefix=args.split_prefix,
+        holdout_hashes=holdout_hashes,
     )
     elapsed = time.time() - t0
 
     logger.info(f"=== built in {elapsed / 60:.1f} min ===")
+    total_prompt = sum(sp["tokens_written"] for sp in final["splits"].values())
+    total_docs = sum(final["sources"][e["key"]]["docs"] for e in entries)
     replay_tokens = 0
     for e in entries:
         s = final["sources"][e["key"]]
         target = int(args.target_tokens * e["weight"])
+        token_share = s["tokens"] / max(1, total_prompt)
+        # the conversation-count share, not the token share, is what a source actually gets under
+        # per-conversation loss weighting (every row's gradient is 1/its own supervised tokens, so a
+        # source's pull on the model is its share of ROWS, not its share of tokens) -- printing both
+        # next to each other is what makes a token-weighted mix that is a conversation-weighted
+        # trap visible at build time instead of after training
+        conv_share = s["docs"] / max(1, total_docs)
         logger.info(
-            f"  {e['key']}: {s['tokens']:,}/{target:,} prompt tokens, {s['ev_tokens']:,} evidence, "
-            f"{s['docs']:,} docs, skipped {final['skipped'][e['key']]}"
+            f"  {e['key']}: {s['tokens']:,}/{target:,} prompt tokens ({token_share:.1%} of corpus "
+            f"tokens), {s['ev_tokens']:,} evidence, {s['docs']:,} docs ({conv_share:.1%} of corpus "
+            f"conversations), skipped {final['skipped'][e['key']]}"
         )
         if e["render"] == "messages":
             replay_tokens += s["tokens"]
-    total_prompt = sum(sp["tokens_written"] for sp in final["splits"].values())
     logger.info(f"  conditions: {final['conditions']}")
     logger.info(
         f"  replay share: {replay_tokens / max(1, total_prompt):.1%} "
