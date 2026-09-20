@@ -38,14 +38,19 @@ Batches carry, on top of the SFT keys:
     condition_ids       [B, S]         per QUERY token (the packed row, not the evidence axis): which
                                         of prepare_evidence_data.CONDITIONS the token's own
                                         conversation was built under, -1 on row padding
+    answerable_ids      [B, S]         same axis: 1 where the token's conversation has a real answer
+                                        as its target, 0 where it has a refusal, -1 on row padding.
+                                        NOT derivable from condition_ids -- a natively unanswerable
+                                        SQuAD row is built under `gold` and still abstains
 
 A batch in which nothing retrieved anything omits the first five of those (``evidence_ids`` through
 ``chunk_gold``), which is how a pure replay batch takes the bit-identical no-evidence forward rather
-than an all-padding one. ``condition_ids`` does not follow that rule -- it describes the QUERY side,
-which every row has whether or not it retrieved anything (a replay row is condition "none") -- but it
-is corpus wide rather than per batch: a corpus built before ``.evgold``/``.cond`` existed omits both
-``chunk_gold`` and ``condition_ids`` from every batch, never some, and ``EvidenceDataset`` warns once
-at load time rather than failing, so an older corpus keeps training without the labels.
+than an all-padding one. ``condition_ids``/``answerable_ids`` do not follow that rule -- they describe
+the QUERY side, which every row has whether or not it retrieved anything (a replay row is condition
+"none") -- but they are corpus wide rather than per batch: a corpus built before
+``.evgold``/``.cond``/``.ans`` existed omits all three of ``chunk_gold``, ``condition_ids`` and
+``answerable_ids`` from every batch, never some, and ``EvidenceDataset`` warns once at load time
+rather than failing, so an older corpus keeps training without the labels.
 """
 import os
 from typing import Iterator, List
@@ -116,6 +121,7 @@ class EvidenceDataset(SFTDataset):
         self.evkeyidx_path = os.path.join(data_dir, f"{split}.evkeyidx")
         self.evgold_path = os.path.join(data_dir, f"{split}.evgold")
         self.cond_path = os.path.join(data_dir, f"{split}.cond")
+        self.ans_path = os.path.join(data_dir, f"{split}.ans")
         for path in (self.ev_path, self.evidx_path, self.evchunk_path,
                      self.evkey_path, self.evkeyidx_path):
             if not os.path.isfile(path):
@@ -142,30 +148,36 @@ class EvidenceDataset(SFTDataset):
         # crash, or every corpus already on disk stops loading. Exactly one existing is a different
         # failure -- the writer always appends both together, so a mismatch means an interrupted or
         # hand edited build, which deserves the same hard failure the five-file checks above give.
-        gold_exists, cond_exists = os.path.isfile(self.evgold_path), os.path.isfile(self.cond_path)
-        if gold_exists != cond_exists:
+        present = {
+            name: os.path.isfile(path) for name, path in
+            (("evgold", self.evgold_path), ("cond", self.cond_path), ("ans", self.ans_path))
+        }
+        if len(set(present.values())) != 1:
             raise ValueError(
-                f"{split}.evgold and {split}.cond disagree on whether they exist -- the corpus "
-                f"writer always writes both together, so this means an interrupted build"
+                f"{split}.evgold / {split}.cond / {split}.ans disagree on whether they exist "
+                f"({present}) -- the corpus writer always writes all three together, so this means "
+                f"an interrupted build"
             )
-        self.has_condition_labels = gold_exists and cond_exists
+        self.has_condition_labels = all(present.values())
         if self.has_condition_labels:
             if os.path.getsize(self.evgold_path) != n_chunks:
                 raise ValueError(
                     f"{split}.evgold has {os.path.getsize(self.evgold_path):,} entries but "
                     f"{split}.evkey has {n_chunks:,} chunks -- the corpus is out of sync, rebuild it"
                 )
-            if os.path.getsize(self.cond_path) != self.num_docs:
-                raise ValueError(
-                    f"{split}.cond has {os.path.getsize(self.cond_path):,} entries but "
-                    f"{split}.idx has {self.num_docs:,} documents -- the corpus is out of sync, "
-                    f"rebuild it"
-                )
+            for name, path in (("cond", self.cond_path), ("ans", self.ans_path)):
+                if os.path.getsize(path) != self.num_docs:
+                    raise ValueError(
+                        f"{split}.{name} has {os.path.getsize(path):,} entries but "
+                        f"{split}.idx has {self.num_docs:,} documents -- the corpus is out of sync, "
+                        f"rebuild it"
+                    )
         else:
             logger.warning(
-                f"EvidenceDataset[{split}]: no {split}.evgold/{split}.cond -- this corpus predates "
-                f"the gold flag and condition label, so chunk_gold/condition_ids will be omitted "
-                f"from every batch. Rebuild with scripts/prepare_evidence_data.py to get them."
+                f"EvidenceDataset[{split}]: no {split}.evgold/{split}.cond/{split}.ans -- this "
+                f"corpus predates the gold flag, the condition label and the answerability flag, so "
+                f"chunk_gold/condition_ids/answerable_ids will be omitted from every batch. Rebuild "
+                f"with scripts/prepare_evidence_data.py to get them."
             )
 
         logger.info(
@@ -188,6 +200,8 @@ class EvidenceDataset(SFTDataset):
                       if self.has_condition_labels else None)
         cond_mmap = (np.memmap(self.cond_path, dtype=np.uint8, mode="r")
                     if self.has_condition_labels else None)
+        ans_mmap = (np.memmap(self.ans_path, dtype=np.uint8, mode="r")
+                   if self.has_condition_labels else None)
 
         num_docs = idx_mmap.shape[0] - 1
         order = self.document_order(num_docs)
@@ -207,7 +221,7 @@ class EvidenceDataset(SFTDataset):
 
         rows: List[dict] = []
         current = {"seq": [], "labels": [], "weights": [], "sections": [], "evidence": [],
-                   "conditions": []}
+                   "conditions": [], "answerable": []}
         committed_position = first - num_workers
         skipped_too_long = 0
         # how full the rows actually come out. A row costs a full width forward whatever fraction of
@@ -237,15 +251,24 @@ class EvidenceDataset(SFTDataset):
             # filled with -1 rather than a fresh segment id past the last real block -- padding
             # belongs to no conversation and no condition. None entirely when the corpus has no
             # .cond file, so a batch built from it never carries a column of meaningless -1s.
-            condition_ids = None
-            if self.has_condition_labels:
-                condition_ids, cstart = [], 0
-                for block_len, cond_idx in zip(current["sections"], current["conditions"]):
+            def expand(per_conversation):
+                """one value per conversation -> one per query token, -1 past the last block."""
+                out, cstart = [], 0
+                for block_len, value in zip(current["sections"], per_conversation):
                     cend = min(cstart + block_len, self.max_length)
                     if cend > cstart:
-                        condition_ids.extend([cond_idx] * (cend - cstart))
+                        out.extend([value] * (cend - cstart))
                     cstart = cend
-                condition_ids.extend([-1] * (self.max_length - len(condition_ids)))
+                out.extend([-1] * (self.max_length - len(out)))
+                return out
+
+            condition_ids = answerable_ids = None
+            if self.has_condition_labels:
+                condition_ids = expand(current["conditions"])
+                # the groundedness label's second axis, carried the same way and for the same
+                # reason: it is a fact about the conversation, and the loss reads it at one chosen
+                # position inside that conversation's own block
+                answerable_ids = expand(current["answerable"])
 
             rows.append({
                 "input_ids": padded, "document_ids": doc_ids,
@@ -253,6 +276,7 @@ class EvidenceDataset(SFTDataset):
                 "loss_weights": torch.tensor(weights, dtype=torch.float32),
                 "evidence": list(current["evidence"]),
                 "condition_ids": condition_ids,
+                "answerable_ids": answerable_ids,
                 "num_segments": seg,
             })
             packed["rows"] += 1
@@ -266,7 +290,8 @@ class EvidenceDataset(SFTDataset):
                     f"evidence {ev_fill:.0%} of its cap, {packed['closed_by_evidence']} row(s) "
                     f"closed by the evidence budget"
                 )
-            for key in ("seq", "labels", "weights", "sections", "evidence", "conditions"):
+            for key in ("seq", "labels", "weights", "sections", "evidence", "conditions",
+                        "answerable"):
                 current[key].clear()
 
         def yield_batch():
@@ -281,6 +306,9 @@ class EvidenceDataset(SFTDataset):
             if self.has_condition_labels:
                 batch["condition_ids"] = torch.tensor(
                     [r["condition_ids"] for r in rows], dtype=torch.long
+                )
+                batch["answerable_ids"] = torch.tensor(
+                    [r["answerable_ids"] for r in rows], dtype=torch.long
                 )
             batch.update(_pack_evidence(rows))
             rows.clear()
@@ -306,6 +334,7 @@ class EvidenceDataset(SFTDataset):
             # out of every batch downstream rather than filling them with meaningless placeholders
             ev_gold = evgold_mmap[key_start:key_end].tolist() if self.has_condition_labels else None
             condition_idx = int(cond_mmap[doc]) if self.has_condition_labels else -1
+            answerable_idx = int(ans_mmap[doc]) if self.has_condition_labels else -1
 
             block_len = len(tokens) + self.num_mtp_tokens
             if block_len > usable or len(ev_tokens) > self.max_evidence_tokens:
@@ -347,6 +376,7 @@ class EvidenceDataset(SFTDataset):
                 {"ids": ev_tokens, "chunks": ev_chunks, "keys": ev_keys, "gold": ev_gold}
             )
             current["conditions"].append(condition_idx)
+            current["answerable"].append(answerable_idx)
             committed_position = position
 
             if len(current["seq"]) >= usable:

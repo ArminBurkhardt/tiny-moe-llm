@@ -11,27 +11,39 @@ work on looped transformers, and where this model agrees or disagrees with it, i
 [docs/review_2026-09-18.md](../review_2026-09-18.md); what it changed and what it left open is
 folded into Phase 4 and Phase 7 below.
 
-## Now (2026-09-19)
+## Now (2026-09-20)
 
-Phase 4's port, corpus builder, trainer profile and eval are built and smoke-tested; the real
-corpus is not. In order:
+Phase 4's port, corpus builder, trainer profile and eval are built; all three of the losses the
+review left unattached are now wired. The corpus is building. In order:
 
-1. **Delete the smoke artifacts** — `data/prepared/evidence_*` (the 5M-token smoke corpus, built
-   before the gold flag, the condition label, the windowed web text and the shuffled shard order
-   existed) and `ckpts/evidence_smoke/` (trained off the arm C lineage, which is no longer the
-   seed).
-2. **Build the real corpus:** `python scripts/prepare_evidence_data.py --target-tokens 150000000`.
-   ~150M prompt tokens carrying ~440M evidence tokens; ~11 hours at the measured ~400 docs/s,
-   resumable, unattended. Read the per-source `too_long` counts and the conversation-vs-token
-   share the builder prints at the end before training on it.
-3. **While it builds, wire the two losses that exist but nothing calls** — see "Before the run"
-   under Phase 4. Neither blocks the corpus build; both should be in before the run.
-4. **Run:** `python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt`,
-   under a watch, and **kill at 10M tokens if the per-condition val CE gap (gold vs none) is under
-   ~0.1 nats**. The smoke measured 22.8k prompt tok/s before evidence was routed through the dense
-   decoder; expect less, and read the real figure off the first log lines.
-5. **Read G3 and G3b** with `eval_abstention.py --evidence-port` (both passes), then the benchmark
+1. **Corpus: in flight.** `python scripts/prepare_evidence_data.py --target-tokens 150000000
+   --max-evidence-tokens 4608 --max-source-epochs 4`. Read the realized per-source passes,
+   `too_long` counts and shares it prints at the end before training on it.
+
+   The one-pass build that preceded it is archived as `data/prepared/evidence_nomany_*` and is
+   what the numbers below were read off: **106M prompt / 101M evidence tokens, and it stopped
+   short of 150M because both QA sources are finite and were fully consumed** (SQuAD v2 ~130k
+   rows, HotpotQA ~90k, 10.7M prompt tokens between them). Three things came out of reading it:
+   the `many` condition produced **2 rows out of 304,662** because 16–32 distractors exceed the
+   1536-token default evidence cap and an over-budget row is dropped; the evidence-to-prompt ratio
+   is **0.96, not the smoke corpus's 2.93**, because web text (56% of tokens, a fixed 384-token
+   held span) and replay (33%, no evidence) dominate the token mass while QA rows still carry
+   6–7.6×; and QA ends up at **~18% of the gradient** once `loss_weight_floor_tokens: 64` is
+   applied to its short answers. `EvidenceSource.repeat` is the answer to the third — another pass
+   over a QA source redraws every row's condition and distractors, so the repeat is a new task on
+   a seen question, bounded at 4 passes.
+2. **Migrate the seed:** `python scripts/migrate_groundedness_head.py
+   -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt`. The head is a new parameter, so
+   the `--evidence` run needs a seed carrying it.
+3. **Run:** `python scripts/sft.py --evidence -c <the _grounded.pt seed>`, under a watch, and
+   **kill at 10M tokens if the per-condition val CE gap (gold vs none) is under ~0.1 nats**. The
+   smoke measured 22.8k prompt tok/s before evidence was routed through the dense decoder; expect
+   less, and read the real figure off the first log lines.
+4. **Read G3 and G3b** with `eval_abstention.py --evidence-port` (both passes), then the benchmark
    suite. The migrated seed reads a gold-vs-none gap of exactly 0.0000 nats, which is the baseline.
+
+`ckpts/evidence_smoke/` is still on disk: it is the only checkpoint that can rehearse the
+`--evidence` profile end to end before the real run.
 
 **The plan in one line:** prove every mechanism against its own ablation on a fixed benchmark
 suite — reshape the IR expert, feed the IR/CrossAttention pair real external evidence, align the
@@ -901,21 +913,36 @@ here is the residue — things that exist but are not attached, or were named an
 
 **Before the run** (neither blocks the corpus build):
 
-- **Wire `evidence_selection_loss` into the `--evidence` profile.** The loss exists
-  ([information_retrieval.py](../../modules/model/information_retrieval.py)), is tested
-  (`tests/test_evidence_selector.py`), and the corpus carries the gold flag it needs — but
-  `train_step` never calls it. Without it nothing trains the selector toward relevance except the
-  reader gate's indirect gradient (review §1.4). BCE over the per-token external weights before the
-  sum-and-detach (`last_memory_weights`), renormalized to the token's visible chunks, on supervised
-  positions; add it to the evidence profile's loss with its own weight, and log it.
-- **Wire `GroundednessHead` + `groundedness_loss`** ([evidence.py](../../modules/model/evidence.py))
-  at the last prompt position of each conversation, target "gold present AND answerable" from the
-  corpus's `.evgold`/`.cond` labels. Built, tested nowhere, attached nowhere. G3b is read on this
-  head *and* on the mass split separately (review §1.5); the mass split alone cannot separate
-  SQuAD v2's adversarial unanswerables from answerables because both retrieve a relevant passage.
-- **Pass the aux loss's token mask.** `compute_aux_loss(token_mask=...)` exists and `None` is
-  bit-identical; `TinyMoETransformer.forward` does not plumb it, so the aux loss is still read
-  over pads and moves 3x with row fill (review §1.13). Plumb `input_ids != pad` through.
+- ~~**Wire `evidence_selection_loss` into the `--evidence` profile.**~~ **Done 2026-09-19.**
+  `LoopMixtureOfExperts.evidence_selection_term` pairs each IR module's `memory_weights_by_loop`
+  with the recurrence's `last_memory_visible` and averages the BCE over every (loop, IR expert)
+  read; `train_step` adds it at `TrainingConfig.evidence_selection_weight` (0.1) whenever the batch
+  carries evidence *and* the corpus's gold flag, which is structurally never outside `--evidence`.
+  Supervised positions are `labels != -100`. It asserts gradient checkpointing is off — a
+  checkpointed segment's stashed weights carry no graph, so the term would train nothing and say
+  nothing. Logged as `selection:` per log step and in the `[eval]` line (held out).
+- ~~**Wire `GroundednessHead` + `groundedness_loss`**~~ **Done 2026-09-20.**
+  `scripts/migrate_groundedness_head.py` adds the head (zero-init, and read by no forward, so the
+  seed scores exactly as its source); `TinyMoETransformer.groundedness_term` reads
+  `moe.last_reader_output` at the positions `pretrain.answer_start_positions` picks — the last
+  prompt token of each supervised span, which is where `--evidence-port` reads the mass — and
+  `train_step` adds it at `TrainingConfig.groundedness_weight` (0.1). G3b is now readable on the
+  head *and* on the mass split separately (review §1.5).
+
+  The label needed a corpus change. `answerable` is **not** a function of `.cond`: a natively
+  unanswerable SQuAD row is built under `gold` like any other and still takes an abstention target,
+  which is the exact pair this head exists to separate. The builder now writes a per-document
+  `.ans` sidecar where `apply_condition` decides the target, and `EvidenceDataset` carries it as
+  `answerable_ids`. `[eval]` reports the held-out BCE *and* its AUROC — a head that has only
+  learned the corpus's base rate has a falling BCE and an AUROC of 0.5.
+
+  **The head's weight gradient is exactly zero until the reader's `o_proj` leaves zero**: it reads
+  the reader's output, which is identically zero on a fresh port, so only its bias can move. The
+  same dependency `|g_proj|rms` exists to expose on the IR read, and the reason the AUROC rather
+  than the BCE is the number to watch early.
+- ~~**Pass the aux loss's token mask.**~~ **Done 2026-09-19.** `TinyMoETransformer.forward` takes
+  `token_mask` and hands it to the MoE; `pretrain.py` and `sft.py` both pass `input_ids != pad`
+  (review §1.13). The aux loss's absolute value is therefore not comparable to any earlier run's.
 - **Optional, cheap:** the 5M-token encoded-vs-raw evidence A/B (`evidence_encoder: true` vs
   `false`) the review asked for as the de-risk of §1.1. The encoder is now the default on the
   strength of the argument, not a measurement; a smoke reading of the gold-vs-none val gap under
@@ -923,7 +950,8 @@ here is the residue — things that exist but are not attached, or were named an
 
 **During the run:** kill at 10M tokens if the per-condition val CE gap (gold vs none) is under
 ~0.1 nats. Watch `|shared_evidence.o_proj|rms` (must leave zero), the `external mass` per
-condition (gold/mixed above distractors/none), and `IR E/ln32` per loop.
+condition (gold/mixed above distractors/none), `selection` (the supervised ranking loss; falling
+on train *and* in `[eval]`, not just on train), and `IR E/ln32` per loop.
 
 **Not built, and not needed for G3/G3b:**
 

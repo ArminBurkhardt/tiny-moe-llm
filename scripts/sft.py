@@ -78,9 +78,12 @@ from modules.runtime.hf_sync import HFSync
 from modules.runtime.status import eta_seconds, format_duration, write_status
 from config import EvidenceConfig, IRConfig, ModelConfig, RepairConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
-    USE_LOW_PRECISION, chosen_recipe, log_precision_mode, sample_n_loops,
+    USE_LOW_PRECISION, answer_start_positions, chosen_recipe, log_precision_mode, sample_n_loops,
     save_expert_selection_graph, save_loss_graph, train_step,
 )
+# the same ranking metric eval_abstention.py reports G3b with, imported rather than restated so the
+# validation pass and the acceptance script cannot disagree about what AUROC means here
+from scripts.eval_calibration import roc_auc
 # imported rather than restated, so the condition index -> name mapping used for validation and
 # training logs can never drift from what the corpus builder actually wrote into `.cond`
 from scripts.prepare_evidence_data import CONDITIONS
@@ -557,6 +560,9 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     overall ``ce`` is built from, restricted to one condition's tokens at a time. This is the
     gold-vs-none gap the run is killed on, so it has to be readable from the same pass rather than a
     separate script -- see the call site below for how it is computed without a second forward.
+
+    When the corpus also carries the per chunk gold flag, ``selection`` is the held-out reading of
+    the supervised selection term the objective adds (``LoopMixtureOfExperts.evidence_selection_term``).
     """
     was_training = model.training
     model.eval()
@@ -570,6 +576,12 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     n_batches = 0
     cond_ce_sum = {c: 0.0 for c in CONDITIONS}
     cond_weight_sum = {c: 0.0 for c in CONDITIONS}
+    # plain per-batch mean: the selection loss is already a mean over a batch's supervised,
+    # evidence-bearing positions, and weighting it by supervised TOKENS would weight it by answer
+    # length, which has nothing to do with how many chunks were ranked
+    selection_sum, selection_batches = 0.0, 0
+    grounded_sum, grounded_batches = 0.0, 0
+    grounded_scores, grounded_labels = [], []
 
     for batch in dataset:
         if n_batches >= max_batches:
@@ -581,15 +593,54 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
         pad_mask = input_ids == pad_token_id
         loss_weights = batch["loss_weights"].to(device) if conversation_weighting else None
 
+        # the val split carries evidence too, and reading it WITHOUT is a different task: val CE
+        # would then be measuring the model answering from memory, which is not what is being
+        # trained and would drift away from the training curve for the wrong reason
+        evidence = evidence_from_batch(model, batch, cu_seqlens)
+
         with te.autocast(enabled=USE_LOW_PRECISION, recipe=chosen_recipe):
             out = model(
                 input_ids=input_ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 return_aux_loss=True, return_hidden=True,
-                # the val split carries evidence too, and reading it WITHOUT is a different task:
-                # val CE would then be measuring the model answering from memory, which is not what
-                # is being trained and would drift away from the training curve for the wrong reason
-                evidence=evidence_from_batch(model, batch, cu_seqlens),
+                evidence=evidence,
+                token_mask=~pad_mask,
             )
+            # held-out reading of the same term the objective adds (see pretrain.train_step): the
+            # training log's copy is one batch of whatever the selector was just pushed toward, so
+            # a selector that is memorizing the training slice's chunk order separates here first
+            if evidence is not None and evidence.chunk_gold is not None:
+                selection = model.moe.evidence_selection_term(
+                    evidence.chunk_gold, supervised=(labels != -100).reshape(-1)
+                )
+                if selection is not None:
+                    selection_sum += selection.item()
+                    selection_batches += 1
+
+                # the groundedness readout, held out. The BCE says it is training; the AUROC over
+                # the same positions is the number the gate is actually read at, and the two can
+                # disagree -- a head that predicts the corpus's base rate has a falling BCE and an
+                # AUROC of 0.5, which is the failure this pass exists to make visible early.
+                answerable = batch.get("answerable_ids")
+                if answerable is not None and model.groundedness_head is not None:
+                    answerable = answerable.to(device)
+                    positions = answer_start_positions(labels)
+                    grounded = model.groundedness_term(
+                        evidence.chunk_gold, answerable, positions
+                    )
+                    if grounded is not None:
+                        grounded_sum += grounded.item()
+                        grounded_batches += 1
+                        flat = positions.reshape(-1)
+                        logits = model.groundedness_head(
+                            model.moe.last_reader_output
+                        ).reshape(-1)[flat]
+                        gold_present = (
+                            model.moe.last_memory_visible.to(logits.dtype)
+                            @ evidence.chunk_gold.to(logits.dtype)
+                        )[flat] > 0
+                        target = gold_present & (answerable.reshape(-1)[flat] > 0)
+                        grounded_scores.append(logits.float().cpu())
+                        grounded_labels.append(target.cpu())
             hidden = out[0]
             extra_token_outputs = out[2] if model.has_mtp else None
             _, loss_ce, metrics = compute_mtp_loss(
@@ -668,6 +719,16 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     }
     if per_condition:
         result["per_condition_ce"] = per_condition
+    if selection_batches:
+        result["selection"] = selection_sum / selection_batches
+    if grounded_batches:
+        result["grounded"] = grounded_sum / grounded_batches
+        scores = torch.cat(grounded_scores).numpy()
+        labels_cat = torch.cat(grounded_labels).numpy()
+        # only defined with both classes present on the slice; a slice that happens to be all
+        # grounded (or all not) gets no number rather than a misleading 0.5
+        if 0 < labels_cat.sum() < labels_cat.size:
+            result["grounded_auroc"] = float(roc_auc(scores, labels_cat))
     return result
 
 
@@ -926,10 +987,18 @@ def sft(args):
             " | per-condition CE: {" + ", ".join(f"{c}: {v:.4f}" for c, v in per_condition.items())
             + "}" if per_condition else ""
         )
+        sel_str = (
+            f" | selection: {stats['selection']:.4f}" if "selection" in stats else ""
+        )
+        if "grounded" in stats:
+            sel_str += f" | grounded: {stats['grounded']:.4f}"
+            if "grounded_auroc" in stats:
+                sel_str += f" (AUROC {stats['grounded_auroc']:.4f})"
         logger.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
             f"p_max: {stats['p_max']:.4f} | top1_acc: {stats['top1_acc']:.4f} | "
-            f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches{cond_str}"
+            f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches"
+            f"{cond_str}{sel_str}"
         )
 
     sft_tokens = token_count - start_token_count
@@ -1017,6 +1086,15 @@ def sft(args):
                     evidence=evidence_from_batch(
                         accelerator.unwrap_model(model), batch, cu_seqlens
                     ),
+                    # keep the load balancing loss off the padding. It matters more here than in
+                    # pretraining: a conversation is never split across rows and an evidence row can
+                    # close on its evidence budget with the prompt axis half empty, so row fill
+                    # varies batch to batch and the aux loss moves with it rather than with routing.
+                    token_mask=~pad_mask,
+                    # the groundedness label's second axis; absent from every corpus built before
+                    # the .ans sidecar, which drops the term rather than guessing it
+                    answerable=(batch["answerable_ids"].to(device)
+                                if "answerable_ids" in batch else None),
                 )
 
                 if not is_log_step:
@@ -1106,6 +1184,18 @@ def sft(args):
                     inj_rms = unwrapped_model.moe.inject.weight.detach().float().pow(2).mean().sqrt().item()
                     ir_entropy_str += f"|inject|rms: {inj_rms:.2e} | "
                 if args.evidence:
+                    # the supervised selection term itself (NaN on a step whose batch retrieved
+                    # nothing, or on a corpus with no gold flag -- both are "no label", not zero
+                    # loss). Falling and the external mass separating by condition is the pair that
+                    # says the selector is ranking; either alone can move for the other's reason.
+                    sel = metrics.get("selection_loss")
+                    if sel is not None:
+                        ir_entropy_str += f"selection: {sel.item():.4f} | "
+                    # the other supervised head on the port. NaN whenever the checkpoint carries no
+                    # head or the corpus no .ans, which is a missing label rather than a zero loss
+                    grounded = metrics.get("groundedness_loss")
+                    if grounded is not None:
+                        ir_entropy_str += f"grounded: {grounded.item():.4f} | "
                     evidence_module = unwrapped_model.moe.shared_evidence
                     if evidence_module is not None:
                         # the reader's own neutrality zero, same reason as |g_proj|rms above: if

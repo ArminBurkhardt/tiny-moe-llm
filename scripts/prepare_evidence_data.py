@@ -41,10 +41,10 @@ in-context attention, which already works, and leave the port untrained.
 
 ### On-disk format
 
-Seven files beyond the usual ``{split}.{bin,idx,mask}`` triple. The first five are indexed by the
+Eight files beyond the usual ``{split}.{bin,idx,mask}`` triple. The first five are indexed by the
 same document number (or, for the two chunk-level ones, the same chunk axis) so a row and its
-evidence cannot drift apart; the last two add a document-level and a chunk-level label to that same
-pair of axes:
+evidence cannot drift apart; the last three add a chunk-level and two document-level labels to that
+same pair of axes:
 
     {split}.ev        uint16   evidence token stream
     {split}.evidx     uint64   per document offsets into .ev (doc_count + 1 entries)
@@ -53,6 +53,7 @@ pair of axes:
     {split}.evkeyidx  uint64   per document offsets into the chunk axis (doc_count + 1 entries)
     {split}.evgold    uint8    per chunk (same axis as .evkey/.evkeyidx): 1 = gold, 0 = distractor
     {split}.cond      uint8    per document (same axis as .idx/.evidx): index into CONDITIONS
+    {split}.ans       uint8    per document: 1 = the target is the real answer, 0 = a refusal
 
 A document with no evidence writes nothing and leaves both offsets equal to the previous entry.
 That is a genuinely empty evidence segment at train time, which flash answers with exact zeros --
@@ -68,7 +69,12 @@ machinery, and it keeps a document's evidence contiguous on disk.
 and it has to live on the chunk axis because the mix itself is what makes selection a real task.
 ``cond`` exists so validation loss (and any other per-row statistic) can be split by condition without
 re-deriving it from the evidence buffer's shape, which is ambiguous for a row where the draw happened
-to produce an empty or gold-only buffer under more than one condition.
+to produce an empty or gold-only buffer under more than one condition. ``ans`` is the other half of
+the groundedness label and is NOT a function of ``cond``: a natively unanswerable SQuAD row is built
+under ``gold`` like any other and still takes an abstention target, and separating those two is the
+whole point of a groundedness readout. Recovering it downstream would mean matching the target text
+against the abstention phrasings -- exact, since the set is closed, but a second opinion about a fact
+this file already knows when it picks the target.
 
 ### Token accounting
 
@@ -155,6 +161,16 @@ class EvidenceSource:
     local_bin: str = ""              # web text reads the prepared corpus instead of the Hub
     qa: bool = False
     holdout: bool = False            # check each row against the pretraining holdout hashes
+    # start another pass over the source when it runs out before reaching its token target. Only
+    # the QA sources set it, and only because a second pass over them is not duplication: a row
+    # becomes a different conversation under each condition, so a question that arrived as `gold`
+    # last pass is likely `distractors` on this one, with distractors drawn from a reservoir that
+    # has moved on. That is the corpus's own lesson -- answerability is a property of the buffer,
+    # not of the question -- taught on the same question twice. It does repeat the ANSWER text,
+    # which is why ``--max-source-epochs`` bounds it rather than letting a small source be looped
+    # arbitrarily far. Replay must never repeat (it exists to be ordinary unseen text) and web text
+    # has no need to: the prepared corpus behind it is larger than any target here.
+    repeat: bool = False
 
 
 # Condition mix. ``mixed`` is the largest share because it is the only condition that matches what a
@@ -173,10 +189,16 @@ QA_CONDITIONS = {"gold": 0.25, "mixed": 0.36, "many": 0.08, "distractors": 0.16,
 LM_CONDITIONS = {"gold": 0.40, "mixed": 0.30, "distractors": 0.20, "none": 0.10}
 
 SOURCES = [
+    # both QA sources are FINITE and small: SQuAD v2's train split is ~130k rows (~5.9M prompt
+    # tokens) and HotpotQA's ~90k (~4.9M), against weights that ask for 20% and 15% of a corpus
+    # sized in the hundreds of millions. Read once they cannot come close, and the first build made
+    # that concrete -- QA landed at 10% of tokens and ~18% of the gradient, i.e. the only source
+    # that exercises the evidence port was a minority of the training signal. `repeat` is what
+    # closes that gap; see the field's own comment for why re-reading these rows is not duplication.
     EvidenceSource("squad_v2", 0.20, "rajpurkar/squad_v2", "squad_v2/train",
-                   render="squad_v2", condition_weights=QA_CONDITIONS, qa=True),
+                   render="squad_v2", condition_weights=QA_CONDITIONS, qa=True, repeat=True),
     EvidenceSource("hotpot_qa", 0.15, "hotpotqa/hotpot_qa", "distractor/train",
-                   render="hotpot_qa", condition_weights=QA_CONDITIONS, qa=True),
+                   render="hotpot_qa", condition_weights=QA_CONDITIONS, qa=True, repeat=True),
     EvidenceSource("webtext", 0.40, render="webtext", condition_weights=LM_CONDITIONS,
                    local_bin="ir"),
     # >=20% replay, no evidence attached at all. With no corpus attached the forward pass is
@@ -388,7 +410,21 @@ class ChunkEmbedder:
         if not texts:
             return np.zeros((0, EMBED_DIM), dtype=np.float32)
         keys = [hashlib.sha1(t.encode("utf-8", "ignore")).digest() for t in texts]
-        missing = [i for i, k in enumerate(keys) if k not in self.cache]
+        # this call's own vectors, held separately from the cache so the result cannot depend on
+        # what eviction does below. Reading the answer back out of self.cache instead is a real
+        # failure and not a rare one: once the cache is full, inserting this batch's misses evicts
+        # the OLDEST entries, and the oldest entries are exactly the long-lived keys this batch hit
+        # on -- so the lookup at the end raises KeyError on a key that was present when the batch
+        # started. It first fires at whatever document fills the cache (~70M tokens in at 200k
+        # entries), which is why no smoke-sized build ever saw it.
+        vectors = {}
+        missing = []
+        for i, key in enumerate(keys):
+            cached = self.cache.get(key)
+            if cached is None:
+                missing.append(i)
+            else:
+                vectors[key] = cached
         self.cache_hits += len(texts) - len(missing)
         if missing:
             fresh = self._embed([texts[i] for i in missing])
@@ -399,13 +435,14 @@ class ChunkEmbedder:
                     # signal worth tracking and an LRU's bookkeeping would buy nothing
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[keys[i]] = vec
-        return np.stack([self.cache[k] for k in keys], axis=0)
+                vectors[keys[i]] = vec
+        return np.stack([vectors[k] for k in keys], axis=0)
 
 
 # ---------------------------------------------------------------------------------------- the writer
 
 EVIDENCE_SUFFIXES = ("bin", "idx", "mask", "ev", "evidx", "evchunk", "evkey", "evkeyidx",
-                     "evgold", "cond")
+                     "evgold", "cond", "ans")
 
 
 def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
@@ -429,6 +466,7 @@ def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
         "evkeyidx": (docs + 1) * 8,
         "evgold": chunks,
         "cond": docs,
+        "ans": docs,
     }
     for suffix, target in targets.items():
         path = os.path.join(data_dir, f"{split}.{suffix}")
@@ -462,7 +500,7 @@ class EvidenceWriter:
 
     def write(self, ids: Sequence[int], mask: Sequence[int], ev_ids: Sequence[int],
               ev_chunk: Sequence[int], keys: np.ndarray, ev_gold: Sequence[int],
-              condition_idx: int) -> None:
+              condition_idx: int, answerable: int) -> None:
         assert len(ids) == len(mask), "prompt ids and mask disagree"
         assert len(ev_ids) == len(ev_chunk), "evidence ids and chunk ids disagree"
         assert keys.shape[0] == 0 or keys.shape[1] == EMBED_DIM, f"bad key width {keys.shape}"
@@ -475,6 +513,12 @@ class EvidenceWriter:
         self.files["evkey"].write(np.asarray(keys, dtype=np.float16).tobytes())
         self.files["evgold"].write(np.asarray(ev_gold, dtype=np.uint8).tobytes())
         self.files["cond"].write(np.asarray([condition_idx], dtype=np.uint8).tobytes())
+        # answerability is a separate axis from the condition and cannot be recovered from it: a
+        # natively unanswerable SQuAD row is built under `gold` like any other and still takes an
+        # abstention target, which is exactly the pair a groundedness readout has to tell apart.
+        # Recorded here, where apply_condition's own decision is still in hand, rather than
+        # re-derived downstream by matching the target text against the abstention phrasings
+        self.files["ans"].write(np.asarray([answerable], dtype=np.uint8).tobytes())
 
         self.state["tokens_written"] += len(ids)
         self.state["ev_tokens"] += len(ev_ids)
@@ -509,8 +553,8 @@ def _shuffle_paired(chunks: List[str], gold_flags: List[bool],
 
 def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: random.Random,
                     num_distractors: int,
-                    many_distractors: Tuple[int, int] = (16, 32)) -> Tuple[List[str], List[bool], str]:
-    """Turn one row plus a condition into ``(chunk texts, per-chunk gold flags, target answer)``.
+                    many_distractors: Tuple[int, int] = (16, 32)) -> Tuple[List[str], List[bool], str, bool]:
+    """Turn one row plus a condition into ``(chunk texts, gold flags, target answer, answerable)``.
 
     The abstention targets are the load-bearing part. Under ``distractors`` and ``none`` the answer
     is replaced even for a row whose answer is perfectly well known -- that is the point: the model
@@ -521,6 +565,12 @@ def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: ran
     The gold flags are returned alongside the (possibly shuffled) chunks rather than left for the
     caller to re-derive, because ``mixed``/``many`` shuffle gold in among the distractors and forget
     which one it was -- the flag is the only place that distinction survives.
+
+    ``answerable`` is the fourth return for the same reason: it is "this row's target is the real
+    answer, not a refusal", which is decided right here and is NOT a function of the condition. A
+    natively unanswerable SQuAD row takes an abstention target under ``gold`` exactly like it does
+    under ``none``, and telling those two apart is the whole job of a groundedness readout. A
+    language modeling row is always answerable -- its continuation is its continuation.
     """
     unanswerable = not row.answer
 
@@ -557,11 +607,11 @@ def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: ran
         # no abstention target exists for language modeling: the continuation is the continuation
         # whether or not the buffer helps. What the unanswerable conditions teach here is that
         # unusable evidence must not COST anything, which is the finding the ceiling probe made.
-        return chunks, gold_flags, row.answer
+        return chunks, gold_flags, row.answer, True
 
     if condition in ("distractors", "none") or unanswerable:
-        return chunks, gold_flags, abstention.pick(abstention.ABSTENTIONS_PASSAGE_TRAIN, rng)
-    return chunks, gold_flags, row.answer
+        return chunks, gold_flags, abstention.pick(abstention.ABSTENTIONS_PASSAGE_TRAIN, rng), False
+    return chunks, gold_flags, row.answer, True
 
 
 def pick_condition(weights: dict, rng: random.Random) -> str:
@@ -623,6 +673,50 @@ def local_document_factory(bin_path: str, idx_path: str) -> Callable:
 
 # ------------------------------------------------------------------------------------------- driver
 
+def _start_next_epoch(slot: dict, max_source_epochs: int) -> bool:
+    """Rewind an exhausted source for another pass, or report that it is finished.
+
+    Three conditions, all of them there to make the rewind terminate. The source has to be marked
+    ``repeat`` (QA only -- see ``EvidenceSource.repeat``); it has to still be short of its token
+    target, so a source that met its share simply stops; and it has to be under the epoch cap,
+    which is what bounds how often the same answer text can reappear.
+
+    The fourth guard is the one that is not a policy: **an epoch that produced no new tokens ends
+    the source**, whatever the cap says. Without it, a source whose every row is dropped (too long,
+    unrenderable, held out) would rewind forever at full speed and the build would never finish or
+    fail -- it would simply stop making progress, which is the failure mode hardest to see in a log.
+
+    Returns:
+        True if the source was rewound and the caller should keep drawing from it.
+    """
+    state, entry = slot["state"], slot["entry"]
+    if not entry.get("repeat") or state["tokens"] >= slot["target"]:
+        return False
+    epoch = state.get("epoch", 0)
+    if epoch + 1 >= max_source_epochs:
+        logger.info(
+            f"source {entry['key']}: exhausted after {epoch + 1} pass(es) and "
+            f"{state['tokens']:,} of {slot['target']:,} target tokens -- at the epoch cap"
+        )
+        return False
+    if state["tokens"] <= state.get("tokens_at_epoch_start", 0):
+        logger.warning(
+            f"source {entry['key']}: a whole pass produced no tokens -- stopping it rather than "
+            f"rewinding again (every row dropped?)"
+        )
+        return False
+    state["epoch"] = epoch + 1
+    state["tokens_at_epoch_start"] = state["tokens"]
+    state["file_idx"], state["row_idx"] = 0, 0
+    slot["gen"] = entry["row_factory"](0, 0)
+    logger.info(
+        f"source {entry['key']}: pass {epoch + 2}, at {state['tokens']:,} of "
+        f"{slot['target']:,} target tokens. The rows repeat; their conditions and distractors "
+        f"do not."
+    )
+    return True
+
+
 def build_corpus(
     source_entries: List[dict],
     target_tokens: int,
@@ -643,6 +737,7 @@ def build_corpus(
     checkpoint_docs: int = 2000,
     split_prefix: str = "evidence",
     holdout_hashes: Optional[set] = None,
+    max_source_epochs: int = 4,
 ) -> dict:
     """Interleave sources, apply conditions, embed chunks, write both splits.
 
@@ -676,13 +771,17 @@ def build_corpus(
     state.setdefault("sources", {})
     state.setdefault("splits", {})
     state.setdefault("conditions", {c: 0 for c in CONDITIONS})
+    # how many rows carry a real answer rather than a refusal, the second axis of the groundedness
+    # label. Read next to the condition counts: `gold` holding fewer answerable rows than it has
+    # documents is SQuAD v2's natively unanswerable share showing through, which is expected
+    state.setdefault("answerable_docs", 0)
     state.setdefault("skipped", {})
     for split in (train_split, val_split):
         state["splits"].setdefault(split, {})
     for entry in source_entries:
         state["sources"].setdefault(
             entry["key"], {"file_idx": 0, "row_idx": 0, "tokens": 0, "ev_tokens": 0,
-                           "docs": 0, "done": False},
+                           "docs": 0, "done": False, "epoch": 0, "tokens_at_epoch_start": 0},
         )
         state["skipped"].setdefault(
             entry["key"], {"too_long": 0, "unrenderable": 0, "no_evidence": 0, "holdout": 0},
@@ -751,6 +850,8 @@ def build_corpus(
             try:
                 file_idx, row_idx, raw = next(slot["gen"])
             except StopIteration:
+                if _start_next_epoch(slot, max_source_epochs):
+                    continue
                 slot["state"]["done"] = True
                 candidates = live()
                 continue
@@ -782,7 +883,8 @@ def build_corpus(
             split = val_split if split_rng.random() < val_fraction else train_split
             writers[split].write(rendered["ids"], rendered["mask"], rendered["ev_ids"],
                                  rendered["ev_chunk"], rendered["keys"], rendered["ev_gold"],
-                                 CONDITIONS.index(rendered["condition"]))
+                                 CONDITIONS.index(rendered["condition"]),
+                                 int(rendered["answerable"]))
             source_state = state["sources"][rendered["source"]]
             source_state["tokens"] += len(rendered["ids"])
             source_state["ev_tokens"] += len(rendered["ev_ids"])
@@ -790,6 +892,7 @@ def build_corpus(
             state["conditions"][rendered["condition"]] = (
                 state["conditions"].get(rendered["condition"], 0) + 1
             )
+            state["answerable_docs"] += int(rendered["answerable"])
             since_checkpoint += 1
             if total_tokens() >= target_tokens:
                 break
@@ -837,8 +940,11 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
             if msgs is not None and doc_hash(render_pretrain_chat(msgs)) in holdout_hashes:
                 state["skipped"][key]["holdout"] += 1
                 return None
+        # a replay row's target is the assistant's real reply, never a refusal, so it is answerable
+        # in the only sense this flag carries. It still labels 0 for groundedness, because that
+        # label is "gold present AND answerable" and a replay row retrieved nothing at all
         return {"conversation": conversation, "chunks": [], "gold_flags": [],
-                "condition": "none", "key": key}
+                "condition": "none", "key": key, "answerable": True}
 
     condition = pick_condition(entry["condition_weights"], cond_rng)
 
@@ -854,19 +960,20 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
         ids = [template.bos_id] + prefix + cont
         mask = [0] * (len(prefix) + 1) + [1] * len(cont)
         gold_texts = [template.tokenizer.decode(c, skip_special_tokens=True) for c in held]
-        chunk_texts, gold_flags, _ = apply_condition(
+        chunk_texts, gold_flags, _, answerable = apply_condition(
             EvidenceRow(gold=gold_texts, lm=True), condition, reservoir, cond_rng, num_distractors,
             many_distractors=many_distractors,
         )
         reservoir.extend(gold_texts)
         record = {"conversation": None, "ids": ids, "mask": mask, "chunks": chunk_texts,
-                  "gold_flags": gold_flags, "condition": condition, "key": key}
+                  "gold_flags": gold_flags, "condition": condition, "key": key,
+                  "answerable": answerable}
     else:
         row = (render_squad_row if render == "squad_v2" else render_hotpot_row)(raw)
         if row is None:
             state["skipped"][key]["unrenderable"] += 1
             return None
-        chunk_texts, gold_flags, answer = apply_condition(
+        chunk_texts, gold_flags, answer, answerable = apply_condition(
             row, condition, reservoir, cond_rng, num_distractors, many_distractors=many_distractors,
         )
         reservoir.extend(row.gold)
@@ -877,6 +984,7 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
                 {"role": "assistant", "content": answer},
             ],
             "chunks": chunk_texts, "gold_flags": gold_flags, "condition": condition, "key": key,
+            "answerable": answerable,
         }
 
     if condition != "none" and not chunk_texts:
@@ -1004,6 +1112,12 @@ def main():
                         help="rows per tokenizer/embedder call; the embedder is a GPU forward and "
                              "runs at roughly flat cost up to a few hundred chunks")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max-source-epochs", type=int, default=4,
+                        help="how many passes a `repeat` source (the two QA sets) may make before "
+                             "it stops, whether or not it reached its token target. They are small "
+                             "and finite -- one pass leaves QA at ~10%% of corpus tokens -- and each "
+                             "pass redraws every row's condition and distractors, so the repeat is "
+                             "a new task on a seen question. 1 disables repeating")
     parser.add_argument("--split-prefix", default="evidence")
     parser.add_argument("--webtext-phase", default="ir",
                         help="which prepared {phase}.bin/.idx the web text arm reads")
@@ -1072,7 +1186,7 @@ def main():
         entries.append({
             "key": spec.key, "weight": spec.weight, "render": spec.render,
             "condition_weights": spec.condition_weights, "row_factory": factory, "qa": spec.qa,
-            "holdout": spec.holdout,
+            "holdout": spec.holdout, "repeat": spec.repeat,
         })
 
     total_w = sum(e["weight"] for e in entries)
@@ -1092,7 +1206,7 @@ def main():
         chunk_tokens=args.chunk_tokens, webtext_held_tokens=args.webtext_held_tokens,
         render_batch=args.render_batch, val_fraction=args.val_fraction, seed=args.seed,
         checkpoint_docs=args.checkpoint_docs, split_prefix=args.split_prefix,
-        holdout_hashes=holdout_hashes,
+        holdout_hashes=holdout_hashes, max_source_epochs=args.max_source_epochs,
     )
     elapsed = time.time() - t0
 
@@ -1110,14 +1224,23 @@ def main():
         # next to each other is what makes a token-weighted mix that is a conversation-weighted
         # trap visible at build time instead of after training
         conv_share = s["docs"] / max(1, total_docs)
+        passes = s.get("epoch", 0) + 1
         logger.info(
             f"  {e['key']}: {s['tokens']:,}/{target:,} prompt tokens ({token_share:.1%} of corpus "
             f"tokens), {s['ev_tokens']:,} evidence, {s['docs']:,} docs ({conv_share:.1%} of corpus "
-            f"conversations), skipped {final['skipped'][e['key']]}"
+            f"conversations)"
+            + (f", {passes} passes" if passes > 1 else "")
+            + f", skipped {final['skipped'][e['key']]}"
         )
         if e["render"] == "messages":
             replay_tokens += s["tokens"]
     logger.info(f"  conditions: {final['conditions']}")
+    answerable = final.get("answerable_docs", 0)
+    logger.info(
+        f"  answerable rows: {answerable:,}/{total_docs:,} ({answerable / max(1, total_docs):.1%}) "
+        f"-- the rest take an abstention target, and the difference between that share and the "
+        f"distractors+none share is SQuAD v2's natively unanswerable rows"
+    )
     logger.info(
         f"  replay share: {replay_tokens / max(1, total_prompt):.1%} "
         f"(the floor is 20% -- below it the trunk is not protected)"

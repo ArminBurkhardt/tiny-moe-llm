@@ -65,6 +65,8 @@ scale differently.
 | `num_epochs` | 1 | Safety net on the outer loop only. The real stop condition is the phase's token target |
 | `lambda_mtp` | 0.1 | Weight on each auxiliary MTP loss |
 | `aux_loss_weight` | 0.01 | Weight on the MoE load-balancing loss |
+| `groundedness_weight` | 0.1 | Weight on the groundedness readout's BCE. Needs a checkpoint carrying the head (`migrate_groundedness_head.py`) **and** a corpus with `.evgold`/`.ans`; 0 by construction otherwise. `0.0` disables it |
+| `evidence_selection_weight` | 0.1 | Weight on the evidence selector's supervised ranking loss. Only a batch carrying evidence **and** the corpus's per-chunk gold flag has this term at all, so it is 0 by construction outside `--evidence`. `0.0` disables it |
 | `target_tokens` | 16e9 | **Combined** phase1+phase2 budget. Drives `total_steps` and the cosine length |
 | `warmup_steps` | 1000 | Linear LR warmup before cosine decay |
 | `noise_anneal_tokens` | 1e9 | Tokens over which router exploration noise decays 1 → 0 |

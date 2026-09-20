@@ -258,7 +258,7 @@ python scripts/prepare_data.py --phases ir --ir-tokens 210000000 --val-tokens 20
 python scripts/migrate_ir_reshape.py -c CKPT --arm random             # rebuild the IR table
 python scripts/sft.py --ir -c CKPT_irrandom.pt                        # sharpen it (G2 / G2b)
 python scripts/migrate_evidence_port.py -c CKPT                       # add the evidence port
-python scripts/prepare_evidence_data.py --target-tokens 150000000     # the oracle-evidence corpus
+python scripts/prepare_evidence_data.py --target-tokens 150000000 --max-evidence-tokens 4608  # the oracle-evidence corpus
 python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt
 python scripts/eval_abstention.py -c CKPT --evidence-port --evidence-condition gold,none,distractors,mixed
 ```
@@ -295,7 +295,7 @@ scripts/
   prepare_data.py              builds phase1/phase2 .bin/.idx from the Hub source mix;
                                  --phases ir builds the IR sharpening corpus
   prepare_sft_data.py          builds sft_train/sft_val .bin/.idx/.mask; --profile repair
-  prepare_evidence_data.py     builds the five-condition oracle-evidence corpus (+ .ev/.evkey/.evgold/.cond)
+  prepare_evidence_data.py     builds the five-condition oracle-evidence corpus (+ .ev/.evkey/.evgold/.cond/.ans)
   archive_corpus.py            pack/list/restore a prepared split as one .tar.gz
   fetch_tokenizer.py           downloads the pruned 65536-token tokenizer
   sft.py                       the post-training entry point: --repair, --ir, --evidence profiles

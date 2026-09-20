@@ -49,8 +49,9 @@ Only the MLP experts are dispatched sparsely.
    (hard token fraction `f_i` × mean soft prob `P_i`), minimized at a uniform distribution.
    Normalized by the loops actually run. It takes an optional `token_mask` so padded positions can
    be excluded (a mostly-padding batch reads a near-uniform routing signal on its pad rows and
-   moved the aux loss 3x with row fill); `None` is bit-identical to the unmasked form, and the
-   trainer does not pass it yet.
+   moved the aux loss 3x with row fill); `None` is bit-identical to the unmasked form. Both
+   trainers pass `input_ids != pad` through `TinyMoETransformer.forward`'s `token_mask`, so
+   numbers from a run before that are not comparable to one after it.
 5. `top_k` selection → renormalize the selected weights to sum to 1. One `torch.topk` feeds both the
    aux loss and the selection.
 
@@ -125,11 +126,27 @@ zero-init scale makes the gate *exactly* 1, and it gives the selector a dense, a
 through the reader. Its `o_proj` is zero-init. All of these tensors are in `is_fresh_loop_param`
 and train at the from-scratch rate under `sft.py --evidence`.
 
-[evidence.py](../modules/model/evidence.py) also holds `GroundednessHead` + `groundedness_loss`
-(BCE against the corpus label "gold chunk present AND answerable", on the reader's output) and
 `information_retrieval.evidence_selection_loss` (BCE between the per-chunk external share and the
-gold flag). Both exist and are tested; neither is wired into `train_step` yet — see
-[NEXT.md](plans/NEXT.md) Phase 4.
+gold flag) is the selector's supervised half, reached through
+`LoopMixtureOfExperts.evidence_selection_term`: it reads each IR module's `last_memory_weights`
+(the per-chunk breakdown before the sum-and-detach) against the mask the recurrence built once in
+`last_memory_visible`, averages over every loop and IR expert, and `train_step` adds it at
+`TrainingConfig.evidence_selection_weight`. Uniform loop weights, not `loop_ce_weights`' ascending
+ones — a relevant chunk is relevant at every depth. `None` whenever the batch had no external
+store or the corpus no gold flag, which is every profile but `--evidence`.
+
+[evidence.py](../modules/model/evidence.py) also holds `GroundednessHead` + `groundedness_loss`
+(BCE against the corpus label "gold chunk present AND answerable", on the reader's output), added
+to a checkpoint by `migrate_groundedness_head.py` and inferred from the state dict.
+`TinyMoETransformer.groundedness_term` reads `moe.last_reader_output` — the read before the
+per-loop gain and before the shared/routed sum, because the question is about the read rather than
+about what the accumulator did with it — at the last prompt token of each supervised span, and
+`train_step` adds it at `TrainingConfig.groundedness_weight`. `gold_present` comes from
+`last_memory_visible @ chunk_gold`, `answerable` from the corpus's `.ans` sidecar.
+
+Its weight gradient is **exactly zero until the reader's `o_proj` leaves zero**, because the head
+reads a zero vector until then and only its bias can move. So an early falling `grounded:` is the
+base rate being learned; the held-out AUROC in the `[eval]` line is what says otherwise.
 
 ## Depth policy
 

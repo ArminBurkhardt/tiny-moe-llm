@@ -22,12 +22,15 @@ Nine assertions:
    supervised token can attend to another row's leftovers.
 7. **condition_ids matches each document's own condition across its whole query-side span**
    (including its BOS and separator pad, which belong to the same segment).
-8. **A corpus missing ``.evgold``/``.cond`` still loads**, with both columns simply absent from every
-   batch, rather than crashing -- the compatibility path for the corpus already on disk.
-9. **The loss weight floor caps a short conversation's per-token weight at ``1/floor``** while
+8. **answerable_ids is carried per document and is not a relabelling of the condition** -- the
+   fixture's first row is `gold` with a refusal target, which is the SQuAD v2 case that makes it a
+   column of its own, and the assertion refuses to pass if that row is ever removed.
+9. **A corpus missing ``.evgold``/``.cond``/``.ans`` still loads**, with all three columns simply
+   absent from every batch, rather than crashing -- the compatibility path for older corpora.
+10. **The loss weight floor caps a short conversation's per-token weight at ``1/floor``** while
    leaving a conversation already at or past the floor at exactly ``1/n_supervised``.
 
-All nine are pure index arithmetic (no model, no CUDA call) and run anywhere; only the end-to-end
+All ten are pure index arithmetic (no model, no CUDA call) and run anywhere; only the end-to-end
 isolation check at the bottom needs a GPU, and it is printed as its own final check rather than
 numbered above, since it runs only when CUDA is available.
 """
@@ -54,19 +57,21 @@ MAX_LEN = 16
 # which is what assertion 2 reads. Every entry of CONDITIONS appears at least once, and the prompt
 # token counts (3, 2, 4, 3, 2) deliberately straddle assertion 9's floor (3): two documents sit
 # exactly at it, one above, two below.
+# the last column is `answerable`, and the first row is why it cannot be read off the condition:
+# a natively unanswerable question is built under `gold` like any other and still abstains
 DOCS = [
-    ([10, 11, 12], [100, 101], [2], [1], "gold"),
-    ([20, 21], [], [], [], "none"),           # retrieved nothing: the zero length segment case
-    ([30, 31, 32, 33], [300, 301, 302], [2, 1], [1, 0], "mixed"),
-    ([40, 41, 42], [400, 401, 402, 403], [4], [0], "distractors"),
-    ([50, 51], [500, 501, 502], [3], [1], "many"),
+    ([10, 11, 12], [100, 101], [2], [1], "gold", 0),
+    ([20, 21], [], [], [], "none", 1),        # retrieved nothing: the zero length segment case
+    ([30, 31, 32, 33], [300, 301, 302], [2, 1], [1, 0], "mixed", 1),
+    ([40, 41, 42], [400, 401, 402, 403], [4], [0], "distractors", 0),
+    ([50, 51], [500, 501, 502], [3], [1], "many", 1),
 ]
 
 
 def build_corpus(data_dir, split="evidence_train"):
     state = {}
     writer = EvidenceWriter(data_dir, split, state)
-    for tokens, ev, chunk_lens, chunk_gold, condition in DOCS:
+    for tokens, ev, chunk_lens, chunk_gold, condition, answerable in DOCS:
         ids = [BOS] + tokens
         mask = [0] + [1] * len(tokens)
         ev_chunk = []
@@ -81,7 +86,8 @@ def build_corpus(data_dir, split="evidence_train"):
             # because a document's chunks can disagree with each other on gold (see "mixed" above)
             keys[chunk_idx, 0] = ev[0] if ev else 0.0
             keys[chunk_idx, 1] = chunk_idx
-        writer.write(ids, mask, ev, ev_chunk, keys, chunk_gold, CONDITIONS.index(condition))
+        writer.write(ids, mask, ev, ev_chunk, keys, chunk_gold,
+                     CONDITIONS.index(condition), answerable)
     writer.sync()
     writer.close()
     return state
@@ -122,7 +128,7 @@ def main():
         flat_ev = batch["evidence_ids"].reshape(-1).tolist()
         # which fixture document each conversation slot holds, in packing order, alongside which
         # ROW it packed into -- assertion 7 needs the row as well as the segment
-        expected = [ev for _, ev, _, _, _ in DOCS]
+        expected = [ev for _, ev, _, _, _, _ in DOCS]
         conv_segments, conv_rows = [], []
         for r in range(B):
             n_conv = int((doc_slot[r] >= 0).any()) and int(doc_slot[r].max()) + 1
@@ -168,7 +174,7 @@ def main():
         assert "chunk_gold" in batch, "the batch carries no chunk_gold even though .evgold exists"
         chunk_gold_flat = batch["chunk_gold"][valid].tolist()
         chunk_idx_marker = chunk_keys[:, 1].tolist()
-        gold_by_doc = {ev[0]: gold for _, ev, _, gold, _ in DOCS if ev}
+        gold_by_doc = {ev[0]: gold for _, ev, _, gold, _, _ in DOCS if ev}
         assert len(chunk_gold_flat) == len(marker), "chunk_gold and chunk_keys disagree on count"
         for doc_marker, idx_marker, got in zip(marker, chunk_idx_marker, chunk_gold_flat):
             want = gold_by_doc[int(doc_marker)][int(idx_marker)]
@@ -214,6 +220,26 @@ def main():
         assert checked_cond == len(DOCS), f"only checked {checked_cond} of {len(DOCS)} documents"
         print(f"7. condition_ids matches each document's own condition ({checked_cond} docs)  PASS")
 
+        # answerable_ids rides the same axis, and the fixture's first document is the case that
+        # makes it a separate column at all: condition `gold`, target a refusal. A reader that
+        # derived answerability from the condition would get that row backwards.
+        assert "answerable_ids" in batch, "the batch carries no answerable_ids even though .ans exists"
+        answerable_ids = batch["answerable_ids"]
+        for local_idx, (r, global_seg) in enumerate(zip(conv_rows, conv_segments)):
+            want = DOCS[local_idx][5]
+            positions = (seg[r] == global_seg).nonzero().flatten()
+            got = answerable_ids[r][positions].unique().tolist()
+            assert got == [want], (
+                f"document {local_idx} (condition {DOCS[local_idx][4]!r}) reads answerable_ids "
+                f"{got} over its own segment, want [{want}]"
+            )
+        gold_row = DOCS[0]
+        assert gold_row[4] == "gold" and gold_row[5] == 0, (
+            "the fixture no longer contains an unanswerable row under the gold condition -- "
+            "assertion 8 would pass without testing the case it exists for"
+        )
+        print(f"8. answerable_ids is carried per document and is not the condition ({len(DOCS)} docs)  PASS")
+
         # a corpus predating .evgold/.cond has to load anyway, just without the two columns --
         # simulated by building the same fixture and then removing the two sidecar files, mirroring
         # the corpus that is already on disk
@@ -222,6 +248,7 @@ def main():
             build_corpus(no_labels_dir)
             os.remove(os.path.join(no_labels_dir, "evidence_train.evgold"))
             os.remove(os.path.join(no_labels_dir, "evidence_train.cond"))
+            os.remove(os.path.join(no_labels_dir, "evidence_train.ans"))
             legacy = EvidenceDataset(
                 no_labels_dir, tokenizer, batch_size=2, max_length=MAX_LEN, split="evidence_train",
                 num_mtp_tokens=1, shuffle=False,
@@ -238,7 +265,7 @@ def main():
             assert "evidence_ids" in legacy_batches[0], (
                 "the legacy corpus still has real evidence -- only the two new columns should be gone"
             )
-            print("8. a corpus missing .evgold/.cond loads and omits the labels    PASS")
+            print("9. a corpus missing .evgold/.cond/.ans loads and omits the labels    PASS")
         finally:
             shutil.rmtree(no_labels_dir, ignore_errors=True)
 
@@ -269,7 +296,7 @@ def main():
             )
             checked_weight += 1
         assert checked_weight == len(DOCS), f"only checked {checked_weight} of {len(DOCS)} documents"
-        print(f"9. the loss weight floor caps short conversations at 1/floor ({checked_weight} docs)  PASS")
+        print(f"10. the loss weight floor caps short conversations at 1/floor ({checked_weight} docs)  PASS")
 
         if not torch.cuda.is_available():
             print("   (GPU absent -- skipping the end to end isolation check)")

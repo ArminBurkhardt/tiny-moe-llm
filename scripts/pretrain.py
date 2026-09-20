@@ -102,6 +102,29 @@ def log_precision_mode():
             + ". Note the routed MoE grouped GEMM stays BF16 by design (see moe.py)."
         )
 
+def answer_start_positions(labels: torch.Tensor) -> torch.Tensor:
+    """``[B, S]`` mask of the last PROMPT token before each supervised span.
+
+    One position per answer turn, which is where a groundedness readout belongs: it is the last
+    state that has seen the whole question and all of the evidence and none of the answer, i.e. the
+    position ``eval_abstention.py --evidence-port`` reads the external mass at. Scoring every
+    supervised token instead would weight a row by how long its answer happens to be and would
+    also ask the question again at positions that can already see part of the answer.
+
+    Derived from the labels alone rather than from segment boundaries: a supervised run STARTS
+    wherever a supervised token follows an unsupervised one, which handles a multi-turn
+    conversation's several answer spans without needing to know where the conversations are.
+    Position 0 can never qualify (there is no prompt token before it), which is also what keeps a
+    row that begins mid-answer from scoring a position belonging to the previous row.
+    """
+    supervised = labels != -100
+    starts = torch.zeros_like(supervised)
+    starts[:, 1:] = supervised[:, 1:] & ~supervised[:, :-1]
+    positions = torch.zeros_like(supervised)
+    positions[:, :-1] = starts[:, 1:]
+    return positions
+
+
 def train_step(
     model: TinyMoETransformer,
     input_ids: torch.Tensor,
@@ -117,6 +140,8 @@ def train_step(
     n_loops: int = None,
     loss_weights: torch.Tensor = None,
     evidence=None,
+    token_mask: torch.Tensor = None,
+    answerable: torch.Tensor = None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -135,6 +160,17 @@ def train_step(
             ``modules.data.evidence_dataset.evidence_from_batch``. None -- every caller before the
             evidence corpus existed -- is bit-for-bit the forward this function already ran, which is
             what lets the evidence profile reuse it unchanged rather than forking it.
+
+            When the batch carries a per chunk gold flag, this is also what makes the supervised
+            selection term computable: the loss reads the mass split the forward just produced
+            (see ``LoopMixtureOfExperts.evidence_selection_term``), so nothing extra is forwarded.
+        token_mask: optional ``[B, S]`` True/1 for a real (non pad) token, forwarded to the MoE's
+            load balancing loss so it is not averaged over padding. None reproduces the aux loss
+            every run before this one trained under.
+        answerable: optional ``[B, S]`` 1/0 per token for "this conversation's target is a real
+            answer, not a refusal" (the evidence corpus's ``.ans`` sidecar, -1 on row padding).
+            Together with the batch's gold flag it is the groundedness label; None -- every caller
+            but the evidence profile, and any corpus predating the sidecar -- drops that term.
     """
     loop_ce_weights = (
         TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
@@ -155,6 +191,7 @@ def train_step(
                 return_hidden=True,
                 n_loops=n_loops,
                 evidence=evidence,
+                token_mask=token_mask,
             )
             else:
                 logits, aux_loss = model(
@@ -166,6 +203,7 @@ def train_step(
                     return_hidden=True,
                     n_loops=n_loops,
                     evidence=evidence,
+                    token_mask=token_mask,
                 )
                 extra_token_outputs = None
 
@@ -185,6 +223,66 @@ def train_step(
             loss, loss_ce, metrics = out if collect_metrics else (out[0], out[1], None)
 
             loss = loss + TrainingConfig.aux_loss_weight * aux_loss
+
+            # the selector's only supervision toward relevance. Read off the forward that just ran
+            # rather than recomputed: the IR module keeps this recurrence's per (token, chunk) read
+            # weights live (see LoopMixtureOfExperts.evidence_selection_term), so the term costs a
+            # [tokens, chunks] BCE and no second pass. Absent -- and therefore exactly the objective
+            # every earlier run trained under -- for any batch without evidence or without the
+            # corpus's gold flag, which is every profile but --evidence.
+            selection_loss = None
+            if (
+                TrainingConfig.evidence_selection_weight > 0.0
+                and evidence is not None
+                and evidence.chunk_gold is not None
+            ):
+                # a checkpointed segment's stashed weights were computed under no_grad, so the term
+                # would be a scalar with no graph -- silently zero gradient into the selector rather
+                # than an error. Both levels are off in this repo; this is the tripwire if that changes.
+                assert not (unwrapped.use_checkpointing or unwrapped.use_sub_checkpointing), (
+                    "the evidence selection loss reads tensors the forward stashed, which gradient "
+                    "checkpointing recomputes under no_grad -- it would train nothing. Turn "
+                    "checkpointing off for the evidence profile, or make the term part of the forward."
+                )
+                selection_loss = unwrapped.moe.evidence_selection_term(
+                    evidence.chunk_gold,
+                    # the query positions the corpus actually supervises: an answer token's own
+                    # position is the one reading evidence while that token is produced
+                    supervised=(labels != -100).reshape(-1),
+                )
+                if selection_loss is not None:
+                    loss = loss + TrainingConfig.evidence_selection_weight * selection_loss
+
+            # the groundedness readout, on the same stashed forward. Separate from the selection
+            # term because it answers a different question -- "does what was retrieved ground an
+            # answer at all", which the mass split alone cannot express: an adversarial SQuAD v2
+            # row retrieves a relevant passage and still has no answer in it. Gated on the head
+            # existing (a migration adds it) as well as on the labels, so a checkpoint without one
+            # trains exactly as it did before.
+            groundedness = None
+            if (
+                TrainingConfig.groundedness_weight > 0.0
+                and unwrapped.groundedness_head is not None
+                and evidence is not None
+                and evidence.chunk_gold is not None
+                and answerable is not None
+            ):
+                groundedness = unwrapped.groundedness_term(
+                    evidence.chunk_gold, answerable, answer_start_positions(labels)
+                )
+                if groundedness is not None:
+                    loss = loss + TrainingConfig.groundedness_weight * groundedness
+            if metrics is not None:
+                # NaN rather than a missing key on a step that had no evidence, so the log line's
+                # field count does not change between steps
+                metrics["selection_loss"] = (
+                    selection_loss.detach() if selection_loss is not None
+                    else torch.full((), float("nan"), device=loss.device)
+                )
+                metrics["groundedness_loss"] = (
+                    groundedness.detach() if groundedness is not None
+                    else torch.full((), float("nan"), device=loss.device)
+                )
 
             accelerator.backward(loss)
             # clip on the real update step only (matters once gradient accumulation > 1).
@@ -758,6 +856,9 @@ def pretrain(phase=None):
                     # gathered only on the steps the log block below actually reads them
                     collect_metrics=is_log_step,
                     n_loops=step_n_loops,
+                    # keep the load balancing loss off the padding: it is a mean over positions, so
+                    # a batch's trailing pad run otherwise dilutes it by however full the rows are
+                    token_mask=~pad_mask,
                 )
 
 

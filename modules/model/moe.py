@@ -10,7 +10,7 @@ from transformer_engine.pytorch import checkpoint
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
-from modules.model.information_retrieval import RetrievalEntropyTracking
+from modules.model.information_retrieval import RetrievalEntropyTracking, evidence_selection_loss
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
 from modules.model.evidence import EvidenceBatch, evidence_memory, chunk_mean_mass, apply_chunk_gate
 
@@ -202,6 +202,10 @@ def is_fresh_loop_param(name: str) -> bool:
         or name.endswith("evidence_loop_scale")
         or name.endswith("direct_gate.weight")
         or name.endswith("evidence_gate_scale")
+        # the groundedness readout, the one entry here that lives on the model rather than in the
+        # block: same story, a whole module arriving at its zero-init from a migration
+        or name.startswith("groundedness_head.")
+        or ".groundedness_head." in name
     )
 
 
@@ -463,6 +467,17 @@ class LoopMixtureOfExperts(nn.Module):
         else:
             self.evidence_gate_scale = None
 
+        # the selector's token-to-chunk visibility mask for the most recent forward, the second half
+        # of what a supervised selection loss needs (the first half being each IR module's
+        # last_memory_weights). Kept here rather than on the IR modules because it is built once per
+        # recurrence from the query side's segmentation and is the same object every IR expert and
+        # every loop scored against. Plain attribute, cleared on a forward without evidence, same
+        # lifetime rule as last_memory_mass.
+        self.last_memory_visible = None
+        # the evidence reader's own output from the most recent loop, [B, S, H], for a groundedness
+        # readout to attach to. See forward_step for why it is the ungated, unscaled read.
+        self.last_reader_output = None
+
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
         # one retrieval entropy tracker shared by every IR expert, so the trainer reads a single
@@ -624,9 +639,16 @@ class LoopMixtureOfExperts(nn.Module):
             # init neutral, so this is a no-op until either learns something.
             evidence_query = step_input + self.evidence_query_bias(self._loop_enc_row(loop_idx, step_input.dtype))
             evidence_gain = self.evidence_loop_scale[min(int(loop_idx), self.evidence_loop_scale.numel() - 1)]
-            output = output + evidence_gain * self.shared_evidence(
+            reader_output = self.shared_evidence(
                 evidence_query, None, cu_seqlens, max_seqlen, position_embeddings, evidence=reader_evidence
             )
+            # kept for a groundedness readout, which asks about the READ rather than about what the
+            # loop's accumulator did with it -- so it wants this, before the per-loop gain and
+            # before the shared/routed sum. Same lifetime rule as the IR module's mass: overwritten
+            # every loop (the last one is the most informed read) and cleared by a forward that
+            # attaches no evidence, so nothing can pick up a stale batch's activations.
+            self.last_reader_output = reader_output
+            output = output + evidence_gain * reader_output
 
         # accumulate the non-MLP experts' weighted outputs. still a mask multiply (never
         # mask.sum()/boolean indexing -- that's a per-expert device sync), but the per-(slot, expert)
@@ -762,6 +784,14 @@ class LoopMixtureOfExperts(nn.Module):
         memory = evidence_memory(
             evidence, cu_seqlens, hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
         )
+        # cleared rather than left alone on a batch with no external store, so a trainer reading it
+        # after the forward cannot pair this batch's read weights with the last batch's mask
+        self.last_memory_visible = None if memory is None else memory[1]
+        # same rule for the reader's output: a batch that attaches no evidence never enters the
+        # reader branch below, so without this a groundedness readout would score the last
+        # evidence-bearing batch's activations against this batch's labels
+        if evidence is None:
+            self.last_reader_output = None
 
         loops_run = 0
         for loop in range(n_loops):
@@ -819,6 +849,50 @@ class LoopMixtureOfExperts(nn.Module):
             m.refresh_clusters(recycle=recycle, dead_quantile=dead_quantile)
             for m in self.ir_modules if m.num_clusters > 0
         ]
+
+    def evidence_selection_term(self, chunk_gold: torch.Tensor, supervised: torch.Tensor = None):
+        """Supervised selection loss over the read the forward pass just did. Scalar, or None.
+
+        The selector's only other gradient toward RELEVANCE is the reader's per chunk gate, which
+        reaches it through the reader's own zero-init output projection and only for the ~6% of
+        tokens the router opened an MLP slot for -- so on its own it trains the split's magnitude
+        long before it trains its ranking. This is the direct term: ``evidence_selection_loss``
+        (see information_retrieval.py) against the corpus's per chunk gold flag.
+
+        Averaged over every (loop, IR expert) read of this recurrence, not only the last one: the
+        module is re-applied at every loop with a query the earlier loops moved, each application
+        produces its own mass split, and supervising only the final one leaves the earlier reads --
+        which is where the table demonstrably sharpens -- unsupervised. Uniform weights rather than
+        ``loop_ce_weights``' ascending ones, because a relevant chunk is relevant at every depth;
+        nothing here is a readout whose later loops should dominate.
+
+        Must be called right after the forward that produced the reads, and only from a forward
+        that ran WITHOUT gradient checkpointing: the stashed weights of a checkpointed segment were
+        computed under ``no_grad`` and carry no graph, so the loss would be a silent no-op.
+
+        Args:
+            chunk_gold: ``[M]`` bool/float, the corpus's gold flag on the same chunk axis as
+                ``EvidenceBatch.chunk_keys``/``chunk_segments``.
+            supervised: optional ``[B * S]`` mask restricting the loss to supervised query
+                positions (``(labels != -100).reshape(-1)``).
+
+        Returns:
+            Scalar loss, or None when this forward carried no external store to select over (no
+            evidence, no IR expert, or a checkpoint without the port) -- which every caller before
+            the evidence corpus existed is.
+        """
+        visible = self.last_memory_visible
+        if visible is None or chunk_gold is None:
+            return None
+        terms = [
+            evidence_selection_loss(weights, visible, chunk_gold, supervised=supervised)
+            for module in self.ir_modules
+            for weights in module.memory_weights_by_loop.values()
+            if weights is not None
+        ]
+        if not terms:
+            return None
+        return torch.stack(terms).mean()
 
 
 

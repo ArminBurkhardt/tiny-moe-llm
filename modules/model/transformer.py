@@ -6,7 +6,9 @@ from modules.model.moe import LoopMixtureOfExperts
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextModel
 from modules.model.modules import SmallLMHead
 from modules.model.mtp import MTPHead
-from modules.model.evidence import EvidenceBatch, chunk_position_ids, evidence_cu_seqlens
+from modules.model.evidence import (
+    EvidenceBatch, GroundednessHead, chunk_position_ids, evidence_cu_seqlens, groundedness_loss,
+)
 from modules.model.attention import cu_seqlens_from_doc_ids
 from utils import logger
 
@@ -96,6 +98,7 @@ class TinyMoETransformer(nn.Module):
         evidence_port: bool = False,
         evidence_encoder: bool | int = True,
         ir_direct_read: bool = True,
+        groundedness_head: bool = False,
     ):
         super().__init__()
 
@@ -176,6 +179,15 @@ class TinyMoETransformer(nn.Module):
         
         self.norm = RMSNorm(hidden_size)
         self.lm_head = SmallLMHead(hidden_size, vocab_size, factor=lm_head_factor)
+
+        # reads the evidence reader's own output, never the residual stream (see GroundednessHead).
+        # Inferred from the state dict like the port itself, so a checkpoint that predates it keeps
+        # loading and a migration is what adds it. Zero-init output, and nothing in forward() reads
+        # this head -- a trainer picks the positions -- so attaching it changes no logit.
+        self.groundedness_head = (
+            GroundednessHead(hidden_size, dropout=dropout)
+            if (groundedness_head and evidence_port) else None
+        )
 
         self.mtp_head = MTPHead(
             hidden_size, 
@@ -477,6 +489,52 @@ class TinyMoETransformer(nn.Module):
         )
 
 
+    def groundedness_term(self, chunk_gold: torch.Tensor, answerable: torch.Tensor,
+                          positions: torch.Tensor):
+        """BCE on the reader's own output at ``positions``, against the corpus label. Or None.
+
+        The label is "a gold chunk was in front of the model AND the row actually has an answer"
+        (see ``groundedness_loss``), and both halves are facts about the corpus rather than about
+        this model's output -- which is what keeps this from collapsing onto ``p_max`` the way the
+        deleted correctness head did. They are also genuinely two axes: a natively unanswerable
+        SQuAD row is built under the ``gold`` condition and still takes an abstention target, so
+        ``answerable`` cannot be recovered from the evidence buffer's contents.
+
+        ``gold_present`` is derived from the selector's own visibility mask rather than from the
+        segment arithmetic a second time: ``last_memory_visible`` already says which chunks each
+        token's document owns, so one matmul against the gold flag answers "does this token's
+        document hold a gold chunk" on exactly the axis the reader ran on.
+
+        Reads what the forward stashed (``moe.last_reader_output``), so it must be called right
+        after that forward and only from one that ran WITHOUT gradient checkpointing -- the same
+        constraint, for the same reason, as ``LoopMixtureOfExperts.evidence_selection_term``.
+
+        Args:
+            chunk_gold: ``[M]`` bool/float per chunk gold flag, on ``chunk_keys``' own axis.
+            answerable: ``[B, S]`` 1 where the token's conversation has a real answer as its
+                target, 0 where it has a refusal. Negative entries (row padding) are never read --
+                ``positions`` excludes them.
+            positions: ``[B, S]`` mask of the positions to score, chosen by the trainer (the last
+                prompt token of each answer span, typically).
+
+        Returns:
+            Scalar loss, or None when this model has no head, this batch carried no evidence, or
+            the corpus has no labels -- every one of which is "nothing to supervise", not zero.
+        """
+        reader = self.moe.last_reader_output
+        visible = self.moe.last_memory_visible
+        if (self.groundedness_head is None or reader is None or visible is None
+                or chunk_gold is None or answerable is None):
+            return None
+        logits = self.groundedness_head(reader).reshape(-1)                      # [B * S]
+        gold_present = visible.to(logits.dtype) @ chunk_gold.to(logits.dtype)    # [B * S]
+        return groundedness_loss(
+            logits,
+            (gold_present > 0).to(logits.dtype),
+            answerable.reshape(-1).clamp_min(0).to(logits.dtype),
+            mask=positions.reshape(-1).to(logits.dtype),
+        )
+
     def _convergence_exit(self, tol: float, min_loops: int):
         """Build an ``exit_check`` that stops looping once the READOUT stops moving.
 
@@ -529,6 +587,7 @@ class TinyMoETransformer(nn.Module):
         min_loops: int = 1,
         skip_mtp: bool = False,
         evidence: EvidenceBatch = None,
+        token_mask: torch.Tensor = None,
     ):
         """forward pass of the model
 
@@ -566,6 +625,13 @@ class TinyMoETransformer(nn.Module):
                 None, which reproduces the forward this model ran before the port existed, bit for
                 bit -- that property is what lets one checkpoint serve both modes and is asserted in
                 ``tests/test_evidence_port.py``.
+            token_mask (torch.Tensor, optional): [batch_size, seq_len], True/1 for a real (non pad)
+                token, forwarded to the MoE's load balancing loss (see ``compute_aux_loss``). The
+                aux loss is a mean over positions, so without this it is read over padding too and
+                its value moves with how full the batch's rows happen to be -- which the evidence
+                corpus's rows, closing early on their evidence budget, vary a lot more than
+                document-packed pretraining ones do. Defaults to None, which is the aux loss this
+                model trained under, bit for bit.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -585,7 +651,7 @@ class TinyMoETransformer(nn.Module):
         if self.training and self.use_checkpointing:
             assert converge_tol is None, "converge_tol is inference-only"
             x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
-            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, None, 0, None, evidence, use_reentrant=False)
+            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, None, 0, None, evidence, token_mask, use_reentrant=False)
             # final RMSNorm applied at every loop, not just the last -- lm_head reads self.norm(x),
             # never the raw residual stream, so per-loop CE needs this too.
             x_all = self.norm(hidden_states_all)
@@ -599,7 +665,7 @@ class TinyMoETransformer(nn.Module):
             moe_cache = kv_cache.moe if kv_cache is not None else None
             exit_check = None if converge_tol is None else self._convergence_exit(converge_tol, min_loops)
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
-            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence)
+            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence, token_mask=token_mask)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=False)

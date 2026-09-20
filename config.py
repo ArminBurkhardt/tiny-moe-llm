@@ -57,6 +57,18 @@ class TrainingConfig:
     Seq_length = int(Config["training"]["seq_length"])
     lambda_mtp = float(Config["training"]["lambda_mtp"])
     aux_loss_weight = float(Config["training"]["aux_loss_weight"])
+    # the supervised selection term's coefficient. Lives here with every other loss weight rather
+    # than on EvidenceConfig: the objective is assembled in one place (pretrain.train_step, which
+    # every profile reuses), and a second copy of a weight is a second thing that drifts.
+    evidence_selection_weight = float(Config["training"].get("evidence_selection_weight", 0.0))
+    assert evidence_selection_weight >= 0.0, (
+        f"evidence_selection_weight ({evidence_selection_weight}) must be >= 0"
+    )
+    # the groundedness readout's coefficient, here for the same reason
+    groundedness_weight = float(Config["training"].get("groundedness_weight", 0.0))
+    assert groundedness_weight >= 0.0, (
+        f"groundedness_weight ({groundedness_weight}) must be >= 0"
+    )
     num_epochs = int(Config["training"]["num_epochs"])
     learning_rate = float(Config["training"]["lr"])
     lr = float(Config["training"]["lr"])

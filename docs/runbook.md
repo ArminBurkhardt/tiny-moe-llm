@@ -432,8 +432,11 @@ python scripts/sft.py --ir -c ckpts/trained/checkpoint_phase2_final_phase0_irran
 
 # evidence (Phase 4): port the seed, build the oracle-evidence corpus, train, read the gates
 python scripts/migrate_evidence_port.py -c ckpts/repair/checkpoint_repair_final_irrandom.pt
-python scripts/prepare_evidence_data.py --target-tokens 150000000         # ~11 h at ~400 docs/s, resumable
-python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt
+python scripts/migrate_groundedness_head.py -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt
+# ~1-3 h, resumable. --max-evidence-tokens 4608 or the `many` condition is dropped wholesale (the
+# 1536 default is under 16-32 distractors); --max-source-epochs lets the finite QA sets repeat
+python scripts/prepare_evidence_data.py --target-tokens 150000000 --max-evidence-tokens 4608 --max-source-epochs 4
+python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt
 python scripts/eval_abstention.py -c ckpts/evidence/checkpoint_evidence_final.pt --evidence-port \
     --evidence-condition gold,none,distractors,mixed --max-examples 2000 --batch-size 16
 python scripts/eval_benchmarks.py -c ckpts/evidence/checkpoint_evidence_final.pt --compare docs/measurements/benchmarks/*.json

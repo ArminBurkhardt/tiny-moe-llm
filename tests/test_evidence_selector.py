@@ -21,11 +21,17 @@ Four groups of assertions:
    tokens alone, ``None`` stays bit-identical to today's numerics, and the fixture actually is a case
    the unmasked loss gets wrong (padding skewed hard onto one expert), or the test would pass
    vacuously.
+5. **Both of those are actually attached to the model**, which is a separate claim from either one
+   being correct: a loss that is only tested standalone trains nothing. ``evidence_selection_term``
+   is None exactly when there is nothing to select over, it carries a gradient back to the
+   selector's own tensors after a real forward, and ``token_mask`` reaches ``compute_aux_loss``
+   through ``TinyMoETransformer.forward``.
 
 Plain script, not pytest (see tests/run_tests.sh). Requires the WSL/CUDA environment because
 modules/model/* pulls in transformer_engine at import time regardless of whether a given assertion
 needs the GPU for its own math.
 """
+import math
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
@@ -34,6 +40,10 @@ from modules.model.experts import InformationRetrievalExpert
 from modules.model.information_retrieval import evidence_selection_loss
 from modules.model.evidence import EvidenceBatch, scatter_chunk_score_to_tokens, apply_chunk_gate, chunk_mean_mass
 from modules.model.router import compute_aux_loss
+from modules.model.transformer import TinyMoETransformer
+# the trainer's own position rule, imported rather than restated -- a second copy here would let
+# the test keep passing while the objective moved to a different position
+from scripts.pretrain import answer_start_positions
 
 DEVICE = "cuda"
 BF16 = torch.bfloat16
@@ -218,12 +228,235 @@ def test_aux_loss_mask():
     print("13. token_mask=None stays bit-identical to today's numerics                      PASS")
 
 
+MODEL_P = dict(
+    vocab_size=512, max_seq_len=128, hidden_size=256, intermediate_size=512,
+    head_dim=32, num_layers=2, num_heads=8, num_mlp_experts=8, num_attn_experts=1,
+    top_k=2, n_loops=3, num_ir_experts=1, num_ir_entries=256, ir_dim=64,
+    dropout=0.0, ple_embeddings_size=32, mtp_num_extra_tokens=2, lm_head_factor=4,
+    evidence_port=True,
+)
+
+
+def _model_with(**overrides):
+    torch.manual_seed(0)
+    model = TinyMoETransformer(**dict(MODEL_P, **overrides)).to(DEVICE).to(BF16).eval()
+    # both terms read tensors the forward stashed, and a checkpointed segment recomputes them
+    # under no_grad -- the trainer asserts this is off, so the test runs the same way
+    model.set_checkpointing(False, False)
+    return model
+
+
+def _model():
+    return _model_with()
+
+
+def test_selection_term_wiring():
+    model = _model()
+    B, S, S_ev = 2, 24, 12
+    input_ids = torch.randint(1, MODEL_P["vocab_size"], (B, S), device=DEVICE)
+    ev_ids = torch.randint(1, MODEL_P["vocab_size"], (B, S_ev), device=DEVICE)
+    ev_chunk = torch.tensor([[0] * 6 + [1] * 6, [2] * 6 + [3] * 6], device=DEVICE)
+    ev_segment = torch.tensor([[0] * S_ev, [1] * S_ev], device=DEVICE)
+    chunk_segments = torch.tensor([0, 0, 1, 1], device=DEVICE)
+    chunk_gold = torch.tensor([1.0, 0.0, 0.0, 1.0], device=DEVICE)
+    keys = torch.randn(4, MODEL_P["ir_dim"], device=DEVICE, dtype=BF16)
+
+    # a forward with no evidence at all leaves nothing to select over, and the term has to say so
+    # rather than return a zero the trainer would add to the loss as if it were a measurement
+    with torch.no_grad():
+        model(input_ids, skip_mtp=True)
+    assert model.moe.evidence_selection_term(chunk_gold) is None, (
+        "a no-evidence forward produced a selection term -- the trainer would be adding a stale "
+        "batch's read weights to this batch's loss"
+    )
+
+    # the reader without the selector: evidence tokens but no chunk keys, so there is no external
+    # store in the read at all and still nothing to supervise
+    reader_only = model.build_evidence(ev_ids, ev_chunk, ev_segment, 2)
+    with torch.no_grad():
+        model(input_ids, skip_mtp=True, evidence=reader_only)
+    assert model.moe.evidence_selection_term(chunk_gold) is None, (
+        "evidence without chunk keys produced a selection term -- there is no external store to rank"
+    )
+    print("14. the selection term is None exactly when nothing was selected over             PASS")
+
+    evidence = model.build_evidence(
+        ev_ids, ev_chunk, ev_segment, 2, chunk_keys=keys, chunk_segments=chunk_segments,
+        chunk_gold=chunk_gold,
+    )
+    model.zero_grad(set_to_none=True)
+    logits = model(input_ids, skip_mtp=True, evidence=evidence)
+    # supervise the back half of each row, the way an answer span sits at the end of a prompt
+    supervised = torch.zeros(B, S, device=DEVICE)
+    supervised[:, S // 2:] = 1.0
+    term = model.moe.evidence_selection_term(evidence.chunk_gold, supervised=supervised.reshape(-1))
+    assert term is not None and torch.isfinite(term), f"no finite selection term: {term}"
+    assert term.requires_grad, "the selection term has no graph -- it would train nothing"
+    term.backward()
+
+    ir = model.moe.ir_modules[0]
+    # key_adapter is the selector's OWN tensor: the renormalization inside the loss divides the
+    # parametric/external split out, so what is left is pure ranking, and this is the weight that
+    # decides where an external chunk lands relative to the query
+    grad = ir.key_adapter.weight.grad
+    assert grad is not None and torch.isfinite(grad).all(), (
+        "no gradient reached the selector's key adapter -- the term is attached to nothing"
+    )
+    assert grad.abs().max().item() > 0, "the key adapter's gradient is exactly zero"
+    # the term also reaches the trunk, which is correct rather than leakage: loop 2's query is the
+    # state loop 1 (reader included) produced, so "supervises the split alone" is a statement about
+    # what the loss MEASURES, not about which tensors the recurrence puts between it and the input
+    print(
+        f"15. the selection term trains the selector (|dkey_adapter|max = "
+        f"{grad.abs().max().item():.2e})                                PASS"
+    )
+    del logits
+
+
+def test_forward_token_mask():
+    model = _model()
+    B, S = 2, 24
+    input_ids = torch.randint(1, MODEL_P["vocab_size"], (B, S), device=DEVICE)
+    # a trailing pad run, the shape every packed row ends with
+    input_ids[:, S - 8:] = 0
+    mask = torch.ones(B, S, dtype=torch.bool, device=DEVICE)
+    mask[:, S - 8:] = False
+
+    with torch.no_grad():
+        _, aux_none = model(input_ids, return_aux_loss=True, skip_mtp=True)
+        _, aux_default = model(input_ids, return_aux_loss=True, skip_mtp=True, token_mask=None)
+        _, aux_masked = model(input_ids, return_aux_loss=True, skip_mtp=True, token_mask=mask)
+    assert torch.equal(aux_none, aux_default), "token_mask=None changed the forward's aux loss"
+    assert not torch.equal(aux_none, aux_masked), (
+        "token_mask did not reach compute_aux_loss through the model's forward -- the padded "
+        "positions are still in the mean"
+    )
+    print(
+        f"16. token_mask reaches the aux loss through the model forward ({aux_none.item():.4f} "
+        f"-> {aux_masked.item():.4f})   PASS"
+    )
+
+
+def test_groundedness_wiring():
+    """The head reads the reader, the label is the AND, and the positions are the prompt's last."""
+    model = _model_with(groundedness_head=True)
+    B, S, S_ev = 2, 24, 12
+    input_ids = torch.randint(1, MODEL_P["vocab_size"], (B, S), device=DEVICE)
+    ev_ids = torch.randint(1, MODEL_P["vocab_size"], (B, S_ev), device=DEVICE)
+    ev_chunk = torch.tensor([[0] * 6 + [1] * 6, [2] * 6 + [3] * 6], device=DEVICE)
+    ev_segment = torch.tensor([[0] * S_ev, [1] * S_ev], device=DEVICE)
+    # row 0's document holds a gold chunk, row 1's holds none -- the two halves of the label have
+    # to come apart, or the test cannot tell the AND from either operand
+    chunk_gold = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE)
+    evidence = model.build_evidence(
+        ev_ids, ev_chunk, ev_segment, 2,
+        chunk_keys=torch.randn(4, MODEL_P["ir_dim"], device=DEVICE, dtype=BF16),
+        chunk_segments=torch.tensor([0, 0, 1, 1], device=DEVICE),
+        chunk_gold=chunk_gold,
+    )
+
+    labels = torch.full((B, S), -100, device=DEVICE, dtype=torch.long)
+    labels[:, S // 2:] = input_ids[:, S // 2:]
+    positions = answer_start_positions(labels)
+    expected = torch.zeros(B, S, dtype=torch.bool, device=DEVICE)
+    expected[:, S // 2 - 1] = True
+    assert torch.equal(positions, expected), (
+        f"the scored position is not the last prompt token: {positions.nonzero().tolist()}"
+    )
+    print("17. the groundedness position is the last prompt token of each answer span     PASS")
+
+    answerable = torch.ones(B, S, dtype=torch.long, device=DEVICE)
+    model.zero_grad(set_to_none=True)
+    model(input_ids, skip_mtp=True, evidence=evidence)
+    term = model.groundedness_term(evidence.chunk_gold, answerable, positions)
+    assert term is not None and torch.isfinite(term), f"no finite groundedness term: {term}"
+    # a zero-init head is exactly p = 0.5, so the BCE starts at ln 2 whatever the labels are
+    assert abs(term.item() - math.log(2)) < 1e-2, (
+        f"a zero-init head should start at ln 2 = {math.log(2):.4f}, got {term.item():.4f}"
+    )
+    term.backward()
+
+    # On a freshly migrated port the reader's o_proj is zero, so its output -- which is what this
+    # head reads -- is IDENTICALLY zero, and the head's weight gradient is exactly zero with it.
+    # The head can move its bias (the corpus's base rate) and nothing else until the reader leaves
+    # its own zero. Asserted rather than worked around: it is the same dependency |g_proj|rms
+    # exists to make visible on the IR read, and it means an early `grounded` falling in the log is
+    # the base rate being learned, not grounding -- the held-out AUROC is what tells them apart.
+    assert model.moe.last_reader_output.abs().max().item() == 0.0, (
+        "the fixture's reader is not at its zero init -- assertion 18 is not testing what it says"
+    )
+    frozen_grad = model.groundedness_head.out_proj.weight.grad
+    assert frozen_grad is not None and frozen_grad.abs().max().item() == 0.0, (
+        f"the head's weights moved while the reader is zero: {frozen_grad.abs().max().item()}"
+    )
+    print(f"18. the head starts at ln 2 ({term.item():.4f}) and is weight-frozen until the "
+          f"reader leaves zero   PASS")
+
+    # wake the reader, exactly as tests/test_evidence_port.py does for its own assertion 3, and the
+    # head has something to say. Read on the OUTPUT rather than on a second backward: the weight
+    # gradient is the reader's output times a per position error, so "the logits stop being the
+    # bias everywhere" is the same fact, and stacking several backwards through TE's fused ops in
+    # one process trips its saved-tensor bookkeeping for reasons that have nothing to do with this.
+    live_model = _model_with(groundedness_head=True)
+    with torch.no_grad():
+        frozen = live_model.groundedness_head(
+            torch.zeros(1, 4, MODEL_P["hidden_size"], device=DEVICE, dtype=BF16)
+        )
+        assert torch.equal(frozen, torch.zeros_like(frozen)), (
+            "the head is not neutral on a zero read -- a migrated checkpoint would start with an "
+            "opinion it never learned"
+        )
+        torch.nn.init.normal_(live_model.moe.shared_evidence.attn.o_proj.weight, std=0.02)
+        torch.nn.init.normal_(live_model.groundedness_head.out_proj.weight, std=0.5)
+        live_model(input_ids, skip_mtp=True, evidence=evidence)
+        logits = live_model.groundedness_head(live_model.moe.last_reader_output)
+    assert live_model.moe.last_reader_output.abs().max().item() > 0, "the reader stayed at zero"
+    assert logits.std().item() > 0, (
+        "the head's output is constant across positions even with a live reader -- it is not "
+        "reading the read"
+    )
+    print(f"19. with a live reader the head reads it (logit sd = {logits.std().item():.3f}), and "
+          f"is exactly 0 on a zero read  PASS")
+
+    # the label is the AND of two independent axes: row 0's document holds a gold chunk and row 1's
+    # does not, so flipping `answerable` off for row 0 has to change the loss -- otherwise the head
+    # is being trained on gold presence alone, which is the mass split again and exactly what this
+    # head exists to go beyond. Read with a live reader, since at p = 0.5 every BCE is ln 2.
+    axes_model = _model_with(groundedness_head=True)
+    with torch.no_grad():
+        torch.nn.init.normal_(axes_model.moe.shared_evidence.attn.o_proj.weight, std=0.02)
+        torch.nn.init.normal_(axes_model.groundedness_head.out_proj.weight, std=0.5)
+    with torch.no_grad():
+        axes_model(input_ids, skip_mtp=True, evidence=evidence)
+        both_true = axes_model.groundedness_term(evidence.chunk_gold, answerable, positions)
+        half = answerable.clone()
+        half[0] = 0
+        gold_only = axes_model.groundedness_term(evidence.chunk_gold, half, positions)
+    assert not torch.isclose(both_true, gold_only), (
+        f"answerability does not move the label ({both_true.item():.4f} vs {gold_only.item():.4f})"
+        f" -- the loss is reading gold presence alone"
+    )
+    print("20. answerability is a real second axis of the label, not a relabelled gold flag PASS")
+
+    # and a model without the head says so rather than returning a zero a trainer would add
+    plain = _model_with(groundedness_head=False)
+    with torch.no_grad():
+        plain(input_ids, skip_mtp=True, evidence=evidence)
+    assert plain.groundedness_term(evidence.chunk_gold, answerable, positions) is None, (
+        "a checkpoint with no head produced a groundedness term"
+    )
+    print("21. no head means no term, not a zero                                           PASS")
+
+
 def main():
     test_direct_read()
     test_selection_loss()
     test_chunk_mean_mass()
     test_reader_gate()
     test_aux_loss_mask()
+    test_selection_term_wiring()
+    test_forward_token_mask()
+    test_groundedness_wiring()
 
 
 if __name__ == "__main__":

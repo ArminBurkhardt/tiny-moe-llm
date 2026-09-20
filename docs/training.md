@@ -132,9 +132,20 @@ loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-fi
   `top1_acc`, computed on the chunks already materialized; only `.item()`-ing them at log cadence
   is a host sync.
 
-Two more losses exist for the evidence profile and are **not yet wired in**:
-`information_retrieval.evidence_selection_loss` and `evidence.groundedness_loss`. See
-[NEXT.md](plans/NEXT.md) Phase 4.
+- **Selection loss**: `evidence_selection_weight * evidence_selection_term(...)`, the supervised
+  ranking term on the evidence selector. Present only on a batch that carries evidence *and* the
+  corpus's per-chunk gold flag, so it is structurally absent from every profile but `--evidence`
+  and from any corpus built before the flag. It reads the mass split the forward already produced
+  (`LoopMixtureOfExperts.evidence_selection_term`, averaged over every loop and every IR expert),
+  so it costs one `[tokens, chunks]` BCE and no second pass — and it asserts gradient checkpointing
+  is off, because a checkpointed segment's stashed weights carry no graph.
+
+- **Groundedness loss**: `groundedness_weight * groundedness_term(...)`, BCE on the evidence
+  reader's own output at the last prompt token of each supervised span
+  (`pretrain.answer_start_positions`), against the corpus label "a gold chunk is present AND the
+  row is answerable". Needs a checkpoint carrying the head (`migrate_groundedness_head.py`) and a
+  corpus carrying `.evgold`/`.ans`, so like the selection term it is structurally absent
+  everywhere else. Reads the same stashed forward, with the same no-checkpointing requirement.
 
 ## The finetune profiles
 
