@@ -264,20 +264,30 @@ evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence
                    # reason, so the table trains at `lr` above instead
   num_epochs: 1 # one pass. The abstention targets come from a closed phrasing set and a second
                 # pass starts memorizing the strings instead of the policy
-  batch_size: 4 # 4 x 4096 stays resident on the 32GB card; 8 spills into shared memory at ~4x the
-                # throughput cost. The evidence axis adds to that peak, so this is not the place to
-                # economize
-  grad_accumulation_steps: 4 # ~65k prompt tokens per optimizer step
-  max_evidence_tokens: 12288 # cap on ONE ROW's evidence. Evidence is embedded and cross attended at
-                             # every loop, so without a cap peak memory would depend on which
-                             # conversations happened to pack together. 3x seq_length because that
-                             # is the corpus's measured evidence-to-prompt token ratio (2.93): a cap
-                             # below it closes every row on evidence long before the token budget
-                             # fills, and the row is then mostly padding -- a full width forward for
-                             # a handful of real tokens. Evidence tokens are far cheaper than prompt
-                             # tokens (an embedding lookup plus one k/v projection per loop, never
-                             # the decoder or the LM head), so balancing the two budgets here costs
-                             # little memory and is what keeps the rows dense
+  batch_size: 2 # NOT 4. Peak memory on this profile is set by the evidence axis, not the prompt
+                # axis: measured on this corpus it is ~3.5 GiB + 0.61 MiB per evidence token, and
+                # the prompt axis is lost in the noise beside it. Four rows of ~10.7k evidence
+                # tokens each is ~30 GiB before the optimizer's fp32 masters and moments (+4.3 GiB)
+                # and the 32GB card has ~30.2 GiB free -- it fills the card and dies inside WSL as
+                # `CUDA driver error: device not ready`, at a different op every time. Two rows of
+                # a fuller cap costs the same tokens per optimizer step and fits with room
+  grad_accumulation_steps: 8 # ~65k prompt tokens per optimizer step, unchanged from batch 4 x 4
+  max_evidence_tokens: 14336 # cap on ONE ROW's evidence. Evidence is encoded by the dense decoder
+                             # once per forward and cross attended at every loop, so without a cap
+                             # peak memory would depend on which conversations happened to pack
+                             # together -- and it is the dominant term in that peak, not a rounding
+                             # error on it. The number has to be read against the corpus, not set
+                             # once: a row needs ratio x seq_length of evidence to fill its token
+                             # budget, so below that the evidence budget closes the row early and
+                             # the unused prompt slots are padding the body still pays a full
+                             # 502M FLOP/token to run. This corpus's ratio is 3.75, so filling
+                             # 4096 prompt tokens wants ~15.4k evidence tokens; 14336 (3.5x) is
+                             # that minus a safety margin for the peak, and measures 64% fill at
+                             # ~25 GiB. Not the ~90% the ratio alone predicts: the ratio is a
+                             # corpus mean and packing is greedy, so a row that happens to draw
+                             # QA conversations (short prompts, 6-7.6x evidence) closes on
+                             # evidence while its token budget is still half empty. The earlier
+                             # 12288 was 3x against a ratio-2.93 corpus and leaves this one at 55%
   checkpoint_every_tokens: 25000000
   eval_every_tokens: 10000000
   conversation_loss_weighting: true # this is a policy change, and unweighted CE makes a six token

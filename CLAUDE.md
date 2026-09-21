@@ -6,26 +6,45 @@ what lives where, the non-obvious invariants, how to run things, and **what is n
 ## What is next (keep this section current)
 
 Authoritative copy: the "Now" section at the top of [docs/plans/NEXT.md](docs/plans/NEXT.md)
-(the plan; older notes call it `PLAN.md`). Update both when the next step changes. As of 2026-09-19:
+(the plan; older notes call it `PLAN.md`). Update both when the next step changes. As of 2026-09-20:
 
-1. **Corpus: building** (`--target-tokens 150000000 --max-evidence-tokens 4608
-   --max-source-epochs 4`). The one-pass build is archived as `data/prepared/evidence_nomany_*`;
-   read the realized passes and shares the builder prints at the end before training on either.
-2. Migrate the seed: `python scripts/migrate_groundedness_head.py
-   -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt` (the head is a new parameter).
-3. Train: `python scripts/sft.py --evidence -c <the _grounded.pt seed>` under a watch; kill at 10M
+1. **Corpus: built** (`--target-tokens 150000000 --max-evidence-tokens 4608 --max-source-epochs 4`,
+   28 min). `evidence_train`: 963,011 conversations, 140.1M prompt tokens, 525.6M evidence tokens,
+   3.74M chunks; `evidence_val` 9,707. Both QA sources ran the full 4 passes, so QA is 32.6% of
+   tokens and ~90% of conversations; `many` is 58,767 rows; 59.9% of rows answerable; replay 25.0%
+   of tokens. The one-pass build is archived as `data/prepared/evidence_nomany_*` (and is no longer
+   loadable — it predates `.ans`).
+2. **Seed: migrated.** `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`, 4
+   tensors / 1.5K parameters added, every other tensor bit-identical to its source.
+3. **Batch and cap: retuned** to `batch_size: 2`, `grad_accumulation_steps: 8`,
+   `max_evidence_tokens: 14336` — same tokens per optimizer step, 64% fill instead of 55%, ~25 GiB
+   peak. Measured: peak ≈ **3.5 GiB + 0.61 MiB per evidence token**, the prompt axis negligible
+   beside it, so batch 4 on this corpus wants ~30 GiB before the optimizer's +4.3 GiB against
+   ~30.2 GiB free and dies inside WSL as `CUDA driver error: device not ready`. ~0.7 s/step
+   expected, so 10M tokens is roughly 20 minutes.
+4. Train: `python scripts/sft.py --evidence -c <the _grounded.pt seed>` under a watch; kill at 10M
    tokens if the per-condition `[eval]` gold-vs-none CE gap is < ~0.1 nats. Watch `selection:`,
    `grounded:` (and its held-out AUROC), `|shared_evidence.o_proj|rms`, `external mass`.
-4. Read G3/G3b with `eval_abstention.py --evidence-port`, then the benchmark suite. Baseline on the
+5. Read G3/G3b with `eval_abstention.py --evidence-port`, then the benchmark suite. Baseline on the
    migrated seed: gold-vs-none gap 0.0000 nats.
 
 All three losses are wired now (`evidence_selection_loss`, `groundedness_loss`, the aux
-`token_mask`). `ckpts/evidence_smoke/` is still on disk and is the only checkpoint that can
-rehearse the `--evidence` profile end to end.
+`token_mask`). **`ckpts/evidence_smoke/` is empty** — the rehearsal checkpoints were deleted, so
+the only way to exercise the `--evidence` profile now is the real run. Its log survives as
+`ckpts/evsmoke.log` and is the memory and throughput reference: batch 4 × 4096, cap 12288, a
+ratio-2.93 corpus, **peak 24.29 GB with full optimizer state**, 18–29k tok/s. `ckpts/evidence/`
+does not exist yet, so the first `--evidence` launch honours its `-c` seed; once it does, a later
+launch resumes from it instead.
 
 **End every turn with a short "something you should know in my opinion"** — one thing the user
 did not ask about but should hear: a risk noticed in passing, a stale assumption, a cheaper path,
 a number that does not add up. Plain prose, one to three sentences, never skipped.
+
+**Close every turn that did work with three short lines**: what was done, what changed
+architecturally (a new tensor, a new loss term, a moved invariant, a changed on-disk format —
+"nothing structural" is a valid and common answer), and what is next. One or two sentences each,
+in the reply and not in a file, before the "something you should know". A turn that only answered
+a question skips it.
 
 ## Running anything: WSL + `env_init`
 
@@ -58,8 +77,14 @@ that has stopped climbing by the first checkpoint is the answer. The remaining h
 control at matched tokens — worth having sometimes, and worth saying out loud either way.
 
 **Fix slow runs immediately.** 4 × 4096 stays resident on the 5090 (21–27GB peak); 8 × 4096 spills
-into shared system memory at a ~3–4x throughput cost and does not OOM. **All local finetunes run in
-BF16 — do not set `USE_FP8`.**
+into shared system memory at a ~3–4x throughput cost and does not OOM. **That is the no-evidence
+figure.** With evidence attached the peak is set by the evidence axis, not the prompt axis —
+measured ≈ **3.5 GiB + 0.61 MiB per evidence token**, with the prompt axis lost in the noise beside
+it — so `--evidence` runs at 2 × 4096 with the accumulation doubled. **An evidence run that
+overflows does not degrade gracefully**: WSL's paravirt layer reports it as
+`CUDA driver error: device not ready` at an arbitrary op (backward, rotary, an MoE activation),
+with `dxgkio_make_resident: Ioctl failed: -12` in `dmesg`, which reads like a driver fault and is
+an ordinary out-of-memory. **All local finetunes run in BF16 — do not set `USE_FP8`.**
 
 ## Subagents
 
@@ -69,7 +94,7 @@ invoke the skill itself. Reason: its report is injected verbatim into this conte
 uncompressed one is 2–3x the size of what it says. Caveman applies to the **report**, not to what
 the subagent writes into the repo (code, comments, docstrings, docs, commit messages stay normal
 prose). One subagent per task; combine tasks that share a file, state the owned files in the prompt,
-run disjoint groups in parallel.
+run disjoint groups in parallel. Any documentation or code comments must be written in the same style as the rest of the repo, not in caveman.
 
 ## What this is
 
@@ -87,7 +112,7 @@ One real run exists: 16B tokens of pretraining on a rented H100, then a chain of
 SFT, abstention repair, three IR sharpening arms, a loop injection arm — and the Phase 4 build.
 [docs/CONCLUSION.md](docs/CONCLUSION.md) is the pretraining write-up; every gate since is in
 [docs/measurements/](docs/measurements/); the plan is [docs/plans/NEXT.md](docs/plans/NEXT.md)
-(Phases 0, 1, 1b, 2, 3, 3b, 3c done; 4 built and smoke-tested, corpus not yet built); the
+(Phases 0, 1, 1b, 2, 3, 3b, 3c done; 4 built, smoke-tested and its corpus built, not yet run); the
 pre-Phase-4 review is [docs/review_2026-09-18.md](docs/review_2026-09-18.md). **The benchmark suite
 is the quality instrument** — CE on the local slice is a health check —
 [benchmark_snapshot.md](docs/measurements/benchmark_snapshot.md) is the baseline every change is
@@ -223,9 +248,19 @@ Tests are plain scripts (`sys.path.insert` + asserts). GPU-free ones: the `modul
   (key absent) means "use `utils.HF_UPLOAD_REPO`" — the two must never be collapsed.
 - `IRConfig` adds `fresh_lr`, the temperature anneal (`temperature_scale(progress)` is geometric,
   clamped at 1.0), `cluster_refresh_tokens`, `dead_quantile`. `EvidenceConfig` adds `fresh_lr` (port
-  tensors only), `max_evidence_tokens` (set against the corpus's evidence-to-prompt ratio, not for
-  memory: below ~3× `seq_length` at ratio 2.93 evidence closes every row early — a corpus whose
-  ratio is below 1 makes 12288 oversized, which is the harmless direction), `loss_weight_floor_tokens`
+  tensors only), `max_evidence_tokens` (**set against the corpus's evidence-to-prompt ratio, and
+  it is also the dominant term in peak memory** — the two pull opposite ways, which is the whole
+  difficulty. A row needs `ratio * seq_length` of evidence to fill its token budget, so under that
+  the evidence budget closes every row early and the unused prompt slots are padding the body still
+  pays 502M FLOP/token to run; over it, `0.61 MiB` per evidence token times the batch overflows the
+  card. At 12288 against the rebuilt corpus's ratio of 3.75 the dataset closes 206 of its first 256
+  rows on the evidence budget, for 55% fill; 14336 at `batch_size: 2` is 64% fill at ~25 GiB —
+  read `fill` and `closed by the evidence budget` off the packing line in the first minute of any
+  run. **Fill lags what the ratio predicts** because the ratio is a corpus mean and packing is
+  greedy: a row that draws QA conversations (short prompts, 6–7.6× evidence) closes on evidence
+  with its token budget half empty, so the return on raising the cap is sublinear — 12288 → 14336
+  bought 9 points. A corpus whose ratio is below 1 makes 12288 oversized, the harmless direction),
+  `loss_weight_floor_tokens`
   (64: it caps a conversation's total weight at `min(n_supervised/64, 1)`, so gradient share is
   **not** the conversation share for a source with short answers — a 5-token SQuAD answer counts
   ~0.08 against a long continuation's 1.0, and the three shares to read are tokens, conversations
@@ -517,7 +552,9 @@ Prints each source's conversation share next to its token share and its `too_lon
 - **The evidence-to-prompt ratio is a composition statistic**, not a property of the rows: 7.6 for
   SQuAD, 6.3 for HotpotQA, 0.45 for web text, 0 for replay. The 2.93 that sized
   `EvidenceConfig.max_evidence_tokens` came from a QA-heavy smoke corpus; a one-pass real corpus
-  reads 0.96 because web text and replay dominate its tokens.
+  reads 0.96 because web text and replay dominate its tokens, and the four-pass rebuild reads
+  **3.75** because repeating the QA sources moves the composition back. So the cap has to be
+  re-read against every corpus rather than carried over.
 
 ## Training loop notes ([scripts/pretrain.py](scripts/pretrain.py))
 

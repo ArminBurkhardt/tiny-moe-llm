@@ -14,36 +14,71 @@ folded into Phase 4 and Phase 7 below.
 ## Now (2026-09-20)
 
 Phase 4's port, corpus builder, trainer profile and eval are built; all three of the losses the
-review left unattached are now wired. The corpus is building. In order:
+review left unattached are now wired. The corpus is built and the seed is migrated. In order:
 
-1. **Corpus: in flight.** `python scripts/prepare_evidence_data.py --target-tokens 150000000
-   --max-evidence-tokens 4608 --max-source-epochs 4`. Read the realized per-source passes,
-   `too_long` counts and shares it prints at the end before training on it.
+1. **Corpus: built** (28 min). `python scripts/prepare_evidence_data.py --target-tokens 150000000
+   --max-evidence-tokens 4608 --max-source-epochs 4`. Realized: `evidence_train` 963,011
+   conversations, **140.1M prompt / 525.6M evidence tokens, 3.74M chunks**; `evidence_val` 9,707.
+   Both QA sources stopped at the **4-pass cap**, not at their token target — squad_v2 25.0M
+   prompt tokens (17.7% of the corpus, 52.6% of conversations), hotpot_qa 21.0M (14.9%, 37.0%) —
+   so a 5th pass would still add QA if it is ever wanted. Web text 60.1M (42.5%), replay 35.4M
+   (25.0%, above the 20% floor). `many` is **58,767 rows**, 59.9% of rows are answerable, and
+   `too_long` fell to 10,029 on squad and 1,910 on hotpot.
 
-   The one-pass build that preceded it is archived as `data/prepared/evidence_nomany_*` and is
-   what the numbers below were read off: **106M prompt / 101M evidence tokens, and it stopped
-   short of 150M because both QA sources are finite and were fully consumed** (SQuAD v2 ~130k
-   rows, HotpotQA ~90k, 10.7M prompt tokens between them). Three things came out of reading it:
-   the `many` condition produced **2 rows out of 304,662** because 16–32 distractors exceed the
-   1536-token default evidence cap and an over-budget row is dropped; the evidence-to-prompt ratio
-   is **0.96, not the smoke corpus's 2.93**, because web text (56% of tokens, a fixed 384-token
-   held span) and replay (33%, no evidence) dominate the token mass while QA rows still carry
-   6–7.6×; and QA ends up at **~18% of the gradient** once `loss_weight_floor_tokens: 64` is
-   applied to its short answers. `EvidenceSource.repeat` is the answer to the third — another pass
-   over a QA source redraws every row's condition and distractors, so the repeat is a new task on
-   a seen question, bounded at 4 passes.
-2. **Migrate the seed:** `python scripts/migrate_groundedness_head.py
-   -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt`. The head is a new parameter, so
-   the `--evidence` run needs a seed carrying it.
-3. **Run:** `python scripts/sft.py --evidence -c <the _grounded.pt seed>`, under a watch, and
+   The one-pass build that preceded it is archived as `data/prepared/evidence_nomany_*` (no longer
+   loadable — it predates `.ans`) and is what the three findings were read off: **106M prompt /
+   101M evidence tokens, stopping short of 150M because both QA sources are finite and were fully
+   consumed** (SQuAD v2 ~130k rows, HotpotQA ~90k, 10.7M prompt tokens between them); the `many`
+   condition produced **2 rows out of 304,662** because 16–32 distractors exceed the 1536-token
+   default evidence cap and an over-budget row is dropped; the evidence-to-prompt ratio read
+   **0.96, not the smoke corpus's 2.93**, because web text (56% of tokens, a fixed 384-token held
+   span) and replay (33%, no evidence) dominated the token mass while QA rows still carried
+   6–7.6×; and QA ended up at **~18% of the gradient** once `loss_weight_floor_tokens: 64` is
+   applied to its short answers. `EvidenceSource.repeat` answered the third — another pass over a
+   QA source redraws every row's condition and distractors, so the repeat is a new task on a seen
+   question, bounded at 4 passes — and took QA to 32.6% of tokens.
+2. **Seed: migrated.** `python scripts/migrate_groundedness_head.py
+   -c ckpts/repair/checkpoint_repair_final_irrandom_evidence.pt` wrote
+   `..._evidence_grounded.pt`: 4 tensors, 1.5K parameters, every other tensor bit-identical to its
+   source, `evidence_port` and `groundedness_head` both inferred back out of it.
+3. **Batch and cap: retuned.** The rebuilt corpus's ratio is **3.75**, so the 12288 cap — sized
+   against the smoke corpus's 2.93 — closed **206 of the first 256 rows on the evidence budget**
+   for **55% fill**, spending nearly half the body FLOPs on padding. Raising it ran into the other
+   wall: a three-point probe (forward + backward, no optimizer state) measures peak memory at
+   **≈ 3.5 GiB + 0.61 MiB per evidence token**, with the prompt axis negligible beside it, so four
+   rows of ~10.7k evidence tokens is ~30 GiB before the optimizer's fp32 masters and moments
+   (+4.3 GiB) against ~30.2 GiB free — it fills the card. Settled at **`batch_size: 2`,
+   `grad_accumulation_steps: 8`, `max_evidence_tokens: 14336`**: the same ~65k prompt tokens per
+   optimizer step, **64% fill** (182 of 256 rows still close on evidence), ~25 GiB peak. 64 and
+   not the ~90% the ratio alone predicts, because the ratio is a corpus mean and packing is
+   greedy: a row that draws QA conversations — short prompts, 6–7.6× evidence — closes on the
+   evidence budget with its token budget half empty. The return on raising the cap is sublinear,
+   9 points for 12288 → 14336, and the next 2048 would cost ~2.4 GiB of the ~5 GiB headroom left.
+
+   | cap | batch | peak allocated | evidence tokens/step | s/step |
+   |---|---|---|---|---|
+   | 12288 | 2 | 17.39 GiB | 22,638 | 0.566 |
+   | 12288 | 1 | 9.30 GiB | 8,706 | 0.275 |
+   | 16384 | 1 | 10.62 GiB | 10,858 | 0.299 |
+
+   **An evidence run that overflows does not report an OOM.** WSL's GPU paravirt layer surfaces it
+   as `RuntimeError: CUDA driver error: device not ready` at an arbitrary op — backward one run,
+   the rotary apply the next, an MoE activation the third — with
+   `dxgkio_make_resident: Ioctl failed: -12` in `dmesg`. It reads like a driver fault and it is an
+   ordinary out-of-memory.
+4. **Run:** `python scripts/sft.py --evidence -c <the _grounded.pt seed>`, under a watch, and
    **kill at 10M tokens if the per-condition val CE gap (gold vs none) is under ~0.1 nats**. The
-   smoke measured 22.8k prompt tok/s before evidence was routed through the dense decoder; expect
-   less, and read the real figure off the first log lines.
-4. **Read G3 and G3b** with `eval_abstention.py --evidence-port` (both passes), then the benchmark
+   smoke measured 22.8k prompt tok/s on a ratio-2.93 corpus at batch 4; at ratio 3.75 and batch 2
+   expect roughly 0.7 s/step and ~11k prompt tok/s, so 10M tokens is around 20 minutes and a full
+   epoch is a few hours. Read the real figure off the first log lines. `ckpts/evidence/` does not
+   exist yet, so this first launch honours `-c`; any later one resumes from it instead.
+5. **Read G3 and G3b** with `eval_abstention.py --evidence-port` (both passes), then the benchmark
    suite. The migrated seed reads a gold-vs-none gap of exactly 0.0000 nats, which is the baseline.
 
-`ckpts/evidence_smoke/` is still on disk: it is the only checkpoint that can rehearse the
-`--evidence` profile end to end before the real run.
+`ckpts/evidence_smoke/` is **empty** — the rehearsal checkpoints have been deleted, so nothing can
+rehearse the `--evidence` profile end to end any more. What survives is `ckpts/evsmoke.log`, and
+it is the memory and throughput reference the real run is read against: batch 4 × 4096, cap 12288,
+a ratio-2.93 corpus, peak 24.29 GB with full optimizer state, 18–29k tokens/sec.
 
 **The plan in one line:** prove every mechanism against its own ablation on a fixed benchmark
 suite — reshape the IR expert, feed the IR/CrossAttention pair real external evidence, align the
@@ -999,9 +1034,17 @@ makes evidence the one that always binds: rows close after a handful of short QA
 the token budget barely touched, and the run then pays a full 4096-wide forward and backward for a
 row that is ~96% padding. It is invisible in the loss and shows up only as throughput, which reads
 like a slow GPU rather than a corpus problem — the first smoke run collapsed from 2,747 to 221
-tokens/sec this way and pushed allocation into system memory. `max_evidence_tokens: 12288` is 3 ×
+tokens/sec this way and pushed allocation into system memory. `max_evidence_tokens: 12288` was 3 ×
 `seq_length` against a measured ratio of 2.93, and `EvidenceDataset` now logs the realized row fill
-and how many rows the evidence budget closed, early enough to kill a run over.
+and how many rows the evidence budget closed, early enough to kill a run over. The number does not
+survive a change of corpus: the four-pass build reads a ratio of **3.75**, at which 12288 closes
+206 of the first 256 rows and fill is 55% — a milder version of the same failure, and the reason
+the cap is re-read against every corpus rather than carried forward. The claim that evidence
+tokens are cheap enough to ignore in the peak is also wrong and has been removed from the config:
+they go through the full dense decoder, and measured peak is ≈ 3.5 GiB + 0.61 MiB per evidence
+token, which makes the cap the dominant memory term rather than a rounding error on it. Raising
+the cap and lowering the batch move together, which is why this corpus runs at 2 × 14336 rather
+than 4 × 12288.
 
 **Gate G3:** gold-vs-no-evidence CE gap ≥ ~0.3 nats on the answer span; abstention rate under
 no-evidence ≫ under gold; benchmark suite within noise.
