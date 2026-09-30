@@ -1,0 +1,867 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Evidence Path Design</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..125,400..800&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<style>
+/* layout: one reading column of spec sheets; two signal colors run through everything:
+   blue = token stream (trunk), copper = evidence path, violet = selector */
+:root{
+  --bg:#f2f4f7; --panel:#ffffff; --panel2:#e9edf3; --fg:#141b26; --mut:#566273; --line:#cfd6e0;
+  --trunk:#2456c9; --trunk-bg:#e3ebfb; --ev:#b4531a; --ev-bg:#fbeadd; --sel:#6b3fb8; --sel-bg:#eee6fa;
+  --ok:#1d7a4f; --ok-bg:#def3e8; --warn:#9a6a00; --warn-bg:#fbf0d2; --bad:#b3261e; --bad-bg:#fbe3e1;
+  --display:"Archivo","Arial Narrow",Arial,sans-serif; --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif; --mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#0d1218; --panel:#151c25; --panel2:#1c2531; --fg:#e6ebf2; --mut:#93a0b3; --line:#2b3645;
+  --trunk:#7fa6ff; --trunk-bg:#16264a; --ev:#f0a06a; --ev-bg:#3a2214; --sel:#b99bf5; --sel-bg:#2a1d47;
+  --ok:#6fd3a2; --ok-bg:#12301f; --warn:#e6c05c; --warn-bg:#33290d; --bad:#ff8e86; --bad-bg:#3a1614; color-scheme:dark } }
+:root[data-theme="dark"]{
+  --bg:#0d1218; --panel:#151c25; --panel2:#1c2531; --fg:#e6ebf2; --mut:#93a0b3; --line:#2b3645;
+  --trunk:#7fa6ff; --trunk-bg:#16264a; --ev:#f0a06a; --ev-bg:#3a2214; --sel:#b99bf5; --sel-bg:#2a1d47;
+  --ok:#6fd3a2; --ok-bg:#12301f; --warn:#e6c05c; --warn-bg:#33290d; --bad:#ff8e86; --bad-bg:#3a1614; color-scheme:dark }
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.55;margin:0}
+.wrap{max-width:1080px;margin:0 auto;padding-inline:20px;padding-block:36px 72px;display:flex;flex-direction:column;gap:44px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0;line-height:1.12}
+h1{font-size:clamp(30px,5.2vw,52px);font-weight:800;font-stretch:88%;letter-spacing:-.01em}
+h2{font-size:clamp(21px,3vw,28px);font-weight:700;font-stretch:92%}
+h3{font-size:16px;font-weight:700;letter-spacing:.01em}
+p{margin:0;max-width:70ch}
+code,.mono{font-family:var(--mono);font-size:.88em}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--mut)}
+.lede{font-size:17px;color:var(--fg);max-width:66ch}
+section{display:flex;flex-direction:column;gap:16px}
+.sub{color:var(--mut)}
+header.top{display:flex;flex-direction:column;gap:14px;border-bottom:2px solid var(--fg);padding-bottom:24px}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:13px;color:var(--mut)}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.sw{width:12px;height:12px;border-radius:2px;display:inline-block}
+.chip{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.06em;padding:2px 7px;border-radius:3px;white-space:nowrap;display:inline-block}
+.c-built{background:var(--panel2);color:var(--mut)}
+.c-change{background:var(--warn-bg);color:var(--warn)}
+.c-new{background:var(--ok-bg);color:var(--ok)}
+.c-drop{background:var(--bad-bg);color:var(--bad)}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px 18px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.card.trunk{border-top:3px solid var(--trunk)} .card.ev{border-top:3px solid var(--ev)} .card.sel{border-top:3px solid var(--sel)}
+.card p,.card li{font-size:14px}
+ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px}
+.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:6px;background:var(--panel)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-family:var(--mono);font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--mut);background:var(--panel2);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.k{font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+pre{margin:0;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--sel);border-radius:6px;padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:12.8px;line-height:1.6}
+pre.t{border-left-color:var(--trunk)} pre.e{border-left-color:var(--ev)}
+.cm{color:var(--mut)}
+figure{margin:0;display:flex;flex-direction:column;gap:8px}
+figure .scroll{padding:10px}
+figcaption{font-size:13px;color:var(--mut);max-width:80ch}
+svg{display:block;width:100%;height:auto;min-width:720px;font-family:var(--mono)}
+svg.narrow{min-width:520px}
+.bt{fill:var(--trunk-bg);stroke:var(--trunk);stroke-width:1.5}
+.be{fill:var(--ev-bg);stroke:var(--ev);stroke-width:1.5}
+.bs{fill:var(--sel-bg);stroke:var(--sel);stroke-width:1.5}
+.bn{fill:var(--panel2);stroke:var(--line);stroke-width:1.2}
+.tx{fill:var(--fg);font-size:12.5px;font-weight:700}
+.ts{fill:var(--mut);font-size:11px}
+.lt{stroke:var(--trunk);stroke-width:1.8;fill:none} .le{stroke:var(--ev);stroke-width:1.8;fill:none} .ls{stroke:var(--sel);stroke-width:1.8;fill:none}
+.mt{fill:var(--trunk)} .me{fill:var(--ev)} .ms{fill:var(--sel)}
+.lab-t{fill:var(--trunk);font-size:11px} .lab-e{fill:var(--ev);font-size:11px} .lab-s{fill:var(--sel);font-size:11px}
+.cell-on{fill:var(--ev);opacity:.85} .cell-off{fill:var(--panel2)} .cell-half{fill:var(--ev);opacity:.4}
+.axis{stroke:var(--mut);stroke-width:1.2}
+.frame{fill:none;stroke:var(--line);stroke-width:1.4;stroke-dasharray:6 4}
+.ld{stroke:var(--mut);stroke-width:1.2;stroke-dasharray:4 3}
+.tg{font-size:9px;font-weight:700;letter-spacing:.06em}
+.tag-built{fill:var(--panel2)} .tag-built+.tg{fill:var(--mut)}
+.tag-change{fill:var(--warn-bg)} .tag-change+.tg{fill:var(--warn)}
+.tag-new{fill:var(--ok-bg)} .tag-new+.tg{fill:var(--ok)}
+.tag-drop{fill:var(--bad-bg)} .tag-drop+.tg{fill:var(--bad)}
+#blueprints svg{min-width:1000px} .tick{stroke:var(--mut);stroke-width:1}
+.bar-w{fill:var(--warn);opacity:.35} .dot-e{fill:var(--trunk)} .dot-k{fill:var(--bad)}
+.flow{display:flex;flex-direction:column;gap:0;border:1px solid var(--line);border-radius:6px;background:var(--panel);overflow:hidden}
+.step{display:grid;grid-template-columns:34px minmax(0,1fr);gap:12px;padding:11px 14px;border-bottom:1px solid var(--line);align-items:start}
+.step:last-child{border-bottom:0}
+.step .n{font-family:var(--mono);font-weight:700;font-size:12px;color:var(--mut);padding-top:2px}
+.step b{font-weight:600}
+.step .d{font-size:14px;min-width:0}
+.step.t{box-shadow:inset 3px 0 0 var(--trunk)} .step.e{box-shadow:inset 3px 0 0 var(--ev)} .step.s{box-shadow:inset 3px 0 0 var(--sel)}
+.note{border:1px solid var(--line);border-left:3px solid var(--warn);background:var(--panel);border-radius:6px;padding:12px 16px;font-size:14px}
+.note.bad{border-left-color:var(--bad)} .note.ok{border-left-color:var(--ok)}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.kv div{background:var(--panel);padding:11px 13px;display:flex;flex-direction:column;gap:2px;min-width:0}
+.kv .l{font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
+.kv .v{font-family:var(--mono);font-size:15px;font-weight:700}
+.kv .s{font-size:12px;color:var(--mut)}
+nav{display:flex;flex-wrap:wrap;gap:6px 8px;font-family:var(--mono);font-size:12px}
+nav a{color:var(--fg);text-decoration:none;border:1px solid var(--line);background:var(--panel);padding:4px 9px;border-radius:3px}
+nav a:hover,nav a:focus-visible{border-color:var(--fg);outline:none}
+footer{font-size:12.5px;color:var(--mut);border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+
+
+<div class="wrap">
+
+<header class="top">
+  <div class="eyebrow">tiny-moe-llm · design proposal · 2026-09-29 · nothing here has trained</div>
+  <h1>Embeddings choose. Cross-attention reads. The trunk reasons.</h1>
+  <p class="lede">A 384-d embedding search picks candidate chunks because it is cheap. A cross-attention reader then attends over the tokens of those chunks, so exact wording reaches the model. World facts live in the store. The trunk keeps language, common sense and reasoning.</p>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--trunk)"></i>token stream (trunk)</span>
+    <span><i class="sw" style="background:var(--ev)"></i>evidence path</span>
+    <span><i class="sw" style="background:var(--sel)"></i>selector</span>
+    <span><b class="chip c-built">BUILT</b> in the repo today</span>
+    <span><b class="chip c-change">CHANGE</b> exists, altered</span>
+    <span><b class="chip c-new">NEW</b> to build</span>
+    <span><b class="chip c-drop">DROP</b> removed</span>
+  </div>
+  <nav aria-label="Sections">
+    <a href="#pipeline">Pipeline</a><a href="#reader">Reader math</a><a href="#block">Looped block</a><a href="#components">Components</a><a href="#blueprints">Blueprints</a><a href="#poc">POC finetune</a><a href="#scratch">From-scratch run</a><a href="#datasets">Datasets</a><a href="#loop">Loop reasoning</a><a href="#cost">Cost</a><a href="#gates">Gates</a><a href="#review">Opus review</a><a href="#risks">Risks</a>
+  </nav>
+</header>
+
+<section id="pipeline">
+  <div class="eyebrow">1 · pipeline</div>
+  <h2>Two streams, three hand-offs</h2>
+  <p class="sub">Your split is the right one and the proposal keeps it. The additions are a clean way for the selector to steer the reader, and a training recipe that stops rewarding recall from weights.</p>
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 980 430" role="img" aria-label="Token stream on top, evidence path below. The looped block sends a 384-d query to the selector, the selector sends a chunk prior to the reader, the reader returns exact tokens to the block.">
+      <defs>
+        <marker id="at" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mt"/></marker>
+        <marker id="ae" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="me"/></marker>
+        <marker id="as" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ms"/></marker>
+      </defs>
+      <text x="20" y="24" class="lab-t">TOKEN STREAM</text>
+      <rect x="20" y="40" width="140" height="70" rx="4" class="bt"/>
+      <text x="90" y="70" text-anchor="middle" class="tx">Prompt</text>
+      <text x="90" y="90" text-anchor="middle" class="ts">up to 4096 tokens</text>
+      <rect x="200" y="40" width="170" height="70" rx="4" class="bt"/>
+      <text x="285" y="70" text-anchor="middle" class="tx">Dense decoder</text>
+      <text x="285" y="90" text-anchor="middle" class="ts">8 layers, 768 wide</text>
+      <rect x="410" y="40" width="330" height="70" rx="4" class="bt"/>
+      <text x="575" y="70" text-anchor="middle" class="tx">MoE block, applied 3 times</text>
+      <text x="575" y="90" text-anchor="middle" class="ts">shared + routed experts + reader</text>
+      <rect x="780" y="40" width="180" height="70" rx="4" class="bt"/>
+      <text x="870" y="70" text-anchor="middle" class="tx">LM head + MTP</text>
+      <text x="870" y="90" text-anchor="middle" class="ts">per-loop readout</text>
+      <line x1="160" y1="75" x2="198" y2="75" class="lt" marker-end="url(#at)"/>
+      <line x1="370" y1="75" x2="408" y2="75" class="lt" marker-end="url(#at)"/>
+      <line x1="740" y1="75" x2="778" y2="75" class="lt" marker-end="url(#at)"/>
+
+      <rect x="250" y="190" width="230" height="74" rx="4" class="bs"/>
+      <text x="365" y="218" text-anchor="middle" class="tx">Selector</text>
+      <text x="365" y="237" text-anchor="middle" class="ts">cosine of q against k keys + null</text>
+      <text x="365" y="252" text-anchor="middle" class="ts">per token, per loop</text>
+      <rect x="590" y="190" width="230" height="74" rx="4" class="be"/>
+      <text x="705" y="218" text-anchor="middle" class="tx">Reader</text>
+      <text x="705" y="237" text-anchor="middle" class="ts">cross-attention over chunk tokens</text>
+      <text x="705" y="252" text-anchor="middle" class="ts">16 heads, 4 KV heads, no rotary</text>
+
+      <line x1="450" y1="110" x2="400" y2="188" class="ls" marker-end="url(#as)"/>
+      <text x="300" y="150" class="lab-s">q: 384-d query from h</text>
+      <line x1="480" y1="227" x2="588" y2="227" class="ls" marker-end="url(#as)"/>
+      <text x="492" y="218" class="lab-s">prior b[t,c]</text>
+      <line x1="700" y1="190" x2="700" y2="112" class="le" marker-end="url(#ae)"/>
+      <text x="712" y="155" class="lab-e">exact wording, into the residual</text>
+      <line x1="560" y1="110" x2="640" y2="188" class="lt" marker-end="url(#at)"/>
+      <text x="520" y="175" class="lab-t">query x</text>
+
+      <text x="20" y="318" class="lab-e">EVIDENCE PATH</text>
+      <rect x="20" y="335" width="190" height="74" rx="4" class="be"/>
+      <text x="115" y="363" text-anchor="middle" class="tx">Chunk store</text>
+      <text x="115" y="382" text-anchor="middle" class="ts">128-token chunks, ids</text>
+      <text x="115" y="397" text-anchor="middle" class="ts">bge-small key, 384-d</text>
+      <rect x="270" y="335" width="190" height="74" rx="4" class="be"/>
+      <text x="365" y="363" text-anchor="middle" class="tx">Embedding search</text>
+      <text x="365" y="382" text-anchor="middle" class="ts">top-k by cosine</text>
+      <text x="365" y="397" text-anchor="middle" class="ts">raw bge keys, never rebuilt</text>
+      <rect x="610" y="335" width="190" height="74" rx="4" class="be"/>
+      <text x="705" y="363" text-anchor="middle" class="tx">Chunk encoder</text>
+      <text x="705" y="382" text-anchor="middle" class="ts">dense layers 1 to 4</text>
+      <text x="705" y="397" text-anchor="middle" class="ts">same weights as the trunk</text>
+      <line x1="210" y1="372" x2="268" y2="372" class="le" marker-end="url(#ae)"/>
+      <line x1="460" y1="372" x2="608" y2="372" class="le" marker-end="url(#ae)"/>
+      <text x="472" y="363" class="lab-e">token ids of k chunks</text>
+      <line x1="365" y1="335" x2="365" y2="266" class="le" marker-end="url(#ae)"/>
+      <text x="377" y="305" class="lab-e">k candidate keys</text>
+      <line x1="705" y1="335" x2="705" y2="266" class="le" marker-end="url(#ae)"/>
+      <text x="717" y="305" class="lab-e">states [n, 768]</text>
+    </svg>
+    </div>
+    <figcaption>Only three things cross between the streams: a 384-d query going down, a per-token chunk prior going sideways, and attended token states going up. In training the candidates are precomputed offline with the frozen bge encoder. In serving the model's own query drives the search.</figcaption>
+  </figure>
+
+  <div class="grid g3">
+    <div class="card ev"><h3>Store</h3><ul>
+      <li>Fixed windows of 128 model tokens, sentence aligned.</li>
+      <li>MinHash deduplicated, one global chunk id, provenance kept.</li>
+      <li>Key: <code>bge-small-en-v1.5</code>, 384-d, unit norm, fp16.</li>
+      <li>No cached encoder states. At 1.5 KB per token a 0.4B-token store would be 600 GB. Chunks are encoded on the fly.</li>
+      <li>Target size: at least 0.4B tokens, about one store token per model parameter.</li></ul></div>
+    <div class="card sel"><h3>Selector</h3><ul>
+      <li><code>q = normalize(down_proj(norm(h)) + loop_query_bias[loop])</code></li>
+      <li>Keys stay raw bge. The trained <code>key_adapter</code> goes, so the index is never rebuilt.</li>
+      <li>Softmax over the k candidates plus one learned null key. Null mass means nothing relevant.</li>
+      <li>Always on. The router never specialized, so relevance must not depend on it.</li>
+      <li>No value read. It carries gist only.</li></ul></div>
+    <div class="card ev"><h3>Reader</h3><ul>
+      <li>Cross-attention, 16 query heads x 48, 4 KV heads.</li>
+      <li>Reads encoded chunk tokens, so spans can be copied.</li>
+      <li>Selector prior enters the attention logit per token. It is causal by construction.</li>
+      <li>One learned sink slot per segment with a zero value, so the reader can attend nowhere.</li>
+      <li>K and V are loop invariant, so one cache per buffer serves all loops.</li></ul></div>
+  </div>
+</section>
+
+<section id="reader">
+  <div class="eyebrow">2 · reader math</div>
+  <h2>How the selector steers the reader</h2>
+  <p class="sub">The repo's current coupling is <code>1 + evidence_gate_scale * sigmoid(chunk_mean_mass)</code>. It averages over the whole document, so it leaks future tokens in training, and its input range makes it nearly constant. The replacement adds the selector's own logit to the attention logit through a one-hot channel. It needs no attention bias argument, so flash-attn varlen still works.</p>
+<pre><span class="cm"># M = max chunks per segment (static). head_dim grows from 48 to 48 + M, rounded to a multiple of 8</span>
+k'[j] = [ W_k e[j] ; onehot(rank(chunk(j))) ]        <span class="cm"># evidence token j, v padded with zeros</span>
+q'[t] = [ W_q x[t] ; sqrt(48) * b[t, 1..M] ]         <span class="cm"># query token t</span>
+logit(t, j) = q'[t] · k'[j] / sqrt(48)
+            = content(t, j) + b[t, chunk(j)]          <span class="cm"># softmax_scale = 48^-0.5 passed explicitly</span>
+
+b[t, c] = gamma[h] * z[t, c]  -  lambda * log(n_c)  +  vis[t, c]
+z[t, c] = cos(q_sel[t], key[c]) / tau                <span class="cm"># the selector's own logit, already [T, M]</span>
+vis     = 0 where chunk c is visible to token t, else -1e4
+sink    = one extra slot per segment: learned key, value 0</pre>
+  <div class="grid g2">
+    <div class="card sel"><h3>Why this form</h3><ul>
+      <li>The selection loss and the reader use the same number <code>z</code>. Ranking learned from gold flags transfers directly.</li>
+      <li><code>gamma</code> is one scalar per head. At zero its gradient is <code>sum(g * z)</code>, which is nonzero, so there is no dead chain.</li>
+      <li><code>lambda * log(n_c)</code> removes the length bias. A chunk three times longer otherwise gets 1.1 nats for free.</li>
+      <li>The visibility mask also expresses the per-window staircase of the from-scratch run.</li></ul></div>
+    <div class="card"><h3>Init and cost</h3><ul>
+      <li>POC: <code>gamma = 0</code>, <code>lambda = 0</code>. The reader is unchanged at step 0.</li>
+      <li>From scratch: <code>gamma = 1</code>, <code>lambda = 0</code>.</li>
+      <li>M = 16 gives head_dim 64, about +33% on the reader's attention.</li>
+      <li>M = 40 covers 32 chunks plus the <code>many</code> condition and gives head_dim 88.</li>
+      <li>A read site is about 7 MFLOP per token, 1.4% of the body. This is an estimate.</li></ul></div>
+  </div>
+  <div class="note">My first draft added <code>P * key</code> to the reader's keys and <code>Q * q_sel</code> to its queries. The Opus review showed that this mostly learns content-by-selector cross terms, and that the pure selector term is a new bilinear form unrelated to the cosine the selection loss trains. The one-hot channel replaces it.</div>
+</section>
+
+<section id="block">
+  <div class="eyebrow">3 · forward pass</div>
+  <h2>One loop of the block</h2>
+  <div class="flow">
+    <div class="step t"><div class="n">0</div><div class="d"><b>Input.</b> <code>step_input = h</code>, shape <code>[B, S, 768]</code>. <code>cu_seqlens</code> is built in-thread from <code>document_ids</code>.</div></div>
+    <div class="step s"><div class="n">1</div><div class="d"><b>Selector.</b> Scores the visible candidate keys for every token. Produces <code>z [T, M]</code> and the null mass. Runs first so this loop's scores steer this loop's read.</div></div>
+    <div class="step e"><div class="n">2</div><div class="d"><b>Reader.</b> <code>read = CrossAttn(x = step_input + evidence_query_bias[loop], K/V = encoded chunks, prior = b)</code>. Skipped entirely when no evidence is attached, which keeps that path bit-identical.</div></div>
+    <div class="step t"><div class="n">3</div><div class="d"><b>Always-on experts.</b> <code>acc = shared_mlp(h) + shared_attn(h)</code>.</div></div>
+    <div class="step t"><div class="n">4</div><div class="d"><b>Routed experts.</b> Self-attention and cross-attention experts run densely. 32 MLP experts run sparse at top-k 2 through one grouped GEMM. The router is loop conditioned by <code>loop_router_bias</code>.</div></div>
+    <div class="step t"><div class="n">5</div><div class="d"><b>Block update.</b> <code>h = h + loop_scale[loop] * dropout(post_norm(acc))</code>.</div></div>
+    <div class="step e"><div class="n">6</div><div class="d"><b>Evidence update.</b> <code>h = h + g_loop[loop] * RMSNorm(o_proj(read))</code>. The read enters after <code>post_norm</code>, so it keeps its own share of the residual. <b class="chip c-change">CHANGE</b></div></div>
+    <div class="step t"><div class="n">7</div><div class="d"><b>Readout.</b> The normed state of every loop goes to the chunked CE. The groundedness head reads <code>read</code> and the null mass at the last prompt token of each answer span.</div></div>
+  </div>
+  <div class="note bad">Neutrality moves from <code>o_proj</code> to <code>g_loop</code>. A norm placed after a zero-init <code>o_proj</code> has a gradient near 1/sqrt(eps) at zero, so one optimizer step would put a unit-RMS read into the residual. With <code>g_loop = 0</code> and a default-init <code>o_proj</code>, the first step is still exactly neutral and <code>g_loop</code> gets a real gradient. From scratch <code>g_loop</code> starts at 1.</div>
+</section>
+
+<section id="components">
+  <div class="eyebrow">4 · components</div>
+  <h2>What changes, per run</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>component</th><th>repo today</th><th>POC finetune</th><th>from-scratch run</th></tr></thead>
+    <tbody>
+    <tr><td class="k">token embedding</td><td>65536 x 768, 50.3M, input side only</td><td><b class="chip c-built">BUILT</b> as is</td><td>one table, tied to the head, decayed as an input only</td></tr>
+    <tr><td class="k">LM head</td><td>untied: 768 x 768 projection plus four block-diagonal 192 to 16384 heads, 13.2M, rank 192 per vocab quarter</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> tied: <code>norm(h) @ A @ E^T</code>, one 768 x 768 adapter, 0.59M</td></tr>
+    <tr><td class="k">MTP head</td><td>untied, factor 8, rank 48 per group, 3.3M</td><td>as is</td><td><b class="chip c-change">CHANGE</b> tied through a 384 to 768 adapter, 0.29M; CE subsampled</td></tr>
+    <tr><td class="k">per-layer and router embeddings</td><td>two more token tables, 16.8M and 2.1M</td><td>as is</td><td>projections of the one table, gated on a zero-ablation of the PLE read</td></tr>
+    <tr><td class="k">dense decoder</td><td>8 layers, 768, 12 heads x 64, 3 KV heads</td><td><b class="chip c-built">BUILT</b> as is</td><td>scaled to the run's shape</td></tr>
+    <tr><td class="k">looped block</td><td>n_loops 3, 32 MLP experts top-k 2, 1 self-attn, 1 cross-attn, 1 IR expert</td><td><b class="chip c-built">BUILT</b> as is</td><td>IR expert leaves the routed pool</td></tr>
+    <tr><td class="k">readout</td><td>none, the head reads every loop state</td><td>as is</td><td><b class="chip c-new">NEW</b> 2-layer coda with its own KV slots</td></tr>
+    <tr><td class="k">loss placement</td><td>per-loop CE 0.2 / 0.3 / 1.0</td><td>as is</td><td><b class="chip c-change">CHANGE</b> last loop only, tested against per-loop</td></tr>
+    <tr><td class="k">depth sampling</td><td>30% of steps stop at loop 1 or 2</td><td>as is</td><td><b class="chip c-change">CHANGE</b> depth 3 to 5, gradient window of 3</td></tr>
+    <tr><td class="k">loop_scale</td><td>migrated 0.637 / 0.326 / 0.098</td><td>rescale probe at eval first</td><td><b class="chip c-change">CHANGE</b> length 5, fresh 1/sqrt(5)</td></tr>
+    <tr><td class="k">loop_inject</td><td>off in the current checkpoint</td><td>off</td><td><b class="chip c-change">CHANGE</b> on</td></tr>
+    <tr><td class="k">selection loss</td><td>same gold for every loop, uniform mean</td><td>as is</td><td><b class="chip c-change">CHANGE</b> union over loops</td></tr>
+    <tr><td class="k">learned IR table</td><td>65536 x 384, two-stage read</td><td>kept, trains at trunk LR</td><td><b class="chip c-drop">DROP</b> zeroing its read costs 0.0002 nats</td></tr>
+    <tr><td class="k">selector</td><td>routed IR expert, union softmax with the table</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> always on, candidates plus null key</td></tr>
+    <tr><td class="k">key_adapter</td><td>trained square map on bge keys</td><td>as is</td><td><b class="chip c-drop">DROP</b> keys stay raw bge</td></tr>
+    <tr><td class="k">selector value read</td><td>value_adapter, g_proj, up_proj, direct_gate</td><td>as is, direct_gate starts at zero</td><td><b class="chip c-drop">DROP</b> gist only</td></tr>
+    <tr><td class="k">selector to reader</td><td>1 + scale * sigmoid(document mean mass)</td><td><b class="chip c-change">CHANGE</b> scale frozen at 0</td><td><b class="chip c-new">NEW</b> one-hot chunk channel</td></tr>
+    <tr><td class="k">reader positions</td><td>rotary on query and key, unrelated bases</td><td><b class="chip c-change">CHANGE</b> arm B: no rotary</td><td>no rotary, if arm B wins</td></tr>
+    <tr><td class="k">reader sink</td><td>none</td><td>none</td><td><b class="chip c-new">NEW</b> one slot per segment</td></tr>
+    <tr><td class="k">reader output</td><td>zero-init o_proj, summed before post_norm</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> g_loop * RMSNorm(o_proj), after post_norm</td></tr>
+    <tr><td class="k">read sites</td><td>once per loop</td><td>once per loop</td><td>per loop, plus dense layers 3 and 6 as a pilot A/B</td></tr>
+    <tr><td class="k">chunk encoder</td><td>all 8 dense layers, gradient on, no checkpointing</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> first 4 layers, TE checkpoint</td></tr>
+    <tr><td class="k">first-stage search</td><td>none, the corpus builder picks chunks</td><td>none, oracle buffers</td><td><b class="chip c-new">NEW</b> offline bge in training, model query in serving</td></tr>
+    <tr><td class="k">groundedness head</td><td>reads the reader output</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> also reads null mass</td></tr>
+    <tr><td class="k">per-loop re-query, append</td><td>unbuilt</td><td>not used</td><td>deferred until the pilot passes</td></tr>
+    </tbody></table></div>
+</section>
+
+<section id="blueprints">
+  <div class="eyebrow">5 · blueprints</div>
+  <h2>Every tensor that matters, per run</h2>
+  <p class="sub">Read top to bottom: token tables, decoder, the looped block with its internals, readout, objective. Tags mark what is built, what changes, what is new and what is dropped. Parameter counts for the from-scratch run are estimates.</p>
+  <figure>
+    <div class="scroll">
+<svg viewBox="0 0 1000 1242" role="img" aria-label="Blueprint of the POC finetune: four token tables, an 8-layer decoder that also encodes chunks, one MoE block applied three times with a routed IR selector and an always-on reader, untied factored heads, per-loop loss.">
+<defs>
+<marker id="ar-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mt"/></marker>
+<marker id="ar-e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="me"/></marker>
+<marker id="ar-s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ms"/></marker>
+</defs>
+<rect x="20" y="292" width="960" height="606" rx="6" class="frame"/><text x="32" y="312" class="tx">MoE block, applied 3 times (n_loops 3); every weight below is shared across the loops</text>
+<rect x="20" y="20" width="200" height="128" rx="4" class="bt"/><text x="30" y="39" class="tx">embed_tokens</text><text x="30" y="56" class="ts">65536 x 768, 50.3M</text><text x="30" y="70" class="ts">input side only, not tied</text><text x="30" y="84" class="ts">scaled by sqrt(768) in the</text><text x="30" y="98" class="ts">forward</text><rect x="168" y="27" width="44" height="14" rx="2" class="tag-built"/><text x="190" y="37.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="230" y="20" width="200" height="128" rx="4" class="bt"/><text x="240" y="39" class="tx">per-layer table</text><text x="240" y="56" class="ts">65536 x 256, 16.8M</text><text x="240" y="70" class="ts">feeds the cross-attention</text><text x="240" y="84" class="ts">expert</text><text x="240" y="98" class="ts">separate table</text><rect x="378" y="27" width="44" height="14" rx="2" class="tag-built"/><text x="400" y="37.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="440" y="20" width="200" height="128" rx="4" class="bt"/><text x="450" y="39" class="tx">router table</text><text x="450" y="56" class="ts">65536 x 32, 2.1M</text><text x="450" y="70" class="ts">separate table</text><rect x="588" y="27" width="44" height="14" rx="2" class="tag-built"/><text x="610" y="37.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="660" y="20" width="320" height="128" rx="4" class="be"/><text x="670" y="39" class="tx">evidence rows, oracle</text><text x="670" y="56" class="ts">from the corpus builder: 1 to 32 chunks per</text><text x="670" y="70" class="ts">row</text><text x="670" y="84" class="ts">conditions gold, mixed, many, distractors,</text><text x="670" y="98" class="ts">none</text><text x="670" y="112" class="ts">bge-small keys 384-d computed offline</text><text x="670" y="126" class="ts">chunk_keys [B, C, 384] plus slot map,</text><text x="670" y="140" class="ts">nothing ragged</text><rect x="928" y="27" width="44" height="14" rx="2" class="tag-built"/><text x="950" y="37.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="20" y="170" width="620" height="100" rx="4" class="bt"/><text x="30" y="189" class="tx">dense decoder, 8 layers</text><text x="30" y="206" class="ts">768 wide, 12 heads x 64, 3 KV heads, rotary, MLP 768 to 2304 gated, about 61M</text><text x="30" y="220" class="ts">output h0 [B, S, 768]; cu_seqlens built in-thread from document_ids</text><rect x="588" y="177" width="44" height="14" rx="2" class="tag-built"/><text x="610" y="187.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="660" y="170" width="320" height="100" rx="4" class="be"/><text x="670" y="189" class="tx">chunk encoder, same 8 layers</text><text x="670" y="206" class="ts">chunk-causal, positions restart per chunk</text><text x="670" y="220" class="ts">gradient on, no checkpointing, cached across</text><text x="670" y="234" class="ts">loops</text><text x="670" y="248" class="ts">0.61 MiB per evidence token, cap 14336 per</text><text x="670" y="262" class="ts">row</text><rect x="928" y="177" width="44" height="14" rx="2" class="tag-built"/><text x="950" y="187.5" text-anchor="middle" class="tg">BUILT</text>
+<line x1="640" y1="220" x2="660" y2="220" class="ld"/><text x="650" y="214" text-anchor="middle" class="ts">shared</text>
+<line x1="330" y1="270" x2="330" y2="292" class="lt" marker-end="url(#ar-t)"/>
+<text x="338" y="285" class="lab-t">h0</text>
+<rect x="40" y="324" width="290" height="100" rx="4" class="bn"/><text x="50" y="343" class="tx">loop conditioning</text><text x="50" y="360" class="ts">sinusoidal loop code, 32-d, 64 rows</text><text x="50" y="374" class="ts">3 zero-init linear biases: router,</text><text x="50" y="388" class="ts">selector query, reader query</text><rect x="278" y="331" width="44" height="14" rx="2" class="tag-built"/><text x="300" y="341.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="345" y="324" width="290" height="100" rx="4" class="bn"/><text x="355" y="343" class="tx">loop_inject</text><text x="355" y="360" class="ts">768 x 768 zero-init, re-presents h0</text><text x="355" y="374" class="ts">every loop</text><text x="355" y="388" class="ts">absent in the seed checkpoint</text><rect x="583" y="331" width="44" height="14" rx="2" class="tag-built"/><text x="605" y="341.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="650" y="324" width="310" height="100" rx="4" class="be"/><text x="660" y="343" class="tx">chunk gate on evidence states</text><text x="660" y="360" class="ts">1 + evidence_gate_scale * sigmoid(mean</text><text x="660" y="374" class="ts">mass)</text><text x="660" y="388" class="ts">the mean runs over the whole document, so</text><text x="660" y="402" class="ts">it is not causal</text><text x="660" y="416" class="ts">frozen at 0 for the first run</text><rect x="922" y="331" width="30" height="14" rx="2" class="tag-change"/><text x="937" y="341.5" text-anchor="middle" class="tg">FIX</text>
+<rect x="40" y="446" width="440" height="156" rx="4" class="bs"/><text x="50" y="465" class="tx">selector = IR expert, routed</text><text x="50" y="482" class="ts">q = normalize(down_proj(norm h) 768 to 384 +</text><text x="50" y="496" class="ts">loop_query_bias[k])</text><text x="50" y="510" class="ts">one softmax over the learned table 65536 x 384 (256 centroids,</text><text x="50" y="524" class="ts">probe 8, top 32) and the external keys through key_adapter 384</text><text x="50" y="538" class="ts">x 384</text><text x="50" y="552" class="ts">value read: value_adapter, g_proj (zero), up_proj, direct_gate</text><text x="50" y="566" class="ts">(zero)</text><text x="50" y="580" class="ts">mass per chunk feeds the gate, the selection loss and the G3b</text><text x="50" y="594" class="ts">readout</text><rect x="428" y="453" width="44" height="14" rx="2" class="tag-built"/><text x="450" y="463.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="500" y="446" width="460" height="156" rx="4" class="be"/><text x="510" y="465" class="tx">reader = shared_evidence, always on</text><text x="510" y="482" class="ts">q_proj(step_input + evidence_query_bias[k]), 16 heads x 48</text><text x="510" y="496" class="ts">k_proj, v_proj over the encoded states, 4 KV heads, flash varlen,</text><text x="510" y="510" class="ts">not causal</text><text x="510" y="524" class="ts">rotary: q by prompt position, k by chunk position; arm B runs</text><text x="510" y="538" class="ts">without rotary</text><text x="510" y="552" class="ts">o_proj zero-init, times evidence_loop_scale[k] (init 1); no KV</text><text x="510" y="566" class="ts">cache slot</text><rect x="922" y="453" width="30" height="14" rx="2" class="tag-change"/><text x="937" y="463.5" text-anchor="middle" class="tg">FIX</text>
+<line x1="480" y1="524" x2="500" y2="524" class="ls" marker-end="url(#ar-s)"/>
+<rect x="40" y="624" width="300" height="72" rx="4" class="bt"/><text x="50" y="643" class="tx">always-on seed</text><text x="50" y="660" class="ts">shared_mlp 768 to 2304 gated</text><text x="50" y="674" class="ts">shared_attn 16 heads x 48, 4 KV heads</text><text x="50" y="688" class="ts">+ evidence_loop_scale[k] * reader output</text><rect x="288" y="631" width="44" height="14" rx="2" class="tag-built"/><text x="310" y="641.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="360" y="624" width="600" height="72" rx="4" class="bt"/><text x="370" y="643" class="tx">routed pool, top 2 per token</text><text x="370" y="660" class="ts">router + loop_router_bias, noise 0.3 annealed to 0, aux loss 0.01</text><text x="370" y="674" class="ts">[ SelfAttn x1 | CrossAttn x1, reads the per-layer table | IR x1 | MLP x32 ]</text><text x="370" y="688" class="ts">non-MLP experts run densely every loop; MLP experts through one grouped GEMM</text><rect x="908" y="631" width="44" height="14" rx="2" class="tag-built"/><text x="930" y="641.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="40" y="718" width="920" height="72" rx="4" class="bt"/><text x="50" y="737" class="tx">block update</text><text x="50" y="754" class="ts">output = seed + routed;  delta = dropout(post_norm(output));  h = h + loop_scale[k] * delta</text><text x="50" y="768" class="ts">loop_scale = [0.637, 0.326, 0.098], the folded halt gate, not in the fresh LR group; loop 3 adds at most about a tenth of a unit</text><text x="50" y="782" class="ts">update</text><rect x="908" y="725" width="44" height="14" rx="2" class="tag-built"/><text x="930" y="735.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="40" y="812" width="920" height="72" rx="4" class="bn"/><text x="50" y="831" class="tx">depth and readout state</text><text x="50" y="848" class="ts">stochastic depth: 30% of steps run 1 or 2 loops and rescale the CE weights so the last loop run carries 1.0</text><text x="50" y="862" class="ts">every loop state goes to the same final norm and the same head: [loops, B, S, 768]</text><text x="50" y="876" class="ts">loops beyond 3 at inference reuse loop_scale[2] but see loop codes never trained</text><rect x="908" y="819" width="44" height="14" rx="2" class="tag-built"/><text x="930" y="829.5" text-anchor="middle" class="tg">BUILT</text>
+<line x1="330" y1="898" x2="330" y2="920" class="lt" marker-end="url(#ar-t)"/>
+<text x="338" y="913" class="lab-t">per-loop states</text>
+<rect x="20" y="920" width="300" height="100" rx="4" class="bt"/><text x="30" y="939" class="tx">SmallLMHead, untied</text><text x="30" y="956" class="ts">768 x 768 projection + 4 blocks 192 to</text><text x="30" y="970" class="ts">16384</text><text x="30" y="984" class="ts">13.2M, rank 192 per vocab quarter</text><text x="30" y="998" class="ts">per-loop CE, weights [0.2, 0.3, 1.0]</text><text x="30" y="1012" class="ts">non-final loops on 25% of positions</text><rect x="268" y="927" width="44" height="14" rx="2" class="tag-built"/><text x="290" y="937.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="340" y="920" width="300" height="100" rx="4" class="bt"/><text x="350" y="939" class="tx">MTP head, untied</text><text x="350" y="956" class="ts">factor 8, rank 48 per group, 3.3M</text><text x="350" y="970" class="ts">last loop only, 2 extra tokens</text><text x="350" y="984" class="ts">weight 0.1</text><rect x="588" y="927" width="44" height="14" rx="2" class="tag-built"/><text x="610" y="937.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="660" y="920" width="320" height="100" rx="4" class="bs"/><text x="670" y="939" class="tx">groundedness head</text><text x="670" y="956" class="ts">reads last_reader_output at the last prompt</text><text x="670" y="970" class="ts">token of each answer span</text><text x="670" y="984" class="ts">label: gold present AND answerable, BCE 0.1</text><text x="670" y="998" class="ts">its weight gradient is zero until o_proj</text><text x="670" y="1012" class="ts">moves</text><rect x="928" y="927" width="44" height="14" rx="2" class="tag-built"/><text x="950" y="937.5" text-anchor="middle" class="tg">BUILT</text>
+<rect x="20" y="1042" width="960" height="100" rx="4" class="bn"/><text x="30" y="1061" class="tx">objective and run</text><text x="30" y="1078" class="ts">loss = sum_k w_k CE_k + 0.1 MTP + 0.01 aux + 0.1 selection BCE(IR mass vs gold, every loop, every IR expert) + 0.1 groundedness</text><text x="30" y="1092" class="ts">token weight 1 / max(n_supervised, 64); conversation weighting on; the selection loss needs gradient checkpointing off</text><text x="30" y="1106" class="ts">batch 2 x 4096, accumulate 8, cap 14336 evidence tokens per row; lr 1e-5 trunk, 3e-4 port tensors; fp32 master on every parameter</text><text x="30" y="1120" class="ts">kill at 10M tokens if the fixed-target gold-minus-none gap is under 0.1 nats; eval every 2.5M tokens and at step 0; validation from SQuAD</text><text x="30" y="1134" class="ts">dev and HotpotQA dev</text><rect x="942" y="1049" width="30" height="14" rx="2" class="tag-change"/><text x="957" y="1059.5" text-anchor="middle" class="tg">FIX</text>
+<rect x="20" y="1164" width="960" height="58" rx="4" class="bn"/><text x="30" y="1183" class="tx">size</text><text x="30" y="1200" class="ts">383.5M total, 224.2M active, about 502 MFLOP per prompt token plus 118 per evidence token; four token tables 85.7M; learned table and</text><text x="30" y="1214" class="ts">adapters about 34M</text>
+</svg>
+    </div>
+    <figcaption>POC finetune on the grafted checkpoint. The three FIX tags are the pre-launch changes: the chunk gate frozen at zero, the reader's rotary made optional for arm B, and the kill number moved to the fixed-target gap. Everything else runs as built.</figcaption>
+  </figure>
+  <figure>
+    <div class="scroll">
+<svg viewBox="0 0 1000 1466" role="img" aria-label="Blueprint of the from-scratch run: one tied token table, a 6-layer prelude whose first four layers encode chunks, a looped core of three sublayers with an always-on selector and one-hot chunk channel readers, a two-layer coda, tied heads, one loss on the last pass.">
+<defs>
+<marker id="ar-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mt"/></marker>
+<marker id="ar-e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="me"/></marker>
+<marker id="ar-s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ms"/></marker>
+</defs>
+<rect x="20" y="400" width="960" height="544" rx="6" class="frame"/><text x="32" y="420" class="tx">looped core, D passes (3 to 5), 3 sublayers per pass; every weight below is shared across the passes</text>
+<rect x="40" y="554" width="920" height="268" rx="6" class="frame"/><text x="52" y="574" class="tx">sublayer, repeated 3 times per pass</text>
+<rect x="20" y="20" width="420" height="128" rx="4" class="bt"/><text x="30" y="39" class="tx">one token table E</text><text x="30" y="56" class="ts">65536 x 1024, 67.1M, init std 1 / sqrt(1024)</text><text x="30" y="70" class="ts">tied to the LM head and the MTP head; weight decay on the</text><text x="30" y="84" class="ts">input side only</text><text x="30" y="98" class="ts">per-layer table = E W_ple (1024 x 256) and router table = E</text><text x="30" y="112" class="ts">W_moe (1024 x 32), gated on a zero-ablation of the</text><text x="30" y="126" class="ts">per-layer read</text><rect x="378" y="27" width="54" height="14" rx="2" class="tag-change"/><text x="405" y="37.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="460" y="20" width="180" height="128" rx="4" class="bn"/><text x="470" y="39" class="tx">dropped</text><text x="470" y="56" class="ts">learned IR table</text><text x="470" y="70" class="ts">key_adapter</text><text x="470" y="84" class="ts">value_adapter, g_proj,</text><text x="470" y="98" class="ts">up_proj, direct_gate</text><text x="470" y="112" class="ts">factored heads</text><text x="470" y="126" class="ts">chunk gate</text><rect x="592" y="27" width="40" height="14" rx="2" class="tag-drop"/><text x="612" y="37.5" text-anchor="middle" class="tg">DROP</text>
+<rect x="660" y="20" width="320" height="128" rx="4" class="be"/><text x="670" y="39" class="tx">chunk store</text><text x="670" y="56" class="ts">128-token chunks, sentence aligned, MinHash</text><text x="670" y="70" class="ts">deduplicated</text><text x="670" y="84" class="ts">raw bge-small key 384-d fp16 per chunk,</text><text x="670" y="98" class="ts">global id</text><text x="670" y="112" class="ts">at least 0.4B tokens, built from the</text><text x="670" y="126" class="ts">training corpus</text><text x="670" y="140" class="ts">no cached encoder states</text><rect x="938" y="27" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="37.5" text-anchor="middle" class="tg">NEW</text>
+<rect x="20" y="170" width="620" height="100" rx="4" class="bt"/><text x="30" y="189" class="tx">prelude: dense decoder, 8 layers</text><text x="30" y="206" class="ts">1024 wide, 16 heads x 64, 4 KV heads, rotary, MLP 1024 to 3072 gated, about 109M</text><text x="30" y="220" class="ts">output h0; layers 1 to 4 double as the chunk encoder</text><rect x="578" y="177" width="54" height="14" rx="2" class="tag-change"/><text x="605" y="187.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="660" y="170" width="320" height="100" rx="4" class="be"/><text x="670" y="189" class="tx">retrieval</text><text x="670" y="206" class="ts">training: offline bge query of the previous</text><text x="670" y="220" class="ts">256-token window, top 2, the document itself</text><text x="670" y="234" class="ts">excluded, near duplicates dropped</text><text x="670" y="248" class="ts">serving: the model's own q through an ANN</text><text x="670" y="262" class="ts">over the raw keys</text><rect x="938" y="177" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="187.5" text-anchor="middle" class="tg">NEW</text>
+<line x1="640" y1="220" x2="660" y2="220" class="ld"/><text x="650" y="214" text-anchor="middle" class="ts">shared</text>
+<rect x="660" y="292" width="320" height="86" rx="4" class="be"/><text x="670" y="311" class="tx">chunk encoder: prelude 1 to 4</text><text x="670" y="328" class="ts">chunk-causal, TE checkpoint, encoded once</text><text x="670" y="342" class="ts">per forward</text><text x="670" y="356" class="ts">about 0.25 MiB per evidence token, an</text><text x="670" y="370" class="ts">estimate</text><rect x="918" y="299" width="54" height="14" rx="2" class="tag-change"/><text x="945" y="309.5" text-anchor="middle" class="tg">CHANGE</text>
+<line x1="820" y1="270" x2="820" y2="292" class="le" marker-end="url(#ar-e)"/>
+<line x1="330" y1="270" x2="330" y2="400" class="lt" marker-end="url(#ar-t)"/>
+<text x="338" y="339" class="lab-t">h0</text>
+<rect x="40" y="432" width="300" height="100" rx="4" class="bn"/><text x="50" y="451" class="tx">loop conditioning</text><text x="50" y="468" class="ts">loop code clamped to the trained depth</text><text x="50" y="482" class="ts">zero-init biases: router, selector query,</text><text x="50" y="496" class="ts">reader query</text><text x="50" y="510" class="ts">loop_inject on: h0 re-presented every</text><text x="50" y="524" class="ts">pass</text><rect x="278" y="439" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="449.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="360" y="432" width="600" height="100" rx="4" class="bs"/><text x="370" y="451" class="tx">selector, always on, not routed</text><text x="370" y="468" class="ts">q = normalize(down_proj(norm h) 1024 to 384 + loop_query_bias[k])</text><text x="370" y="482" class="ts">z[t, c] = cos(q_t, raw bge key_c) / tau over the candidates plus one learned null key</text><text x="370" y="496" class="ts">no value read; the null mass feeds the groundedness head; z feeds the reader and the</text><text x="370" y="510" class="ts">losses</text><rect x="898" y="439" width="54" height="14" rx="2" class="tag-change"/><text x="925" y="449.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="60" y="586" width="280" height="128" rx="4" class="bt"/><text x="70" y="605" class="tx">self-attention</text><text x="70" y="622" class="ts">16 heads x 64, 4 KV heads, rotary</text><text x="70" y="636" class="ts">shared across the three sublayers and</text><text x="70" y="650" class="ts">across passes</text><rect x="278" y="593" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="603.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="360" y="586" width="580" height="128" rx="4" class="be"/><text x="370" y="605" class="tx">reader in sublayers 1 and 3</text><text x="370" y="622" class="ts">q' = [W_q x ; sqrt(64) * b_t]   k' = [W_k e ; onehot(chunk)]   head 64 + M, M up to</text><text x="370" y="636" class="ts">40, softmax_scale 64^-0.5</text><text x="370" y="650" class="ts">b[t, c] = gamma_h * z[t, c] - lambda * log n_c + vis[t, c];  gamma init 1, lambda</text><text x="370" y="664" class="ts">init 0, vis is the window staircase</text><text x="370" y="678" class="ts">one sink slot per segment with value 0; no rotary; 4 KV heads; K and V are</text><text x="370" y="692" class="ts">pass-invariant, one cache per buffer</text><text x="370" y="706" class="ts">o_proj, then after post_norm: h = h + g_loop[k] * read, g_loop init 1</text><rect x="898" y="593" width="34" height="14" rx="2" class="tag-new"/><text x="915" y="603.5" text-anchor="middle" class="tg">NEW</text>
+<line x1="340" y1="650" x2="360" y2="650" class="lt" marker-end="url(#ar-t)"/>
+<rect x="60" y="736" width="280" height="72" rx="4" class="bt"/><text x="70" y="755" class="tx">MLP</text><text x="70" y="772" class="ts">always-on MLP 1024 to 3072 gated</text><text x="70" y="786" class="ts">+ 8 routed experts, top 2, aux 0.01</text><text x="70" y="800" class="ts">grouped GEMM; cut from 32 experts</text><rect x="278" y="743" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="753.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="360" y="736" width="580" height="72" rx="4" class="bt"/><text x="370" y="755" class="tx">sublayer update</text><text x="370" y="772" class="ts">delta = dropout(post_norm(self-attention + MLP + routed))</text><text x="370" y="786" class="ts">h = h + loop_scale[k] * delta,  loop_scale length 5, fresh init 1 / sqrt(5)</text><text x="370" y="800" class="ts">then the reader add above, so the read keeps its own share of the residual</text><rect x="878" y="743" width="54" height="14" rx="2" class="tag-change"/><text x="905" y="753.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="40" y="844" width="920" height="86" rx="4" class="bn"/><text x="50" y="863" class="tx">depth schedule</text><text x="50" y="880" class="ts">D drawn per step: 3 with p 0.7, 4 with p 0.2, 5 with p 0.1;  minimum 3, so no pass is trained as an early exit; expected 3.4</text><text x="50" y="894" class="ts">the first D - 3 passes run under no_grad and are detached; the last 3 carry gradient; memory stays at 3 passes of activations</text><text x="50" y="908" class="ts">log steps run D = 3; inference runs 3, up to 4 for evidence queries once a held-out 4-hop gain is shown; no convergence exit</text><text x="50" y="922" class="ts">k hops over evidence need at least k passes by construction: the selector and the reader both query the state a pass starts with</text><rect x="918" y="851" width="34" height="14" rx="2" class="tag-new"/><text x="935" y="861.5" text-anchor="middle" class="tg">NEW</text>
+<line x1="330" y1="944" x2="330" y2="966" class="lt" marker-end="url(#ar-t)"/>
+<text x="338" y="959" class="lab-t">h_D, last pass only</text>
+<rect x="20" y="966" width="300" height="86" rx="4" class="bs"/><text x="30" y="985" class="tx">coda</text><text x="30" y="1002" class="ts">2 dense layers, about 27M</text><text x="30" y="1016" class="ts">own KV cache slots, zero-init residual</text><text x="30" y="1030" class="ts">branch</text><text x="30" y="1044" class="ts">convergence exit stays off</text><rect x="278" y="973" width="34" height="14" rx="2" class="tag-new"/><text x="295" y="983.5" text-anchor="middle" class="tg">NEW</text>
+<rect x="340" y="966" width="300" height="86" rx="4" class="bt"/><text x="350" y="985" class="tx">LM head, tied</text><text x="350" y="1002" class="ts">logits = norm(h) @ A @ E^T</text><text x="350" y="1016" class="ts">A 1024 x 1024, 1.0M new parameters</text><text x="350" y="1030" class="ts">fused linear + cross-entropy kernel</text><text x="350" y="1044" class="ts">one loss, on the coda output</text><rect x="578" y="973" width="54" height="14" rx="2" class="tag-change"/><text x="605" y="983.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="660" y="966" width="320" height="86" rx="4" class="bt"/><text x="670" y="985" class="tx">MTP head, tied</text><text x="670" y="1002" class="ts">512 to 1024 adapter, 0.5M, onto E^T</text><text x="670" y="1016" class="ts">2 extra tokens, weight 0.1, CE on a 25%</text><text x="670" y="1030" class="ts">token subsample</text><text x="670" y="1044" class="ts">reads the coda output</text><rect x="918" y="973" width="54" height="14" rx="2" class="tag-change"/><text x="945" y="983.5" text-anchor="middle" class="tg">CHANGE</text>
+<line x1="320" y1="1009" x2="340" y2="1009" class="lt" marker-end="url(#ar-t)"/>
+<rect x="20" y="1074" width="960" height="128" rx="4" class="bn"/><text x="30" y="1093" class="tx">objective</text><text x="30" y="1110" class="ts">L = CE * span_weight + 0.1 MTP + 0.01 aux + 0.1 L_sel + 0.1 contrastive + 0.1 groundedness</text><text x="30" y="1124" class="ts">L_sel: u_c = 1 - prod over passes in the gradient window of (1 - p_hat[k, c]);  BCE(u_c, gold_c) over visible chunks; p_hat renormalized</text><text x="30" y="1138" class="ts">over visible chunks</text><text x="30" y="1152" class="ts">contrastive: q against the bge key of the gold chunk, in-batch negatives, multi-positive, same-document and near-duplicate negatives masked</text><text x="30" y="1166" class="ts">groundedness: reader output + null mass at the answer start; label gold present AND answerable</text><text x="30" y="1180" class="ts">span weights: language 1, supported fact span 1, unsupported fact span 0; counterfactual swap on 15% of supported spans; tail entities</text><text x="30" y="1194" class="ts">anonymized in 50% of documents</text><rect x="938" y="1081" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="1091.5" text-anchor="middle" class="tg">NEW</text>
+<rect x="20" y="1224" width="960" height="114" rx="4" class="bn"/><text x="30" y="1243" class="tx">data and optimizer</text><text x="30" y="1260" class="ts">45% web and edu text, 10% code and math, 15% evidence QA (six conditions plus partial hop, buffer capped at 8 chunks), 10% synthetic</text><text x="30" y="1274" class="ts">fictional chains, 20% chat replay; retrieval attached to every slice</text><text x="30" y="1288" class="ts">AdamW lr 4e-4, warmup 1000 steps, cosine to 0.1 lr, weight decay 0.02 on ndim &gt;= 2 except E in its output role and the loop scales, clip</text><text x="30" y="1302" class="ts">1.0, BF16, FP8 only after a short validation</text><text x="30" y="1316" class="ts">pilot: about 120M parameters at width 512, 1 to 2B tokens, matched control without retrieval;  real run: shape L below, about 2.5k H100</text><text x="30" y="1330" class="ts">hours</text>
+<rect x="20" y="1360" width="960" height="86" rx="4" class="bn"/><text x="30" y="1379" class="tx">shape L, estimates</text><text x="30" y="1396" class="ts">width 1024, 16 heads x 64, 4 KV heads; prelude 8 layers, core 3 sublayers x 8 experts, coda 2 layers</text><text x="30" y="1410" class="ts">about 470M total, about 300M active per token at one pass:  E 67M  |  prelude 109M  |  looped core 265M  |  coda 27M  |  selector, readers,</text><text x="30" y="1424" class="ts">heads about 3M</text><text x="30" y="1438" class="ts">about 1.0 GFLOP per token at 3 passes, twice today; about 350B tokens in 2.5k H100 hours at the plan's base rate, evidence included</text>
+</svg>
+    </div>
+    <figcaption>From-scratch run. One token table serves the input, both heads and the two small per-token tables. The looped core is three sublayers deep per pass instead of one block, the selector is always on and reads raw store keys, and the reader receives the selector's logit through the one-hot chunk channel. One loss on the last pass through the coda.</figcaption>
+  </figure>
+</section>
+
+<section id="poc">
+  <div class="eyebrow">6 · POC finetune · RTX 5090</div>
+  <h2>A mechanism check on the grafted checkpoint</h2>
+  <p class="sub">This run answers one question: can the port be read at all. It runs the architecture as built, with the gate frozen. It cannot show where facts live, because the seed already scores near zero closed-book and the corpus has no counterfactual rows.</p>
+
+  <div class="kv">
+    <div><span class="l">seed</span><span class="v">repair + port</span><span class="s">checkpoint_repair_final_irrandom_evidence_grounded.pt</span></div>
+    <div><span class="l">corpus</span><span class="v">963,011 conv</span><span class="s">140.1M prompt, 525.6M evidence tokens</span></div>
+    <div><span class="l">evidence ratio</span><span class="v">3.75</span><span class="s">SQuAD 7.6, HotpotQA 6.3, web 0.45</span></div>
+    <div><span class="l">batch</span><span class="v">2 x 4096</span><span class="s">accumulate 8, about 65k prompt tokens per step</span></div>
+    <div><span class="l">evidence cap</span><span class="v">14,336</span><span class="s">per row, 64% fill, about 25 GiB peak</span></div>
+    <div><span class="l">learning rate</span><span class="v">1e-5 / 3e-4</span><span class="s">trunk / port tensors</span></div>
+    <div><span class="l">schedule</span><span class="v">3% warmup</span><span class="s">cosine to 0.05 lr, 1 epoch</span></div>
+    <div><span class="l">precision</span><span class="v">BF16</span><span class="s">fp32 master on every parameter</span></div>
+    <div><span class="l">regularisation</span><span class="v">0.05 / 0.01</span><span class="s">dropout / weight decay, clip 1.0</span></div>
+    <div><span class="l">speed</span><span class="v">~0.7 s/step</span><span class="s">10M tokens in about 20 min, expected</span></div>
+  </div>
+
+<pre class="t">loss = sum over loops of w[loop] * CE[loop]             <span class="cm"># w = [0.2, 0.3, 1.0]; non-final loops on 25% of positions</span>
+     + 0.10 * MTP                                       <span class="cm"># 2 extra tokens</span>
+     + 0.01 * router balance
+     + 0.10 * selection BCE                             <span class="cm"># selector share vs gold flag, per loop; needs checkpointing off</span>
+     + 0.10 * groundedness BCE                          <span class="cm"># label: gold present AND answerable</span>
+
+CE token weight = 1 / max(n_supervised_in_conversation, 64)
+depth: with probability 0.3 a step runs 1 or 2 loops; log steps run all 3</pre>
+
+  <h3>Training step</h3>
+  <div class="flow">
+    <div class="step e"><div class="n">1</div><div class="d"><b>Batch.</b> <code>input_ids</code>, <code>document_ids</code>, labels, evidence ids, <code>chunk_keys [B, C, 384]</code>, slot map, <code>chunk_gold</code>, <code>condition_ids</code>, answerable flag. Nothing ragged leaves the dataloader.</div></div>
+    <div class="step e"><div class="n">2</div><div class="d"><b>Encode evidence once.</b> <code>evidence_from_batch</code> runs the dense decoder over the chunks, chunk-causal, positions restarting per chunk. Cached for all loops.</div></div>
+    <div class="step t"><div class="n">3</div><div class="d"><b>Forward.</b> Dense decoder, then the block at the sampled depth. Returns per-loop normed states, not logits.</div></div>
+    <div class="step t"><div class="n">4</div><div class="d"><b>Loss.</b> Chunked CE through <code>main_lm_head</code>, plus the four auxiliary terms.</div></div>
+    <div class="step t"><div class="n">5</div><div class="d"><b>Optimizer.</b> On every eighth micro step: copy gradients to the fp32 masters, clip at 1.0, AdamW on the masters, write back to bf16, clear the gradients by hand.</div></div>
+    <div class="step s"><div class="n">6</div><div class="d"><b>Log every 10 steps.</b> <code>|shared_evidence.o_proj|rms</code>, external mass per condition, <code>selection:</code>, <code>grounded:</code>.</div></div>
+    <div class="step s"><div class="n">7</div><div class="d"><b>Eval every 2.5M tokens, and at step 0.</b> Fixed-target answer CE under gold and under none, on held-out rows.</div></div>
+  </div>
+
+  <figure>
+    <div class="scroll">
+    <svg class="narrow" viewBox="0 0 760 170" role="img" aria-label="Timeline of the first 10 million tokens: warmup until 4.2 million, evals at 0, 2.5, 5, 7.5 and 10 million, kill decision at 10 million.">
+      <rect x="60" y="62" width="269" height="26" class="bar-w"/>
+      <text x="66" y="54" class="ts">warmup to 4.2M tokens</text>
+      <line x1="60" y1="100" x2="700" y2="100" class="axis"/>
+      <g class="tick"><line x1="60" y1="94" x2="60" y2="106"/><line x1="220" y1="94" x2="220" y2="106"/><line x1="380" y1="94" x2="380" y2="106"/><line x1="540" y1="94" x2="540" y2="106"/><line x1="700" y1="94" x2="700" y2="106"/></g>
+      <text x="60" y="126" text-anchor="middle" class="ts">0</text><text x="220" y="126" text-anchor="middle" class="ts">2.5M</text><text x="380" y="126" text-anchor="middle" class="ts">5M</text><text x="540" y="126" text-anchor="middle" class="ts">7.5M</text><text x="700" y="126" text-anchor="middle" class="ts">10M tokens</text>
+      <circle cx="60" cy="75" r="6" class="dot-e"/><circle cx="220" cy="75" r="6" class="dot-e"/><circle cx="380" cy="75" r="6" class="dot-e"/><circle cx="540" cy="75" r="6" class="dot-e"/><circle cx="700" cy="75" r="8" class="dot-k"/>
+      <text x="700" y="52" text-anchor="end" class="tx">kill or continue</text>
+      <text x="60" y="152" class="ts">blue: eval, fixed-target gap   red: decision   about 20 minutes wall clock</text>
+    </svg>
+    </div>
+    <figcaption>Five readings before the decision instead of one. The configured cadence today is 10M tokens with no step-0 eval, which puts the only reading on the decision itself.</figcaption>
+  </figure>
+
+  <div class="grid g2">
+    <div class="card"><h3>Fix before launch</h3><ul>
+      <li>Kill number is the fixed-target gap. The in-run per-condition CE compares an answer against a refusal and read minus 3.25 nats on a dead reader.</li>
+      <li>Validation comes from SQuAD dev and HotpotQA dev. Every QA question in the current split is also in train.</li>
+      <li><code>eval_every_tokens: 2500000</code> and an eval before step 1.</li>
+      <li>Freeze <code>evidence_gate_scale</code>: <code>requires_grad = False</code> and out of the fresh group.</li>
+      <li>Add a flag for the reader to run without rotary.</li>
+      <li>Primary eval reading uses one chunk per passage, as in training.</li>
+      <li>Print <code>|g_proj|rms</code> of the seed once.</li></ul></div>
+    <div class="card"><h3>Arms and decisions</h3><ul>
+      <li><b>Arm A:</b> as built, gate frozen. <b>Arm B:</b> same, reader without rotary.</li>
+      <li><b>Kill at 10M</b> if the fixed-target gap is under 0.1 nats.</li>
+      <li><b>Pass</b> at 50% of the in-context ceiling, about 1.6 of 3.23 nats, with distractor minus none at or below 0.</li>
+      <li>A rising <code>o_proj</code> RMS with a flat gap means the reader learned a bias, not retrieval.</li>
+      <li>Under 50%: test a reader per loop or dense-layer reads before more data.</li>
+      <li><b>Arm C, only after a pass:</b> the one-hot chunk channel with <code>gamma = 0</code>.</li></ul></div>
+  </div>
+</section>
+
+<section id="scratch">
+  <div class="eyebrow">7 · from-scratch run · pilot on the 5090, then H100</div>
+  <h2>Retrieval from token 0, facts kept out of the loss</h2>
+  <p class="sub">Every graft onto the converged checkpoint measured zero, and the published systems that externalize facts all impose it in pretraining. The pilot is the first experiment that can falsify the goal.</p>
+
+  <div class="kv">
+    <div><span class="l">pilot</span><span class="v">~120M params</span><span class="s">1 to 2B tokens, RTX 5090</span></div>
+    <div><span class="l">control</span><span class="v">matched tokens</span><span class="s">same shape and data, no retrieval</span></div>
+    <div><span class="l">real run</span><span class="v">shape L</span><span class="s">about 470M, about 2.5k H100 hours</span></div>
+    <div><span class="l">optimizer</span><span class="v">lr 4e-4</span><span class="s">1000 warmup steps, cosine to 0.1 lr</span></div>
+    <div><span class="l">weight decay</span><span class="v">0.02</span><span class="s">on ndim 2 and above, clip 1.0</span></div>
+    <div><span class="l">precision</span><span class="v">BF16</span><span class="s">FP8 only after a short validation</span></div>
+  </div>
+
+  <h3>Model shape</h3>
+  <p class="sub">Two candidate shapes. M keeps today's width and FLOPs. L is the recommendation: width buys reasoning bandwidth and a full-rank tied head, and the extra prelude layers buy language competence, which is where a fact-free trunk spends its parameters. Counts are estimates until the constructor prints them.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>part</th><th>shape M</th><th>shape L, recommended</th></tr></thead>
+    <tbody>
+      <tr><td class="k">width, heads</td><td>768, 12 x 64, 4 KV</td><td>1024, 16 x 64, 4 KV</td></tr>
+      <tr><td class="k">tied table plus adapters</td><td>51M</td><td>69M</td></tr>
+      <tr><td class="k">prelude</td><td>6 layers, 46M</td><td>8 layers, 109M</td></tr>
+      <tr><td class="k">looped core, 3 sublayers, 8 experts each</td><td>151M, 57M active per pass</td><td>265M, 98M active per pass</td></tr>
+      <tr><td class="k">coda</td><td>2 layers, 15M</td><td>2 layers, 27M</td></tr>
+      <tr><td class="k">total, active</td><td>264M, 170M</td><td>470M, 300M</td></tr>
+      <tr><td class="k">FLOP per token at 3 passes</td><td>about 600M, 1.2x today</td><td>about 1.0G, 2x today</td></tr>
+      <tr><td class="k">layer-equivalents at 3 passes</td><td>17</td><td>19</td></tr>
+      <tr><td class="k">tokens in budget</td><td>about 250B in 1k H100 hours</td><td>about 350B in 2.5k H100 hours</td></tr>
+    </tbody></table></div>
+  <p class="sub">Experts stay at 8 per sublayer in both shapes, so the parameters that can hold facts are about 130M in M and 225M in L, against 170M today. If closed-book recall rises in the pilot, cut experts before cutting width. The 5k-hour ceiling in the plan leaves room for L; the data cap is 400B tokens.</p>
+
+  <h3>Building one training sequence</h3>
+  <div class="grid g2">
+    <figure>
+      <div class="scroll">
+      <svg class="narrow" viewBox="0 0 560 330" role="img" aria-label="Visibility staircase: tokens in window w can read chunks retrieved for windows up to w. Eight windows shown.">
+        <text x="300" y="22" text-anchor="middle" class="ts">token window (256 tokens each)</text>
+        <g class="ts" text-anchor="middle"><text x="125" y="46">w0</text><text x="175" y="46">w1</text><text x="225" y="46">w2</text><text x="275" y="46">w3</text><text x="325" y="46">w4</text><text x="375" y="46">w5</text><text x="425" y="46">w6</text><text x="475" y="46">w7</text></g>
+        <g class="ts" text-anchor="end"><text x="92" y="75">chunks for w0</text><text x="92" y="107">w1</text><text x="92" y="139">w2</text><text x="92" y="171">w3</text><text x="92" y="203">w4</text><text x="92" y="235">w5</text><text x="92" y="267">w6</text><text x="92" y="299">w7</text></g>
+        <g>
+          <rect x="102" y="56" width="46" height="28" class="cell-half"/><rect x="152" y="56" width="46" height="28" class="cell-on"/><rect x="202" y="56" width="46" height="28" class="cell-on"/><rect x="252" y="56" width="46" height="28" class="cell-on"/><rect x="302" y="56" width="46" height="28" class="cell-on"/><rect x="352" y="56" width="46" height="28" class="cell-on"/><rect x="402" y="56" width="46" height="28" class="cell-on"/><rect x="452" y="56" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="88" width="46" height="28" class="cell-off"/><rect x="152" y="88" width="46" height="28" class="cell-on"/><rect x="202" y="88" width="46" height="28" class="cell-on"/><rect x="252" y="88" width="46" height="28" class="cell-on"/><rect x="302" y="88" width="46" height="28" class="cell-on"/><rect x="352" y="88" width="46" height="28" class="cell-on"/><rect x="402" y="88" width="46" height="28" class="cell-on"/><rect x="452" y="88" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="120" width="46" height="28" class="cell-off"/><rect x="152" y="120" width="46" height="28" class="cell-off"/><rect x="202" y="120" width="46" height="28" class="cell-on"/><rect x="252" y="120" width="46" height="28" class="cell-on"/><rect x="302" y="120" width="46" height="28" class="cell-on"/><rect x="352" y="120" width="46" height="28" class="cell-on"/><rect x="402" y="120" width="46" height="28" class="cell-on"/><rect x="452" y="120" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="152" width="46" height="28" class="cell-off"/><rect x="152" y="152" width="46" height="28" class="cell-off"/><rect x="202" y="152" width="46" height="28" class="cell-off"/><rect x="252" y="152" width="46" height="28" class="cell-on"/><rect x="302" y="152" width="46" height="28" class="cell-on"/><rect x="352" y="152" width="46" height="28" class="cell-on"/><rect x="402" y="152" width="46" height="28" class="cell-on"/><rect x="452" y="152" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="184" width="46" height="28" class="cell-off"/><rect x="152" y="184" width="46" height="28" class="cell-off"/><rect x="202" y="184" width="46" height="28" class="cell-off"/><rect x="252" y="184" width="46" height="28" class="cell-off"/><rect x="302" y="184" width="46" height="28" class="cell-on"/><rect x="352" y="184" width="46" height="28" class="cell-on"/><rect x="402" y="184" width="46" height="28" class="cell-on"/><rect x="452" y="184" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="216" width="46" height="28" class="cell-off"/><rect x="152" y="216" width="46" height="28" class="cell-off"/><rect x="202" y="216" width="46" height="28" class="cell-off"/><rect x="252" y="216" width="46" height="28" class="cell-off"/><rect x="302" y="216" width="46" height="28" class="cell-off"/><rect x="352" y="216" width="46" height="28" class="cell-on"/><rect x="402" y="216" width="46" height="28" class="cell-on"/><rect x="452" y="216" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="248" width="46" height="28" class="cell-off"/><rect x="152" y="248" width="46" height="28" class="cell-off"/><rect x="202" y="248" width="46" height="28" class="cell-off"/><rect x="252" y="248" width="46" height="28" class="cell-off"/><rect x="302" y="248" width="46" height="28" class="cell-off"/><rect x="352" y="248" width="46" height="28" class="cell-off"/><rect x="402" y="248" width="46" height="28" class="cell-on"/><rect x="452" y="248" width="46" height="28" class="cell-on"/>
+          <rect x="102" y="280" width="46" height="28" class="cell-off"/><rect x="152" y="280" width="46" height="28" class="cell-off"/><rect x="202" y="280" width="46" height="28" class="cell-off"/><rect x="252" y="280" width="46" height="28" class="cell-off"/><rect x="302" y="280" width="46" height="28" class="cell-off"/><rect x="352" y="280" width="46" height="28" class="cell-off"/><rect x="402" y="280" width="46" height="28" class="cell-off"/><rect x="452" y="280" width="46" height="28" class="cell-on"/>
+        </g>
+      </svg>
+      </div>
+      <figcaption>Filled cells are readable. The chunks for window w are retrieved with a query built only from text before w, so no token reads evidence chosen with knowledge of its own future. Window 0 is queried from tokens 0 to 63 and readable from token 64, shown lighter. The mask lives in <code>vis[t, c]</code>, 8 of 16 windows drawn.</figcaption>
+    </figure>
+    <div class="flow">
+      <div class="step e"><div class="n">1</div><div class="d"><b>Window.</b> Split the 4096 tokens into 16 windows of 256.</div></div>
+      <div class="step e"><div class="n">2</div><div class="d"><b>Query.</b> bge embedding of the preceding window's text. Offline, cheap.</div></div>
+      <div class="step e"><div class="n">3</div><div class="d"><b>Retrieve.</b> Top 2 chunks per window. Exclude the document itself.</div></div>
+      <div class="step e"><div class="n">4</div><div class="d"><b>Filter near duplicates.</b> Drop a candidate whose longest common token run with the target is 32 or more, or whose 8-gram Jaccard is 0.3 or more. Mirrors otherwise turn the reader into a copy machine.</div></div>
+      <div class="step s"><div class="n">5</div><div class="d"><b>Tag fact spans.</b> Entities, numbers, dates. A span is supported when it occurs in a visible chunk. Numbers need two tokens or a matching context n-gram.</div></div>
+      <div class="step s"><div class="n">6</div><div class="d"><b>Flag gold.</b> A chunk holding a supported span is gold for the selection loss and the contrastive loss.</div></div>
+      <div class="step t"><div class="n">7</div><div class="d"><b>Rewrite.</b> Apply the counterfactual swap and the tail anonymization below.</div></div>
+      <div class="step t"><div class="n">8</div><div class="d"><b>Report.</b> Share of supervised tokens whose facts are in the buffer. Under about 20% is a failed build.</div></div>
+    </div>
+  </div>
+
+  <h3>What each token is trained on</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>token class</th><th>loss weight</th><th>treatment</th><th>why</th></tr></thead>
+    <tbody>
+      <tr><td class="k">language, non-fact</td><td>1</td><td>plain next-token CE</td><td>the trunk keeps syntax, common words, common sense</td></tr>
+      <tr><td class="k">fact span, supported</td><td>1</td><td>chunk flagged gold</td><td>reading is rewarded</td></tr>
+      <tr><td class="k">fact span, unsupported</td><td>0</td><td>not rewarded, not punished</td><td>recall from weights earns nothing</td></tr>
+      <tr><td class="k">counterfactual swap</td><td>1</td><td>on 15% of supported spans the entity is swapped for a same-type one, in the chunk and the target alike</td><td>the only lever where recall from weights loses</td></tr>
+      <tr><td class="k">tail anonymization</td><td>1</td><td>in 50% of documents, unsupported entities below the head-frequency threshold get a typed placeholder, in input and target</td><td>masking alone leaves entity-to-attribute links in the input</td></tr>
+    </tbody></table></div>
+
+  <h3>Token tables and the head</h3>
+  <div class="grid g2">
+    <div class="card trunk"><h3>Today: four unrelated views of the token</h3><ul>
+      <li>Input embedding 50.3M, per-layer embeddings 16.8M, router embedding 2.1M, two factored heads 16.5M. Together 85.7M, about a quarter of the model.</li>
+      <li>The main head is a 768 x 768 projection followed by four independent 192 to 16384 blocks, split by token id. Each vocab quarter lives in its own 192-d subspace.</li>
+      <li>This is the one parameter saving in the model that constrains the output distribution itself, and it was never measured.</li></ul></div>
+    <div class="card"><h3>Next run: one table, tied</h3><ul>
+      <li>The head becomes <code>norm(h) @ A @ E^T</code> with <code>E</code> the input embedding and <code>A</code> a 768 x 768 adapter. New parameters: 0.59M, plus 0.29M for the MTP adapter.</li>
+      <li>The cost moves to compute: a full 65536-wide softmax is about 101 MFLOP per token per application against 26 today. A fused linear plus cross-entropy kernel and a subsampled MTP head roughly cover it.</li>
+      <li>Init <code>E</code> at std <code>1/sqrt(768)</code>, or the tied readout saturates at step 0. Exclude the tied table from weight decay on the output side.</li>
+      <li>Gate: the plan's oracle-head measurement. Tie if the factoring costs 0.02 nats or more. Below that, keep the factored head and still collapse the other tables.</li></ul></div>
+  </div>
+
+  <h3>Slice mix</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>slice</th><th>token share</th><th>conditions</th><th>evidence ratio</th></tr></thead>
+    <tbody>
+      <tr><td class="k">web and edu text</td><td>45%</td><td>per-window retrieval, staircase visibility</td><td>about 1.0</td></tr>
+      <tr><td class="k">code and math</td><td>10%</td><td>per-window retrieval</td><td>about 1.0</td></tr>
+      <tr><td class="k">evidence QA</td><td>15%</td><td>gold, mixed, many, distractors, none, counterfactual, partial hop; buffer capped at 8 chunks</td><td>about 2</td></tr>
+      <tr><td class="k">synthetic chains</td><td>10%</td><td>fictional 1 to 3 hop chains with distractors and a decoy chain</td><td>about 5, estimate</td></tr>
+      <tr><td class="k">chat replay</td><td>20%</td><td>per-window retrieval, filtered to instruction rows</td><td>about 1.0</td></tr>
+    </tbody></table></div>
+  <p class="sub">Partial hop is a HotpotQA row with one supporting paragraph withheld, and its target abstains. Distractors are half bge hard negatives and half random. Sources, the store and the build metrics are under datasets; the synthetic chains under loop reasoning.</p>
+
+<pre class="e">loss = CE(head(coda(h_D))) * span_weight                <span class="cm"># proposed arm: one loss on the last loop run; control arm keeps per-loop CE</span>
+     + 0.10 * MTP  +  0.01 * router balance
+     + 0.10 * selection BCE on the union over loops     <span class="cm"># returned from forward_step so checkpointing can stay on</span>
+     + 0.10 * contrastive(q, bge key of gold chunk)     <span class="cm"># multi-positive; windows with no gold are skipped;</span>
+                                                        <span class="cm"># same-document and near-duplicate negatives masked</span>
+     + 0.10 * groundedness BCE
+
+q for the search = loop-0 query at the last token of the preceding window
+last 15% of the pilot: candidates are re-fetched with the model's own q; recall@32 against bge is reported</pre>
+  <div class="note ok">The contrastive term cannot collapse, because the keys are fixed bge vectors and only the query side learns. It aligns the query. The candidate refresh in the last 15% is what exposes the reader to the model's own retrieval errors before serving.</div>
+</section>
+
+<section id="datasets">
+  <div class="eyebrow">8 · datasets</div>
+  <h2>What each run trains on</h2>
+  <p class="sub">The POC corpus exists and stays as built, with its evaluation fixed. The from-scratch corpus is a new builder mode.</p>
+
+  <h3>POC finetune corpus, as built</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>source</th><th>prompt tokens</th><th>share of tokens</th><th>share of conversations</th><th>evidence</th></tr></thead>
+    <tbody>
+      <tr><td class="k">squad_v2</td><td>25.0M</td><td>17.7%</td><td>52.6%</td><td>one chunk per passage, 4 passes with redrawn conditions</td></tr>
+      <tr><td class="k">hotpot_qa</td><td>21.0M</td><td>14.9%</td><td>37.0%</td><td>both supporting paragraphs plus 8 retrieved near misses, 4 passes</td></tr>
+      <tr><td class="k">web text</td><td>60.1M</td><td>42.5%</td><td>small</td><td>one held 384-token span, 128-token chunks</td></tr>
+      <tr><td class="k">smoltalk2 replay</td><td>35.4M</td><td>25.0%</td><td>small</td><td>none</td></tr>
+    </tbody></table></div>
+  <p class="sub">963,011 conversations, 140.1M prompt and 525.6M evidence tokens, ratio 3.75, <code>many</code> 58,767 rows, 59.9% answerable. By supervised tokens about 92% carry content the buffer does not supply, so this corpus can show reading, not fact removal.</p>
+  <div class="grid g2">
+    <div class="card"><h3>Fix before the run</h3><ul>
+      <li>Validation from SQuAD dev and HotpotQA dev by source id. The current split has every QA question in both halves.</li>
+      <li>Primary eval reading with one chunk per passage, as trained.</li>
+      <li>Exclude same-context passages from the eval distractor pool.</li></ul></div>
+    <div class="card"><h3>Cheap second corpus, if the mechanism check passes</h3><ul>
+      <li>A counterfactual condition: swap the answer entity in the gold chunk, label follows the chunk.</li>
+      <li>bge hard negatives for half the distractors.</li>
+      <li>Two passes over the QA sources instead of four.</li>
+      <li>Retrieval attached to the replay rows.</li>
+      <li>A wider abstention phrasing set.</li></ul></div>
+  </div>
+
+  <h3>From-scratch corpus</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>slice</th><th>tokens</th><th>sources</th><th>evidence</th><th>supervision</th></tr></thead>
+    <tbody>
+      <tr><td class="k">web and edu text</td><td>45%</td><td>the pretrain mix, fineweb-edu weighted up</td><td>top 2 per 256-token window, staircase visibility, ratio about 1</td><td>span weights, counterfactual swaps, tail anonymization</td></tr>
+      <tr><td class="k">code and math</td><td>10%</td><td>stackv2 edu, Nemotron math</td><td>same per-window retrieval</td><td>plain CE; procedural skill belongs in the weights</td></tr>
+      <tr><td class="k">evidence QA</td><td>15%</td><td>SQuAD v2, HotpotQA, Natural Questions, TriviaQA with passages, MuSiQue, 2Wiki; at most 2 passes each</td><td>gold, mixed, many, distractors, none, counterfactual, partial hop; buffer capped at 8 chunks, ratio about 2</td><td>answer or abstain; hop labels from MuSiQue and 2Wiki for evaluation</td></tr>
+      <tr><td class="k">synthetic chains</td><td>10%</td><td>generated, fictional entities</td><td>hops 1 / 2 / 3 at 25 / 50 / 25, 6 to 14 distractors, one decoy chain</td><td>answer; 4-hop and unseen hop-2 templates held out</td></tr>
+      <tr><td class="k">chat replay</td><td>20%</td><td>smoltalk2 filtered to instruction and format rows</td><td>same per-window retrieval</td><td>assistant text, span weights</td></tr>
+    </tbody></table></div>
+  <p class="sub">Retrieval is attached to every slice, so the only evidence-free case is the abstention condition. The QA buffer cap is the main cost lever: at 8 chunks the corpus ratio lands near 1.3 instead of 2.1.</p>
+
+  <div class="grid g3">
+    <div class="card ev"><h3>Store</h3><ul>
+      <li>Training corpus plus Wikipedia, at least 0.4B tokens.</li>
+      <li>128-token chunks, MinHash deduplicated.</li>
+      <li>The training document itself is excluded from its own candidates.</li>
+      <li>Closed-book probe answers held out of the pretraining text.</li></ul></div>
+    <div class="card"><h3>Offline cost at 100B tokens</h3><ul>
+      <li>Fact tagger: about 15 H100 hours.</li>
+      <li>bge window queries: about 5 H100 hours.</li>
+      <li>ANN search: about 400M queries, CPU hours with a flat index on GPU.</li>
+      <li>Near-duplicate filter: negligible. Hash sets of 8-grams and 32-grams per document, one lookup per candidate n-gram.</li>
+      <li>Store deduplication: minutes.</li></ul></div>
+    <div class="card"><h3>Build metrics to print</h3><ul>
+      <li>Share of tagged spans supported by a visible chunk. Under about 20% fails the build.</li>
+      <li>Gold recall of bge top 2 on the QA slices.</li>
+      <li>Near-duplicate drop rate per source.</li>
+      <li>Evidence ratio and weighted gradient share per slice.</li>
+      <li>Contamination check of the probe answers.</li></ul></div>
+  </div>
+</section>
+
+<section id="loop">
+  <div class="eyebrow">9 · internal reasoning</div>
+  <h2>Making the loop reason over what it reads</h2>
+  <p class="sub">There is good reason to expect the loop to compose facts it reads. There is no clean measurement yet that it does. Every per-loop number on record comes from a checkpoint whose third loop passed only 8% of its update for all 16B pretraining tokens.</p>
+
+  <figure>
+    <div class="scroll">
+    <svg viewBox="0 0 980 330" role="img" aria-label="Each loop reads the evidence once from its input state, so a two-hop answer needs at least two loops before the coda reads out.">
+      <defs>
+        <marker id="bt2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mt"/></marker>
+        <marker id="be2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="me"/></marker>
+        <marker id="bs2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="ms"/></marker>
+      </defs>
+      <rect x="20" y="50" width="110" height="70" rx="4" class="bt"/>
+      <text x="75" y="80" text-anchor="middle" class="tx">h0</text>
+      <text x="75" y="100" text-anchor="middle" class="ts">decoder out</text>
+      <rect x="170" y="50" width="150" height="70" rx="4" class="bt"/>
+      <text x="245" y="80" text-anchor="middle" class="tx">loop 1</text>
+      <text x="245" y="100" text-anchor="middle" class="ts">finds the bridge</text>
+      <rect x="360" y="50" width="150" height="70" rx="4" class="bt"/>
+      <text x="435" y="80" text-anchor="middle" class="tx">loop 2</text>
+      <text x="435" y="100" text-anchor="middle" class="ts">follows the bridge</text>
+      <rect x="550" y="50" width="150" height="70" rx="4" class="bt"/>
+      <text x="625" y="80" text-anchor="middle" class="tx">loop 3</text>
+      <text x="625" y="100" text-anchor="middle" class="ts">composes</text>
+      <rect x="740" y="50" width="100" height="70" rx="4" class="bs"/>
+      <text x="790" y="80" text-anchor="middle" class="tx">coda</text>
+      <text x="790" y="100" text-anchor="middle" class="ts">2 layers</text>
+      <rect x="880" y="50" width="80" height="70" rx="4" class="bt"/>
+      <text x="920" y="80" text-anchor="middle" class="tx">head</text>
+      <text x="920" y="100" text-anchor="middle" class="ts">one loss</text>
+      <line x1="130" y1="85" x2="168" y2="85" class="lt" marker-end="url(#bt2)"/>
+      <line x1="320" y1="85" x2="358" y2="85" class="lt" marker-end="url(#bt2)"/>
+      <line x1="510" y1="85" x2="548" y2="85" class="lt" marker-end="url(#bt2)"/>
+      <line x1="700" y1="85" x2="738" y2="85" class="lt" marker-end="url(#bt2)"/>
+      <line x1="840" y1="85" x2="878" y2="85" class="lt" marker-end="url(#bt2)"/>
+      <path d="M75 50 C 75 12, 625 12, 625 48" class="ls" marker-end="url(#bs2)"/>
+      <text x="350" y="16" text-anchor="middle" class="lab-s">input re-presented to every loop (loop_inject)</text>
+
+      <rect x="170" y="230" width="150" height="66" rx="4" class="be"/>
+      <text x="245" y="258" text-anchor="middle" class="tx">chunk A</text>
+      <text x="245" y="277" text-anchor="middle" class="ts">Orlen was born in Vesk</text>
+      <rect x="360" y="230" width="150" height="66" rx="4" class="be"/>
+      <text x="435" y="258" text-anchor="middle" class="tx">chunk B</text>
+      <text x="435" y="277" text-anchor="middle" class="ts">Vesk lies in Tarn</text>
+      <rect x="550" y="230" width="290" height="66" rx="4" class="bn"/>
+      <text x="695" y="258" text-anchor="middle" class="tx">distractors and a decoy chain</text>
+      <text x="695" y="277" text-anchor="middle" class="ts">same relations, other entities</text>
+      <line x1="245" y1="230" x2="245" y2="122" class="le" marker-end="url(#be2)"/>
+      <text x="255" y="180" class="lab-e">read 1</text>
+      <line x1="435" y1="230" x2="435" y2="122" class="le" marker-end="url(#be2)"/>
+      <text x="445" y="180" class="lab-e">read 2, query carries Vesk</text>
+      <text x="20" y="180" class="ts">Q: which region was</text>
+      <text x="20" y="196" class="ts">Orlen born in?</text>
+    </svg>
+    </div>
+    <figcaption>The selector and the reader both query the state a loop starts with, and chunks are encoded independently of each other. Chunk B can only be found once Vesk is in the state, which is after loop 1. So k hops over evidence need at least k loops. The architecture already forces depth. The training data never asked for it.</figcaption>
+  </figure>
+
+  <h3>What the audit found in the current objective</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>mechanism</th><th>what it does today</th><th>effect on reasoning</th><th>status</th></tr></thead>
+    <tbody>
+      <tr><td class="k">per-loop CE</td><td>weights 0.2 / 0.3 / 1.0, one shared norm and head for every loop</td><td>every loop state must be token shaped</td><td>confirmed, effect partly overstated at full depth</td></tr>
+      <tr><td class="k">random depth</td><td>30% of steps stop at loop 1 or 2 and that loop gets weight 1.0</td><td>intermediate readout share rises from 33% to 52%; loops 1 and 2 are trained as exits</td><td>arithmetic confirmed</td></tr>
+      <tr><td class="k">loop_scale</td><td>0.637 / 0.326 / 0.098, applied after <code>post_norm</code>, not in the fresh LR group</td><td>loop 3 can add at most about a tenth of a unit update, whatever the reader returns</td><td>confirmed</td></tr>
+      <tr><td class="k">block gradient</td><td>about 65% arrives through the loop-1 application, 29% loop 2, 7% loop 3</td><td>the shared block is trained mostly as a first pass</td><td>approximation</td></tr>
+      <tr><td class="k">selection loss</td><td>same gold flags for every loop, shares renormalized to sum 1</td><td>with two gold chunks every loop is pushed to 0.5 / 0.5</td><td>confirmed</td></tr>
+      <tr><td class="k">readout</td><td>no layer between the last loop and the head</td><td>the loop-3 read is never processed before it is decoded</td><td>confirmed</td></tr>
+      <tr><td class="k">progress</td><td>no term rewards or penalizes a later loop for changing the state</td><td>loop 1 can satisfy the final loss alone through the residual</td><td>confirmed</td></tr>
+      <tr><td class="k">depth past 3</td><td>CE 3.4112 at loop 3, 3.4115 at loop 4, 3.4900 at loop 8</td><td>extra loops overthink; measured on plain text with no evidence</td><td>confirmed</td></tr>
+    </tbody></table></div>
+
+  <h3>Proposed objective and depth schedule</h3>
+<pre class="t">L = CE(head(coda(h_D)))                              <span class="cm"># one loss, on the last loop run, through the coda</span>
+  + 0.10 * MTP(coda(h_D)) + 0.01 * router balance
+  + 0.10 * L_sel + 0.10 * contrastive + 0.10 * groundedness
+
+p[k,c] = selector mass of loop k on chunk c, renormalized over visible chunks
+u[c]   = 1 - product over loops k in the gradient window of (1 - p[k,c])
+L_sel  = mean over (selector, token) of mean over visible c of BCE(u[c], gold[c])
+
+depth D     : 3 with p 0.7, 4 with p 0.2, 5 with p 0.1   (expected 3.4; inference 3, at most 4)
+gradient    : the first D - 3 loops run under no_grad and are detached; the last 3 carry gradient
+loop_scale  : length 5, fresh init 1/sqrt(5); evidence_loop_scale length 5
+loop_inject : on, so the decoder still gets gradient when the prefix is detached
+loop_enc    : clamped to the trained depth at inference</pre>
+  <figure>
+    <div class="scroll">
+    <svg class="narrow" viewBox="0 0 760 190" role="img" aria-label="Depth schedule: at depth 3 all loops carry gradient; at depth 5 the first two loops run without gradient and the last three carry it.">
+      <text x="20" y="48" class="ts">D = 3</text><text x="20" y="64" class="ts">70%</text>
+      <rect x="80" y="30" width="90" height="44" rx="3" class="bt"/><rect x="180" y="30" width="90" height="44" rx="3" class="bt"/><rect x="280" y="30" width="90" height="44" rx="3" class="bt"/>
+      <text x="125" y="57" text-anchor="middle" class="tx">1</text><text x="225" y="57" text-anchor="middle" class="tx">2</text><text x="325" y="57" text-anchor="middle" class="tx">3</text>
+      <rect x="380" y="30" width="80" height="44" rx="3" class="bs"/><text x="420" y="57" text-anchor="middle" class="tx">coda</text>
+      <text x="20" y="128" class="ts">D = 5</text><text x="20" y="144" class="ts">10%</text>
+      <rect x="80" y="110" width="90" height="44" rx="3" class="bn"/><rect x="180" y="110" width="90" height="44" rx="3" class="bn"/>
+      <rect x="280" y="110" width="90" height="44" rx="3" class="bt"/><rect x="380" y="110" width="90" height="44" rx="3" class="bt"/><rect x="480" y="110" width="90" height="44" rx="3" class="bt"/>
+      <text x="125" y="137" text-anchor="middle" class="tx">1</text><text x="225" y="137" text-anchor="middle" class="tx">2</text><text x="325" y="137" text-anchor="middle" class="tx">3</text><text x="425" y="137" text-anchor="middle" class="tx">4</text><text x="525" y="137" text-anchor="middle" class="tx">5</text>
+      <rect x="580" y="110" width="80" height="44" rx="3" class="bs"/><text x="620" y="137" text-anchor="middle" class="tx">coda</text>
+      <text x="175" y="176" text-anchor="middle" class="ts">no gradient, detached</text>
+      <text x="425" y="176" text-anchor="middle" class="ts">gradient window of 3</text>
+    </svg>
+    </div>
+    <figcaption>The minimum depth is 3, so loops 1 and 2 are never trained as exits. Deeper steps start the gradient window from a state the block produced itself, which is the published recipe against overthinking. Memory stays at three loops of activations.</figcaption>
+  </figure>
+
+  <div class="grid g2">
+    <div class="card"><h3>Synthetic chains, 10% of tokens</h3><ul>
+      <li>Fictional entities, so weights cannot know the answer.</li>
+      <li>Hops 1 / 2 / 3 at 25 / 50 / 25 by rows, chunk order shuffled.</li>
+      <li>6 to 14 distractors: same relation with other entities, bridge relation with other entities, and one full decoy chain.</li>
+      <li>Held out: 4-hop chains and unseen hop-2 templates.</li>
+      <li>A hop index per gold chunk is written for evaluation only.</li></ul></div>
+    <div class="card"><h3>Validity rule</h3><ul>
+      <li>Score accuracy by hops and by loops run.</li>
+      <li>Every cell with fewer loops than hops must sit at chance.</li>
+      <li>Anything above chance there is a leak in the data, because the read structure makes it impossible.</li>
+      <li>A 1-hop curve must saturate before any null result is read.</li></ul></div>
+  </div>
+
+  <h3>Judged and rejected</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>idea</th><th>verdict</th><th>reason</th></tr></thead>
+    <tbody>
+      <tr><td>hinge that forbids loop k from scoring worse than loop k-1</td><td><b class="chip c-drop">DROP</b></td><td>puts token loss back on intermediate states</td></tr>
+      <tr><td>staging evidence so hop 2 becomes visible only in loop 2</td><td><b class="chip c-drop">DROP</b></td><td>the read structure already enforces it; staging leaks the hop order</td></tr>
+      <tr><td>selection target per hop and per loop</td><td><b class="chip c-drop">DROP</b></td><td>latent hops do not align to loops; union only</td></tr>
+      <tr><td>explicit feedback from reader output to the next query</td><td><b class="chip c-drop">DROP</b> for now</td><td>flat query drift was measured without evidence; revisit if it stays flat with evidence</td></tr>
+      <tr><td>coda grafted onto the current checkpoint</td><td><b class="chip c-drop">DROP</b></td><td>grafts stand at 0 for 4 and there is no composition data</td></tr>
+      <tr><td>bridge entity as a small supervised span</td><td>pilot arm</td><td>minimal published supervision for two-hop; not a default</td></tr>
+    </tbody></table></div>
+
+  <h3>Experiment ladder on the 5090</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>rung</th><th>tokens</th><th>what runs</th><th>number to read</th><th>pass</th><th>decides</th></tr></thead>
+    <tbody>
+      <tr><td class="k">R0</td><td>0</td><td>existing checkpoints, <code>loop_scale</code> multiplied by 1, 2, 3.5, 5.9 at eval</td><td>CE gain from loop 2 to 3</td><td>0.02 nats, loops 1 and 2 not worse</td><td>whether graft arms reset <code>loop_scale</code></td></tr>
+      <tr><td class="k">R1</td><td>10M</td><td>the planned evidence finetune</td><td>selector AUROC per loop</td><td>loop 2 or 3 beats loop 1 by 0.02</td><td>whether reads differ by loop at all</td></tr>
+      <tr><td class="k">R1b</td><td>0</td><td>one micro step at depth 3 and at depth 6 with the prefix</td><td>peak memory</td><td>fits the card</td><td>whether depth 6 is trainable</td></tr>
+      <tr><td class="k">R2</td><td>0</td><td>synthetic chains scored on the R1 checkpoint</td><td>accuracy by hops and loops</td><td>chance wherever loops are fewer than hops</td><td>whether the instrument is valid</td></tr>
+      <tr><td class="k">R3</td><td>2 x 30M</td><td>graft: proposed objective against current recipe, 15% synthetic</td><td>2-hop accuracy at 3 loops minus 1 loop</td><td>+0.15 and proposed beats current</td><td>a pass helps; a null decides nothing</td></tr>
+      <tr><td class="k">R4</td><td>4 x 1B</td><td>from scratch, 120M: loss placement by coda, 2 x 2</td><td>held-out-template 2-hop accuracy at 3 loops</td><td>best arm 10 points over per-loop loss without coda; 3-hop above chance</td><td>objective and coda</td></tr>
+      <tr><td class="k">R5</td><td>0</td><td>winner, eval only</td><td>held-out 4-hop at 4 to 6 loops; HotpotQA bridge by loops</td><td>4-hop rises with loops; 0.05 nats from 1 to 3 loops</td><td>whether it enters the real run</td></tr>
+      <tr><td class="k">R6</td><td>1 to 2B</td><td>hop 1 seen only in pretraining text, hop 2 retrieved</td><td>2-hop accuracy</td><td>well above chance at 2 loops or more</td><td>whether weights and store compose</td></tr>
+    </tbody></table></div>
+  <p class="sub">R4 replaces the existing planned test, which changes loss placement, depth sampling and the coda in a single arm and so cannot attribute a result. All four arms share fresh <code>loop_scale</code>, input re-presentation and data. The run times for R4 are unmeasured.</p>
+
+  <div class="grid g3">
+    <div class="card"><h3>Strong evidence</h3><p>The read structure forces depth for composition. Small looped models compose on synthetic tasks, including at 124M parameters and below.</p></div>
+    <div class="card"><h3>Weak evidence</h3><p>Transfer to natural multi-hop questions at this size. Published second hops fail off template, and this model reads BoolQ below chance.</p></div>
+    <div class="card"><h3>No evidence</h3><p>Any loop measurement here without the halt gate confound. Any looped model with an evidence port showing a depth curve on real questions.</p></div>
+  </div>
+  <div class="note">With 3 passes the model can compose about 2 to 3 hops over evidence before readout. The schedule to 5 trains the block to keep working from its own output; inference stays at 3 passes, 4 at most. At 3 sublayers per pass that is 17 to 20 layer-equivalents per token against 11 today, and 26 at the training ceiling. Whether 2 or 3 sublayers per pass is right is a pilot arm at matched compute.</div>
+</section>
+
+<section id="cost">
+  <div class="eyebrow">10 · cost</div>
+  <h2>What the evidence path costs</h2>
+  <p class="sub">Body cost is about 502 MFLOP per prompt token. The encoder adds 118 MFLOP per evidence token at 8 layers. Everything below is derived from those two constructor numbers and has not been measured on a run.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>configuration</th><th>evidence ratio r</th><th>encoder coefficient</th><th>read sites</th><th>cost multiplier</th></tr></thead>
+    <tbody>
+      <tr><td>POC as built, 8-layer encoder</td><td>3.75</td><td>0.235</td><td>3</td><td class="k">about 1.92</td></tr>
+      <tr><td>from scratch, text slice only</td><td>1.0</td><td>0.157</td><td>3</td><td class="k">about 1.20</td></tr>
+      <tr><td>from scratch, full mix, QA buffer capped</td><td>1.3</td><td>0.157</td><td>3</td><td class="k">about 1.25</td></tr>
+      <tr><td>from scratch, full mix, dense reads</td><td>1.3</td><td>0.157</td><td>5</td><td class="k">about 1.28</td></tr>
+    </tbody></table></div>
+  <ul>
+    <li>The coefficient 0.157 is the 4-layer encoder at 0.118, times 4/3 for the recompute under checkpointing.</li>
+    <li>The QA slice drives the mix: 0.75 x 1.0 + 0.15 x 2 + 0.10 x 5 gives about 1.3 with the buffer capped at 8 chunks, 2.1 without the cap.</li>
+    <li>The coda and steps deeper than 3 passes add body cost that is not in this table. Expected depth is 3.4 passes, and the prefix passes run forward only. Shape L below roughly doubles the body cost per token.</li>
+    <li>At the plan's 97k tokens per second base rate, 1k H100 hours is about 349B tokens without evidence and about 280B at 1.25, for shape M. Shape L halves both.</li>
+    <li>Memory was 0.61 MiB per evidence token with 8 layers and no checkpointing. With 4 layers and checkpointing the estimate is about 0.25 MiB.</li>
+    <li>Offline preparation at 100B tokens: tagging is about 15 H100 hours, bge queries about a third of that.</li>
+  </ul>
+</section>
+
+<section id="gates">
+  <div class="eyebrow">11 · acceptance</div>
+  <h2>Gates that make the goal falsifiable</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>gate</th><th>metric</th><th>bar</th><th>POC</th><th>pilot</th></tr></thead>
+    <tbody>
+      <tr><td class="k">A1</td><td>closed-book EM with the pathway off and a neutral prompt, by obscurity tier</td><td>tail tiers near chance</td><td>already met by the seed, so uninformative</td><td>decisive against the control</td></tr>
+      <tr><td class="k">A2</td><td>fixed-target answer CE, gold minus none, held-out rows</td><td>50% of the 3.23 nat ceiling, distractor minus none at or below 0</td><td>the run's main reading</td><td>yes</td></tr>
+      <tr><td class="k">A3</td><td>counterfactual follow rate, by entity frequency</td><td>follows the chunk 90%, answers from memory at most 5%</td><td>eval only</td><td>yes, at every checkpoint</td></tr>
+      <tr><td class="k">A4</td><td>store edit: change or delete the chunk and its neighbours</td><td>70% of edits propagate</td><td>eval only</td><td>yes</td></tr>
+      <tr><td class="k">A5</td><td>selector mass on the gold chunk, per loop</td><td>AUROC 0.674, three sigma over the 0.584 probe</td><td>yes</td><td>yes</td></tr>
+      <tr><td class="k">A6</td><td>HotpotQA, BoolQ, SciQ through the port against in-prompt</td><td>port matches in-prompt</td><td>yes</td><td>yes</td></tr>
+    </tbody></table></div>
+  <p class="sub">A3 is read at every checkpoint because context reliance is known to rise early and then decay under finetuning on context that agrees with the weights.</p>
+</section>
+
+<section id="review">
+  <div class="eyebrow">12 · verification</div>
+  <h2>What the Opus 5.5 review changed</h2>
+  <p class="sub">One Opus 5.5 subagent checked the draft against the code and attacked it. It confirmed every hyperparameter against <code>config.yaml</code> and judged that the architecture makes sense for the goal. It changed six things.</p>
+  <div class="scroll"><table>
+    <thead><tr><th>draft</th><th>finding</th><th>now</th></tr></thead>
+    <tbody>
+      <tr><td>additive <code>P * key</code> and <code>Q * q_sel</code> in the reader</td><td>learns cross terms; the selector term is unrelated to the trained cosine; no way to attend nowhere; length bias</td><td>one-hot chunk channel, sink slot, length term</td></tr>
+      <tr><td>RMSNorm after a zero-init <code>o_proj</code></td><td>norm gradient at zero breaks neutrality after one step</td><td>zero-init gain after the norm</td></tr>
+      <tr><td>search over adapted keys</td><td>trained <code>key_adapter</code> moves keys out of bge space, so the index would need rebuilding</td><td>raw bge keys, adapter dropped</td></tr>
+      <tr><td>unsupported spans masked, nothing else</td><td>facts still reach the weights through the input side and through supported occurrences</td><td>counterfactual swaps and tail anonymization added</td></tr>
+      <tr><td>512-token windows, r = 0.5</td><td>window 0 has no evidence; the staircase cannot be expressed with plain flash-attn</td><td>256-token windows, early window-0 query, mask in the chunk channel</td></tr>
+      <tr><td>cached encoder states in the store</td><td>600 GB at 0.4B tokens</td><td>encode on the fly</td></tr>
+    </tbody></table></div>
+  <p class="sub">A second Opus 5.5 verdict merged three competing loop designs into the one under loop reasoning. It dropped five ideas, among them my suggestion to make the second-hop chunk visible only from loop 2, because the read structure already enforces that.</p>
+  <p class="sub">It also corrected three statements about the current code: the reader uses 16 heads of 48 with 4 KV heads, the external store is scored densely and not through the two-stage path, and the 118 MFLOP figure covers the encoder only.</p>
+</section>
+
+<section id="risks">
+  <div class="eyebrow">13 · open risks</div>
+  <h2>What can still fail</h2>
+  <div class="grid g3">
+    <div class="card"><h3>Facts leak in through the input</h3><p>Without the counterfactual swaps A1 is expected to fail. The swap rate and the anonymization rate are first guesses and need a sweep in the pilot.</p></div>
+    <div class="card"><h3>Small models ignore evidence</h3><p>Models of 7B and under have been measured ignoring oracle passages most of the time. At about 120M the pilot may come out flat. The matched control and A6 decide.</p></div>
+    <div class="card"><h3>Retrieval mismatch and leakage</h3><p>The reader trains on bge's errors and serves on its own. Near-duplicate continuations inflate the language-model gain. Report gains by overlap tier.</p></div>
+    <div class="card"><h3>Reader bandwidth</h3><p>One read per loop is narrow next to designs that read in every layer. The dense-layer reads are the prepared answer, not a measured one.</p></div>
+    <div class="card"><h3>Coverage</h3><p>With the document itself excluded, a fact that appears in one document only is never supported. It is masked, never memorized and never practised.</p></div>
+    <div class="card"><h3>Multi-hop stays implicit</h3><p>The buffer is fixed per forward. Re-querying between loops and appending chunks is untrained and deferred until the pilot passes.</p></div>
+  </div>
+</section>
+
+<footer>Sources: <span class="mono">config.yaml</span>, <span class="mono">modules/model/{moe,evidence,information_retrieval,experts,gemma4,transformer}.py</span>, <span class="mono">docs/review_2026-09-29.md</span>. Numbers marked as estimates were derived, not measured.</footer>
+</div>
+
+</body>
+</html>

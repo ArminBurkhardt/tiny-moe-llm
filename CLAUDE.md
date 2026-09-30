@@ -8,19 +8,29 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 
 ## Now (keep current)
 
-Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-09-20
+Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-09-30
 the evidence port (Phase 4) is built, its corpus built, its seed migrated, and it has not trained.
+The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
+pathway, reasoning in the looped trunk"; the design is `docs/evidence_path_design.html`, the
+findings are `docs/review_2026-09-29.md`.
 
 - Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
   3.75, QA 32.6% of tokens after 4 passes, `many` 58,767 rows, 59.9% answerable. `evidence_val`
-  9,707. The archived one-pass `evidence_nomany_*` predates `.ans` and no longer loads.
+  9,707, **but every QA question in it is also in train**; it is a train-loss slice until rebuilt
+  from SQuAD dev and HotpotQA dev.
 - Seed: `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`.
 - `EvidenceConfig`: `batch_size: 2`, `grad_accumulation_steps: 8`, `max_evidence_tokens: 14336`
   (64% fill, ~25 GiB peak, ~0.7 s/step, 10M tokens in ~20 min).
-- **Next:** `python scripts/sft.py --evidence -c <seed>` under a Monitor watch. Kill at 10M tokens
-  if the per-condition `[eval]` gold-vs-none CE gap is under ~0.1 nats (seed baseline 0.0000).
-  Watch `selection:`, `grounded:` and its held-out AUROC, `|shared_evidence.o_proj|rms`,
-  `external mass`. Then `eval_abstention.py --evidence-port` (G3/G3b), then the benchmark suite.
+- **Next, before any launch (no GPU):** a fixed-target gold-minus-none pass in `sft.py`'s
+  `evaluate()` as the kill number (the per-condition `[eval]` CE compares an answer against a
+  refusal and reads -3.25 nats on a dead reader); the validation rebuild; `eval_every_tokens:
+  2500000` plus an eval before step 1; `evidence_gate_scale` frozen at 0 (`chunk_mean_mass` is not
+  causal); a no-rotary flag for the reader; `|g_proj|rms` of the seed printed once.
+- **Then:** the loop scale probe (`eval_stage0.py` with `loop_scale` x 1, 2, 3.5, 5.9 on `ir_c`),
+  then `python scripts/sft.py --evidence -c <seed>` under a Monitor watch, arm A as built and arm B
+  without reader rotary, 10M tokens each. Kill on the fixed-target gap under 0.1 nats. Read the
+  selector AUROC and external mass **per loop**. Pass at 50% of the 3.23-nat ceiling. This run is
+  a mechanism check of the reader; it decides nothing about where facts live.
 - `ckpts/evidence_smoke/` is empty; `ckpts/evsmoke.log` is the memory and throughput reference
   (batch 4 x 4096, cap 12288, peak 24.29 GB with optimizer state, 18-29k tok/s).
   `ckpts/evidence/` does not exist, so the first `--evidence` launch honours `-c`; later ones resume.
