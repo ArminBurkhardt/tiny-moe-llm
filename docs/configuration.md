@@ -107,14 +107,16 @@ numbers is a second thing that can drift. All four default `hf_upload_repo` to `
 
 | Key | `sft` | `repair` | `ir` | `evidence` |
 |-----|-------|----------|------|------------|
-| splits | `sft_train`/`sft_val` | `repair_train`/`repair_val` | `ir_train`/`ir_val` | `evidence_train`/`evidence_val` |
+| splits | `sft_train`/`sft_val` | `repair_train`/`repair_val` | `ir_train`/`ir_val` | `evidence_train`/`evidence_dev`, plus `fixed_split: evidence_fixed`. Both held-out splits come from `prepare_evidence_data.py --heldout` (SQuAD v2 dev, HotpotQA dev). `evidence_val` is not held out for QA (every QA question in it is also in train) |
 | `lr` | 3e-5 | 1e-5 | 1e-5 | 1e-5 |
 | `fresh_lr` | — | — | 3e-4 (the rebuilt `ir_module` subtree + `down_proj`/`up_proj`) | 3e-4 (the port's own zero-init tensors only; the table trains at `lr`) |
 | `num_epochs` | 2 | 1 | 1 | 1 |
 | `batch_size` × `grad_accumulation_steps` | 8 × 4 (spills into shared memory on the 5090 — use 4 × 8) | 4 × 4 | 4 × 4 | **2 × 8** — same tokens per optimizer step, half the evidence axis per micro step. Peak memory here is ~3.5 GiB + 0.61 MiB per evidence token, so the evidence axis sets it and 4 rows overflow the card |
 | `dropout` | 0.05 | inherited | inherited | inherited |
 | `conversation_loss_weighting` | false | **true** | false | **true**, floored by `loss_weight_floor_tokens: 64` |
-| `checkpoint_every_tokens` / `eval_every_tokens` | 100M / 25M | 10M / 5M | 50M / 10M | 25M / 10M |
+| `checkpoint_every_tokens` / `eval_every_tokens` | 100M / 25M | 10M / 5M | 50M / 10M | 25M / 2.5M, plus an eval before step 1 on a fresh start (every profile) |
+| fixed-target pass | - | - | - | `fixed_eval_max_batches` 100 over `evidence_fixed`, token-level (unweighted) answer CE per condition, gain = CE(none) - CE(cond), per-loop selector readings. `kill_tokens` 10M / `kill_min_gain` 0.1: the first eval past 10M with a gold gain under 0.1 nats saves and exits 10 |
+| `freeze_evidence_gate` | - | - | - | true: `evidence_gate_scale` gets `requires_grad=False` and is zeroed if loaded nonzero (the gate reads a document-mean, so it sees future tokens) |
 | anneal | — | — | `temperature_start` 1.0 → `temperature_end` 0.05 over `temperature_anneal_fraction` 0.7, geometric | — |
 | `cluster_refresh_tokens` / `dead_quantile` | — | — | 20M / 0.02 | 20M / 0.02 (the table still trains, so its centroids still track it) |
 | `max_evidence_tokens` | — | — | — | 14336, one row's evidence cap. It must be read against the corpus's evidence-to-prompt ratio, not set once: a row needs `ratio × seq_length` of evidence to fill its token budget, and under that the evidence budget closes the row early and the unused prompt slots become padding the body still pays for. The old 12288 was 3× `seq_length` against a 2.93 ratio; the four-pass corpus reads 3.75, where 12288 closed 206 of the first 256 rows for 55% fill. 14336 is 3.5× — the ratio's 15.4k minus a safety margin, since the cap is also the dominant term in peak memory — and measures 64% fill, short of what the ratio predicts because packing is greedy and a row drawing QA conversations closes on evidence early |

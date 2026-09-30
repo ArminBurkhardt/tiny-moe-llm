@@ -12,30 +12,40 @@ and the new references). The design itself, with blueprints of both runs, is
 
 ## Now (2026-09-30)
 
-Nothing has trained since 2026-09-20. The evidence port, corpus and seed are built. The direction
-review found that the planned `--evidence` run cannot be read as configured. In order:
+Nothing has trained since 2026-09-20. The run's instruments were fixed on 2026-09-30 (Phase 4,
+"Before the launch", all eight items) and R0 was read. In order:
 
-1. **Fix the run's instruments** (Phase 4, "Before the launch"; no GPU): the fixed-target
-   gold-minus-none gap as the kill number inside `sft.py`'s `evaluate()`, a validation split from
-   SQuAD dev and HotpotQA dev, `eval_every_tokens: 2500000` plus an eval before step 1,
-   `evidence_gate_scale` frozen, a no-rotary flag for the reader, `|g_proj|rms` of the seed printed
-   once.
-2. **Run the loop scale probe** (Phase 4b, R0; eval only): `eval_stage0.py` on `ir_c` with
-   `loop_scale` multiplied by 1, 2, 3.5 and 5.9. It decides whether `loop_scale` joins the fresh
-   LR group for the graft arms.
-3. **Launch** `python scripts/sft.py --evidence -c <seed>` under a Monitor watch, arm A as built
-   and arm B without reader rotary, 10M tokens each. Kill on the fixed-target gap under 0.1 nats.
-   Read the per-loop selector AUROC and the per-loop external mass. This run is a mechanism check:
-   it can show that the port reads, not where facts live.
-4. **Build the separation instruments** (Phase 4b): counterfactual and closed-book conditions in
+1. **Launch** arm A, then arm B, each under a Monitor watch:
+   ```
+   python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt
+   python scripts/sft.py --evidence --reader-no-rotary --run-name norope -c <same seed>
+   ```
+   The kill is automatic: the first eval past 10M tokens with a fixed-target gold gain under 0.1
+   nats saves and exits 10. Otherwise stop each arm by hand at 10M (`touch ckpts/evidence*/STOP`)
+   and read the five `[eval fixed]` blocks: the gain, the per-loop chunk AUROC, the per-loop mass.
+   This run is a mechanism check: it can show that the port reads, not where facts live.
+2. **Build the separation instruments** (Phase 4b): counterfactual and closed-book conditions in
    `eval_abstention.py`, the synthetic chain generator and its eval, an evidence path in
    `eval_benchmarks.py`.
-5. **Then the pilot** (Phase 5).
+3. **Then the pilot** (Phase 5).
+
+Seed baselines, read before step 1 on the new splits: fixed-target gold gain **-0.0020 nats**
+(noise from packing, the reader is exactly neutral: `eval_abstention.py --evidence-port` reads
++0.0000 on 400 SQuAD rows), chunk AUROC 0.434 / 0.415 / 0.415 by loop (the seed's selector ranks
+gold chunks slightly below distractors), gold share of the external mass 0.334 (uniform over the
+buffer), grounded AUROC 0.5000 (zero head). **R0 failed on both checkpoints**
+([loop_scale_probe.md](../measurements/loop_scale_probe.md)): every multiplier makes loop 3 worse,
+so `loop_scale` stays out of the fresh group in graft arms. The seed's `g_proj` and `direct_gate`
+are both exactly zero and hold each other there: the IR value path is dead for this run, which
+matches the real-run decision (selector without a value read); the selector trains from the
+selection loss alone (`value_adapter` gradient 0 at step 10, `key_adapter` 1.4e-3).
 
 Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
-3.75. Seed `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`. `EvidenceConfig`:
-batch 2, accumulate 8, `max_evidence_tokens: 14336` (64% fill, ~25 GiB, ~0.7 s/step, 10M tokens in
-about 20 min). `ckpts/evidence/` does not exist, so the first launch honours `-c`.
+3.75. Held-out `evidence_dev` 18,966 rows (ratio 11.2, QA only) and `evidence_fixed` 13,333
+questions x 4 conditions (ratio 6.25), from `prepare_evidence_data.py --heldout`. `evidence_val`
+is a train-loss slice. `EvidenceConfig`: batch 2, accumulate 8, `max_evidence_tokens: 14336`,
+`eval_every_tokens: 2500000`; smoke peak 26.4 GB, 8.6 to 14.8k tok/s. `ckpts/evidence/` does not
+exist, so the first launch honours `-c`.
 
 ## The goal
 
@@ -208,6 +218,16 @@ closed-book, and 92% of the corpus's supervised tokens carry content the buffer 
 
 ### Before the launch
 
+**Done 2026-09-30**, all eight: `[eval fixed]` in `sft.py` over `evidence_fixed` with the kill at
+10M tokens, `evidence_dev` / `evidence_fixed` from `prepare_evidence_data.py --heldout`, the 2.5M
+cadence plus a step-0 eval, `freeze_evidence_gate`, `--reader-no-rotary` (inferred from
+`moe.evidence_reader_rotary_off`), one chunk per passage and same-passage exclusion in
+`eval_abstention.py`, the seed's value path printed, and the tests (`test_port_backward`,
+`test_gate_causality`, `test_evidence_decode_cache`, `test_fresh_param_routing`,
+`test_reader_rotary`, `test_prepare_evidence_heldout`). The gate test measured the leak it exists
+for: at scale 5 earlier positions move 4.2e-3 against an exact 0, and cached against uncached
+decode differs by 8.1e-3.
+
 Ordered by how badly each would mislead the run. None needs the GPU.
 
 1. **The kill number.** `sft.py`'s per-condition `[eval]` CE uses each row's own target, the answer
@@ -277,7 +297,8 @@ checkpoints; it is on the critical path because the pilot cannot be read without
 - **R0, the loop scale probe.** `eval_stage0.py` gets a flag that multiplies `loop_scale` at eval.
   Run on `ir_c` and `phase2_final` with factors 1, 2, 3.5 and 5.9. Read the CE gain from loop 2 to
   3. Pass at 0.02 nats with loops 1 and 2 not worse. Decides whether `loop_scale` joins the fresh
-  LR group in graft arms.
+  LR group in graft arms. **FAIL 2026-09-30** on both checkpoints, monotone in the multiplier
+  ([loop_scale_probe.md](../measurements/loop_scale_probe.md)): it does not join.
 - **A3 and A1 conditions in `eval_abstention.py`.** A counterfactual condition following the
   Faithfulness-QA recipe: swap the answer entity in the gold chunk for a same-type entity, score EM
   against the swapped answer and report the parametric-answer rate, stratified by entity frequency.

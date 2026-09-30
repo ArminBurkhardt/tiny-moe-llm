@@ -9,30 +9,29 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 ## Now (keep current)
 
 Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-09-30
-the evidence port (Phase 4) is built, its corpus built, its seed migrated, and it has not trained.
-The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
+the evidence port (Phase 4) is built, its instruments fixed, R0 read, and it has not trained. The
+plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the design is `docs/evidence_path_design.html`, the
 findings are `docs/review_2026-09-29.md`.
 
 - Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
-  3.75, QA 32.6% of tokens after 4 passes, `many` 58,767 rows, 59.9% answerable. `evidence_val`
-  9,707, **but every QA question in it is also in train**; it is a train-loss slice until rebuilt
-  from SQuAD dev and HotpotQA dev.
-- Seed: `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`.
-- `EvidenceConfig`: `batch_size: 2`, `grad_accumulation_steps: 8`, `max_evidence_tokens: 14336`
-  (64% fill, ~25 GiB peak, ~0.7 s/step, 10M tokens in ~20 min).
-- **Next, before any launch (no GPU):** a fixed-target gold-minus-none pass in `sft.py`'s
-  `evaluate()` as the kill number (the per-condition `[eval]` CE compares an answer against a
-  refusal and reads -3.25 nats on a dead reader); the validation rebuild; `eval_every_tokens:
-  2500000` plus an eval before step 1; `evidence_gate_scale` frozen at 0 (`chunk_mean_mass` is not
-  causal); a no-rotary flag for the reader; `|g_proj|rms` of the seed printed once.
-- **Then:** the loop scale probe (`eval_stage0.py` with `loop_scale` x 1, 2, 3.5, 5.9 on `ir_c`),
-  then `python scripts/sft.py --evidence -c <seed>` under a Monitor watch, arm A as built and arm B
-  without reader rotary, 10M tokens each. Kill on the fixed-target gap under 0.1 nats. Read the
-  selector AUROC and external mass **per loop**. Pass at 50% of the 3.23-nat ceiling. This run is
-  a mechanism check of the reader; it decides nothing about where facts live.
-- `ckpts/evidence_smoke/` is empty; `ckpts/evsmoke.log` is the memory and throughput reference
-  (batch 4 x 4096, cap 12288, peak 24.29 GB with optimizer state, 18-29k tok/s).
+  3.75. Held out (`prepare_evidence_data.py --heldout`, SQuAD v2 dev + HotpotQA dev):
+  `evidence_dev` 18,966 rows (the objective's held-out copy, ratio 11.2) and `evidence_fixed`
+  13,333 questions x gold/mixed/distractors/none, real answer every time (the kill number).
+  `evidence_val` is a train-loss slice for QA.
+- Seed: `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`. Step-0 readings:
+  fixed-target gold gain -0.0020 (noise), chunk AUROC 0.43 / 0.42 / 0.42 by loop, gold share
+  0.334 (uniform). `g_proj` and `direct_gate` both exactly 0: the IR value path is dead for this
+  run, the selector trains from the selection loss alone.
+- **R0 failed** ([loop_scale_probe.md](docs/measurements/loop_scale_probe.md)): any `loop_scale`
+  multiplier makes loop 3 worse; `loop_scale` stays at the trunk's rate in graft arms.
+- **Next:** arm A `python scripts/sft.py --evidence -c <seed>`, then arm B with
+  `--reader-no-rotary --run-name norope`, each under a Monitor watch, 10M tokens (stop by hand with
+  STOP unless the automatic kill fires: gold gain under 0.1 nats at the first eval past 10M saves
+  and exits 10). Read the `[eval fixed]` gain and the per-loop chunk AUROC. Pass at 50% of the
+  3.23-nat ceiling. A mechanism check of the reader; it decides nothing about where facts live.
+- `ckpts/instrsmoke.log` is the memory and throughput reference for this config (batch 2 x 4096,
+  cap 14336, peak 26.4 GB, 8.6-14.8k tok/s).
   `ckpts/evidence/` does not exist, so the first `--evidence` launch honours `-c`; later ones resume.
 
 ## Ending a turn
@@ -202,7 +201,11 @@ Tables in [configuration.md](docs/configuration.md).
   `dead_quantile`.
 - `EvidenceConfig`: `fresh_lr` (port tensors only), refresh cadence, `loss_weight_floor_tokens`
   (64: a conversation weighs `min(n_supervised/64, 1)`, so a 5-token SQuAD answer counts ~0.08;
-  read token, conversation and weighted shares separately), and `max_evidence_tokens`.
+  read token, conversation and weighted shares separately), and `max_evidence_tokens`. Also
+  `fixed_split` + `fixed_eval_max_batches` (the `[eval fixed]` pass: token-level answer CE per
+  condition, gain = CE(none) - CE(cond), per-loop selector readings), `kill_tokens` /
+  `kill_min_gain` (one automatic decision, exit 10), `freeze_evidence_gate` (requires_grad off:
+  the gate is non-causal and breaks cached decode once its scale leaves 0).
 - **`max_evidence_tokens` pulls two ways.** Under `ratio * seq_length` rows close early on the
   evidence budget and the empty prompt slots are padding the body still pays ~502M FLOP/token for;
   over it, 0.61 MiB per evidence token times the batch overflows the card. The ratio is a corpus
@@ -219,8 +222,10 @@ Constraints:
   full-table read.
 - **The checkpoint, not the yaml, decides shape and mode.** `model_params_for_state_dict` reads IR
   sizes from `z_keys`, forces `ir_num_clusters=0` without centroids, infers `loop_inject`,
-  `evidence_port`, `ir_direct_read`, groundedness head from tensor presence. `load_model_state` is
-  strict except `IR_TEMPERATURE_KEYS` and `NEUTRAL_LOOP_KEYS` (whose inits are the old behaviour).
+  `evidence_port`, `ir_direct_read`, groundedness head, and reader rotary (off iff the buffer
+  `moe.evidence_reader_rotary_off` exists; `sft.py --reader-no-rotary` sets it on a seed) from tensor
+  presence. `load_model_state` is strict except `IR_TEMPERATURE_KEYS` and `NEUTRAL_LOOP_KEYS`
+  (whose inits are the old behaviour) and `READER_MODE_KEYS` (a marker with no learned value).
   Resume paths (`utils.load_checkpoint`, `sft.load_sft_checkpoint`) are fully strict.
   `evidence_encoder` always comes from the yaml.
 - Hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL` 20 (pretrain) / 10 (sft), expert heads 16/4,
