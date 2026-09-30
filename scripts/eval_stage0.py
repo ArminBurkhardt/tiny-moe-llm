@@ -420,6 +420,14 @@ def main():
     parser.add_argument("--max-loops", type=int, default=ModelConfig.Params["n_loops"],
                         help="run the recurrence this deep; loops past n_loops are the untrained-depth probe")
     parser.add_argument("--top-m", type=int, default=32, help="how many IR entries the top-m mass column sums")
+    parser.add_argument("--loop-scale-mult", type=float, default=1.0,
+                        help="multiply the checkpoint's loop_scale by this before scoring, to ask "
+                             "whether a later loop is weak because its gain is small rather than "
+                             "because it has nothing to add")
+    parser.add_argument("--loop-scale-loops", default="",
+                        help="comma separated 1-based loops the multiplier applies to (default: "
+                             "every entry). Indices past the trained depth reuse the last entry, so "
+                             "scaling the last trained loop also scales every deeper one")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -434,6 +442,18 @@ def main():
 
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model, checkpoint_offset = load_model(args.checkpoint, args.device)
+    if args.loop_scale_mult != 1.0:
+        scale = model.moe.loop_scale
+        loops = ([int(x) - 1 for x in args.loop_scale_loops.split(",") if x.strip()]
+                 or list(range(scale.numel())))
+        before = scale.detach().float().tolist()
+        with torch.no_grad():
+            for idx in loops:
+                scale[idx] *= args.loop_scale_mult
+        logger.info(
+            f"loop_scale x{args.loop_scale_mult} on loops {[i + 1 for i in loops]}: "
+            f"{[round(v, 4) for v in before]} -> {[round(v, 4) for v in scale.detach().float().tolist()]}"
+        )
     start_doc_idx = args.start_doc_idx if args.start_doc_idx is not None else checkpoint_offset
     logger.info(f"Held-out slice starts at doc {start_doc_idx:,} (checkpoint global_offset={checkpoint_offset:,})")
 

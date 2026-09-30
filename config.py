@@ -376,7 +376,25 @@ class EvidenceConfig(SFTConfig):
     _Block = Config.get("evidence", {}) or {}
 
     train_split = str(_Block.get("train_split", "evidence_train"))
-    val_split = str(_Block.get("val_split", "evidence_val"))
+    # built from SQuAD v2 dev and HotpotQA dev by `prepare_evidence_data.py --heldout`. The old
+    # `evidence_val` was split per rendered row after the QA sources repeated, so every QA question
+    # in it is also in train: it reads as a train-loss slice, not a held-out one.
+    val_split = str(_Block.get("val_split", "evidence_dev"))
+    # the same dev questions, each answerable one written under gold / mixed / distractors / none
+    # with the real answer as the target every time. CE(none) - CE(cond) on this split is what the
+    # evidence is worth; the per-condition CE on `val_split` compares an answer against a refusal
+    # and reads about -3.25 nats on a checkpoint whose reader is dead. Empty disables the pass.
+    fixed_split = str(_Block.get("fixed_split", "evidence_fixed"))
+    fixed_eval_max_batches = int(_Block.get("fixed_eval_max_batches", 100))
+    # stop the run at the first fixed-target eval at or past `kill_tokens` whose gold gain is under
+    # `kill_min_gain` nats. 0 disables the automatic stop; the gain is printed either way.
+    kill_tokens = int(_Block.get("kill_tokens", 10_000_000))
+    kill_min_gain = float(_Block.get("kill_min_gain", 0.1))
+    # the reader's per chunk gate reads a document-mean of the selector's mass, which includes the
+    # document's future tokens: training would see the future and cached, uncached and training
+    # gates would disagree. Frozen at zero (requires_grad off, so in no param group), where the gate
+    # is exactly 1.0 and the reader is ungated.
+    freeze_evidence_gate = bool(_Block.get("freeze_evidence_gate", True))
     lr = float(_Block.get("lr", 1.0e-5))
     fresh_lr = float(_Block.get("fresh_lr", 3.0e-4))
     num_epochs = int(_Block.get("num_epochs", 1))
@@ -389,7 +407,7 @@ class EvidenceConfig(SFTConfig):
     seed = int(_Block.get("seed", SFTConfig.seed))
     checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 25_000_000))
     keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
-    eval_every_tokens = int(_Block.get("eval_every_tokens", 10_000_000))
+    eval_every_tokens = int(_Block.get("eval_every_tokens", 2_500_000))
     eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
     conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", True))
 

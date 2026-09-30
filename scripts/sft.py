@@ -125,6 +125,15 @@ LOG_INTERVAL = 10
 # refresh. Below this the centroid stage is dropping entries the read wanted, and the fix is more
 # probed clusters, not more training (docs/plans/NEXT.md Phase 3).
 IR_MIN_CANDIDATE_RECALL = 0.9
+# answer-span CE gained by putting the gold passage in the prompt instead of nothing, measured on
+# this checkpoint family (docs/measurements/evidence_ceiling.md). A reading through the port is
+# reported as a fraction of it.
+EVIDENCE_CEILING_NATS = 3.2306
+# optimizer steps at which the selector's input-side gradients are logged once each: early enough to
+# catch a tensor that never receives gradient, late enough to see whether one started to
+GRAD_PROBE_STEPS = (10, 100)
+GRAD_PROBE_SUFFIXES = ("key_adapter.weight", "value_adapter.weight", "down_proj.weight",
+                       "loop_query_bias.weight")
 
 
 def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True):
@@ -536,9 +545,81 @@ def load_pretrained_weights(model, path: str):
     return token_count
 
 
+def _selector_readings_by_loop(model, chunk_gold: torch.Tensor, positions: torch.Tensor,
+                               condition_ids: torch.Tensor, sink: dict) -> None:
+    """Append this batch's per loop selector readings at the answer start positions to ``sink``.
+
+    Two readings per loop, both at the last prompt token of each answer span (the state that has
+    seen the question and the buffer and none of the answer):
+
+    - ``mass``: the external share of the read, bucketed by condition. Scored as an AUROC of
+      buffers holding a gold chunk (``gold``, ``mixed``) against buffers of distractors only;
+      ``none`` rows are left out because their mass is zero by construction.
+    - ``chunk``: each visible chunk's share of that token's external mass against its gold flag,
+      over tokens whose buffer holds both kinds. Ranking, not magnitude: the share is renormalized
+      per token so a token that reads the store harder does not score every chunk higher.
+
+    IR experts are averaged, as ``LoopMixtureOfExperts._selector_chunk_mass`` does. Eval only: this
+    moves tensors to the host.
+    """
+    visible = model.moe.last_memory_visible
+    modules = [m for m in model.moe.ir_modules if m.memory_weights_by_loop]
+    if visible is None or not modules:
+        return
+    flat = positions.reshape(-1).nonzero().squeeze(-1)
+    if flat.numel() == 0:
+        return
+    cond = condition_ids.reshape(-1)[flat]
+    vis = visible[flat]                                          # [P, M]
+    gold = chunk_gold.to(torch.bool).unsqueeze(0).expand_as(vis) & vis
+    has_both = (gold.any(dim=-1) & (vis & ~gold).any(dim=-1))
+    for loop_idx in sorted(modules[0].memory_weights_by_loop):
+        weights = torch.stack([
+            m.memory_weights_by_loop[loop_idx][flat].float() for m in modules
+            if m.memory_weights_by_loop.get(loop_idx) is not None
+        ]).mean(dim=0)                                           # [P, M]
+        weights = weights * vis
+        mass = weights.sum(dim=-1)
+        entry = sink.setdefault(loop_idx, {"mass": [], "cond": [], "share": [], "gold": [],
+                                           "gold_share": []})
+        entry["mass"].append(mass.cpu())
+        entry["cond"].append(cond.cpu())
+        if has_both.any():
+            share = weights[has_both] / mass[has_both].clamp_min(1e-12).unsqueeze(-1)
+            keep = vis[has_both]
+            entry["share"].append(share[keep].cpu())
+            entry["gold"].append(gold[has_both][keep].cpu())
+            entry["gold_share"].append((share * gold[has_both]).sum(dim=-1).cpu())
+
+
+def _summarize_selector_readings(sink: dict) -> dict:
+    """``_selector_readings_by_loop``'s sink -> ``{loop: {mass_by_condition, mass_auroc,
+    chunk_auroc, gold_share}}``, each entry present only when its classes are."""
+    out = {}
+    for loop_idx, entry in sorted(sink.items()):
+        mass = torch.cat(entry["mass"]).numpy()
+        cond = torch.cat(entry["cond"]).numpy()
+        reading = {"mass_by_condition": {
+            c: float(mass[cond == i].mean()) for i, c in enumerate(CONDITIONS) if (cond == i).any()
+        }}
+        gold_rows = np.isin(cond, [CONDITIONS.index("gold"), CONDITIONS.index("mixed")])
+        distract_rows = cond == CONDITIONS.index("distractors")
+        if gold_rows.any() and distract_rows.any():
+            rows = gold_rows | distract_rows
+            reading["mass_auroc"] = float(roc_auc(mass[rows], gold_rows[rows].astype(np.float64)))
+        if entry["share"]:
+            share = torch.cat(entry["share"]).numpy()
+            label = torch.cat(entry["gold"]).numpy()
+            if 0 < label.sum() < label.size:
+                reading["chunk_auroc"] = float(roc_auc(share, label.astype(np.float64)))
+            reading["gold_share"] = float(torch.cat(entry["gold_share"]).mean())
+        out[loop_idx] = reading
+    return out
+
+
 @torch.no_grad()
 def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_batches: int,
-             conversation_weighting: bool = False):
+             conversation_weighting: bool = False, selector_by_loop: bool = False):
     """Validation pass over the val split: CE on supervised tokens plus the calibration signals.
 
     Reports ``p_max``/top-1 accuracy because the acceptance criterion is about the abstention
@@ -557,12 +638,18 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
 
     When a batch carries ``condition_ids`` (the evidence corpus, if it was built with the ``.cond``
     sidecar), the returned dict also has ``per_condition_ce``: the same final-loop CE term the
-    overall ``ce`` is built from, restricted to one condition's tokens at a time. This is the
-    gold-vs-none gap the run is killed on, so it has to be readable from the same pass rather than a
-    separate script -- see the call site below for how it is computed without a second forward.
+    overall ``ce`` is built from, restricted to one condition's tokens at a time, computed without
+    a second forward (see the call site below). On a split whose targets depend on the condition
+    it compares an answer against a refusal; only on the fixed-target split, where every condition
+    forces the real answer, is CE(none) - CE(gold) what the evidence is worth.
 
     When the corpus also carries the per chunk gold flag, ``selection`` is the held-out reading of
     the supervised selection term the objective adds (``LoopMixtureOfExperts.evidence_selection_term``).
+
+    Args:
+        selector_by_loop: also collect the selector's per loop readings at the answer start
+            positions (see ``_selector_readings_by_loop``), returned as ``selector_by_loop``. Needs
+            the gold flag and ``condition_ids``; silently absent without them.
     """
     was_training = model.training
     model.eval()
@@ -582,6 +669,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     selection_sum, selection_batches = 0.0, 0
     grounded_sum, grounded_batches = 0.0, 0
     grounded_scores, grounded_labels = [], []
+    selector_sink = {}
 
     for batch in dataset:
         if n_batches >= max_batches:
@@ -615,6 +703,11 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 if selection is not None:
                     selection_sum += selection.item()
                     selection_batches += 1
+                if selector_by_loop and batch.get("condition_ids") is not None:
+                    _selector_readings_by_loop(
+                        model, evidence.chunk_gold, answer_start_positions(labels),
+                        batch["condition_ids"].to(device), selector_sink,
+                    )
 
                 # the groundedness readout, held out. The BCE says it is training; the AUROC over
                 # the same positions is the number the gate is actually read at, and the two can
@@ -729,6 +822,8 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
         # grounded (or all not) gets no number rather than a misleading 0.5
         if 0 < labels_cat.sum() < labels_cat.size:
             result["grounded_auroc"] = float(roc_auc(scores, labels_cat))
+    if selector_sink:
+        result["selector_by_loop"] = _summarize_selector_readings(selector_sink)
     return result
 
 
@@ -770,6 +865,18 @@ def sft(args):
     train_dataset = make_dataset(data_dir, cfg.train_split, tokenizer, cfg)
     # a stable order makes successive eval numbers comparable
     val_dataset = make_dataset(data_dir, cfg.val_split, tokenizer, cfg, shuffle=False)
+    fixed_dataset = None
+    fixed_split = getattr(cfg, "fixed_split", "")
+    if fixed_split:
+        if not os.path.isfile(os.path.join(data_dir, f"{fixed_split}.ev")):
+            raise SystemExit(
+                f"{fixed_split} is missing from {data_dir}: build it with "
+                f"`python scripts/prepare_evidence_data.py --heldout --max-evidence-tokens 4608`, "
+                f"or set evidence.fixed_split: \"\" to run without the kill number"
+            )
+        # on-disk order, never shuffled: the split is written question-major, so the first N
+        # batches hold every condition of the same questions and the gap is paired
+        fixed_dataset = make_dataset(data_dir, fixed_split, tokenizer, cfg, shuffle=False)
     dataloader = DataLoader(train_dataset, batch_size=None, num_workers=NUM_DATA_WORKERS,
                             prefetch_factor=2)
 
@@ -803,12 +910,25 @@ def sft(args):
         seed_keys = torch.load(seed_path, map_location="cpu", mmap=True)["model_state_dict"]
         model_params = model_params_for_state_dict(seed_keys, model_params)
         del seed_keys
+    if args.reader_no_rotary:
+        if not args.evidence:
+            raise SystemExit("--reader-no-rotary only applies to --evidence")
+        # the seed decides every other mode; this one is chosen here because no seed carries it yet.
+        # The run's own checkpoints do, so its resumes must pass the flag again or fail to load
+        model_params["evidence_reader_rotary"] = False
+        logger.info("evidence reader: no rotary (query and evidence keys unrotated)")
     model = TinyMoETransformer(**model_params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
+    # before the param groups are built, so the gate lands in none of them and gets no fp32 master
+    frozen_gate = None
+    if args.evidence and getattr(cfg, "freeze_evidence_gate", False):
+        frozen_gate = model.moe.evidence_gate_scale
+        if frozen_gate is not None:
+            frozen_gate.requires_grad_(False)
 
     # the two profiles that set fresh_lr disagree on what "fresh" means: the IR profile rebuilt the
     # whole ir_module subtree from scratch, but the evidence profile's table is that same subtree
@@ -897,6 +1017,39 @@ def sft(args):
         for bf16_param, master in master_pairs:
             master.data.copy_(bf16_param.data.float())
 
+    if frozen_gate is not None:
+        gate_value = float(frozen_gate.detach().float().item())
+        if gate_value != 0.0:
+            logger.warning(
+                f"evidence_gate_scale loaded as {gate_value:.4e}; zeroing it, since the gate is "
+                f"frozen and only a zero scale makes it exactly 1.0"
+            )
+            with torch.no_grad():
+                frozen_gate.zero_()
+        logger.info("evidence_gate_scale frozen at 0 (ungated reader, no gradient)")
+
+    if args.evidence:
+        # read once: two zero matrices in series (g_proj inside the table module, direct_gate on the
+        # expert) each get a gradient proportional to the other, so both zero means the IR value
+        # path stays exactly zero for the whole run and the selector trains only through the
+        # selection loss
+        for expert in model.moe.experts:
+            if not hasattr(expert, "ir_module"):
+                continue
+            g_rms = expert.ir_module.g_proj.weight.detach().float().pow(2).mean().sqrt().item()
+            gate = getattr(expert, "direct_gate", None)
+            d_rms = gate.weight.detach().float().pow(2).mean().sqrt().item() if gate is not None else None
+            logger.info(
+                f"seed IR value path: |g_proj|rms {g_rms:.3e}"
+                + (f", |direct_gate|rms {d_rms:.3e}" if d_rms is not None else "")
+            )
+            if g_rms == 0.0 and d_rms == 0.0:
+                logger.warning(
+                    "g_proj and direct_gate are both exactly zero: they hold each other at zero, so "
+                    "the IR expert's output is zero for this run and the selector learns only from "
+                    "the selection loss (the frozen gate removes its other path through the reader)"
+                )
+
     # same stop contract as pretraining, so an unattended/interruptible box gets a checkpoint out
     # of a SIGTERM instead of losing everything since the last save. clear_sentinel() first: a STOP
     # left over from a previous run would otherwise kill every relaunch before it trains a step.
@@ -971,7 +1124,44 @@ def sft(args):
         ):
             hf.delete(f"{phase}/{os.path.basename(deleted)}")
 
+    def run_fixed_validation(epoch, step):
+        """The fixed-target pass: the real answer forced under every condition. Returns the gold
+        gain CE(none) - CE(gold) in nats, or None when it could not be read."""
+        stats = evaluate(unwrapped_model, fixed_dataset, device, tokenizer.pad_token_id,
+                         cfg.fixed_eval_max_batches, conversation_weighting=False,
+                         selector_by_loop=True)
+        per_condition = (stats or {}).get("per_condition_ce") or {}
+        if "none" not in per_condition or "gold" not in per_condition:
+            logger.warning(f"fixed-target pass read no gold/none tokens from {fixed_split}")
+            return None
+        # token-level mean over the answer tokens, the unit the in-context ceiling was measured in
+        none_ce = per_condition["none"]
+        gains = {c: none_ce - v for c, v in per_condition.items() if c != "none"}
+        gold_gain = gains["gold"]
+        parts = [
+            f"[eval fixed] epoch {epoch} step {step} | answer CE: {{"
+            + ", ".join(f"{c}: {v:.4f}" for c, v in per_condition.items()) + "}",
+            "gain vs none: {" + ", ".join(f"{c}: {v:+.4f}" for c, v in gains.items()) + "}",
+            f"gold gain {gold_gain / EVIDENCE_CEILING_NATS:.1%} of the {EVIDENCE_CEILING_NATS:.2f}"
+            f" nat ceiling",
+        ]
+        if "grounded_auroc" in stats:
+            parts.append(f"grounded AUROC {stats['grounded_auroc']:.4f}")
+        parts.append(f"{stats['tokens']:,} answer tokens over {stats['batches']} batches")
+        logger.info(" | ".join(parts))
+        for loop_idx, reading in (stats.get("selector_by_loop") or {}).items():
+            fields = ["external mass {" + ", ".join(
+                f"{c}: {v:.3f}" for c, v in reading["mass_by_condition"].items()) + "}"]
+            for key, label in (("mass_auroc", "mass AUROC gold-present vs distractors"),
+                               ("chunk_auroc", "chunk AUROC gold vs distractor"),
+                               ("gold_share", "gold share")):
+                if key in reading:
+                    fields.append(f"{label} {reading[key]:.4f}")
+            logger.info(f"[eval fixed] loop {loop_idx + 1} | " + " | ".join(fields))
+        return gold_gain
+
     def run_validation(epoch, step):
+        """The held-out objective pass, then the fixed-target pass. Returns the gold gain."""
         stats = evaluate(unwrapped_model, val_dataset, device, tokenizer.pad_token_id,
                          cfg.eval_max_batches,
                          conversation_weighting=cfg.conversation_loss_weighting)
@@ -979,10 +1169,14 @@ def sft(args):
             logger.warning(
                 f"validation pass produced no supervised tokens -- is {cfg.val_split} empty?"
             )
-            return
+        else:
+            log_validation(epoch, step, stats)
+        return run_fixed_validation(epoch, step) if fixed_dataset is not None else None
+
+    def log_validation(epoch, step, stats):
         per_condition = stats.get("per_condition_ce")
-        # the gold-vs-none gap is what the run is killed on early -- printed in the same line the
-        # overall CE already gets, so nobody has to re-run anything to read it
+        # each condition scored on its OWN target (an answer under gold, a refusal under none), so
+        # the gap between them is not what the evidence is worth: that is the fixed-target line
         cond_str = (
             " | per-condition CE: {" + ", ".join(f"{c}: {v:.4f}" for c, v in per_condition.items())
             + "}" if per_condition else ""
@@ -1020,6 +1214,36 @@ def sft(args):
     # during the very first batch must not turn into a NameError that loses the save
     step, epoch = step_offset, start_epoch
     stop_training, exit_code = False, EXIT_OK
+    kill_tokens = getattr(cfg, "kill_tokens", 0) if fixed_dataset is not None else 0
+    kill_checked = False
+    # the selector's own tensors only: the IR experts' down_proj shares its name with every decoder
+    # and MLP expert projection
+    ir_prefixes = tuple(
+        f"moe.experts.{i}." for i, expert in enumerate(unwrapped_model.moe.experts)
+        if hasattr(expert, "ir_module")
+    )
+    grad_probe_names = [
+        name for name, p in unwrapped_model.named_parameters()
+        if p.requires_grad and name.startswith(ir_prefixes) and name.endswith(GRAD_PROBE_SUFFIXES)
+    ] if args.evidence and ir_prefixes else []
+
+    def probe_gradients(optimizer_step):
+        def probe():
+            params = dict(unwrapped_model.named_parameters())
+            norms = []
+            for name in grad_probe_names:
+                grad = params[name].grad
+                norms.append(f"{_fresh_family(name)}: "
+                             + (f"{grad.detach().float().norm().item():.3e}" if grad is not None
+                                else "None"))
+            logger.info(f"grad norms at optimizer step {optimizer_step} (pre-clip): "
+                        + ", ".join(norms))
+        return probe
+
+    if not resumed:
+        # the baseline every later reading is a difference from; the seed's reader is dead, so the
+        # fixed-target gain should read about zero here
+        run_validation(start_epoch, step_offset)
 
     try:
         for epoch in range(start_epoch, cfg.num_epochs):
@@ -1095,6 +1319,12 @@ def sft(args):
                     # the .ans sidecar, which drops the term rather than guessing it
                     answerable=(batch["answerable_ids"].to(device)
                                 if "answerable_ids" in batch else None),
+                    grad_probe=(
+                        probe_gradients((step + 1) // cfg.grad_accumulation_steps)
+                        if grad_probe_names and (step + 1) % cfg.grad_accumulation_steps == 0
+                        and (step + 1) // cfg.grad_accumulation_steps in GRAD_PROBE_STEPS
+                        else None
+                    ),
                 )
 
                 if not is_log_step:
@@ -1235,7 +1465,7 @@ def sft(args):
                 # Without its own field the log makes an evidence-conditioned step look as cheap as
                 # a plain SFT one at the same "{phase} tokens" reading.
                 evidence_field = (
-                    f" | evidence tokens: {evidence_token_count / 1e6:.2f}M" if args.evidence else ""
+                    f" | evidence stream: {evidence_token_count / 1e6:.2f}M" if args.evidence else ""
                 )
                 logger.info(
                     f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
@@ -1260,8 +1490,28 @@ def sft(args):
                 )
 
                 if sft_tokens >= next_eval:
-                    run_validation(epoch, step)
+                    gold_gain = run_validation(epoch, step)
                     next_eval = sft_tokens + cfg.eval_every_tokens
+                    if kill_tokens and not kill_checked and sft_tokens >= kill_tokens:
+                        # one decision point, not a running threshold: a run that clears it keeps
+                        # going and is judged on the pass bar from then on
+                        kill_checked = True
+                        min_gain = cfg.kill_min_gain
+                        if gold_gain is not None and gold_gain < min_gain:
+                            logger.warning(
+                                f"KILL: fixed-target gold gain {gold_gain:+.4f} nats is under "
+                                f"{min_gain} at {sft_tokens / 1e6:.2f}M {phase} tokens. Saving and "
+                                f"stopping (exit {EXIT_USER_STOP}, not restarted by a wrapper)."
+                            )
+                            save_and_sync(epoch, step, val_loss, token_count)
+                            exit_code = EXIT_USER_STOP
+                            stop_training = True
+                            break
+                        logger.info(
+                            f"kill check passed at {sft_tokens / 1e6:.2f}M {phase} tokens: gold "
+                            f"gain {gold_gain:+.4f} nats >= {min_gain}" if gold_gain is not None
+                            else "kill check skipped: the fixed-target pass read nothing"
+                        )
 
                 # polled at the log cadence: a stat every few seconds, no GPU sync, and well
                 # inside vast's SIGTERM grace period
@@ -1331,6 +1581,11 @@ def main():
                              "block, the ir_train/ir_val splits, ckpts/ir, a second learning rate "
                              "for the rebuilt table and a retrieval temperature anneal. Seed it "
                              "with -c <a scripts/migrate_ir_reshape.py output>")
+    parser.add_argument("--reader-no-rotary", action="store_true",
+                        help="--evidence only: build the evidence reader without rotary on its "
+                             "query and keys (the encoder already positions chunk tokens). The "
+                             "mode is saved in the run's checkpoints, so pass it on every launch of "
+                             "that run, and give the run its own --run-name")
     parser.add_argument("--run-name", default=None,
                         help="suffix the profile's checkpoint directory, e.g. --run-name random "
                              "writes ckpts/ir_random. Required to run two seeds of one profile "

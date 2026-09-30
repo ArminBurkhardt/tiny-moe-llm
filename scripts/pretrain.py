@@ -142,6 +142,7 @@ def train_step(
     evidence=None,
     token_mask: torch.Tensor = None,
     answerable: torch.Tensor = None,
+    grad_probe=None,
 ):
     """One micro-batch: forward, loss, backward, and (on a sync step) clip + optimizer step.
 
@@ -171,6 +172,10 @@ def train_step(
             answer, not a refusal" (the evidence corpus's ``.ans`` sidecar, -1 on row padding).
             Together with the batch's gold flag it is the groundedness label; None -- every caller
             but the evidence profile, and any corpus predating the sidecar -- drops that term.
+        grad_probe: optional no-argument callable, run on a sync step after backward and before
+            clipping, i.e. the one moment the accumulated raw gradients are readable: the step
+            and the by-hand clear below leave nothing behind. The caller decides when to pass it
+            (it may sync); None costs nothing.
     """
     loop_ce_weights = (
         TrainingConfig.loop_ce_weights if n_loops is None else loop_ce_weights_for(n_loops)
@@ -288,6 +293,8 @@ def train_step(
             # clip on the real update step only (matters once gradient accumulation > 1).
             # accelerator.clip_grad_norm_ unscales/handles the wrapped params correctly.
             if accelerator.sync_gradients:
+                if grad_probe is not None:
+                    grad_probe()
                 accelerator.clip_grad_norm_(model.parameters(), TrainingConfig.grad_clip)
                 # see build_param_groups: the no_decay group is optimized via fp32 masters
                 # because bf16-native AdamW steps on these silently round to zero otherwise.

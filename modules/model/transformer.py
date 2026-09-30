@@ -99,6 +99,7 @@ class TinyMoETransformer(nn.Module):
         evidence_encoder: bool | int = True,
         ir_direct_read: bool = True,
         groundedness_head: bool = False,
+        evidence_reader_rotary: bool = True,
     ):
         super().__init__()
 
@@ -175,8 +176,9 @@ class TinyMoETransformer(nn.Module):
             loop_inject=loop_inject,
             evidence_port=evidence_port,
             ir_direct_read=ir_direct_read,
+            evidence_reader_rotary=evidence_reader_rotary,
         )
-        
+
         self.norm = RMSNorm(hidden_size)
         self.lm_head = SmallLMHead(hidden_size, vocab_size, factor=lm_head_factor)
 

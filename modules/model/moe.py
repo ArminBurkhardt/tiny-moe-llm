@@ -236,6 +236,7 @@ class LoopMixtureOfExperts(nn.Module):
         loop_inject: bool = False,
         evidence_port: bool = False,
         ir_direct_read: bool = True,
+        evidence_reader_rotary: bool = True,
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -287,6 +288,13 @@ class LoopMixtureOfExperts(nn.Module):
                 ``loop_scale``'s own shrinkage) -- without them the reader reads the same query at
                 every loop and the read reaches the residual weaker on later loops regardless of
                 what it learns. Defaults to False.
+            evidence_reader_rotary (bool, optional): rotate the reader's query by its prompt
+                position and its keys by their position inside the chunk. Those two offsets carry
+                no relation to content, so False makes the reader position free (the encoder has
+                already positioned the chunk tokens). False registers the persistent buffer
+                ``evidence_reader_rotary_off`` so the checkpoint carries the mode; True registers
+                nothing, which leaves every existing checkpoint unchanged. Only meaningful with
+                ``evidence_port``. Defaults to True.
             ir_direct_read (bool, optional): give every IR expert a direct, per token output stage
                 instead of the inner attention that averages a document's reads over its whole
                 prefix (see ``InformationRetrievalExpert``'s docstring for why the averaged path
@@ -426,6 +434,10 @@ class LoopMixtureOfExperts(nn.Module):
         self.shared_evidence = None
         self.evidence_query_bias = None
         self.evidence_loop_scale = None
+        # a plain python bool, so the forward branches without reading a tensor
+        self.reader_rotary = bool(evidence_reader_rotary) or not evidence_port
+        if evidence_port and not evidence_reader_rotary:
+            self.register_buffer("evidence_reader_rotary_off", torch.zeros(()), persistent=True)
         if evidence_port:
             self.shared_evidence = CrossAttention(
                 input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads
@@ -640,7 +652,8 @@ class LoopMixtureOfExperts(nn.Module):
             evidence_query = step_input + self.evidence_query_bias(self._loop_enc_row(loop_idx, step_input.dtype))
             evidence_gain = self.evidence_loop_scale[min(int(loop_idx), self.evidence_loop_scale.numel() - 1)]
             reader_output = self.shared_evidence(
-                evidence_query, None, cu_seqlens, max_seqlen, position_embeddings, evidence=reader_evidence
+                evidence_query, None, cu_seqlens, max_seqlen,
+                position_embeddings if self.reader_rotary else None, evidence=reader_evidence
             )
             # kept for a groundedness readout, which asks about the READ rather than about what the
             # loop's accumulator did with it -- so it wants this, before the per-loop gain and

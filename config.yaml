@@ -253,7 +253,17 @@ evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence
           # sharpening run's final checkpoint, migrated to carry the port.
           # Runs LOCALLY on the 5090 in BF16 (do not set USE_FP8).
   train_split: "evidence_train" # from `python scripts/prepare_evidence_data.py`
-  val_split: "evidence_val"
+  val_split: "evidence_dev" # from `prepare_evidence_data.py --heldout`: SQuAD v2 dev + HotpotQA dev,
+                            # disjoint from train. `evidence_val` is NOT held out for QA (every QA
+                            # question in it is also in train); read it as a train-loss slice
+  fixed_split: "evidence_fixed" # same builder run: each answerable dev question under gold, mixed,
+                                # distractors and none with the real answer as the target. The kill
+                                # number, CE(none) - CE(gold), is read here; "" disables the pass
+  fixed_eval_max_batches: 100 # ~2k questions x 4 conditions, question-major so any prefix is paired
+  kill_tokens: 10000000 # stop at the first fixed-target eval past this if the gold gain is below
+  kill_min_gain: 0.1    # this many nats; kill_tokens 0 disables the stop
+  freeze_evidence_gate: true # the chunk gate reads a document-mean of the selector mass, future
+                             # tokens included; frozen at zero it is exactly 1.0 (ungated reader)
   lr: 1.0e-5 # the trunk's rate. It carries 16B tokens plus three finetunes and this pass is not
              # meant to move it -- the benchmark suite is the gate on whether it did
   fresh_lr: 3.0e-4 # the evidence reader and the selector's two adapters plus its source scale.
@@ -289,7 +299,8 @@ evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence
                              # evidence while its token budget is still half empty. The earlier
                              # 12288 was 3x against a ratio-2.93 corpus and leaves this one at 55%
   checkpoint_every_tokens: 25000000
-  eval_every_tokens: 10000000
+  eval_every_tokens: 2500000 # plus one eval before step 1, so a 10M-token decision has a baseline
+                             # and four readings instead of one reading on the decision itself
   conversation_loss_weighting: true # this is a policy change, and unweighted CE makes a six token
                                     # refusal the cheapest loss reduction in the corpus -- the exact
                                     # mechanism that collapsed the first SFT run onto one string

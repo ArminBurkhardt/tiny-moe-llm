@@ -87,6 +87,25 @@ Usage:
 
     python scripts/prepare_evidence_data.py                       # 150M prompt tokens
     python scripts/prepare_evidence_data.py --target-tokens 50000000 --no-webtext
+    python scripts/prepare_evidence_data.py --heldout --max-evidence-tokens 4608
+
+### Held-out splits
+
+The ``{prefix}_val`` split the training build writes is a train-loss slice for QA: it is cut per
+rendered row AFTER the QA sources repeat, so every QA question in it also appears in train. It is
+still a fair slice of the web text and replay arms and of the loss on rows the trainer has seen.
+
+``--heldout`` builds two splits from SQuAD v2 dev and HotpotQA dev instead, which the training
+splits never touch, and never reads or writes the training corpus or its state file:
+
+    {prefix}_dev      every usable dev row once, one QA condition each, targets as in training
+    {prefix}_fixed    answerable rows only, each written four times in a row (question-major) under
+                      gold, mixed, distractors, none, all with the REAL answer as target and
+                      ``ans`` = 1, so one fixed target can be teacher forced under every condition
+
+Rows of both sources are interleaved by one seeded shuffle, so any prefix is a representative
+sample. Distractors come from the dev set's own passages, never the row's own gold. Pass the same
+``--max-evidence-tokens`` as the training build: the default drops every ``many`` row.
 """
 import os
 import sys
@@ -551,9 +570,55 @@ def _shuffle_paired(chunks: List[str], gold_flags: List[bool],
     return list(shuffled_chunks), list(shuffled_flags)
 
 
+class DistractorPool:
+    """A fixed, deduplicated pool of passage texts to draw distractors from.
+
+    The training build draws from a moving reservoir of recent rows. A held-out split has no such
+    stream and needs a pool that is a function of the split alone, and one that can be asked to
+    skip a row's own gold: SQuAD dev carries several questions per context, so an unfiltered pool
+    would sometimes hand a question its own answer passage inside a buffer whose target says the
+    answer is absent.
+
+    Drawing is by rejection, so a draw costs O(k) rather than a copy of a pool that can hold tens of
+    thousands of paragraphs.
+
+    Attributes:
+        texts: the distinct passages, in first-seen order.
+        gold_rejected: how many candidate draws were thrown away for equalling an excluded text.
+    """
+
+    def __init__(self, texts: Sequence[str]):
+        self.texts = list(dict.fromkeys(texts))
+        self.gold_rejected = 0
+
+    def draw(self, k: int, exclude: set, taken: Sequence[str], rng: random.Random) -> List[str]:
+        """Up to ``k`` distinct pool texts that are neither in ``exclude`` nor in ``taken``."""
+        n = len(self.texts)
+        if k <= 0 or n == 0:
+            return []
+        skip = set(exclude) | set(taken)
+        out: List[str] = []
+        for _ in range(20 * k + 20):
+            if len(out) == k:
+                return out
+            text = self.texts[rng.randrange(n)]
+            if text in exclude:
+                self.gold_rejected += 1
+            if text in skip:
+                continue
+            skip.add(text)
+            out.append(text)
+        if len(out) < k:
+            # a pool barely larger than the request: finish exactly instead of rejecting forever
+            rest = [t for t in self.texts if t not in skip]
+            out.extend(rng.sample(rest, min(k - len(out), len(rest))))
+        return out
+
+
 def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: random.Random,
                     num_distractors: int,
-                    many_distractors: Tuple[int, int] = (16, 32)) -> Tuple[List[str], List[bool], str, bool]:
+                    many_distractors: Tuple[int, int] = (16, 32),
+                    pool: Optional[DistractorPool] = None) -> Tuple[List[str], List[bool], str, bool]:
     """Turn one row plus a condition into ``(chunk texts, gold flags, target answer, answerable)``.
 
     The abstention targets are the load-bearing part. Under ``distractors`` and ``none`` the answer
@@ -575,9 +640,14 @@ def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: ran
     unanswerable = not row.answer
 
     def distractors(k: int) -> List[str]:
-        pool = list(row.near)
-        rng.shuffle(pool)
-        picked = pool[:k]
+        near = list(row.near)
+        rng.shuffle(near)
+        picked = near[:k]
+        if pool is not None:
+            # held-out path: top up from the split's own pool, never with the row's own gold
+            if len(picked) < k:
+                picked.extend(pool.draw(k - len(picked), set(row.gold), picked, rng))
+            return picked
         if len(picked) < k and reservoir:
             extra = rng.sample(list(reservoir), min(k - len(picked), len(reservoir)))
             picked.extend(extra)
@@ -1069,6 +1139,274 @@ def _embed_batch(renders, embedder):
                           else np.zeros((0, EMBED_DIM), dtype=np.float32))
 
 
+# --------------------------------------------------------------------------------- held-out splits
+
+# the fixed split's conditions, in the order a question's four rows are written
+FIXED_CONDITIONS = ("gold", "mixed", "distractors", "none")
+
+
+def _heldout_record(row: EvidenceRow, key: str, condition: str, chunks: List[str],
+                    flags: List[bool], answer: str, answerable: bool) -> dict:
+    return {
+        "conversation": [
+            {"role": "user", "content": evidence_prompt(row.question)},
+            {"role": "assistant", "content": answer},
+        ],
+        "chunks": chunks, "gold_flags": flags, "condition": condition, "key": key,
+        "answerable": answerable, "source": key,
+    }
+
+
+def _drop_reason(record: dict, max_doc_tokens: int) -> Optional[str]:
+    """Why ``_encode_batch`` dropped a record, or a condition mislabel it would have let through."""
+    if record.get("dropped"):
+        if "ids" not in record:
+            return "unrenderable"
+        return "prompt_too_long" if len(record["ids"]) > max_doc_tokens else "evidence_too_long"
+    if record["condition"] != "none" and not record["ev_ids"]:
+        # the chunks were promised and vanished (tokenized to nothing): writing it would relabel
+        # the condition as `none`, whose abstention target differs
+        return "no_evidence"
+    return None
+
+
+def _new_split_stats() -> dict:
+    return {"sources": {}, "docs": 0, "prompt_tokens": 0, "ev_tokens": 0, "chunks": 0}
+
+
+def _source_stats(split_stats: dict, key: str) -> dict:
+    return split_stats["sources"].setdefault(key, {
+        "docs": 0, "questions": 0, "prompt_tokens": 0, "ev_tokens": 0, "answerable": 0,
+        "conditions": {c: 0 for c in CONDITIONS}, "drops": {},
+    })
+
+
+def _write_records(records: List[dict], writer: EvidenceWriter, split_stats: dict) -> None:
+    for record in records:
+        if record.get("dropped"):
+            continue
+        writer.write(record["ids"], record["mask"], record["ev_ids"], record["ev_chunk"],
+                     record["keys"], record["ev_gold"], CONDITIONS.index(record["condition"]),
+                     int(record["answerable"]))
+        s = _source_stats(split_stats, record["source"])
+        s["docs"] += 1
+        s["prompt_tokens"] += len(record["ids"])
+        s["ev_tokens"] += len(record["ev_ids"])
+        s["answerable"] += int(record["answerable"])
+        s["conditions"][record["condition"]] += 1
+        split_stats["docs"] += 1
+        split_stats["prompt_tokens"] += len(record["ids"])
+        split_stats["ev_tokens"] += len(record["ev_ids"])
+        split_stats["chunks"] += len(record["ev_gold"])
+
+
+def build_heldout(
+    sources: List[dict],
+    template: ChatTemplate,
+    embedder: ChunkEmbedder,
+    data_dir: str,
+    max_doc_tokens: int = 4094,
+    max_evidence_tokens: int = 1536,
+    num_distractors: int = 3,
+    many_distractors: Tuple[int, int] = (16, 32),
+    render_batch: int = 512,
+    seed: int = 42,
+    split_prefix: str = "evidence",
+    max_questions: Optional[int] = None,
+) -> dict:
+    """Write the two held-out splits, ``{prefix}_dev`` and ``{prefix}_fixed``.
+
+    Free of Hub calls, like ``build_corpus``, so a test can drive it with synthetic rows.
+
+    ``_dev`` is the held-out copy of the training objective: every usable row once, one condition
+    drawn from ``QA_CONDITIONS``, targets exactly as ``apply_condition`` picks them.
+
+    ``_fixed`` is for reading what evidence is worth: each natively answerable question is written
+    four times in a row, under ``gold``, ``mixed``, ``distractors``, ``none``, with the REAL answer
+    as the target every time. Teacher forcing one fixed target under every condition makes
+    CE(none) - CE(gold) a clean measurement, which the per-condition CE of ``_dev`` is not (there an
+    answer is compared against a refusal). If any of a question's four rows cannot be written the
+    other three are dropped too, so every group stays complete and any prefix stays paired.
+
+    Distractors come from a pool of the split's own passages, deduplicated by text and never
+    containing the row's own gold (see ``DistractorPool``).
+
+    Args:
+        sources: ``[{"key", "render", "rows"}]``. ``rows`` are raw dataset rows for ``render``
+            (``squad_v2`` or ``hotpot_qa``) or already-built ``EvidenceRow`` objects.
+        embedder: any object with ``.encode(list[str]) -> [N, 384]``.
+        max_questions: cap on usable questions per source, or None for all.
+
+    Returns:
+        ``{"splits": {name: stats}, "render_dropped": {key: n}, "gold_rejected": {key: n},
+        "pool_sizes": {key: n}}``, where a split's stats hold per-source docs, prompt and evidence
+        tokens, per-condition counts, answerable counts and drop reasons.
+    """
+    dev_split, fixed_split = f"{split_prefix}_dev", f"{split_prefix}_fixed"
+    render_dropped, pools, combined = {}, {}, []
+    for spec in sources:
+        key, rows = spec["key"], []
+        render = {"squad_v2": render_squad_row, "hotpot_qa": render_hotpot_row}.get(spec["render"])
+        render_dropped[key] = 0
+        for raw in spec["rows"]:
+            row = raw if isinstance(raw, EvidenceRow) else render(raw)
+            if row is None:
+                render_dropped[key] += 1
+            else:
+                rows.append(row)
+        if max_questions is not None:
+            rows = rows[:max_questions]
+        texts = []
+        for row in rows:
+            texts.extend(row.gold)
+            texts.extend(row.near)
+        pools[key] = DistractorPool(texts)
+        combined.extend((key, row) for row in rows)
+    # one seeded shuffle across sources: the trainer's eval reads only the first N batches in
+    # on-disk order, so any prefix has to be a representative sample of both sources
+    random.Random(seed).shuffle(combined)
+
+    cond_rng, draw_rng = random.Random(seed + 1), random.Random(seed + 2)
+    scratch = {"skipped": {s["key"]: {"too_long": 0, "unrenderable": 0} for s in sources}}
+    stats = {dev_split: _new_split_stats(), fixed_split: _new_split_stats()}
+    writers = {s: EvidenceWriter(data_dir, s, {}) for s in (dev_split, fixed_split)}
+
+    def condition_record(key, row, condition, answer_override=None):
+        chunks, flags, answer, answerable = apply_condition(
+            row, condition, deque(), draw_rng, num_distractors,
+            many_distractors=many_distractors, pool=pools[key],
+        )
+        if answer_override is not None:
+            answer, answerable = answer_override, True
+        return _heldout_record(row, key, condition, chunks, flags, answer, answerable)
+
+    def finish(records, group):
+        """Encode, decide drops (whole groups of ``group`` rows), embed."""
+        _encode_batch(records, template, max_doc_tokens, max_evidence_tokens, scratch)
+        reasons = []
+        for start in range(0, len(records), group):
+            members = records[start:start + group]
+            found = [r for r in (_drop_reason(m, max_doc_tokens) for m in members) if r]
+            reasons.append(found[0] if found else None)
+            if found:
+                for m in members:
+                    m["dropped"] = True
+        _embed_batch(records, embedder)
+        return reasons
+
+    for start in range(0, len(combined), render_batch):
+        records = []
+        for key, row in combined[start:start + render_batch]:
+            condition = pick_condition(QA_CONDITIONS, cond_rng)
+            records.append(condition_record(key, row, condition))
+        reasons = finish(records, 1)
+        for record, reason in zip(records, reasons):
+            s = _source_stats(stats[dev_split], record["source"])
+            s["questions"] += 1
+            if reason:
+                s["drops"][reason] = s["drops"].get(reason, 0) + 1
+        _write_records(records, writers[dev_split], stats[dev_split])
+
+    answerable = [(k, r) for k, r in combined if r.answer]
+    step = max(1, render_batch // len(FIXED_CONDITIONS))
+    for start in range(0, len(answerable), step):
+        records = []
+        for key, row in answerable[start:start + step]:
+            for condition in FIXED_CONDITIONS:
+                records.append(condition_record(key, row, condition, answer_override=row.answer))
+        reasons = finish(records, len(FIXED_CONDITIONS))
+        for q, reason in enumerate(reasons):
+            group = records[q * len(FIXED_CONDITIONS):(q + 1) * len(FIXED_CONDITIONS)]
+            s = _source_stats(stats[fixed_split], group[0]["source"])
+            s["questions"] += 1
+            if reason:
+                s["drops"][reason] = s["drops"].get(reason, 0) + 1
+            else:
+                assert all(m["ids"] == group[0]["ids"] and m["mask"] == group[0]["mask"]
+                           for m in group), "a fixed group's prompts differ"
+        _write_records(records, writers[fixed_split], stats[fixed_split])
+
+    for writer in writers.values():
+        writer.sync()
+        writer.close()
+    return {
+        "splits": stats, "render_dropped": render_dropped,
+        "gold_rejected": {k: p.gold_rejected for k, p in pools.items()},
+        "pool_sizes": {k: len(p.texts) for k, p in pools.items()},
+    }
+
+
+def log_heldout_report(result: dict) -> None:
+    logger.info(f"  unrenderable source rows: {result['render_dropped']}")
+    logger.info(f"  distractor pools: {result['pool_sizes']} texts; candidate draws rejected for "
+                f"being the row's own gold: {result['gold_rejected']}")
+    for split, sp in result["splits"].items():
+        logger.info(
+            f"  {split}: {sp['docs']:,} docs, {sp['prompt_tokens']:,} prompt tokens, "
+            f"{sp['ev_tokens']:,} evidence tokens (ratio {sp['ev_tokens'] / max(1, sp['prompt_tokens']):.2f}), "
+            f"{sp['chunks']:,} chunks"
+        )
+        for key, s in sp["sources"].items():
+            logger.info(
+                f"    {key}: {s['docs']:,} docs ({s['questions']:,} questions seen), "
+                f"{s['prompt_tokens']:,} prompt, {s['ev_tokens']:,} evidence "
+                f"(ratio {s['ev_tokens'] / max(1, s['prompt_tokens']):.2f}), "
+                f"answerable {s['answerable']:,}, conditions {s['conditions']}, "
+                f"dropped {s['drops'] or 0}" + (" (questions, all four rows)" if "fixed" in split else "")
+            )
+
+
+def _delete_split(data_dir: str, split: str) -> None:
+    for suffix in EVIDENCE_SUFFIXES:
+        path = os.path.join(data_dir, f"{split}.{suffix}")
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def _main_heldout(args) -> None:
+    splits = [f"{args.split_prefix}_dev", f"{args.split_prefix}_fixed"]
+    for split in splits:
+        if os.path.exists(os.path.join(args.data_dir, f"{split}.bin")):
+            if not args.overwrite:
+                raise SystemExit(f"{split}.bin already exists in {args.data_dir}; pass --overwrite")
+            _delete_split(args.data_dir, split)
+
+    scratch_dir = os.path.join(args.data_dir, "_evidence_scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    template = ChatTemplate(tokenizer)
+    hf_token = get_hf_token()
+    hf_api = HfApi(token=hf_token)
+
+    sources = []
+    for key, render, repo_id, filename in (
+        ("squad_v2", "squad_v2", "rajpurkar/squad_v2", "squad_v2/validation-00000-of-00001.parquet"),
+        ("hotpot_qa", "hotpot_qa", "hotpotqa/hotpot_qa", "distractor/validation-00000-of-00001.parquet"),
+    ):
+        info = hf_api.dataset_info(repo_id)
+        logger.info(f"source {key} dev: {filename} (revision {info.sha[:10]})")
+        path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type="dataset",
+                               local_dir=scratch_dir, token=hf_token, revision=info.sha)
+        rows = pd.read_parquet(path, engine="pyarrow").to_dict("records")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        sources.append({"key": key, "render": render, "rows": rows})
+
+    logger.info(f"loading the external embedder ({ChunkEmbedder.REPO})")
+    embedder = ChunkEmbedder(device=args.device)
+    t0 = time.time()
+    result = build_heldout(
+        sources, template, embedder, args.data_dir, max_doc_tokens=args.max_doc_tokens,
+        max_evidence_tokens=args.max_evidence_tokens, num_distractors=args.num_distractors,
+        many_distractors=tuple(args.many_distractors), render_batch=args.render_batch,
+        seed=args.seed, split_prefix=args.split_prefix, max_questions=args.heldout_max_questions,
+    )
+    logger.info(f"=== held-out splits built in {(time.time() - t0) / 60:.1f} min ===")
+    log_heldout_report(result)
+
+
 def _shuffled_shard_order(files: List[str], seed: int, source_key: str) -> List[str]:
     """Reproducibly shuffle a source's sorted shard list, from the seed alone.
 
@@ -1127,9 +1465,19 @@ def main():
                         help="build even if manifest.json has no smoltalk2 holdout hashes (unsafe: "
                              "phase-2 pretraining conversations may leak into the replay arm)")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--heldout", action="store_true",
+                        help="build {prefix}_dev and {prefix}_fixed from SQuAD v2 dev and HotpotQA "
+                             "dev instead of the training corpus (see the module docstring)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="with --heldout, replace existing held-out splits")
+    parser.add_argument("--heldout-max-questions", type=int, default=None,
+                        help="with --heldout, cap usable questions per source (default: all)")
     args = parser.parse_args()
 
     os.makedirs(args.data_dir, exist_ok=True)
+    if args.heldout:
+        _main_heldout(args)
+        return
     scratch_dir = os.path.join(args.data_dir, "_evidence_scratch")
     os.makedirs(scratch_dir, exist_ok=True)
 

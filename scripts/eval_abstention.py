@@ -54,6 +54,7 @@ import os
 import sys
 import json
 import math
+import hashlib
 import random
 import string
 import argparse
@@ -704,15 +705,17 @@ def build_records(frame: pd.DataFrame, template: ChatTemplate, *, max_examples: 
 
 
 def chunk_passage_ids(tokenizer, text: str, chunk_tokens: int) -> List[List[int]]:
-    """Split a passage into fixed-size token chunks, matching the corpus builder's chunk size.
+    """Turn a passage into evidence chunks.
 
-    ``prepare_evidence_data.py`` only chunks this way for the web text arm's held-out span -- a
-    SQuAD passage there is written as ONE chunk however long. Chunking every passage here instead
-    exercises the selector's split over several candidates per question, closer to what a real
-    multi-chunk retrieval buffer looks like than the single always-picked chunk the training corpus
-    gives this source.
+    ``chunk_tokens <= 0`` (the default reading) keeps the whole passage as ONE chunk, exactly as
+    ``prepare_evidence_data.py`` writes a SQuAD passage however long. A positive value splits it
+    into fixed-size token chunks instead: a secondary robustness reading that exercises the
+    selector's split over several candidates per question, closer to a real multi-chunk retrieval
+    buffer than the single always-picked chunk the training corpus gives this source.
     """
     ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if chunk_tokens <= 0:
+        return [ids] if ids else []
     chunks = [ids[i:i + chunk_tokens] for i in range(0, len(ids), chunk_tokens)]
     return [c for c in chunks if c]
 
@@ -769,10 +772,11 @@ def build_evidence_records(frame: pd.DataFrame, template: ChatTemplate, tokenize
             "prompt_ids": prompt_ids,
             "evidence_prompt_text": prompt_text,
             "gold_chunks": list(zip(gold_texts, gold_ids)),
+            "context_key": hashlib.sha1(context.encode("utf-8")).hexdigest(),
         })
 
     for i, record in enumerate(records):
-        record["index"] = i  # this slice's position, used to exclude a row's own chunks as its distractors
+        record["index"] = i  # this slice's position
 
     logger.info(
         f"{len(records):,} questions for --evidence-port "
@@ -784,25 +788,33 @@ def build_evidence_records(frame: pd.DataFrame, template: ChatTemplate, tokenize
     return records
 
 
-def _build_distractor_pool(records: List[dict]) -> List[Tuple[int, str, List[int]]]:
-    """Every record's own gold chunks, flattened and tagged with the record that owns them.
+def _build_distractor_pool(records: List[dict]) -> List[Tuple[str, str, List[int]]]:
+    """Every distinct passage's gold chunks, flattened and tagged with their source passage.
 
-    Built once and shared by every condition: a record's own chunks are excluded when IT draws a
-    distractor (see ``_sample_distractors``), by the ``index`` tag, not by identity, so this stays a
-    plain list rather than needing per-record bookkeeping.
+    SQuAD v2 validation has several questions per passage, so the pool is deduplicated by passage:
+    a passage shared by five questions contributes its chunks once, not five times as likely to be
+    drawn. The tag is the passage identity (``context_key``), not the record index, so another
+    question on the SAME passage cannot hand the gold passage to a record as a distractor (see
+    ``_sample_distractors``). Built once and shared by every condition.
     """
-    return [(r["index"], text, ids) for r in records for text, ids in r["gold_chunks"]]
+    pool, seen = [], set()
+    for r in records:
+        if r["context_key"] in seen:
+            continue
+        seen.add(r["context_key"])
+        pool.extend((r["context_key"], text, ids) for text, ids in r["gold_chunks"])
+    return pool
 
 
-def _sample_distractors(pool: List[Tuple[int, str, List[int]]], own_index: int, k: int,
+def _sample_distractors(pool: List[Tuple[str, str, List[int]]], own_key: str, k: int,
                         rng: random.Random) -> List[Tuple[str, List[int]]]:
-    """``k`` chunks drawn from other records' gold chunks -- the eval-side reservoir.
+    """``k`` chunks drawn from other passages' gold chunks -- the eval-side reservoir.
 
-    Scans the whole pool per call rather than indexing into it, which costs O(slice size) per
-    record; fine at the slice sizes this script runs at (hundreds to low thousands of questions),
-    and simpler than maintaining a live exclusion index for a one-shot eval pass.
+    Every chunk of the record's own passage is excluded. Scans the whole pool per call rather than
+    indexing into it, which costs O(pool size) per record; fine at the slice sizes this script runs
+    at (about a thousand passages), and simpler than a live exclusion index for a one-shot pass.
     """
-    candidates = [(text, ids) for idx, text, ids in pool if idx != own_index]
+    candidates = [(text, ids) for key, text, ids in pool if key != own_key]
     if not candidates:
         return []
     if len(candidates) <= k:
@@ -811,7 +823,7 @@ def _sample_distractors(pool: List[Tuple[int, str, List[int]]], own_index: int, 
 
 
 def attach_condition(records: List[dict], condition: str, template: ChatTemplate, embedder,
-                     pool: List[Tuple[int, str, List[int]]], *, num_distractors: int,
+                     pool: List[Tuple[str, str, List[int]]], *, num_distractors: int,
                      rng: random.Random) -> None:
     """Fill in, per record, the evidence this CONDITION attaches and the target it forces.
 
@@ -837,10 +849,10 @@ def attach_condition(records: List[dict], condition: str, template: ChatTemplate
         elif condition == "distractors":
             chosen = [
                 (t, i, False)
-                for t, i in _sample_distractors(pool, record["index"], num_distractors, rng)
+                for t, i in _sample_distractors(pool, record["context_key"], num_distractors, rng)
             ]
         else:  # mixed
-            distract = _sample_distractors(pool, record["index"], num_distractors, rng)
+            distract = _sample_distractors(pool, record["context_key"], num_distractors, rng)
             chosen = [(t, i, True) for t, i in gold] + [(t, i, False) for t, i in distract]
             rng.shuffle(chosen)
 
@@ -1191,8 +1203,10 @@ def main():
     parser.add_argument("--evidence-condition", default="gold,none",
                         help=f"comma separated subset of {EVIDENCE_CONDITIONS} to score in one pass "
                              "(default: the gold-vs-none acceptance gap)")
-    parser.add_argument("--chunk-tokens", type=int, default=128,
-                        help="evidence chunk size in tokens, matching prepare_evidence_data.py's default")
+    parser.add_argument("--chunk-tokens", type=int, default=0,
+                        help="evidence chunk size in tokens. 0 (default) keeps each passage as one "
+                             "chunk, matching how the training corpus writes a SQuAD passage; a "
+                             "positive value (e.g. 128) re-chunks as a robustness reading")
     parser.add_argument("--num-distractors", type=int, default=3,
                         help="distractor chunks drawn per row for distractors/mixed, matching "
                              "prepare_evidence_data.py's default")
