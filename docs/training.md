@@ -173,7 +173,13 @@ What is genuinely different from pretraining:
   own line with the measured candidate recall.
 - **A validation pass** at `eval_every_tokens` reporting CE, `p_max` and top-1 on the val split at
   full depth with subsampling off; with evidence attached when the split carries it, and **per
-  condition** when the corpus carries `.cond` — the gold-vs-none CE gap is the early-kill number.
+  condition** when the corpus carries `.cond`. The per-condition line uses each row's own target
+  and is a train-distribution health line. For `--evidence` a second, **fixed-target** pass over
+  `fixed_split` (`[eval fixed]`) teacher-forces the real answer under every condition and prints
+  gain = CE(none) - CE(cond), the content gain (gold minus distractors), per-loop reader gain and
+  per-loop selector lines. That pass is the early kill: at the first one past `kill_tokens` the run
+  saves and exits 10 if the gold gain or the content gain is under `kill_min_gain`; the check is
+  re-armed when the pass read nothing, and `kill_checked` is persisted in the checkpoint.
 - **Per-loss-and-gate instrumentation** at every log step: `|g_proj|rms` and `|y|row` (`--ir`),
   `|inject|rms` (when the injection exists), `|shared_evidence.o_proj|rms` and the external mass per
   condition (`--evidence`), the evidence token count as its own field, and `IR E/ln32` per loop.

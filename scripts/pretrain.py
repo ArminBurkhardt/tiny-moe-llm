@@ -125,6 +125,21 @@ def answer_start_positions(labels: torch.Tensor) -> torch.Tensor:
     return positions
 
 
+def predicting_positions(labels: torch.Tensor) -> torch.Tensor:
+    """``[B, S]`` mask of the positions that PRODUCE a supervised token.
+
+    The LM head at position ``p`` predicts the token at ``p + 1`` (``compute_mtp_loss`` pairs
+    ``hidden[:, :-1]`` with ``labels[:, 1:]``), so for an answer span ``s..e`` these are
+    ``s-1..e-1``: the states that read the evidence while the answer is being produced, the first of
+    them being ``answer_start_positions``' own. ``labels != -100`` is one position late: it drops the
+    last prompt token and adds the answer's final token, whose successor is not supervised. The last
+    column is always False, since its successor is not in the row.
+    """
+    supervised = torch.zeros_like(labels, dtype=torch.bool)
+    supervised[:, :-1] = labels[:, 1:] != -100
+    return supervised
+
+
 def train_step(
     model: TinyMoETransformer,
     input_ids: torch.Tensor,
@@ -251,9 +266,9 @@ def train_step(
                 )
                 selection_loss = unwrapped.moe.evidence_selection_term(
                     evidence.chunk_gold,
-                    # the query positions the corpus actually supervises: an answer token's own
-                    # position is the one reading evidence while that token is produced
-                    supervised=(labels != -100).reshape(-1),
+                    # the query positions that produce a supervised token: the state one before an
+                    # answer token is the one reading the evidence while that token is predicted
+                    supervised=predicting_positions(labels).reshape(-1),
                 )
                 if selection_loss is not None:
                     loss = loss + TrainingConfig.evidence_selection_weight * selection_loss

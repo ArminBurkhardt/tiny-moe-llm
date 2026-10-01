@@ -167,3 +167,7 @@ baseline rather than a chance-level one.
 invent a distinction the model has no representation of; it is being asked to make the policy use
 one that measurably exists. That is a materially easier thing to ask, and it is why the probe was
 worth running before either phase started.
+
+**2026-09-30.** The G3b bar moved from 0.65 to **0.674**, 3 sigma of 0.030 over this probe's 0.584
+(0.65 was 2.2 sigma). It applies to the mass/chunk AUROC and the grounded AUROC; the per-token
+chunk AUROC has its own bar of 0.59 over a chance level of 0.5 (see NEXT.md, A5 and G3b).

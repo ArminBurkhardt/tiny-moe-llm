@@ -26,6 +26,9 @@ Four groups of assertions:
    is None exactly when there is nothing to select over, it carries a gradient back to the
    selector's own tensors after a real forward, and ``token_mask`` reaches ``compute_aux_loss``
    through ``TinyMoETransformer.forward``.
+6. **The trainer's position and ranking rules**: the selection loss supervises the positions that
+   produce an answer token (``s-1..e-1`` for a span ``s..e``), and the eval's chunk AUROC is read
+   inside each token's own buffer, where a uniform selector is exactly 0.5.
 
 Plain script, not pytest (see tests/run_tests.sh). Requires the WSL/CUDA environment because
 modules/model/* pulls in transformer_engine at import time regardless of whether a given assertion
@@ -43,7 +46,8 @@ from modules.model.router import compute_aux_loss
 from modules.model.transformer import TinyMoETransformer
 # the trainer's own position rule, imported rather than restated -- a second copy here would let
 # the test keep passing while the objective moved to a different position
-from scripts.pretrain import answer_start_positions
+from scripts.pretrain import answer_start_positions, predicting_positions
+from scripts.sft import _within_buffer_auroc
 
 DEVICE = "cuda"
 BF16 = torch.bfloat16
@@ -448,6 +452,41 @@ def test_groundedness_wiring():
     print("21. no head means no term, not a zero                                           PASS")
 
 
+def test_supervised_positions():
+    """The selection loss reads the states that produce an answer token, not the answer tokens."""
+    B, S = 2, 12
+    labels = torch.full((B, S), -100, dtype=torch.long)
+    labels[0, 5:9] = 7        # span s..e = 5..8, closed by a prompt token
+    labels[1, 8:] = 7         # span running to the row's last column
+    marked = predicting_positions(labels)
+    expected = torch.zeros(B, S, dtype=torch.bool)
+    expected[0, 4:8] = True   # s-1..e-1
+    expected[1, 7:S - 1] = True
+    assert torch.equal(marked, expected), (
+        f"predicting positions are not s-1..e-1: {marked.nonzero().tolist()}"
+    )
+    assert not marked[:, -1].any(), "the last column was marked, but its successor is not in the row"
+    # the first predicting position of a span is the groundedness readout's own
+    assert torch.equal(answer_start_positions(labels) & marked, answer_start_positions(labels))
+    print("22. the selection loss supervises s-1..e-1 for a span s..e, never the last column PASS")
+
+
+def test_within_buffer_auroc():
+    """Chance is 0.5 whatever the buffer sizes; pooling the shares was not."""
+    vis = torch.tensor([[True, True, False, False], [True, True, True, True]])
+    gold = torch.tensor([[True, False, False, False], [False, True, False, False]])
+    uniform = vis.float() / vis.sum(dim=-1, keepdim=True)
+    auroc = _within_buffer_auroc(uniform, gold, vis)
+    assert torch.equal(auroc, torch.full((2,), 0.5)), f"a uniform selector is not at 0.5: {auroc}"
+    ranked = torch.tensor([[0.9, 0.1, 0.0, 0.0], [0.1, 0.5, 0.3, 0.1]])
+    auroc = _within_buffer_auroc(ranked, gold, vis)
+    assert torch.equal(auroc, torch.ones(2)), f"gold ranked first is not 1.0: {auroc}"
+    # the invisible chunk of row 0 is scored nowhere, even with a share above gold's
+    leaky = torch.tensor([[0.2, 0.1, 0.7, 0.0], [0.1, 0.5, 0.3, 0.1]])
+    assert _within_buffer_auroc(leaky, gold, vis)[0].item() == 1.0, "an invisible chunk was scored"
+    print("23. the within-buffer chunk AUROC reads 0.5 for a uniform selector              PASS")
+
+
 def main():
     test_direct_read()
     test_selection_loss()
@@ -457,6 +496,8 @@ def main():
     test_selection_term_wiring()
     test_forward_token_mask()
     test_groundedness_wiring()
+    test_supervised_positions()
+    test_within_buffer_auroc()
 
 
 if __name__ == "__main__":

@@ -13,39 +13,70 @@ and the new references). The design itself, with blueprints of both runs, is
 ## Now (2026-09-30)
 
 Nothing has trained since 2026-09-20. The run's instruments were fixed on 2026-09-30 (Phase 4,
-"Before the launch", all eight items) and R0 was read. In order:
+"Before the launch", all eight items plus the follow-up) and R0 was read. In order:
 
-1. **Launch** arm A, then arm B, each under a Monitor watch:
+1. **Launch** arm A, then arm B, each in the background under a Monitor watch whose output is
+   also teed to a gitignored log (`ckpts/evidence_armA.log`, `ckpts/evidence_armB.log`), so the
+   eval blocks survive a crash:
    ```
    python scripts/sft.py --evidence -c ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt
    python scripts/sft.py --evidence --reader-no-rotary --run-name norope -c <same seed>
    ```
-   The kill is automatic: the first eval past 10M tokens with a fixed-target gold gain under 0.1
-   nats saves and exits 10. Otherwise stop each arm by hand at 10M (`touch ckpts/evidence*/STOP`)
-   and read the five `[eval fixed]` blocks: the gain, the per-loop chunk AUROC, the per-loop mass.
+   Filter: `Traceback|Error|Killed|OOM|assert|device not ready|eval fixed|KILL|kill check|Step|Tokens/sec`.
+   Readings: a step-0 baseline plus four `[eval fixed]` readings at 2.5 / 5 / 7.5 / 10M tokens;
+   the fourth is the decision. The kill is automatic: at the first fixed-target eval past 10M the
+   run saves and exits 10 if the gold gain or the content gain (gold minus distractors) is under
+   0.1 nats. Otherwise stop the arm by hand after the 10M reading with `touch ckpts/evidence/STOP`
+   (arm A) or `touch ckpts/evidence_norope/STOP` (arm B); the file is polled every 10 micro steps
+   and the run saves and exits 10. A glob such as `ckpts/evidence*/STOP` creates nothing. Read
+   the gain per condition, the content gain, the per-loop reader gain and the per-loop chunk
+   AUROC (per token, chance 0.5). Pass: gold gain at least 1.6 nats, distractors gain at least 0.
    This run is a mechanism check: it can show that the port reads, not where facts live.
-2. **Build the separation instruments** (Phase 4b): counterfactual and closed-book conditions in
-   `eval_abstention.py`, the synthetic chain generator and its eval, an evidence path in
-   `eval_benchmarks.py`.
-3. **Then the pilot** (Phase 5).
+2. **R0b, the externalization micro-pilot** (Phase 5, "The ladder"): about 30M parameters, 0.3B
+   tokens and a few 5090 hours per arm, fictional biographies injected at 1 / 10 / 100 / 1000
+   exposures. It decides whether the recipe keeps facts out of the weights before any 1B-token
+   spend. It needs the biography generator and the closed-book rank scorer from Phase 4b first.
+3. **Build the separation instruments** (Phase 4b): the closed-book rank scorer with PopQA and
+   the obscurity tiers, counterfactual and store-edit conditions, the synthetic chain generator
+   with its read-ablation eval, store-level retrieval (A7), an evidence path in
+   `eval_benchmarks.py`, R1b, the in-context ceiling on the `evidence_fixed` rows with a source
+   sidecar.
+4. **Then the pilot** (Phase 5).
+
+Relaunching: a killed or stopped arm is relaunched with the same `-c` and the same flags. Without
+`-c` the yaml builds a model without the port and the strict resume load fails; `kill_checked` is
+persisted in the checkpoint, so a resumed arm does not decide twice. HEAD was verified end to end
+on 2026-09-30 with `--run-name smoke2` (`ckpts/evidence_smoke2.log`, gitignored): the step-0
+`[eval]` and `[eval fixed]` blocks reproduce `ckpts/instrsmoke.log` to four decimals, the new
+lines print, 9.8k to 11.8k tok/s, peak 26 GB, stopped by STOP after the first optimizer steps.
 
 Seed baselines, read before step 1 on the new splits: fixed-target gold gain **-0.0020 nats**
 (noise from packing, the reader is exactly neutral: `eval_abstention.py --evidence-port` reads
-+0.0000 on 400 SQuAD rows), chunk AUROC 0.434 / 0.415 / 0.415 by loop (the seed's selector ranks
-gold chunks slightly below distractors), gold share of the external mass 0.334 (uniform over the
-buffer), grounded AUROC 0.5000 (zero head). **R0 failed on both checkpoints**
-([loop_scale_probe.md](../measurements/loop_scale_probe.md)): every multiplier makes loop 3 worse,
-so `loop_scale` stays out of the fresh group in graft arms. The seed's `g_proj` and `direct_gate`
-are both exactly zero and hold each other there: the IR value path is dead for this run, which
-matches the real-run decision (selector without a value read); the selector trains from the
-selection loss alone (`value_adapter` gradient 0 at step 10, `key_adapter` 1.4e-3).
++0.0000 on 400 SQuAD rows); pooled chunk AUROC 0.434 / 0.415 / 0.415 by loop, which is the old
+metric whose chance level under a uniform selector is 0.421, so the seed selector is uniform (gold
+share of the external mass 0.334), not ranking gold below distractors. The per-token chunk AUROC
+(chance 0.5) reads 0.515 / 0.484 / 0.490 by loop on the seed (smoke2, 2026-09-30), mass/chunk
+AUROC 0.481 / 0.470 / 0.469, content gain -0.0009, per-loop reader gain -0.0016 / -0.0021 /
+-0.0020 (loop 3 equals the headline). Grounded AUROC 0.5000 on all rows and on evidence rows
+(zero head).
+The per-condition `[eval]` gold minus none of -3.25 nats was read on the old leaked split;
+`evidence_dev` reads about -2.3, and neither is the kill number. **R0 failed on both
+checkpoints** ([loop_scale_probe.md](../measurements/loop_scale_probe.md)): every multiplier makes
+loop 3 worse, so `loop_scale` stays out of the fresh group in graft arms. The seed's `g_proj` and
+`direct_gate` are both exactly zero and hold each other there: the IR value path is dead for this
+run, which matches the real-run decision (selector without a value read); the selector trains
+from the selection loss alone (`value_adapter` gradient 0 at step 10, `key_adapter` 1.4e-3).
 
 Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
 3.75. Held-out `evidence_dev` 18,966 rows (ratio 11.2, QA only) and `evidence_fixed` 13,333
 questions x 4 conditions (ratio 6.25), from `prepare_evidence_data.py --heldout`. `evidence_val`
 is a train-loss slice. `EvidenceConfig`: batch 2, accumulate 8, `max_evidence_tokens: 14336`,
-`eval_every_tokens: 2500000`; smoke peak 26.4 GB, 8.6 to 14.8k tok/s. `ckpts/evidence/` does not
-exist, so the first launch honours `-c`.
+`eval_every_tokens: 2500000`, `checkpoint_every_tokens: 10000000` (a save lands at the 10M
+decision). About 42k real prompt tokens per optimizer step at 64% fill (65k is capacity), warmup
+99 steps, about 4.2M tokens. Smoke (`ckpts/instrsmoke.log`): 26.36 GB peak allocated over 110
+micro steps, 6.0k to 14.8k tok/s, about 10k typical; about 0.5 s per micro step, 4 s per
+optimizer step, 10M tokens in 11 to 19 min. `ckpts/evidence/` does not exist, so the first launch
+honours `-c`.
 
 ## The goal
 
@@ -78,10 +109,14 @@ Two mechanisms carry the goal and both are measured separately:
   and it is penalized where recall from weights and evidence disagree. This is a pretraining
   property. Every graft onto the converged checkpoint measured zero, and the published systems
   that externalize facts impose it from token 0.
-- **Reasoning over evidence**: the selector and the reader both query the state a loop starts with,
+- **Reasoning over evidence**: the selector and the reader query the state at their read site,
   and chunks are encoded independently, so a chunk that depends on a fact in another chunk is
-  unreachable until that fact is in the state. k hops over evidence need at least k loops. The
-  architecture forces depth; the data and the objective have to ask for it.
+  unreachable until that fact is in the state. k hops over evidence need at least k sequential
+  read sites before readout. In the built POC that is one read per loop from `step_input`, so
+  there k hops need k loops. In the pilot design the reader sits in sublayers 1 and 3 of every
+  pass, so 2 hops fit in one pass (4 with the prelude-read arm). The architecture permits depth;
+  the data and the objective have to ask for it, and whether the loop, rather than the sublayers
+  of one pass, does the composing is an axiom with a falsifier (Decisions, L1).
 
 ## What must be proven
 
@@ -92,20 +127,32 @@ sigma is recorded before any CE gate is quoted.
 
 | gate | metric | bar | home |
 |---|---|---|---|
-| A1 closed-book floor | EM on TriviaQA, NQ-open, PopQA and an obscurity-tier probe with the pathway off and a neutral prompt | tail tiers near chance, no more than 2x the seed | `eval_benchmarks.py` |
-| A2 evidence recovery | fixed-target answer-span CE, gold minus none, held-out rows | at least 50% of the 3.23-nat in-context ceiling; distractor minus none at most 0 | `eval_abstention.py --evidence-port` |
-| A3 counterfactual faithfulness | answer follows an entity-swapped gold chunk, stratified by entity frequency | follow rate at least 90%, parametric-answer rate at most 5% | new condition in `eval_abstention.py` |
-| A4 store edit | change or delete the gold chunk and its near neighbours; the answer flips or disappears | at least 70% of edits propagate | two-store swap in `eval_abstention.py` |
-| A5 selector | mass on the gold chunk in `mixed`, per loop; groundedness-head AUROC | AUROC at least 0.674, three sigma over the 0.584 probe | `eval_abstention.py` |
-| A6 reasoning retained | HotpotQA, BoolQ and SciQ through the port against in-prompt; language benchmarks within noise | port matches in-prompt | `eval_benchmarks.py` with an evidence path |
-| L1 composition | synthetic k-hop chains with fictional entities, accuracy by hops and by loops run | every cell with fewer loops than hops at chance; held-out-template 2-hop above the control | synthetic eval, Phase 4b |
-| L2 depth pays | held-out 4-hop at 4 loops; HotpotQA bridge answer CE from 1 to 3 loops | rises with loops; at least 0.05 nats | synthetic eval plus `eval_abstention.py` |
+| A1 closed-book externalization | (a) closed-book likelihood rank (or MC accuracy) of the gold answer among at least 20 same-type candidates, pathway off, neutral prompt, head and tail obscurity tiers, entity-valued relations; (b) fact injection: fictional biographies (bioS style, Allen-Zhu and Li, Physics of Language Models 3.1) inserted at 1 / 10 / 100 / 1000 exposures with their chunks in the store | (a) tail-tier rank worse than the matched no-retrieval control by at least 3 sigma (bootstrap); (b) closed-book rank at chance up to 100 exposures where the control memorizes | new closed-book rank scorer, PopQA and the tiers (Phase 4b build item); R0b |
+| A2 evidence recovery | fixed-target answer-span CE on held-out rows, gain = CE(none) - CE(cond) | gold gain at least 1.6 nats (50% of the 3.23-nat in-context ceiling); distractors gain at least 0 | `sft.py` `[eval fixed]`; `eval_abstention.py --evidence-port` cross-check |
+| A3 counterfactual faithfulness | memorization ratio p_orig / (p_orig + p_swap) (Longpre et al. 2021) under an entity-swapped gold chunk, on items answered correctly with the unswapped chunk, stratified by entity frequency, injected high-exposure facts included so conflicts exist at pilot scale; n reported per stratum | memorization ratio at most 0.05 and follow rate at least 90% in every stratum | new condition in `eval_abstention.py` |
+| A4 store edit | edit or delete the gold chunk and its near neighbours in the store, re-retrieve with the model's own query, answer; not the oracle buffer | flip rate at least 70% on items answered correctly before the edit | two-store swap through the model-query retrieval path |
+| A5 selector | chunk AUROC (per token, chance 0.5) per loop; mass/chunk AUROC gold-present vs distractors; grounded AUROC (evidence rows) | chunk AUROC at least 0.59 per loop (3 sigma of 0.030 over 0.5); mass/chunk and grounded AUROC at least 0.674 (0.584 + 3 x 0.030) | `sft.py` `[eval fixed]` (Phase 4 home); `eval_abstention.py` cross-check |
+| A6 reasoning retained | HotpotQA, BoolQ and SciQ through the port against in-prompt, counted only on tasks whose in-prompt score is at least 3 sigma above chance; language benchmarks within noise | port at least in-prompt minus 2 points, judged at the binomial sigma; control is the pilot's own in-prompt score | `eval_benchmarks.py` with an evidence path |
+| A7 store-level retrieval | held-out NQ, TriviaQA and HotpotQA with gold passages in the store: recall@k of the model's query; open-book EM through the whole pathway | model-query recall@k at least bge-query recall@k; pathway EM read against oracle-buffer EM | new, Phase 4b |
+| L1 composition | synthetic k-hop chains with fictional entities, accuracy by hops and by sequential read sites, at fixed D = 3 with the reader output zeroed at every site after site j (read ablation) | every cell with fewer read sites than hops at chance, 1 / (type-matched candidate answers in the buffer); held-out-template 2-hop above the control (the read-ablated model or the per-loop-CE arm) | synthetic eval, Phase 4b |
+| L2 depth pays | held-out 4-hop and HotpotQA bridge answer CE by read sites at D = 3 (read ablation), plus D = 4 against D = 3 | rises with read sites past the first pass; at least 0.05 nats on bridge CE | synthetic eval plus `eval_abstention.py` |
 
-A1 is already met by the seed (TriviaQA 0.014, NQ-open 0.002), so it says nothing until A3 and A4
-exist. It guards against facts coming back in. A3 is read at every checkpoint, because context
-reliance is known to rise early and then decay under finetuning on context that agrees with the
-weights. L1's validity rule is mechanistic: the read structure makes accuracy with fewer loops than
-hops impossible, so anything above chance there is a leak in the data.
+The old A1 bar (tail tiers near chance, at most 2x the seed) could not separate "facts
+externalized" from "too small to know": pythia-410m at 300B tokens already reads TriviaQA 0.021
+and NQ 0.000, under that bar, and every 120M pilot control would pass it. The rank bar is relative
+to the matched control, and the injection probe makes exposure count the variable. The A1 claim
+covers entity-valued relations only, because the fact tagger covers only those; extending it to
+attribute nouns (occupation, nationality, genre) extends the claim. A3 is read at every
+checkpoint, because context reliance is known to rise early and then decay under finetuning on
+context that agrees with the weights; the injected high-exposure facts are what makes a
+weights-against-chunk conflict exist at pilot scale.
+
+L1's validity rule: hops are bounded by sequential read sites before readout, so anything above
+chance in a cell with fewer sites than hops is a leak in the data. It is scored by read ablation at
+fixed D = 3, not by truncating depth: the minimum depth is 3, so 1- and 2-loop exits are untrained
+and a truncated cell at chance would be readout failure. Chance is 1 over the number of
+type-matched candidate answers in the buffer. The control is never the no-retrieval arm, which
+cannot see the chains.
 
 ## Rules (carried over)
 
@@ -123,25 +170,26 @@ hops impossible, so anything above chance there is a leak in the data.
 
 | decision | choice |
 |---|---|
-| goal | The reworded goal above. Strong form is not a gate; A1 with A3 and A4 is. |
+| goal | The reworded goal above. Strong form is not a gate; A1 with A3, A4 and A7 is. |
 | roles | Selector = the IR path, chooses by embedding. Reader = cross-attention over chunk tokens, carries content. |
 | learned IR table | Dropped from the real run. Zeroing its read costs 0.0002 nats on every arm. |
 | selector in the real run | Always on, not routed; scores raw bge keys plus one learned null key; no value read, no key adapter. |
 | selector to reader coupling | The selector's own logit enters the reader's attention logit through a one-hot chunk channel, per token, causal. Replaces the document-mean sigmoid gate. |
 | reader positions | No rotary in the reader; the encoder already positioned chunk tokens. Arm B of Phase 4 tests it. |
-| reader output | `o_proj`, then after `post_norm`: `h = h + g_loop[k] * read`; `g_loop` zero-init on a graft, one-init from scratch. Not a norm after a zero-init projection. |
+| reader output | After `post_norm`: `h = h + g_loop[k] * RMSNorm(o_proj(read))`, `o_proj` at default init; `g_loop` 0 on a graft, 1 from scratch. Neutrality lives in `g_loop`; a norm after a zero-init projection would break it after one step. |
 | evidence encoder | The trunk's own dense decoder, chunk-causal. All 8 layers in the POC; the first 4 prelude layers under TE checkpoint from scratch. No cached encoder states in the store. |
 | readout | A 2-layer coda after the loop, own KV slots. The loop refines, the coda reads out. |
 | loss placement | One CE on the last pass run, through the coda. Per-loop CE is the control arm, not the default. |
 | depth | Drawn per step from {3: 0.7, 4: 0.2, 5: 0.1}; the first D minus 3 passes run under `no_grad` and are detached; minimum 3, so no pass is an exit. Inference 3, at most 4. |
 | loop tensors | `loop_scale` and `evidence_loop_scale` length 5, fresh `1/sqrt(5)`; `loop_inject` on; loop code clamped to the trained depth. |
 | selection supervision | Union over the passes in the gradient window: `u_c = 1 - prod(1 - p_hat[k, c])`, BCE against the gold flag. Never a target per hop and per loop. |
-| query training | InfoNCE on the in-model query against the bge key of the gold chunk, in-batch negatives, same-document and near-duplicate negatives masked. Keys stay bge, so the index is never rebuilt. |
-| token tables | One table, tied to the LM head and the MTP head through small adapters; the per-layer and router tables become projections of it, gated on a zero-ablation of the per-layer read (G9). |
+| query training | InfoNCE on the in-model query against the bge key of the gold chunk, in-batch negatives plus store-mined hard negatives, same-document and near-duplicate negatives masked. Keys stay bge, so the index is never rebuilt; Atlas (Izacard et al. 2022) justifies query-side-only tuning against a fixed index. |
+| token tables | One table, tied to the LM head and the MTP head through small adapters; no weight decay on it. The per-layer and router tables become projections of it, gated on the per-layer table zero-ablation on the seed (Phase 4b). G9 gates the head tie only. |
 | shape | Shape L: width 1024, 16 heads x 64, 4 KV heads; 8 prelude layers; looped core of 3 sublayers per pass with 8 MLP experts each, top 2; 2 coda layers. About 470M total, 300M active per token. Sublayer count and expert count are pilot arms. |
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
 | real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. |
-| real run budget | About 2.5k H100 hours for shape L, about 350B tokens with evidence; the plan's 5k-hour ceiling stands. Recomputed after Phase 6a's throughput work. |
+| real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
+| loops (axiom) | "Loops buy computation, not storage" is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Falsifier (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong for this design. Looping stays a requirement either way. |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
 | POC role | Phase 4 is a mechanism check of the reader, read per loop. It decides nothing about externalization. |
 | matched compute | SMELT's definition: equal compute per token, equal non-embedding parameters and equal KV-cache size, or the comparison is not quoted as compute-matched. |
@@ -166,8 +214,9 @@ Done, with the full records linked:
   Mean MC headroom +0.088 / +0.081 / +0.084 against gpt2-medium's +0.193. BoolQ with the passage in
   the prompt reads 0.46 / 0.44 / 0.42, below chance.
 - **Phase 2**: abstention repair ([abstention_repair.md](../measurements/abstention_repair.md)).
-  False abstention 0.783 to 0.136; recall 0.81 to 0.22; precision pinned at 0.578 six readings
-  running. The data lever is exhausted.
+  The 0.55 arm (the shipped repair): false abstention 0.783 to 0.161, recall 0.81 to 0.22
+  (the 0.40 arm reached 0.136 false abstention at recall 0.18); precision pinned at 0.578 six
+  readings running. The data lever is exhausted.
 - **Phase 3, 3b, 3c**: table reshape and sharpening, the value-scale fix, loop input injection
   ([ir_sharpening.md](../measurements/ir_sharpening.md),
   [ir_scale_fix.md](../measurements/ir_scale_fix.md),
@@ -199,14 +248,17 @@ Each measured, each recorded; a retry must move the ablation, not the entropy.
   retrieval from token 0.
 - `p_max` carries no answerability signal; a linear trunk probe reads 0.584 on every checkpoint.
   Abstention precision is pinned at 0.578 by the data lever.
-- Loops buy computation, not storage. Looping is a requirement.
 - No per-loop number on record is free of the halt gate: it passed 8% of the loop-3 update for all
   16B pretraining tokens, and every later arm grafted onto that lineage. Only the from-scratch
   pilot can separate "loops cannot reason" from "loops were never allowed to".
 - The trunk is already near-empty of facts (TriviaQA 0.014, NQ-open 0.002). The pending run tests
   reader capacity, not fact removal.
-- Depth past 3 degrades on plain text: CE 3.4112 at loop 3, 3.4115 at loop 4, 3.4900 at loop 8 on
-  `ir_c`, with no evidence attached.
+- Depth past 3 degrades on plain text: CE 3.4112 / 3.4115 / 3.4213 / 3.4384 / 3.4618 / 3.4900 at
+  depth 3 to 8 on `ir_c`, with no evidence attached
+  ([loop_scale_probe.md](../measurements/loop_scale_probe.md), "Depth past the trained 3").
+
+"Loops buy computation, not storage" is no longer listed here: nothing measured supports it, so it
+is an axiom under Decisions, next to its falsifier.
 
 ---
 
@@ -214,7 +266,8 @@ Each measured, each recorded; a retry must move the ablation, not the entropy.
 
 One question: can the port be read at all. It runs the architecture as built, on the grafted
 checkpoint, with the gate frozen. It cannot show where facts live: the seed scores near zero
-closed-book, and 92% of the corpus's supervised tokens carry content the buffer does not supply.
+closed-book, and between 54 and 92% of the corpus's supervised tokens (depending on the weighting)
+carry content the buffer does not supply.
 
 ### Before the launch
 
@@ -228,21 +281,29 @@ cadence plus a step-0 eval, `freeze_evidence_gate`, `--reader-no-rotary` (inferr
 for: at scale 5 earlier positions move 4.2e-3 against an exact 0, and cached against uncached
 decode differs by 8.1e-3.
 
-Ordered by how badly each would mislead the run. None needs the GPU.
+**Follow-up, 2026-09-30.** The kill checks two numbers (gold gain and content gain, gold minus
+distractors) and is armed again when the fixed pass read nothing; `kill_checked` is persisted in
+the checkpoint payload. The fixed pass prints a per-loop reader gain from the per-loop CE of the
+same forward and a per-token chunk AUROC (chance 0.5) beside the old pooled one. The selection
+loss supervises the positions that produce a supervised token (`labels[:, 1:] != -100` shifted to
+`:-1`), the positions `answer_start_positions` and the readouts use; the old `labels != -100` was
+off by one. `checkpoint_every_tokens: 10000000` puts a save at the decision.
+
+The eight items as specified, in the order of how badly each would have misled the run:
 
 1. **The kill number.** `sft.py`'s per-condition `[eval]` CE uses each row's own target, the answer
-   under `gold` and a refusal under `none`, and reads minus 3.25 nats on a seed with a dead reader.
-   The `none` bucket also holds replay rows. Add a fixed-target pass to `evaluate()`: teacher-force
-   the real answer under every condition over the natively answerable QA rows, print gold minus
-   none, and kill on that. The 0.0000 seed baseline is this number, read by
-   `eval_abstention.py --evidence-port`.
-2. **The validation split.** `prepare_evidence_data.py` splits per rendered row after the QA
-   sources repeat, so every QA validation question is also in train (7,440 of 7,440). Build
-   `evidence_val` from SQuAD dev and HotpotQA dev, split by source id before the condition draw.
-   Treat the current `evidence_val` as a train-loss slice.
+   under `gold` and a refusal under `none`, and read minus 3.25 nats on a seed with a dead reader
+   (on the old leaked split; `evidence_dev` reads about -2.3). The `none` bucket also holds replay
+   rows. The fixed-target pass teacher-forces the real answer under every condition over the
+   natively answerable QA rows and prints gain = CE(none) - CE(cond); the kill reads it. The seed
+   reads -0.0020 there, and `eval_abstention.py --evidence-port` reads +0.0000 as a cross-check.
+2. **The validation split.** `prepare_evidence_data.py` split per rendered row after the QA
+   sources repeat, so every QA validation question was also in train (7,440 of 7,440). The
+   held-out splits `evidence_dev` and `evidence_fixed` come from SQuAD dev and HotpotQA dev, split
+   by source id before the condition draw. The current `evidence_val` is a train-loss slice.
 3. **Cadence.** `eval_every_tokens: 2500000`, and an eval before step 1, so the decision at 10M
-   tokens has five readings and a baseline instead of one reading on the decision itself. Warmup
-   covers the first ~4.2M tokens.
+   tokens has a step-0 baseline plus four readings at 2.5 / 5 / 7.5 / 10M, the fourth being the
+   decision. Warmup is 99 optimizer steps, about 4.2M tokens.
 4. **The chunk gate.** `chunk_mean_mass` averages the selector's weight over every token of the
    document and that number gates the states every position reads, so training sees future tokens
    and cached, uncached and training gates differ. Freeze `evidence_gate_scale` at zero:
@@ -257,35 +318,50 @@ Ordered by how badly each would mislead the run. None needs the GPU.
    `direct_gate` hold each other at zero and the IR value path is dead for the run.
 8. **Tests.** Three: backward on a zero-init port (`o_proj` gradient nonzero at step 0, q/k/v zero,
    then nonzero after one step), causality of the gate when its scale is nonzero, cached against
-   uncached decode with evidence attached. Plus a GPU-free assert on the `is_fresh_loop_param`
-   predicate and the by-hand gradient clear in `train_step`, which route exactly the tensors this run
-   trains and have no test.
+   uncached decode with evidence attached. Plus an assert on the `is_fresh_loop_param` predicate
+   and the by-hand gradient clear in `train_step`, which route exactly the tensors this run trains
+   (`test_fresh_param_routing`, a GPU test: it builds the model).
 
 ### The run
 
-- Arm A: as built, gate frozen. Arm B: same, reader without rotary. 10M tokens each, about 20
-  minutes each, under a Monitor watch.
-- Kill at 10M tokens if the fixed-target gap is under 0.1 nats.
-- Pass at 50% of the in-context ceiling, about 1.6 of 3.23 nats, with distractor minus none at or
-  below 0. Report the fraction of the ceiling closed, on the same rows as
-  `evidence_ceiling_probe.py`.
-- Read per loop: selector AUROC (`memory_mass_by_loop`), external mass per condition, and the
-  reader gain. A rising `|shared_evidence.o_proj|rms` with a flat gap means the reader learned a
-  bias from a random reader, not retrieval; RMS alone is not the signal.
+- Arm A: as built, gate frozen. Arm B: same, reader without rotary (`--reader-no-rotary
+  --run-name norope`). 10M tokens each, 11 to 19 minutes each at 6.0k to 14.8k tok/s (about 10k
+  typical), in the background under a Monitor watch teed to a gitignored log.
+- Sign convention, stated once: gain = CE(none) - CE(cond) on the fixed-target answer span;
+  positive means the evidence helped.
+- Kill: at the first fixed-target eval past 10M tokens the run saves and exits 10 if the gold gain
+  or the content gain (gold minus distractors) is under 0.1 nats. The check is armed again when
+  the fixed pass read nothing; `kill_checked` is persisted, so a resume does not decide twice.
+- Stop by hand after the 10M reading: `touch ckpts/evidence/STOP` (arm A) or
+  `touch ckpts/evidence_norope/STOP` (arm B). Polled every 10 micro steps; the run saves and exits
+  10. The glob form does not work. Relaunch a killed or stopped arm with the same `-c` and the
+  same flags: without `-c` the yaml builds a model without the port and the strict load fails.
+- Pass: gold gain at least 1.6 nats and distractors gain at least 0. The printed ceiling fraction
+  is against the SQuAD-only 3.23 nats, measured on other rows and another checkpoint, so it is
+  indicative until the Phase 4b ceiling on the `evidence_fixed` rows exists.
+- Read per loop, all from the same `[eval fixed]` forward: the reader gain lines (final loop equals
+  the headline), external mass and mass per chunk per condition, mass/chunk AUROC gold-present vs
+  distractors, chunk AUROC (per token, chance 0.5) and gold share. A rising
+  `|shared_evidence.o_proj|rms` with a flat gain means the reader learned a bias, not retrieval;
+  RMS alone is not the signal.
 - Log gradient norms of `key_adapter`, `value_adapter`, `down_proj` and `loop_query_bias` at steps
   10 and 100.
 - Under 50% of the ceiling: the next arm is a reader per loop or reads in dense layers, before more
-  data. Arm C, only after a pass: the one-hot chunk channel with `gamma = 0`.
+  data. Arm C, only after a pass: the one-hot chunk channel with `gamma = 0` (arm C only; from
+  scratch `gamma` starts at 1).
 
 ### What it decides
 
-A pass says the grafted reader can carry a span. A fail on the graft is weak evidence, given the
-record. Neither outcome moves the real run's design, which is why Phase 5 does not wait for it.
+A pass says the grafted reader can carry a span; it does not change the real run's design. A fail
+on the graft is weak evidence, given the record, but it changes which reader arm the pilot runs
+first (a reader per loop or dense-layer reads). Phase 5 does not wait for it either way.
 
-**Gate G3** (restated): fixed-target gold-minus-none gap on held-out rows, at least 50% of the
-ceiling; distractor minus none at most 0; benchmarks within noise. **Gate G3b**: selector AUROC at
-least 0.674 per loop, which is three sigma over the 0.584 probe (0.65 was 2.2 sigma); the
-groundedness head's AUROC scored in the eval script, beside the mass.
+**Gate G3** (restated): gold gain on the held-out fixed-target rows at least 1.6 nats, 50% of the
+ceiling; distractors gain at least 0; benchmarks within noise. **Gate G3b**: chunk AUROC (per
+token, chance 0.5) at least 0.59 per loop (3 sigma of 0.030 over 0.5); mass/chunk AUROC and
+grounded AUROC (evidence rows) at least 0.674, three sigma over the 0.584 probe (0.65 was 2.2
+sigma). `sft.py`'s `[eval fixed]` is the home; `eval_abstention.py --evidence-port` is the
+cross-check.
 
 ---
 
@@ -299,29 +375,52 @@ checkpoints; it is on the critical path because the pilot cannot be read without
   3. Pass at 0.02 nats with loops 1 and 2 not worse. Decides whether `loop_scale` joins the fresh
   LR group in graft arms. **FAIL 2026-09-30** on both checkpoints, monotone in the multiplier
   ([loop_scale_probe.md](../measurements/loop_scale_probe.md)): it does not join.
-- **A3 and A1 conditions in `eval_abstention.py`.** A counterfactual condition following the
-  Faithfulness-QA recipe: swap the answer entity in the gold chunk for a same-type entity, score EM
-  against the swapped answer and report the parametric-answer rate, stratified by entity frequency.
-  A closed-book condition with a neutral prompt that does not licence abstention. Per-record JSON
-  in evidence mode, EM and non-abstain rate under distractors and none.
-- **A4, the store swap.** Two stores on the same questions: the gold chunk edited or deleted with
-  its near neighbours; report the flip rate.
-- **A5 readouts.** Gold-chunk mass in `mixed` per loop and per IR expert (the eval reads
-  `ir_modules[0]` only today); the groundedness head's AUROC.
+- **R1b, the depth memory probe.** One micro step at depth 3 and at depth 5 with the detached
+  prefix, pilot shape; read peak memory. Decides whether the depth schedule is trainable.
+- **The in-context ceiling on the `evidence_fixed` rows**, read with the seed, and a source
+  sidecar on `evidence_fixed` so every gain splits per source (SQuAD, HotpotQA). The printed
+  ceiling fraction is against the SQuAD-only 3.23 nats on other rows and another checkpoint until
+  then.
+- **A1, the closed-book rank scorer.** Likelihood rank (or MC accuracy) of the gold answer among
+  at least 20 same-type candidates (100 in R0b), pathway off, neutral prompt that does not licence
+  abstention, head and tail obscurity tiers, bootstrap sigma. PopQA and the tiers are not in
+  `eval_benchmarks.py` today: a build item. Plus the fictional biography generator (bioS style) with
+  per-fact exposure counts 1 / 10 / 100 / 1000 and the matching store chunks, shared with R0b.
+- **A3 in `eval_abstention.py`.** A counterfactual condition following the Faithfulness-QA recipe:
+  swap the answer entity in the gold chunk for a same-type entity, and report the memorization
+  ratio p_orig / (p_orig + p_swap) (Longpre et al. 2021) and the follow rate on items answered
+  correctly with the unswapped chunk, stratified by entity frequency, with n per stratum. Injected
+  high-exposure facts are included so conflicts exist at pilot scale. Per-record JSON in evidence
+  mode, EM and non-abstain rate under distractors and none.
+- **A4, the store edit.** Two stores on the same questions: the gold chunk edited or deleted with
+  its near neighbours; re-retrieve with the model's own query, not the oracle buffer; report the
+  flip rate on items answered correctly before the edit.
+- **A5 readouts.** Built in `sft.py`'s `[eval fixed]` (chunk AUROC per token, mass/chunk AUROC,
+  grounded AUROC, per loop). Left for the cross-check: gold-chunk mass per IR expert in
+  `eval_abstention.py` (it reads `ir_modules[0]` only today).
+- **A7, store-level retrieval.** Held-out NQ, TriviaQA and HotpotQA with the gold passages in the
+  store; recall@k of the model's query against bge's; open-book EM through the whole pathway
+  against the oracle-buffer EM.
 - **The synthetic chain generator and eval** (L1, L2). Fictional entities, hops 1 / 2 / 3, 6 to 14
   distractors of three kinds (same relation with other entities, bridge relation with other
   entities, one full decoy chain), shuffled chunk order, a hop index per gold chunk written to an
   `.evhop` sidecar for evaluation only, 4-hop chains and unseen hop-2 templates held out. Score
-  accuracy by hops and by loops run. The validity rule: every cell with fewer loops than hops must
-  sit at chance.
+  accuracy by hops and by sequential read sites at fixed D = 3, zeroing the reader output at every
+  site after site j. The validity rule: every cell with fewer read sites than hops sits at chance,
+  1 / (type-matched candidate answers in the buffer).
 - **An evidence path in `eval_benchmarks.py`.** SciQ and BoolQ carry their passage; put it through
-  the port and diff against the in-prompt score (A6). TriviaQA-rc and NQ with DPR gold passages for
-  the attach delta. HotpotQA validation with both gold paragraphs in the port, by loop count.
+  the port and diff against the in-prompt score (A6, only where in-prompt is 3 sigma over chance).
+  TriviaQA-rc and NQ with DPR gold passages for the attach delta. HotpotQA validation with both
+  gold paragraphs in the port, by read site.
 - **Per-loop readouts in the training log.** `cos(q_k, q_k+1)`, per-loop selector mass, per-loop
   reader gain, and `||h||` per loop (the readout blind spot from the first review).
 - **The oracle head (G9).** Train a dense `768 -> 65536` head on frozen final-loop states for
   100 to 200M tokens; `CE_factored - CE_oracle` is the damage the block-diagonal head does. Tie if
-  at least 0.02 nats. Plus the free reading: least-squares fit of `E A^T` to the trained head.
+  at least 0.02 nats. Plus the free reading: least-squares fit of `E A^T` to the trained head. G9 is
+  the head tie only.
+- **The per-layer table zero-ablation on the seed** (the PLE ablation). Zero the per-layer table's
+  read and measure CE; near the IR table's 0.0002 nats, the per-layer and router tables become
+  projections of `E`; otherwise the per-layer table stays.
 - **A paired-bootstrap CE sigma** on the standard slice, so "within noise" is defined for CE.
 
 ---
@@ -330,18 +429,20 @@ checkpoints; it is on the critical path because the pilot cannot be read without
 
 The first experiment that can falsify the goal. About 120M parameters at width 512, 1 to 2B
 tokens per arm on the 5090, with a matched-token control without retrieval. Run times are
-unmeasured; the R1b memory probe comes first.
+unmeasured; the R1b memory probe comes first, and the R0b micro-pilot (ladder below) reads the
+externalization recipe before any 1B-token arm.
 
 ### The model, from scratch
 
 Every item is in the design page's from-scratch blueprint. Grouped by what it touches.
 
 **Token tables and readout.**
-- One table `E`, init std `1/sqrt(hidden)`, decayed in its input role only. LM head
-  `norm(h) @ A @ E^T` with `A` hidden x hidden; MTP head through a `hidden/2 -> hidden` adapter
-  onto `E^T`, CE on a 25% token subsample. Fused linear plus cross-entropy in
-  `_chunked_linear_ce`. The per-layer and router tables become `E W_ple` and `E W_moe` if the
-  per-layer zero-ablation lands near the IR table's 0.0002 nats; otherwise the per-layer table stays.
+- One table `E`, init std `1/sqrt(hidden)`, no weight decay (it is tied, so its input and output
+  roles cannot be decayed separately). LM head `norm(h) @ A @ E^T` with `A` hidden x hidden; MTP
+  head through a `hidden/2 -> hidden` adapter onto `E^T`, CE on a 25% token subsample. Fused
+  linear plus cross-entropy in `_chunked_linear_ce`. The per-layer and router tables become
+  `E W_ple` and `E W_moe` if the PLE ablation (Phase 4b) lands near the IR table's 0.0002 nats;
+  otherwise the per-layer table stays.
 - A 2-layer coda between the loop and the norm, a separate `ModuleList`, zero-init residual
   branch, own KV slots allocated in `KVCache.__init__`, keys in `NEUTRAL_LOOP_KEYS` and
   `is_fresh_loop_param`. MTP reads the coda output. The convergence exit stays off.
@@ -363,9 +464,11 @@ Every item is in the design page's from-scratch blueprint. Grouped by what it to
   per segment with a learned key and a zero value. No rotary. 4 KV heads. K and V are
   pass-invariant, one cache per buffer. `M` up to 40. Check first that the installed flash-attn
   build accepts the head size.
-- Output: `o_proj`, then after `post_norm`, `h = h + g_loop[k] * read`, `g_loop` init 1.
-- Read sites: sublayers 1 and 3 of every pass. Reads in dense prelude layers 3 and 6 are a pilot
-  arm.
+- Output: after `post_norm`, `h = h + g_loop[k] * RMSNorm(o_proj(read))`, `o_proj` at default
+  init, `g_loop` init 1.
+- Read sites: sublayers 1 and 3 of every pass, so 2 sequential read sites per pass and 2 hops can
+  fit in one pass. Reads in dense prelude layers 3 and 6 are a pilot arm (4 sites before the
+  first pass ends).
 
 **Loop.**
 - 3 sublayers per pass: self-attention (shared), always-on MLP plus 8 routed experts at top 2, the
@@ -380,6 +483,15 @@ Every item is in the design page's from-scratch blueprint. Grouped by what it to
 
 **Encoder.** The first 4 prelude layers, chunk-causal, TE checkpoint, encoded once per forward.
 
+**Objective.** `L = CE x span_weight + 0.1 MTP + 0.01 aux + 0.1 L_sel + 0.1 contrastive + 0.1
+groundedness`, with the MTP targets span-weighted like the main CE. The control arm swaps the first
+term for per-loop CE.
+
+**Optimizer (pilot).** Its own spec, in tokens: warmup 2 to 5% of the pilot's tokens (the design's
+earlier "1000 steps" is 524M tokens at the pretrain batch), the router noise anneal and the
+checkpoint cadence scaled to the pilot's budget, LR from a width-512 sweep, cosine to 0.1 lr, no
+weight decay on `E` or the loop scales.
+
 ### The pilot corpus (a new builder mode)
 
 Retrieval is attached to every slice. The only evidence-free case is the abstention condition.
@@ -388,7 +500,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 |---|---|---|---|---|
 | web and edu text | 45% | the pretrain mix, fineweb-edu weighted up | top 2 chunks per 256-token window, staircase visibility | span weights, counterfactual swaps, tail anonymization |
 | code and math | 10% | stackv2 edu, Nemotron math | same | plain CE |
-| evidence QA | 15% | SQuAD v2, HotpotQA, NQ, TriviaQA with passages, MuSiQue, 2Wiki; at most 2 passes each | gold, mixed, many, distractors, none, counterfactual, partial hop; buffer capped at 8 chunks | answer or abstain |
+| evidence QA | 15% | SQuAD v2, HotpotQA, NQ, TriviaQA with passages, MuSiQue, 2Wiki; at most 2 passes each | gold, mixed, distractors, none, counterfactual, partial hop; buffer capped at 8 chunks, so no `many` | answer or abstain |
 | synthetic chains | 10% | generated | hops 1 / 2 / 3 at 25 / 50 / 25 | answer |
 | chat replay | 20% | smoltalk2, instruction and format rows | same per-window retrieval | assistant text, span weights |
 
@@ -402,10 +514,15 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
   both thresholds.
 - **Span weights.** Entities, numbers and dates are tagged (numbers need two tokens or a matching
   context n-gram). A span is supported when it occurs in a visible chunk: weight 1, chunk flagged
-  gold. Unsupported: weight 0. Language tokens: weight 1. On 15% of supported spans the entity is
-  swapped for a same-type entity in the chunk and the target alike. In 50% of documents,
-  unsupported entities below the head-frequency threshold get a typed placeholder in input and
-  target. The swap and anonymization rates are first guesses and get a sweep.
+  gold. Unsupported: weight 0. Language tokens: weight 1. The MTP targets get the same span
+  weight, or the MTP head relearns what the main loss masks. The tagger covers entity-valued
+  relations only; attribute nouns (occupation, nationality, genre) stay in the loss, so the A1
+  claim is restricted to entity-valued relations unless the tagger is extended to them.
+- **Counterfactual swaps.** On 15% of supported spans the entity is swapped for a same-type entity
+  in every visible chunk that holds it, in the target, and in every later mention in the document.
+- **Tail anonymization.** In 50% of documents, unsupported entities below the head-frequency
+  threshold get a typed placeholder in input and target, re-drawn per epoch. The 15% and 50% rates
+  are first guesses and get a sweep in the micro-pilot (R0b).
 - **QA.** Distractors half bge hard negatives, half random. Partial hop: a HotpotQA row with one
   supporting paragraph withheld, target abstains. Hop labels from MuSiQue and 2Wiki are for
   evaluation only. A wider abstention phrasing set.
@@ -420,19 +537,20 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 
 | rung | tokens | runs | read | pass | decides |
 |---|---|---|---|---|---|
-| R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts |
-| R1 | 10M | the Phase 4 run | selector AUROC per loop | loop 2 or 3 beats loop 1 by 0.02 | whether reads differ by loop at all |
+| R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
+| R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop |
+| R0b | 3 x 0.3B | externalization micro-pilot, about 30M params, a few 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; swap and anonymization rates swept in (c) | closed-book likelihood rank among 100 same-type candidates, by exposure; counterfactual follow in (c) | (b) and (c) at chance up to 100 exposures while (a) climbs | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
 | R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable |
-| R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and loops | chance wherever loops are fewer than hops | whether the instrument is valid |
-| R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` reset | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
-| R4 | 4 x 1B | from scratch: loss placement by coda, 2 x 2, shared fresh `loop_scale`, inject and data | held-out-template 2-hop at 3 loops | best arm 10 points over per-loop loss without coda; 3-hop above chance | objective and coda |
-| R4b | 2 x 1B | sublayers per pass 2 against 3 at matched compute; experts 4 against 8 | L1 plus closed-book recall plus language benchmarks | see gates | shape L's core |
-| R5 | 0 | the winner, eval only | held-out 4-hop at 4 loops; HotpotQA bridge by loops; A1 to A6 | L2 and the A gates | whether the design enters the real run |
-| R6 | 1 to 2B | hop 1 seen only in pretraining text (about 100 exposures), hop 2 retrieved | 2-hop accuracy at 2 or more loops | well above chance | whether weights and store compose |
+| R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
+| R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
+| R4 | 4 x 2 x 1B | from scratch: loss placement by coda, 2 x 2, two seeds per compared arm (training-seed sigma is unmeasured), shared fresh `loop_scale`, inject and data | held-out-template 2-hop at D = 3 | best arm 10 points over per-loop loss without coda, outside the seed spread; 3-hop above chance | objective and coda |
+| R4b | 2 x 1B | sublayers per pass 2 against 3 at matched compute; experts 4 against 8 | L1 plus closed-book rank plus language benchmarks | see gates | shape L's core |
+| R5 | 0 | the winner, eval only | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | L2 and the A gates | whether the design enters the real run |
+| R6 | 1 to 2B | hop 1 seen only in pretraining text (about 100 exposures), hop-1 documents excluded from the store, hop 2 retrieved | closed-book hop-1 accuracy and 2-hop accuracy | at chance on both (the A1 leak probe: above chance means pretraining-text facts reached the weights) | whether the recipe keeps pretraining-text facts out of the weights |
 
 A 1-hop curve must saturate before any null is read. R4 replaces the previous plan's per-loop CE
 test, which changed loss placement, depth sampling and the coda in one arm. Pilot arms that do not
-fit the budget are dropped from the bottom of this table, not the top.
+fit the budget are dropped from the bottom of this table, not the top; R0b runs before all of them.
 
 ### Later, after the pilot passes
 
@@ -454,16 +572,24 @@ checkpointed head at 4x, no `torch.compile`, no CUDA graphs. In order: profile t
 micro-batch on the 80 GB card; the fused linear plus cross-entropy head and the subsampled MTP
 head; then FP8 through Transformer Engine, validated by a 2B-token A/B within about 1% of BF16.
 
-**Gate G8**: at least 2x sustained tokens per second over the 97k/s baseline at equivalent shape,
-measured over an hour with checkpointing and upload live; FP8 A/B loss-matched.
+**Gate G8**: at least 2x the sustained tokens per second that shape L reaches at today's MFU
+(about 30 to 32k/s with evidence, the rate behind the 6b estimate; an estimate until measured),
+defined in tokens per second at shape L, measured over an hour with checkpointing and upload live;
+FP8 A/B loss-matched. "Equivalent shape" is not a definition and is not used.
 
 ### 6b. Budget
 
-Shape L costs about 1.0 GFLOP per token at 3 passes, twice today, and evidence multiplies it by
-about 1.25 at the corpus ratio of 1.3 (QA buffer capped). At the plan's base rate that is about
-350B tokens in 2.5k H100 hours; every G8 multiplier scales it. The data cap is 100B unique tokens
-at 4 epochs. Recompute after 6a; the FLOP line the constructor prints is the anchor, and it goes
-stale silently.
+Shape L costs about 1.3 GFLOP per token forward at 3 passes: body 2 x (109 + 3 x 98 + 27)M =
+860M, tied head 134M, MTP at 25% x 2 tokens 67M, attention 160M, reader sites 80M; the expected
+depth of 3.4 passes adds to the body. Evidence multiplies it by about 1.29 at the slice-mix ratio
+of 1.55 (0.75 x 1.0 + 0.15 x 2 + 0.10 x 5, QA buffer capped). At today's MFU, 2.5k H100 hours buy
+about 270 to 290B tokens; shape M buys about 235B per 1k H100 hours.
+
+The data cap is 400B tokens (100B unique at 4 epochs). Passing G8 at 2x doubles the tokens an
+hour buys, which makes a 2.5k-hour run data-bound at that cap, so the hours and the token target
+cannot both hold. The run spec fixes a token target and derives the hours from the measured rate.
+Every figure here is an estimate until the constructor prints it; recompute after 6a, because
+the FLOP line is the anchor and it goes stale silently.
 
 ### 6c. The corpus at 100B tokens
 
@@ -475,8 +601,9 @@ prep is its own interruption-safe job with its own budget line in the run spec.
 ### 6d. The run spec (`docs/plans/RUN2.md`)
 
 Written before anything is rented. It names, per component, the pilot rung that admitted it and
-its margin. Shape L from the pilot's R4b reading. An LR transfer sweep at reduced width, or muP if
-it can be adopted cheaply. The gate table A1 to A6 and L1, L2, with the seed noise measured. The
+its margin. Shape L from the pilot's R4b reading. A token target, with the hours derived from it.
+An LR transfer sweep at reduced width, or muP if it can be adopted cheaply. The gate table A1 to
+A7 and L1, L2, with the seed noise measured. The
 two-phase curriculum with a reasoning-weighted tail. The per-loop and per-pass readouts in the log
 from step 0. The early signals for a run whose kill rules no longer have zero-init tensors to
 watch: the selector's gold mass per pass, the reader gain per pass, the supported-span share of the
@@ -510,27 +637,33 @@ Kept results:
 
 Live:
 
-- **G3** fixed-target gold-minus-none gap at least 50% of the 3.23-nat ceiling on held-out rows;
-  distractor minus none at most 0; benchmarks within noise (Phase 4).
-- **G3b** selector AUROC at least 0.674 per loop; groundedness-head AUROC scored beside it (Phase 4).
+- **G3** fixed-target gold gain, gain = CE(none) - CE(cond), at least 1.6 nats (50% of the
+  3.23-nat ceiling) on held-out rows; distractors gain at least 0; benchmarks within noise
+  (Phase 4).
+- **G3b** chunk AUROC (per token, chance 0.5) at least 0.59 per loop; mass/chunk AUROC and
+  grounded AUROC (evidence rows) at least 0.674 (Phase 4).
 - **G9** the oracle-head reading recorded; tie the head if the factoring costs at least 0.02 nats
-  (Phase 4b).
-- **A1 to A6, L1, L2** as in "What must be proven" (Phase 5 for the pilot reading, Phase 6 on the
-  real run).
+  (Phase 4b). The PLE ablation is a separate reading and gates the per-layer and router tables.
+- **A1 to A7, L1, L2** as in "What must be proven" (R0b and Phase 5 for the pilot readings, Phase
+  6 on the real run).
 - **G8** throughput (Phase 6a).
 - **G7** the shipped checkpoint (Phase 6e).
 
 Retired: G4 (retriever alignment is now the InfoNCE term inside the pilot, read by A5), G5 and G6
 (subsumed by A6 and the benchmark evidence path; the beyond-context claim is read as HotpotQA with
-64-plus chunks through the port against the best in-prompt packing, at linear cost), R1 to R5 (A1
-to A4 are their measurable forms).
+64-plus chunks through the port against the best in-prompt packing, at linear cost), the previous
+plan's retrieval gates R1 to R5 (A1 to A4 are their measurable forms; the ladder rungs R0 to R6
+above are a different, live series).
 
 ## Risks
 
 - **Facts reach the weights through the input side.** Masking unsupported spans is necessary and
   not sufficient; later tokens still learn entity-to-attribute links from the input. The
   counterfactual swaps and the tail anonymization are the levers, and their rates are guesses.
-  Without them A1 is expected to fail.
+  Without them A1 is expected to fail. The levers only work if they are complete: MTP targets carry
+  the same span weight, a swap reaches every visible chunk and every later mention, the
+  anonymization is re-drawn per epoch, and attribute nouns the tagger misses stay learnable. R0b's
+  arm (b) is the input-side leak test and sweeps the rates before any 1B-token spend.
 - **Small models ignore evidence.** Models of 7B and under have been measured ignoring oracle
   passages 85 to 100% of the time on questions they cannot answer alone. At 120M the pilot may
   come out flat. The matched control and A6 decide, and the 1-hop curve must saturate first.
@@ -586,4 +719,9 @@ to A4 are their measurable forms).
   prefix, fresh loop scales, input re-presentation and a union selection loss.
 - The from-scratch corpus attaches retrieval to every slice, masks unsupported fact spans, swaps
   entities, anonymizes the tail, caps the QA buffer, and includes synthetic chains.
-- The real run targets shape L at about 2.5k H100 hours with a context extension phase after it.
+- The real run targets shape L with a fixed token target and derived hours (about 2.5k H100 hours
+  planned), with a context extension phase after it.
+- 2026-09-30 revision after the review: A1 becomes a closed-book rank against the matched control
+  plus a fact-injection probe, A3 a memorization ratio, A4 goes through the store, A7 is added,
+  L1 and L2 are scored by read ablation at fixed depth, R0b is added, and the budget is recomputed
+  at about 1.3 GFLOP per token.

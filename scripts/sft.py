@@ -78,8 +78,8 @@ from modules.runtime.hf_sync import HFSync
 from modules.runtime.status import eta_seconds, format_duration, write_status
 from config import EvidenceConfig, IRConfig, ModelConfig, RepairConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
-    USE_LOW_PRECISION, answer_start_positions, chosen_recipe, log_precision_mode, sample_n_loops,
-    save_expert_selection_graph, save_loss_graph, train_step,
+    USE_LOW_PRECISION, answer_start_positions, chosen_recipe, log_precision_mode,
+    predicting_positions, sample_n_loops, save_expert_selection_graph, save_loss_graph, train_step,
 )
 # the same ranking metric eval_abstention.py reports G3b with, imported rather than restated so the
 # validation pass and the acceptance script cannot disagree about what AUROC means here
@@ -449,7 +449,8 @@ def pull_from_hub(repo_id: str, filename: str, dest_dir: str, token: str = None)
 
 
 def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token_count,
-                        start_token_count, global_offset, losses, seed, phase=SFT_PHASE):
+                        start_token_count, global_offset, losses, seed, phase=SFT_PHASE,
+                        kill_checked=False):
     """Write an SFT checkpoint atomically.
 
     Deliberately its own function rather than an extension of ``utils.save_checkpoint``: SFT needs
@@ -473,7 +474,9 @@ def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token
         "phase": phase,
         "losses": losses,
         # SFT-only extras, ignored by utils.load_checkpoint's .get()-based reader
-        "sft": {"start_token_count": start_token_count, "seed": seed},
+        # kill_checked: the one automatic kill decision was taken, so a resume must not take it again
+        "sft": {"start_token_count": start_token_count, "seed": seed,
+                "kill_checked": kill_checked},
     }
     # write-then-rename, same reasoning as utils.save_checkpoint: a crash mid-write must not leave
     # a truncated .pt that is also the newest file by mtime, i.e. the one a resume would pick
@@ -519,6 +522,7 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
         "global_offset": checkpoint.get("global_offset", 0),
         "losses": checkpoint.get("losses", None) or [],
         "seed": sft_extra.get("seed", SFTConfig.seed),
+        "kill_checked": sft_extra.get("kill_checked", False),
     }
 
 
@@ -545,19 +549,41 @@ def load_pretrained_weights(model, path: str):
     return token_count
 
 
+def _within_buffer_auroc(share: torch.Tensor, gold: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
+    """``[P]`` AUROC of gold against distractor chunks inside each token's own visible buffer.
+
+    Pairwise over (gold, distractor) pairs of one row: 1 when the gold chunk's share is higher, 0.5
+    on a tie, 0 otherwise. A uniform selector reads exactly 0.5 here. Pooling the shares of every
+    token into one ranking instead does not: it compares shares across buffers of different sizes,
+    and a buffer of more chunks gives each a smaller share, so the pooled reading of a uniform
+    selector on the fixed split was 0.421, not 0.5.
+
+    Args:
+        share: ``[P, M]`` each chunk's share of the token's external mass.
+        gold: ``[P, M]`` bool, visible gold chunks.
+        vis: ``[P, M]`` bool, the token's visible chunks. Rows need at least one of each kind.
+    """
+    distractor = vis & ~gold
+    pairs = gold.unsqueeze(-1) & distractor.unsqueeze(-2)                # [P, M gold, M distractor]
+    diff = share.unsqueeze(-1) - share.unsqueeze(-2)
+    score = (diff > 0).float() + 0.5 * (diff == 0).float()
+    return (score * pairs).sum(dim=(-2, -1)) / pairs.sum(dim=(-2, -1)).clamp_min(1)
+
+
 def _selector_readings_by_loop(model, chunk_gold: torch.Tensor, positions: torch.Tensor,
                                condition_ids: torch.Tensor, sink: dict) -> None:
     """Append this batch's per loop selector readings at the answer start positions to ``sink``.
 
-    Two readings per loop, both at the last prompt token of each answer span (the state that has
+    Three readings per loop, all at the last prompt token of each answer span (the state that has
     seen the question and the buffer and none of the answer):
 
-    - ``mass``: the external share of the read, bucketed by condition. Scored as an AUROC of
-      buffers holding a gold chunk (``gold``, ``mixed``) against buffers of distractors only;
-      ``none`` rows are left out because their mass is zero by construction.
-    - ``chunk``: each visible chunk's share of that token's external mass against its gold flag,
-      over tokens whose buffer holds both kinds. Ranking, not magnitude: the share is renormalized
-      per token so a token that reads the store harder does not score every chunk higher.
+    - ``mass``: the external share of the read, bucketed by condition, raw.
+    - ``mass_per_chunk``: that mass over the number of visible chunks. The union softmax gives a
+      buffer of more chunks more external mass whatever it holds, and ``mixed`` rows carry more
+      chunks than ``distractors`` ones, so the gold-present against distractors-only AUROC is scored
+      on this one; ``none`` rows are left out because their mass is zero by construction.
+    - ``chunk_auroc``: per token, the within-buffer AUROC of gold against distractor shares (see
+      ``_within_buffer_auroc``), over tokens whose buffer holds both kinds. Chance is 0.5.
 
     IR experts are averaged, as ``LoopMixtureOfExperts._selector_chunk_mass`` does. Eval only: this
     moves tensors to the host.
@@ -573,6 +599,7 @@ def _selector_readings_by_loop(model, chunk_gold: torch.Tensor, positions: torch
     vis = visible[flat]                                          # [P, M]
     gold = chunk_gold.to(torch.bool).unsqueeze(0).expand_as(vis) & vis
     has_both = (gold.any(dim=-1) & (vis & ~gold).any(dim=-1))
+    n_visible = vis.sum(dim=-1).clamp_min(1)
     for loop_idx in sorted(modules[0].memory_weights_by_loop):
         weights = torch.stack([
             m.memory_weights_by_loop[loop_idx][flat].float() for m in modules
@@ -580,38 +607,47 @@ def _selector_readings_by_loop(model, chunk_gold: torch.Tensor, positions: torch
         ]).mean(dim=0)                                           # [P, M]
         weights = weights * vis
         mass = weights.sum(dim=-1)
-        entry = sink.setdefault(loop_idx, {"mass": [], "cond": [], "share": [], "gold": [],
-                                           "gold_share": []})
+        entry = sink.setdefault(loop_idx, {"mass": [], "mass_per_chunk": [], "cond": [],
+                                           "chunk_auroc": [], "gold_share": []})
         entry["mass"].append(mass.cpu())
+        entry["mass_per_chunk"].append((mass / n_visible).cpu())
         entry["cond"].append(cond.cpu())
         if has_both.any():
             share = weights[has_both] / mass[has_both].clamp_min(1e-12).unsqueeze(-1)
-            keep = vis[has_both]
-            entry["share"].append(share[keep].cpu())
-            entry["gold"].append(gold[has_both][keep].cpu())
+            entry["chunk_auroc"].append(
+                _within_buffer_auroc(share, gold[has_both], vis[has_both]).cpu()
+            )
             entry["gold_share"].append((share * gold[has_both]).sum(dim=-1).cpu())
 
 
 def _summarize_selector_readings(sink: dict) -> dict:
-    """``_selector_readings_by_loop``'s sink -> ``{loop: {mass_by_condition, mass_auroc,
-    chunk_auroc, gold_share}}``, each entry present only when its classes are."""
+    """``_selector_readings_by_loop``'s sink -> ``{loop: {mass_by_condition,
+    mass_per_chunk_by_condition, mass_auroc, chunk_auroc, gold_share}}``, each entry present only
+    when its classes are. ``chunk_auroc`` is the mean of the per token within-buffer AUROC."""
     out = {}
     for loop_idx, entry in sorted(sink.items()):
         mass = torch.cat(entry["mass"]).numpy()
+        per_chunk = torch.cat(entry["mass_per_chunk"]).numpy()
         cond = torch.cat(entry["cond"]).numpy()
-        reading = {"mass_by_condition": {
-            c: float(mass[cond == i].mean()) for i, c in enumerate(CONDITIONS) if (cond == i).any()
-        }}
+        reading = {
+            "mass_by_condition": {
+                c: float(mass[cond == i].mean()) for i, c in enumerate(CONDITIONS)
+                if (cond == i).any()
+            },
+            "mass_per_chunk_by_condition": {
+                c: float(per_chunk[cond == i].mean()) for i, c in enumerate(CONDITIONS)
+                if (cond == i).any()
+            },
+        }
         gold_rows = np.isin(cond, [CONDITIONS.index("gold"), CONDITIONS.index("mixed")])
         distract_rows = cond == CONDITIONS.index("distractors")
         if gold_rows.any() and distract_rows.any():
             rows = gold_rows | distract_rows
-            reading["mass_auroc"] = float(roc_auc(mass[rows], gold_rows[rows].astype(np.float64)))
-        if entry["share"]:
-            share = torch.cat(entry["share"]).numpy()
-            label = torch.cat(entry["gold"]).numpy()
-            if 0 < label.sum() < label.size:
-                reading["chunk_auroc"] = float(roc_auc(share, label.astype(np.float64)))
+            reading["mass_auroc"] = float(
+                roc_auc(per_chunk[rows], gold_rows[rows].astype(np.float64))
+            )
+        if entry["chunk_auroc"]:
+            reading["chunk_auroc"] = float(torch.cat(entry["chunk_auroc"]).mean())
             reading["gold_share"] = float(torch.cat(entry["gold_share"]).mean())
         out[loop_idx] = reading
     return out
@@ -642,9 +678,13 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     a second forward (see the call site below). On a split whose targets depend on the condition
     it compares an answer against a refusal; only on the fixed-target split, where every condition
     forces the real answer, is CE(none) - CE(gold) what the evidence is worth.
+    ``per_condition_ce_by_loop`` is ``{loop: {condition: CE}}`` off the same call, so its final loop
+    equals ``per_condition_ce``.
 
     When the corpus also carries the per chunk gold flag, ``selection`` is the held-out reading of
     the supervised selection term the objective adds (``LoopMixtureOfExperts.evidence_selection_term``).
+    With a groundedness head, ``grounded_auroc`` is read over every answer start and
+    ``grounded_auroc_evidence`` over those whose buffer holds at least one visible chunk.
 
     Args:
         selector_by_loop: also collect the selector's per loop readings at the answer start
@@ -663,12 +703,13 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     n_batches = 0
     cond_ce_sum = {c: 0.0 for c in CONDITIONS}
     cond_weight_sum = {c: 0.0 for c in CONDITIONS}
+    cond_ce_by_loop_sum = {}
     # plain per-batch mean: the selection loss is already a mean over a batch's supervised,
     # evidence-bearing positions, and weighting it by supervised TOKENS would weight it by answer
     # length, which has nothing to do with how many chunks were ranked
     selection_sum, selection_batches = 0.0, 0
     grounded_sum, grounded_batches = 0.0, 0
-    grounded_scores, grounded_labels = [], []
+    grounded_scores, grounded_labels, grounded_has_evidence = [], [], []
     selector_sink = {}
 
     for batch in dataset:
@@ -698,7 +739,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
             # a selector that is memorizing the training slice's chunk order separates here first
             if evidence is not None and evidence.chunk_gold is not None:
                 selection = model.moe.evidence_selection_term(
-                    evidence.chunk_gold, supervised=(labels != -100).reshape(-1)
+                    evidence.chunk_gold, supervised=predicting_positions(labels).reshape(-1)
                 )
                 if selection is not None:
                     selection_sum += selection.item()
@@ -734,6 +775,11 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                         target = gold_present & (answerable.reshape(-1)[flat] > 0)
                         grounded_scores.append(logits.float().cpu())
                         grounded_labels.append(target.cpu())
+                        # replay rows carry no buffer and are always negatives, so the all rows
+                        # AUROC is partly "is there evidence at all"; the evidence rows one is not
+                        grounded_has_evidence.append(
+                            model.moe.last_memory_visible[flat].any(dim=-1).cpu()
+                        )
             hidden = out[0]
             extra_token_outputs = out[2] if model.has_mtp else None
             _, loss_ce, metrics = compute_mtp_loss(
@@ -766,17 +812,24 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                     weight_total = float(cond_weight[:, 1:].sum().item())
                     if weight_total <= 0.0:
                         continue
-                    _, cond_ce = compute_mtp_loss(
+                    # per loop readings off the same call: with subsampling off every loop is
+                    # scored on the same tokens and weights, and the final loop's entry is the very
+                    # tensor returned as cond_ce
+                    _, cond_ce, cond_metrics = compute_mtp_loss(
                         hidden, labels,
                         lambda_mtp=TrainingConfig.lambda_mtp,
                         main_lm_head=model.lm_head,
                         pad_mask=pad_mask,
                         loop_ce_weights=TrainingConfig.loop_ce_weights,
                         loop_ce_subsample=1.0,
+                        return_metrics=True,
                         loss_weights=cond_weight,
                     )
                     cond_ce_sum[cond] += cond_ce.item() * weight_total
                     cond_weight_sum[cond] += weight_total
+                    for loop_idx, loop_ce in enumerate(cond_metrics["per_loop_ce"]):
+                        loop_sums = cond_ce_by_loop_sum.setdefault(loop_idx, {})
+                        loop_sums[cond] = loop_sums.get(cond, 0.0) + loop_ce.item() * weight_total
 
         # weight each batch by its supervised token count: rows differ a lot in how much of them
         # is prompt, so an unweighted mean over batches is not the corpus mean. Under
@@ -812,16 +865,26 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     }
     if per_condition:
         result["per_condition_ce"] = per_condition
+        result["per_condition_ce_by_loop"] = {
+            loop_idx: {cond: total / cond_weight_sum[cond] for cond, total in sums.items()}
+            for loop_idx, sums in sorted(cond_ce_by_loop_sum.items())
+        }
     if selection_batches:
         result["selection"] = selection_sum / selection_batches
     if grounded_batches:
         result["grounded"] = grounded_sum / grounded_batches
         scores = torch.cat(grounded_scores).numpy()
         labels_cat = torch.cat(grounded_labels).numpy()
+        has_evidence = torch.cat(grounded_has_evidence).numpy()
         # only defined with both classes present on the slice; a slice that happens to be all
         # grounded (or all not) gets no number rather than a misleading 0.5
         if 0 < labels_cat.sum() < labels_cat.size:
             result["grounded_auroc"] = float(roc_auc(scores, labels_cat))
+        evidence_labels = labels_cat[has_evidence]
+        if 0 < evidence_labels.sum() < evidence_labels.size:
+            result["grounded_auroc_evidence"] = float(
+                roc_auc(scores[has_evidence], evidence_labels)
+            )
     if selector_sink:
         result["selector_by_loop"] = _summarize_selector_readings(selector_sink)
     return result
@@ -952,7 +1015,7 @@ def sft(args):
     run_state_path = os.path.join(checkpoint_dir, "run_state.json")
 
     start_epoch, step_offset, start_doc_idx = 0, 0, 0
-    losses, resumed = [], False
+    losses, resumed, resumed_kill_checked = [], False, False
     start_token_count, token_count = 0, 0
 
     found = ckpt_lib.find_resume_checkpoint(
@@ -967,6 +1030,7 @@ def sft(args):
         start_token_count = state["start_token_count"]
         start_doc_idx = state["global_offset"]
         losses = state["losses"]
+        resumed_kill_checked = state["kill_checked"]
         if state["seed"] != cfg.seed:
             # the resume position indexes into a permutation generated from the seed; reading it
             # back under a different seed silently reshuffles which conversations were "already
@@ -1100,7 +1164,7 @@ def sft(args):
             unwrapped_model, optimizer, scheduler, path,
             epoch=epoch, step=step, token_count=tokens, start_token_count=start_token_count,
             global_offset=snapshot_global_offset(start_doc_idx), losses=losses,
-            seed=cfg.seed, phase=phase,
+            seed=cfg.seed, phase=phase, kill_checked=kill_checked,
         )
         ckpt_lib.write_run_state(run_state_path, phase, tokens, name)
         try:
@@ -1124,44 +1188,81 @@ def sft(args):
         ):
             hf.delete(f"{phase}/{os.path.basename(deleted)}")
 
+    def grounded_str(stats):
+        if "grounded_auroc" not in stats and "grounded_auroc_evidence" not in stats:
+            return ""
+        all_rows, evidence_rows = (
+            f"{stats[key]:.4f}" if key in stats else "n/a"
+            for key in ("grounded_auroc", "grounded_auroc_evidence")
+        )
+        return f"grounded AUROC all rows {all_rows} / evidence rows {evidence_rows}"
+
     def run_fixed_validation(epoch, step):
-        """The fixed-target pass: the real answer forced under every condition. Returns the gold
-        gain CE(none) - CE(gold) in nats, or None when it could not be read."""
+        """The fixed-target pass: the real answer forced under every condition. Returns
+        ``(gold_gain, content_gain)`` in nats: CE(none) - CE(gold), and CE(distractors) - CE(gold),
+        which is what the gold chunk's content is worth over a buffer of the same shape without it.
+        Either is None when it could not be read."""
         stats = evaluate(unwrapped_model, fixed_dataset, device, tokenizer.pad_token_id,
                          cfg.fixed_eval_max_batches, conversation_weighting=False,
                          selector_by_loop=True)
         per_condition = (stats or {}).get("per_condition_ce") or {}
         if "none" not in per_condition or "gold" not in per_condition:
             logger.warning(f"fixed-target pass read no gold/none tokens from {fixed_split}")
-            return None
+            return None, None
         # token-level mean over the answer tokens, the unit the in-context ceiling was measured in
         none_ce = per_condition["none"]
         gains = {c: none_ce - v for c, v in per_condition.items() if c != "none"}
         gold_gain = gains["gold"]
+        content_gain = (
+            per_condition["distractors"] - per_condition["gold"]
+            if "distractors" in per_condition else None
+        )
         parts = [
             f"[eval fixed] epoch {epoch} step {step} | answer CE: {{"
             + ", ".join(f"{c}: {v:.4f}" for c, v in per_condition.items()) + "}",
             "gain vs none: {" + ", ".join(f"{c}: {v:+.4f}" for c, v in gains.items()) + "}",
+            "content gain (gold minus distractors) "
+            + (f"{content_gain:+.4f}" if content_gain is not None else "n/a"),
             f"gold gain {gold_gain / EVIDENCE_CEILING_NATS:.1%} of the {EVIDENCE_CEILING_NATS:.2f}"
-            f" nat ceiling",
+            f" nat SQuAD in-context ceiling (different rows)",
         ]
-        if "grounded_auroc" in stats:
-            parts.append(f"grounded AUROC {stats['grounded_auroc']:.4f}")
+        if grounded_str(stats):
+            parts.append(grounded_str(stats))
         parts.append(f"{stats['tokens']:,} answer tokens over {stats['batches']} batches")
         logger.info(" | ".join(parts))
-        for loop_idx, reading in (stats.get("selector_by_loop") or {}).items():
-            fields = ["external mass {" + ", ".join(
-                f"{c}: {v:.3f}" for c, v in reading["mass_by_condition"].items()) + "}"]
-            for key, label in (("mass_auroc", "mass AUROC gold-present vs distractors"),
-                               ("chunk_auroc", "chunk AUROC gold vs distractor"),
+        by_loop_ce = stats.get("per_condition_ce_by_loop") or {}
+        selector = stats.get("selector_by_loop") or {}
+        for loop_idx in sorted(set(by_loop_ce) | set(selector)):
+            loop_ce = by_loop_ce.get(loop_idx)
+            if loop_ce:
+                line = (f"[eval fixed] loop {loop_idx + 1} | answer CE: {{"
+                        + ", ".join(f"{c}: {v:.4f}" for c, v in loop_ce.items()) + "}")
+                if "none" in loop_ce:
+                    line += " | gain vs none: {" + ", ".join(
+                        f"{c}: {loop_ce['none'] - v:+.4f}" for c, v in loop_ce.items()
+                        if c != "none") + "}"
+                logger.info(line)
+            reading = selector.get(loop_idx)
+            if reading is None:
+                continue
+            fields = [
+                "external mass {" + ", ".join(
+                    f"{c}: {v:.3f}" for c, v in reading["mass_by_condition"].items()) + "}",
+                "mass per chunk {" + ", ".join(
+                    f"{c}: {v:.4f}" for c, v in reading["mass_per_chunk_by_condition"].items())
+                + "}",
+            ]
+            for key, label in (("mass_auroc", "mass/chunk AUROC gold-present vs distractors"),
+                               ("chunk_auroc", "chunk AUROC (per token, chance 0.5)"),
                                ("gold_share", "gold share")):
                 if key in reading:
                     fields.append(f"{label} {reading[key]:.4f}")
             logger.info(f"[eval fixed] loop {loop_idx + 1} | " + " | ".join(fields))
-        return gold_gain
+        return gold_gain, content_gain
 
     def run_validation(epoch, step):
-        """The held-out objective pass, then the fixed-target pass. Returns the gold gain."""
+        """The held-out objective pass, then the fixed-target pass. Returns
+        ``(gold_gain, content_gain)``, both None without a fixed split."""
         stats = evaluate(unwrapped_model, val_dataset, device, tokenizer.pad_token_id,
                          cfg.eval_max_batches,
                          conversation_weighting=cfg.conversation_loss_weighting)
@@ -1171,7 +1272,7 @@ def sft(args):
             )
         else:
             log_validation(epoch, step, stats)
-        return run_fixed_validation(epoch, step) if fixed_dataset is not None else None
+        return run_fixed_validation(epoch, step) if fixed_dataset is not None else (None, None)
 
     def log_validation(epoch, step, stats):
         per_condition = stats.get("per_condition_ce")
@@ -1186,8 +1287,8 @@ def sft(args):
         )
         if "grounded" in stats:
             sel_str += f" | grounded: {stats['grounded']:.4f}"
-            if "grounded_auroc" in stats:
-                sel_str += f" (AUROC {stats['grounded_auroc']:.4f})"
+            if grounded_str(stats):
+                sel_str += f" ({grounded_str(stats)})"
         logger.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
             f"p_max: {stats['p_max']:.4f} | top1_acc: {stats['top1_acc']:.4f} | "
@@ -1215,7 +1316,7 @@ def sft(args):
     step, epoch = step_offset, start_epoch
     stop_training, exit_code = False, EXIT_OK
     kill_tokens = getattr(cfg, "kill_tokens", 0) if fixed_dataset is not None else 0
-    kill_checked = False
+    kill_checked = resumed_kill_checked
     # the selector's own tensors only: the IR experts' down_proj shares its name with every decoder
     # and MLP expert projection
     ir_prefixes = tuple(
@@ -1490,28 +1591,36 @@ def sft(args):
                 )
 
                 if sft_tokens >= next_eval:
-                    gold_gain = run_validation(epoch, step)
+                    gold_gain, content_gain = run_validation(epoch, step)
                     next_eval = sft_tokens + cfg.eval_every_tokens
                     if kill_tokens and not kill_checked and sft_tokens >= kill_tokens:
-                        # one decision point, not a running threshold: a run that clears it keeps
-                        # going and is judged on the pass bar from then on
-                        kill_checked = True
                         min_gain = cfg.kill_min_gain
-                        if gold_gain is not None and gold_gain < min_gain:
-                            logger.warning(
-                                f"KILL: fixed-target gold gain {gold_gain:+.4f} nats is under "
-                                f"{min_gain} at {sft_tokens / 1e6:.2f}M {phase} tokens. Saving and "
-                                f"stopping (exit {EXIT_USER_STOP}, not restarted by a wrapper)."
+                        if gold_gain is None or content_gain is None:
+                            # left armed: a pass that read nothing is not a decision
+                            logger.info(
+                                "kill check skipped: the fixed-target pass read no gold, none or "
+                                "distractors tokens; it runs again at the next eval"
                             )
-                            save_and_sync(epoch, step, val_loss, token_count)
-                            exit_code = EXIT_USER_STOP
-                            stop_training = True
-                            break
-                        logger.info(
-                            f"kill check passed at {sft_tokens / 1e6:.2f}M {phase} tokens: gold "
-                            f"gain {gold_gain:+.4f} nats >= {min_gain}" if gold_gain is not None
-                            else "kill check skipped: the fixed-target pass read nothing"
-                        )
+                        else:
+                            # one decision point, not a running threshold: a run that clears it
+                            # keeps going and is judged on the pass bar from then on
+                            kill_checked = True
+                            readings = (f"gold gain {gold_gain:+.4f} nats, content gain "
+                                        f"{content_gain:+.4f} nats")
+                            if gold_gain < min_gain or content_gain < min_gain:
+                                logger.warning(
+                                    f"KILL: fixed-target {readings}; one is under {min_gain} at "
+                                    f"{sft_tokens / 1e6:.2f}M {phase} tokens. Saving and stopping "
+                                    f"(exit {EXIT_USER_STOP}, not restarted by a wrapper)."
+                                )
+                                save_and_sync(epoch, step, val_loss, token_count)
+                                exit_code = EXIT_USER_STOP
+                                stop_training = True
+                                break
+                            logger.info(
+                                f"kill check passed at {sft_tokens / 1e6:.2f}M {phase} tokens: "
+                                f"{readings}, both >= {min_gain}"
+                            )
 
                 # polled at the log cadence: a stat every few seconds, no GPU sync, and well
                 # inside vast's SIGTERM grace period

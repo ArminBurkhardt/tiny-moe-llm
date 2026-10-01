@@ -452,10 +452,23 @@ python scripts/eval_benchmarks.py -c ckpts/evidence/checkpoint_evidence_final.pt
   `|inject|rms`, `|shared_evidence.o_proj|rms` (`--evidence`) are the zero-init tensors; one that
   has stopped climbing by the first checkpoint is the answer, and the remaining hour only buys a
   control at matched tokens — worth having sometimes, worth saying out loud either way.
-- **The `--evidence` early kill is the per-condition `[eval]` line**: kill at 10M tokens if
-  `gold` minus `none` CE is under ~0.1 nats. Also watch `external mass: {gold: …, none: …}`
-  (gold/mixed should rise above distractors/none) and the packing line's `fill` (below ~75%, the
-  evidence cap is closing rows early — see `max_evidence_tokens` in `config.yaml`).
+- **The `--evidence` early kill is the fixed-target `[eval fixed]` line**, over `evidence_fixed`
+  with the real answer as the target under every condition; gain = CE(none) - CE(cond), positive
+  means the evidence helped. At the first fixed-target eval past `kill_tokens` (10M) the run saves
+  and exits 10 if the gold gain or the content gain (gold minus distractors) is under
+  `kill_min_gain` (0.1 nats). The check is armed again when the fixed pass read nothing, and
+  `kill_checked` is persisted in the checkpoint, so a resumed run does not decide twice. The
+  per-condition `[eval]` line uses each row's own target (an answer under `gold`, a refusal under
+  `none`) and is a train-distribution health line, not the kill. Also watch the per-loop
+  `[eval fixed] loop k` reader gain and selector lines (chunk AUROC per token, chance 0.5) and the
+  packing line's `fill` (below ~75%, the evidence cap is closing rows early; see
+  `max_evidence_tokens` in `config.yaml`).
+- **Stopping and relaunching an evidence arm.** `touch ckpts/evidence/STOP` (or
+  `ckpts/evidence_<run-name>/STOP` under `--run-name`), polled every 10 micro steps: the run saves
+  and exits 10. A glob such as `ckpts/evidence*/STOP` creates nothing. Relaunch with the same `-c`
+  and the same flags; without `-c` the yaml builds a model without the port and the strict load
+  fails. Add `eval fixed|KILL|kill check|device not ready` to the watch filter and tee the watched
+  output to a gitignored log.
 - **Throughput is the first thing to read.** 4 × 4096 stays resident on the 5090 (~21–27GB peak);
   8 × 4096 spills into shared system memory at a ~3–4x throughput cost and does not OOM. Do not
   wait out a slow run; fix the batch.

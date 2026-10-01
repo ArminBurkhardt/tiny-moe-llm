@@ -52,3 +52,16 @@ reset it: it keeps the migrated values at the trunk's rate. A fresh `loop_scale`
 question, which R4 already tests. Loop 3's weakness on the grafted lineage is
 a property of what that loop learned, which is one more reason the loop test belongs to the
 from-scratch pilot and not to a graft.
+
+## Depth past the trained 3 (`ir_c`, x1, 2026-09-30)
+
+Same slice and checkpoint, `--max-loops 8`, no evidence attached, `loop_scale` unscaled (loops past
+3 reuse `loop_scale[2]` and see loop codes never trained). Source `ckpts/ir_c/stage0_depth8.log`
+(gitignored).
+
+| depth | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| CE | 3.4112 | 3.4115 | 3.4213 | 3.4384 | 3.4618 | 3.4900 |
+
+Depth past 3 degrades monotonically on plain text, by 0.079 nats at depth 8. It says nothing about
+depth with evidence attached or about a model trained with a depth schedule.

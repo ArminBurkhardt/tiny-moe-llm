@@ -20,18 +20,37 @@ findings are `docs/review_2026-09-29.md`.
   13,333 questions x gold/mixed/distractors/none, real answer every time (the kill number).
   `evidence_val` is a train-loss slice for QA.
 - Seed: `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`. Step-0 readings:
-  fixed-target gold gain -0.0020 (noise), chunk AUROC 0.43 / 0.42 / 0.42 by loop, gold share
-  0.334 (uniform). `g_proj` and `direct_gate` both exactly 0: the IR value path is dead for this
-  run, the selector trains from the selection loss alone.
+  fixed-target gold gain -0.0020 (noise), pooled chunk AUROC 0.43 / 0.41 / 0.42 by loop (the old
+  metric, uniform-selector chance 0.421: the selector is uniform, gold share 0.334), grounded
+  AUROC 0.5000 (zero head). Per-token chunk AUROC (chance 0.5) 0.515 / 0.484 / 0.490 by loop,
+  mass/chunk AUROC 0.481 / 0.470 / 0.469, content gain -0.0009, per-loop reader gain about
+  -0.002 at every loop (smoke2, 2026-09-30). `g_proj` and `direct_gate` both exactly 0: the IR
+  value path is dead for this run, the selector trains from the selection loss alone.
+  `evidence_fixed` ratio 6.25.
 - **R0 failed** ([loop_scale_probe.md](docs/measurements/loop_scale_probe.md)): any `loop_scale`
   multiplier makes loop 3 worse; `loop_scale` stays at the trunk's rate in graft arms.
-- **Next:** arm A `python scripts/sft.py --evidence -c <seed>`, then arm B with
-  `--reader-no-rotary --run-name norope`, each under a Monitor watch, 10M tokens (stop by hand with
-  STOP unless the automatic kill fires: gold gain under 0.1 nats at the first eval past 10M saves
-  and exits 10). Read the `[eval fixed]` gain and the per-loop chunk AUROC. Pass at 50% of the
-  3.23-nat ceiling. A mechanism check of the reader; it decides nothing about where facts live.
-- `ckpts/instrsmoke.log` is the memory and throughput reference for this config (batch 2 x 4096,
-  cap 14336, peak 26.4 GB, 8.6-14.8k tok/s).
+- **Next, in order:**
+  1. Arm A `python scripts/sft.py --evidence -c <seed>`, then arm B with
+     `--reader-no-rotary --run-name norope -c <seed>`, each in the background under a Monitor
+     watch teed to a gitignored log, 10M tokens. Readings: step-0 baseline plus four at
+     2.5 / 5 / 7.5 / 10M, the fourth decides. Automatic kill at the first `[eval fixed]` past 10M
+     (save, exit 10) if gold gain or content gain (gold minus distractors) is under 0.1 nats;
+     otherwise `touch ckpts/evidence/STOP` (arm A) or `touch ckpts/evidence_norope/STOP` (arm B)
+     after the 10M reading. Pass: gold gain at least 1.6 nats (50% of 3.23), distractors gain at
+     least 0. A mechanism check of the reader; it decides nothing about where facts live.
+  2. R0b, the externalization micro-pilot: about 30M params, 0.3B tokens per arm, arms (a) full
+     CE no retrieval, (b) span weights no retrieval, (c) span weights + swaps + anonymization
+     with the store; fictional biographies at 1 / 10 / 100 / 1000 exposures; closed-book rank
+     among 100 candidates by exposure. Needs the biography generator and the closed-book rank
+     scorer from Phase 4b first. If (b) or (c) climb with exposure like (a), the recipe fails
+     before any 1B-token spend.
+  3. Phase 4b instruments (closed-book rank scorer, A3 / A4 / A7, read-ablation chain eval, R1b,
+     the ceiling on `evidence_fixed`), then the pilot (Phase 5).
+- Relaunch a killed or stopped arm with the same `-c` and flags (without `-c` the strict load
+  fails; `kill_checked` is persisted). `ckpts/instrsmoke.log` is the memory and throughput
+  reference (batch 2 x 4096, cap 14336, 26.36 GB peak allocated over 110 micro steps, 6.0k to
+  14.8k tok/s, about 10k typical, about 42k real prompt tokens per optimizer step at 64% fill);
+  `ckpts/evidence_smoke2.log` (2026-09-30) reproduces it on HEAD with the new eval lines.
   `ckpts/evidence/` does not exist, so the first `--evidence` launch honours `-c`; later ones resume.
 
 ## Ending a turn
@@ -56,7 +75,12 @@ findings are `docs/review_2026-09-29.md`.
   rented box (`TINY_LLM_ENV_INIT=/dev/null`).
 - **Every training launch (`sft.py`, `pretrain.py`, `run_training.py`) runs in the background
   under a Monitor watch**, however short. The filter matches failures and progress:
-  `Traceback|Error|Killed|OOM|assert` plus `Step` / `Tokens/sec`.
+  `Traceback|Error|Killed|OOM|assert|device not ready` plus `Step` / `Tokens/sec`, and for
+  `--evidence` also `eval fixed|KILL|kill check`. Tee the watched output to a gitignored `*.log`
+  so the eval blocks survive a crash.
+- STOP files are per run directory: `ckpts/evidence/STOP`, `ckpts/evidence_<run-name>/STOP`
+  (polled every 10 micro steps, save, exit 10). A glob such as `ckpts/evidence*/STOP` creates
+  nothing.
 - A device-side assert prints nothing: process in `R`, GPU ~1%, progress line goes quiet.
   Reproduce one micro step outside the trainer.
 - Kill a run as soon as its own instrumentation says it cannot pass. Zero-init tensors are logged
@@ -120,7 +144,8 @@ History: 16B tokens of pretraining on a rented H100 ([CONCLUSION.md](docs/CONCLU
 local finetunes (SFT, abstention repair, three IR sharpening arms, loop injection) and the Phase 4
 build. **The benchmark suite is the quality instrument**, diffed against
 [benchmark_snapshot.md](docs/measurements/benchmark_snapshot.md); local-slice CE is a health check.
-~5k H100-hours are expected for the real run. Pre-Phase-4 review:
+~2.5k H100-hours planned for shape L, 5k ceiling (estimates until the constructor prints them;
+the run spec fixes a token target and derives hours). Pre-Phase-4 review:
 [review_2026-09-18.md](docs/review_2026-09-18.md).
 
 **Binding verdicts** (each measured, each recorded):
@@ -132,8 +157,9 @@ build. **The benchmark suite is the quality instrument**, diffed against
   pretrains with retrieval from token 0.
 - `p_max` carries no answerability signal; a linear trunk probe reads 0.584 everywhere.
   Abstention precision is pinned at ~0.578 by the data lever.
-- Loops buy computation, not storage. Looping is a requirement; a weak later loop is a defect to
-  fix, never a reason to cut depth.
+- Looping is a requirement; a weak later loop is a defect to fix, never a reason to cut depth.
+  "Loops buy computation, not storage" is an axiom, not a measurement (NEXT.md Decisions, with its
+  L1 falsifier).
 
 ## Layout
 
@@ -165,6 +191,7 @@ Gitignored: `ckpts/`, `data/datasets/`, `data/prepared*`, `data/benchmarks`, `*.
 ```bash
 python scripts/run_training.py                     # the real run; or pretrain.py --phase phase1
 python scripts/prepare_evidence_data.py --target-tokens 150000000 --max-evidence-tokens 4608 --max-source-epochs 4
+python scripts/prepare_evidence_data.py --heldout   # evidence_dev + evidence_fixed from SQuAD v2 dev / HotpotQA dev
 python scripts/prepare_data.py --phases ir --ir-tokens 210000000 --val-tokens 2000000 --manifest-key ir_prep
 python scripts/archive_corpus.py pack --all | list
 python scripts/sft.py [--from-hub | --repair | --ir | --evidence] -c CKPT
@@ -175,6 +202,7 @@ python scripts/eval_benchmarks.py -c CKPT --compare docs/measurements/benchmarks
 python scripts/eval_benchmarks.py --peer pythia-410m --validate --json-out docs/measurements/benchmarks/pythia-410m.json
 python scripts/eval_calibration.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4
 python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4 --max-loops 6
+python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4 --max-loops 4 --loop-scale-mult F [--loop-scale-loops 3]
 python scripts/eval_probe.py -c CKPT --json-out docs/measurements/probe_CKPT.json
 python scripts/evidence_ceiling_probe.py -c CKPT
 python scripts/inference.py -c CKPT -p PROMPT -n 200 [--evidence chunks.json] [--converge-tol T]
@@ -203,9 +231,13 @@ Tables in [configuration.md](docs/configuration.md).
   (64: a conversation weighs `min(n_supervised/64, 1)`, so a 5-token SQuAD answer counts ~0.08;
   read token, conversation and weighted shares separately), and `max_evidence_tokens`. Also
   `fixed_split` + `fixed_eval_max_batches` (the `[eval fixed]` pass: token-level answer CE per
-  condition, gain = CE(none) - CE(cond), per-loop selector readings), `kill_tokens` /
-  `kill_min_gain` (one automatic decision, exit 10), `freeze_evidence_gate` (requires_grad off:
-  the gate is non-causal and breaks cached decode once its scale leaves 0).
+  condition, gain = CE(none) - CE(cond), content gain = gold minus distractors, per-loop reader
+  gain from the same forward, per-loop selector lines with chunk AUROC per token, chance 0.5),
+  `kill_tokens` / `kill_min_gain` (one automatic decision at the first fixed eval past
+  `kill_tokens`: save and exit 10 if gold gain or content gain is under the bar; re-armed when the
+  fixed pass read nothing; `kill_checked` persisted in the checkpoint), `checkpoint_every_tokens`
+  10M (a save at the decision), `freeze_evidence_gate` (requires_grad off: the gate is non-causal
+  and breaks cached decode once its scale leaves 0).
 - **`max_evidence_tokens` pulls two ways.** Under `ratio * seq_length` rows close early on the
   evidence budget and the empty prompt slots are padding the body still pays ~502M FLOP/token for;
   over it, 0.61 MiB per evidence token times the batch overflows the card. The ratio is a corpus
@@ -253,7 +285,8 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
 - Routing is loop-conditioned by a zero-init `loop_router_bias` over a **sinusoidal buffer** of
   the absolute loop index (any depth runs without reshaping). The same `loop_enc` feeds
   `ir_module.loop_query_bias` and `moe.evidence_query_bias`.
-- `loop_inject` (zero-init 768 x 768, inferred) measured useless; kept loadable.
+- `loop_inject` (zero-init 768 x 768, inferred) measured useless as a graft; kept loadable. The
+  from-scratch design reuses it for gradient flow through the detached depth prefix.
 - **Convergence exit** (`forward(..., converge_tol=, min_loops=)`) reads the last position's
   readout, not `||dh||`. Asserted inference-only and exclusive with `kv_cache`.
 - `ParallelSparseMoELayer` runs under `te.autocast(enabled=False)` (NVFP4 needs rows % 16);
@@ -311,7 +344,9 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   has `.evgold`/`.cond` (warned once otherwise). `chunk_segments` comes from packing, never
   re-derived.
 - `evidence_selection_loss`: BCE per visible chunk vs gold, renormalized over the token's visible
-  chunks, averaged over every (loop, IR expert), weight 0.1. **Asserts gradient checkpointing off**
+  chunks, averaged over every (loop, IR expert), weight 0.1. Supervised at the positions that
+  produce a supervised token (`labels[:, 1:] != -100` shifted to `:-1`), the positions
+  `answer_start_positions` and the readouts use. **Asserts gradient checkpointing off**
   (it reads stashed tensors a recompute would produce under `no_grad`). Logged `selection:`.
 - `GroundednessHead` + `groundedness_loss`: label "gold present AND answerable" from the corpus
   (`.ans`, not the condition; never the model's argmax). Reads `moe.last_reader_output` at
@@ -415,8 +450,9 @@ prompt. `--target-tokens` counts prompt tokens.
   state and must be migrated.
 - Every parameter gets an fp32 master (bf16 ulp is ~3x the AdamW step at 3e-5); masters are
   reseeded on resume.
+- The SFT cosine floors at `lr_min_factor: 0.05` of lr (pretrain floors at 0.1).
 - `fresh_lr` group: `--ir` = `is_rebuilt_ir_param or is_fresh_loop_param`; `--evidence` =
-  `is_fresh_loop_param` alone (the sharpened table would be wrecked at 3e-4).
+  `is_fresh_loop_param` alone (the IR table trains at the trunk's rate by choice).
 - Per-conversation loss weighting is off for `SFTConfig`, on for repair and evidence.
   `p_max`/`top1_acc` stay unweighted. The global token counter continues.
 - Chat control tokens are resolved from the tokenizer and asserted. Only assistant text + EOS is
@@ -441,3 +477,5 @@ prompt. `--target-tokens` counts prompt tokens.
 - The append-only evidence buffer and the "evidence still arriving" depth criterion are unbuilt.
 - `eval_benchmarks.py` / `eval_calibration.py` / `eval_stage0.py` cannot attach evidence.
 - Token counts can be inflated by tens of tokens per batch.
+- `evidence_from_batch` flattens with boolean mask indexing in the per-step path: one host sync
+  per micro step, accepted for the 10M evidence run.

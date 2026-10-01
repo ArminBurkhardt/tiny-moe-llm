@@ -386,8 +386,10 @@ class EvidenceConfig(SFTConfig):
     # and reads about -3.25 nats on a checkpoint whose reader is dead. Empty disables the pass.
     fixed_split = str(_Block.get("fixed_split", "evidence_fixed"))
     fixed_eval_max_batches = int(_Block.get("fixed_eval_max_batches", 100))
-    # stop the run at the first fixed-target eval at or past `kill_tokens` whose gold gain is under
-    # `kill_min_gain` nats. 0 disables the automatic stop; the gain is printed either way.
+    # stop the run at the first fixed-target eval at or past `kill_tokens` where either the gold
+    # gain (CE(none) - CE(gold)) or the content gain (CE(distractors) - CE(gold)) is under
+    # `kill_min_gain` nats. Taken once; an eval that read nothing leaves it armed. 0 disables the
+    # automatic stop; both gains are printed either way.
     kill_tokens = int(_Block.get("kill_tokens", 10_000_000))
     kill_min_gain = float(_Block.get("kill_min_gain", 0.1))
     # the reader's per chunk gate reads a document-mean of the selector's mass, which includes the
@@ -405,7 +407,7 @@ class EvidenceConfig(SFTConfig):
     warmup_fraction = float(_Block.get("warmup_fraction", SFTConfig.warmup_fraction))
     lr_min_factor = float(_Block.get("lr_min_factor", SFTConfig.lr_min_factor))
     seed = int(_Block.get("seed", SFTConfig.seed))
-    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 25_000_000))
+    checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 10_000_000))
     keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
     eval_every_tokens = int(_Block.get("eval_every_tokens", 2_500_000))
     eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))

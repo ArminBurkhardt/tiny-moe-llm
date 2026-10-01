@@ -249,29 +249,31 @@ ir: # The IR table's sharpening finetune, `python scripts/sft.py --ir`. Read by 
   hf_upload_repo: "" # local run
 evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence`. Read by
           # config.py's EvidenceConfig, a third SUBCLASS of SFTConfig -- same trainer, same
-          # objective, a corpus that carries a second token stream per row. Seeded from the IR
-          # sharpening run's final checkpoint, migrated to carry the port.
+          # objective, a corpus that carries a second token stream per row. Seeded from the repair
+          # checkpoint with a randomly reshaped IR table (migrate_ir_reshape --arm random, never
+          # sharpened), migrated to carry the port and the groundedness head.
           # Runs LOCALLY on the 5090 in BF16 (do not set USE_FP8).
   train_split: "evidence_train" # from `python scripts/prepare_evidence_data.py`
   val_split: "evidence_dev" # from `prepare_evidence_data.py --heldout`: SQuAD v2 dev + HotpotQA dev,
                             # disjoint from train. `evidence_val` is NOT held out for QA (every QA
                             # question in it is also in train); read it as a train-loss slice
   fixed_split: "evidence_fixed" # same builder run: each answerable dev question under gold, mixed,
-                                # distractors and none with the real answer as the target. The kill
-                                # number, CE(none) - CE(gold), is read here; "" disables the pass
+                                # distractors and none with the real answer as the target. Both kill
+                                # numbers (gold gain, content gain) are read here; "" disables the pass
   fixed_eval_max_batches: 100 # ~2k questions x 4 conditions, question-major so any prefix is paired
-  kill_tokens: 10000000 # stop at the first fixed-target eval past this if the gold gain is below
-  kill_min_gain: 0.1    # this many nats; kill_tokens 0 disables the stop
+  kill_tokens: 10000000 # stop at the first fixed-target eval past this if the gold gain (none minus
+  kill_min_gain: 0.1    # gold) or the content gain (distractors minus gold) is below this many
+                        # nats. Taken once, retried at the next eval if the pass read nothing;
+                        # kill_tokens 0 disables the stop
   freeze_evidence_gate: true # the chunk gate reads a document-mean of the selector mass, future
                              # tokens included; frozen at zero it is exactly 1.0 (ungated reader)
   lr: 1.0e-5 # the trunk's rate. It carries 16B tokens plus three finetunes and this pass is not
              # meant to move it -- the benchmark suite is the gate on whether it did
-  fresh_lr: 3.0e-4 # the evidence reader and the selector's two adapters plus its source scale.
-                   # Never trained, so at the trunk's rate they would sit at their init for the
-                   # whole run and the run would measure nothing. Deliberately does NOT cover the
-                   # IR key/value table, which carries a full sharpening run -- scripts/sft.py passes
-                   # a different fresh predicate for this profile than for `ir:` below for that
-                   # reason, so the table trains at `lr` above instead
+  fresh_lr: 3.0e-4 # whatever moe.is_fresh_loop_param names (the port and loop tensors). Never
+                   # trained, so at the trunk's rate they would sit at their init for the whole run
+                   # and the run would measure nothing. The IR key/value table trains at `lr`
+                   # above by choice: scripts/sft.py passes this profile a different fresh predicate
+                   # than `ir:` below
   num_epochs: 1 # one pass. The abstention targets come from a closed phrasing set and a second
                 # pass starts memorizing the strings instead of the policy
   batch_size: 2 # NOT 4. Peak memory on this profile is set by the evidence axis, not the prompt
@@ -298,7 +300,7 @@ evidence: # The evidence-conditioned finetune, `python scripts/sft.py --evidence
                              # QA conversations (short prompts, 6-7.6x evidence) closes on
                              # evidence while its token budget is still half empty. The earlier
                              # 12288 was 3x against a ratio-2.93 corpus and leaves this one at 55%
-  checkpoint_every_tokens: 25000000
+  checkpoint_every_tokens: 10000000 # puts a save at the 10M decision; the run has none there otherwise
   eval_every_tokens: 2500000 # plus one eval before step 1, so a 10M-token decision has a baseline
                              # and four readings instead of one reading on the decision itself
   conversation_loss_weighting: true # this is a policy change, and unweighted CE makes a six token
