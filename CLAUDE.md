@@ -8,11 +8,21 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 
 ## Now (keep current)
 
-Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-09-30
-the evidence port (Phase 4) is built, its instruments fixed, R0 read, and it has not trained. The
-plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
-pathway, reasoning in the looped trunk"; the design is `docs/evidence_path_design.html`, the
-findings are `docs/review_2026-09-29.md`.
+Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-01
+the Phase 4 arms have run and both were killed by the rule; the Phase 4b instruments and the R0b
+micro-pilot tooling are built and tested but have not run on data. The plan was rewritten on
+2026-09-30 around the goal "facts in the store through the retrieval pathway, reasoning in the
+looped trunk"; the design is `docs/evidence_path_design.html`, the findings are
+`docs/review_2026-09-29.md`.
+
+- **Arms A and B killed at 10.08M tokens** ([evidence_arm_a.md](docs/measurements/evidence_arm_a.md),
+  [evidence_arm_b.md](docs/measurements/evidence_arm_b.md)): gold gain +0.545 / +0.571, content
+  gain +0.058 / +0.081 (bar 0.1 to survive, 1.6 to pass). About 0.49 nats of the gold gain is
+  "a buffer is attached" (distractors gain +0.49), the abstain-versus-answer prior, not content.
+  The selector learned (per-token chunk AUROC 0.515 to 0.650 at loop 1, over the 0.59 bar at every
+  loop from 7.5M); mass/chunk AUROC 0.57 (bar 0.674). No rotary is the better reader (+40% content
+  gain) but not the block. Per the plan the first pilot reader arm is a reader per loop or dense
+  prelude reads. Checkpoints `ckpts/evidence/` and `ckpts/evidence_norope/` (10M, `kill_checked`).
 
 - Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
   3.75. Held out (`prepare_evidence_data.py --heldout`, SQuAD v2 dev + HotpotQA dev):
@@ -29,29 +39,48 @@ findings are `docs/review_2026-09-29.md`.
   `evidence_fixed` ratio 6.25.
 - **R0 failed** ([loop_scale_probe.md](docs/measurements/loop_scale_probe.md)): any `loop_scale`
   multiplier makes loop 3 worse; `loop_scale` stays at the trunk's rate in graft arms.
+- **Built 2026-10-01, untested on real data** (every GPU-free and GPU test passes): the fact
+  injection micro-pilot tooling (`modules/data/biographies.py`, `prepare_injection_data.py`,
+  `init_scratch_seed.py`, `closed_book_rank.py`, `config_micro.yaml` via `TINY_LLM_CONFIG`: 35M
+  total, 12M non-embedding); the chain generator and read-ablation eval (`chains.py`,
+  `prepare_chain_data.py`, `eval_chains.py`, forward kwarg `reader_sites_kept`); the source
+  sidecar `.src` with a byte-checked backfill, per-source `[eval fixed]` lines, `--ceiling-json`,
+  the `counterfactual` condition with per-record JSON in `eval_abstention.py --evidence-port`,
+  `evidence_ceiling_probe.py --fixed-split`; the store format `data/index/<name>/`,
+  `build_store.py`, `eval_store.py` (recall, pathway, edit) and the PopQA `rank` task. Runbooks in
+  the Commands block. `sft.py` takes `--data-dir/--train-split/--val-split` (relaunch with them).
+- **The graft branch is closed.** All seven failed gates (G1, G2, G2b, G2c, R0, arms A and B)
+  measured a zero-init pathway grafted onto the converged checkpoint at 10M tokens or less; RETRO
+  fitting needed about 12B. Every GPU hour from here goes to the from-scratch branch.
 - **Next, in order:**
-  1. Arm A `python scripts/sft.py --evidence -c <seed>`, then arm B with
-     `--reader-no-rotary --run-name norope -c <seed>`, each in the background under a Monitor
-     watch teed to a gitignored log, 10M tokens. Readings: step-0 baseline plus four at
-     2.5 / 5 / 7.5 / 10M, the fourth decides. Automatic kill at the first `[eval fixed]` past 10M
-     (save, exit 10) if gold gain or content gain (gold minus distractors) is under 0.1 nats;
-     otherwise `touch ckpts/evidence/STOP` (arm A) or `touch ckpts/evidence_norope/STOP` (arm B)
-     after the 10M reading. Pass: gold gain at least 1.6 nats (50% of 3.23), distractors gain at
-     least 0. A mechanism check of the reader; it decides nothing about where facts live.
-  2. R0b, the externalization micro-pilot: about 30M params, 0.3B tokens per arm, arms (a) full
-     CE no retrieval, (b) span weights no retrieval, (c) span weights + swaps + anonymization
-     with the store; fictional biographies at 1 / 10 / 100 / 1000 exposures; closed-book rank
-     among 100 candidates by exposure. Needs the biography generator and the closed-book rank
-     scorer from Phase 4b first. If (b) or (c) climb with exposure like (a), the recipe fails
-     before any 1B-token spend.
-  3. Phase 4b instruments (closed-book rank scorer, A3 / A4 / A7, read-ablation chain eval, R1b,
-     the ceiling on `evidence_fixed`), then the pilot (Phase 5).
+  1. Cheap seed-side instruments, about one GPU hour: the in-context ceiling on `evidence_fixed`
+     (`--ceiling-json` for every later arm), the `.src` backfill (CPU), the counterfactual eval
+     and PopQA on the seed and both 10M checkpoints. Store build, edit store and chain eval
+     splits are CPU work that runs while step 2 trains; `eval_store.py` and `eval_chains.py`
+     readings on the 10M checkpoints after it (R2 reads "not readable" without chain training).
+  2. R0b arm (a) alone first: build `data/prepared_inject` (0.3B tokens, three arms, about 20
+     minutes), the scratch seed, then `inject_full` under `TINY_LLM_CONFIG=config_micro.yaml`
+     with `sft.py --evidence`, in the background under a Monitor watch teed to a gitignored log.
+     It decides whether the instrument is readable: if (a) does not climb above its prior
+     control at tier 1000, fix the generator, not the recipe. One to two hours.
+  3. A 20M-token smoke of arm (c) (`inject_retrieval`, STOP by hand, resume later with the same
+     flags): `closed_book_rank.py bios --evidence gold` on the save must land near rank 0. If it
+     is near 0.5 the from-scratch reader does not read and the fix is the reader at micro scale
+     (a reader per loop or dense prelude reads) before any pilot spend.
+  4. Arms (b) and (c) in full, then `compare full masked retrieval` (one verdict per probe form).
+     Chance is not 0.5: corpus value frequency is exposure-weighted, so every closed-book item
+     has a paired fresh-name prior control and the reading is `delta = norm_rank_prior -
+     norm_rank` with a paired bootstrap sigma, on entity attributes. Pass: (b) and (c) within 3
+     sigma of delta 0 through tier 100 while (a) is 3 sigma above. (b) climbs: raise the
+     anonymization rate (`--suffix s15a90`); only (c) climbs: raise the swap rate (`s30a50`); one
+     sweep arm per leak. About a day of 5090 time for the rung.
+  5. The pilot (Phase 5) with the reader settled in step 3, no rotary, after R0b passes; cut the
+     ladder (R4 is 8 x 1B tokens, four to six 5090 days) to the budget before launching it.
 - Relaunch a killed or stopped arm with the same `-c` and flags (without `-c` the strict load
   fails; `kill_checked` is persisted). `ckpts/instrsmoke.log` is the memory and throughput
   reference (batch 2 x 4096, cap 14336, 26.36 GB peak allocated over 110 micro steps, 6.0k to
   14.8k tok/s, about 10k typical, about 42k real prompt tokens per optimizer step at 64% fill);
-  `ckpts/evidence_smoke2.log` (2026-09-30) reproduces it on HEAD with the new eval lines.
-  `ckpts/evidence/` does not exist, so the first `--evidence` launch honours `-c`; later ones resume.
+  `ckpts/evidence_armA.log` and `ckpts/evidence_armB.log` (2026-10-01) are the full 10M runs.
 
 ## Ending a turn
 
@@ -173,13 +202,21 @@ scripts/
   sft.py              post-training: default / --repair / --ir / --evidence -> ckpts/{sft,repair,ir,evidence}
   prepare_data.py     pretrain mix (rented box); `--phases ir` builds the IR corpus locally, NEVER omit --manifest-key
   prepare_sft_data.py, prepare_evidence_data.py, archive_corpus.py  (the builders delete shards as they go)
+  prepare_injection_data.py  fictional biographies at 1/10/100/1000 exposures, arms full/masked/retrieval -> data/prepared_inject
+  prepare_chain_data.py      synthetic k-hop chains with .evhop and .chains.jsonl sidecars -> data/prepared/chains_*
+  build_store.py      retrieval stores (NQ, TriviaQA, HotpotQA) and edit stores -> data/index/<name>/
+  init_scratch_seed.py       random-init seed for a from-scratch sft.py run (TINY_LLM_CONFIG picks the shape)
   migrate_*.py        phase0, ir_reshape (--arm random|warm), loop_inject, evidence_port, groundedness_head
-  eval_abstention.py  THE acceptance metric (SQuAD v2); --evidence-port scores gold/none/distractors/mixed
-  eval_benchmarks.py  fixed 13-task suite, one scoring path for this model and the peers
-  eval_calibration.py eval_probe.py eval_stage0.py evidence_ceiling_probe.py
+  eval_abstention.py  THE acceptance metric (SQuAD v2); --evidence-port scores gold/none/distractors/mixed/counterfactual
+  eval_benchmarks.py  fixed 13-task suite, one scoring path for this model and the peers; popqa is a rank task outside `all`
+  closed_book_rank.py likelihood rank of the gold among same-type candidates (bios: by exposure tier; compare: paired)
+  eval_chains.py      accuracy by hops and by kept read sites (reader_sites_kept) at fixed depth
+  eval_store.py       store recall of the model's query vs bge, open-book pathway EM vs oracle, store-edit flip rate
+  entity_frequency.py exact token-sequence counts in a .bin (the counterfactual strata)
+  eval_calibration.py eval_probe.py eval_stage0.py evidence_ceiling_probe.py (--fixed-split: ceiling on evidence_fixed)
   inference.py gradio_app.py prune_vocab.py fetch_tokenizer.py setup.sh onstart.sh run_sft_after_pretrain.sh
 modules/model/        transformer gemma4 moe router experts information_retrieval evidence mtp attention kv_cache
-modules/data/         dataset (pretrain) sft_dataset evidence_dataset chat abstention
+modules/data/         dataset (pretrain) sft_dataset evidence_dataset chat abstention biographies chains entity_swap store
 modules/runtime/      run lifecycle; MUST NOT import torch.nn / TE / modules.model (its tests are GPU-free)
 tests/                tracked plain assert scripts
 ```
@@ -205,13 +242,33 @@ python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch
 python scripts/eval_stage0.py -c CKPT --start-doc-idx 0 --max-batches 40 --batch-size 4 --max-loops 4 --loop-scale-mult F [--loop-scale-loops 3]
 python scripts/eval_probe.py -c CKPT --json-out docs/measurements/probe_CKPT.json
 python scripts/evidence_ceiling_probe.py -c CKPT
+python scripts/evidence_ceiling_probe.py -c SEED --fixed-split evidence_fixed --max-questions 2000 --json-out docs/measurements/ceiling_fixed.json
+python scripts/prepare_evidence_data.py --heldout --sources-only --max-evidence-tokens 4608   # byte-checked .src backfill, CPU
+python scripts/sft.py --evidence -c SEED --ceiling-json docs/measurements/ceiling_fixed.json [--data-dir D --train-split S --val-split V]
+python scripts/eval_abstention.py -c CKPT --evidence-port --evidence-condition gold,counterfactual,distractors,none --json-out OUT.json
+python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 0.15 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --device cuda
+TINY_LLM_CONFIG=config_micro.yaml python scripts/init_scratch_seed.py --out ckpts/inject/seed_micro.pt --seed 0
+TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence -c ckpts/inject/seed_micro.pt --run-name inject_full --data-dir data/prepared_inject --train-split inject_full_train --val-split inject_val   # also inject_masked, inject_retrieval
+TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped --json-out ckpts/inject/rank_full.json
+python scripts/closed_book_rank.py compare rank_full.json rank_masked.json rank_retrieval.json
+python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits eval,heldout_tmpl,hop4 --eval-questions-per-hop 1000 --seed 42 --device cpu   # train,val on cuda
+python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --json-out OUT.json
+python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max-questions 3000 --chunk-tokens 128 --device cuda --seed 42
+python scripts/build_store.py --edit-from openqa --name openqa_edit --edit-fraction 0.5 --neighbour-cos 0.85 --device cpu --seed 42
+python scripts/eval_store.py recall|pathway|edit -c CKPT --store data/index/openqa [--edit-store data/index/openqa_edit] --buffer 4 --loop 1 --json-out OUT.json
+python scripts/eval_benchmarks.py -c CKPT --tasks popqa --rank-candidates 20 --json-out OUT.json
 python scripts/inference.py -c CKPT -p PROMPT -n 200 [--evidence chunks.json] [--converge-tol T]
 bash tests/run_env_check.sh; bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
 touch ckpts/training/STOP                           # clean stop (exit 10); kill -USR1 <pid> saves now
 ```
 GPU-free tests: the `modules/runtime/` ones (`test_checkpoint_lifecycle`, `test_hf_sync`,
 `test_control`, `test_supervisor`, `test_phase_targets`, `test_hf_token`, `test_checkpoint_atomic`)
-plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_token_tracker`.
+plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_token_tracker`,
+`test_prepare_evidence_heldout`, `test_heldout_sources`, `test_entity_swap`, `test_entity_frequency`,
+`test_counterfactual_condition`, `test_biographies`, `test_prepare_injection`, `test_closed_book_rank`,
+`test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`. `TINY_LLM_CONFIG=path.yaml`
+swaps the config yaml for every script (the checkpoint still decides shape and mode on load, so a
+micro checkpoint under the default yaml fails the strict load, as it should).
 
 ## Config
 
@@ -342,7 +399,16 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
 - Nothing ragged leaves the dataloader: `chunk_keys [B, C, 384]` + `[B, C]` slot map, flattened
   in-thread by `evidence_from_batch`. `chunk_gold` / `condition_ids` ride along when the corpus
   has `.evgold`/`.cond` (warned once otherwise). `chunk_segments` comes from packing, never
-  re-derived.
+  re-derived. `source_ids [B, S]` rides along when `{split}.src` exists (uint8 per document,
+  index into `prepare_evidence_data.SOURCE_KEYS`, 255 unknown; -1 on padding); the `[eval fixed]`
+  pass then prints one line per source, the kill stays on the pooled numbers.
+- **Read ablation** (`forward(..., reader_sites_kept=j)`, inference only, asserted off in training,
+  with a KV cache and with the convergence exit): read sites are numbered
+  `loop * moe.read_sites_per_loop + 1` in execution order; a site above `j` gets `evidence=None`
+  and `memory=None` for that loop, cutting the reader and the IR expert's external read together
+  (the second content route). `None` is bit-identical to today, `j >= sites` equals `None`, `j = 0`
+  equals `evidence=None` on the residual. After an ablated loop `last_reader_output` keeps the last
+  live loop's read and the IR `memory_weights_by_loop` has no entry for it. `test_read_ablation.py`.
 - `evidence_selection_loss`: BCE per visible chunk vs gold, renormalized over the token's visible
   chunks, averaged over every (loop, IR expert), weight 0.1. Supervised at the positions that
   produce a supervised token (`labels[:, 1:] != -100` shifted to `:-1`), the positions
@@ -403,6 +469,18 @@ prompt. `--target-tokens` counts prompt tokens.
 - **`--max-evidence-tokens` default 1536 silently deletes `many`** (over-budget rows are dropped,
   never truncated). Pass 4608.
 - Read each source's conversation share, token share and `too_long` count from the print.
+- `--heldout` writes `{split}.src` (per document, `SOURCE_KEYS` index). `--heldout --sources-only`
+  backfills it onto an existing build: a zero-embedder replay that must match every existing
+  file but `.evkey` byte for byte, then copies only the `.src` files; it aborts naming the first
+  differing file. Never rebuild `evidence_dev` / `evidence_fixed` while an arm reads them.
+- Other evidence-format builders: `prepare_injection_data.py` (biographies plus filler from
+  `data/prepared/{ir,phase1,phase2}.bin`; arms `full` and `masked` share `.bin` bytes and differ
+  in `.mask` only; `retrieval` carries the store card buffer with swaps and name placeholders;
+  `inject_val` is filler only and identical across arms) and `prepare_chain_data.py` (fictional
+  k-hop chains, `.evhop` per chunk and `.chains.jsonl` per document, eval-only sidecars; held-out
+  2-hop compositions are absent from every seen split including 3-hop). Stores
+  (`data/index/<name>/`: `chunks.jsonl`, `keys.npy` fp16 bge, `meta.json`, optional
+  `questions.jsonl`, `query_keys_bge.npy`, `edits.jsonl`) are read by `modules/data/store.py`.
 
 ## Training loop ([pretrain.py](scripts/pretrain.py))
 
@@ -455,12 +533,27 @@ prompt. `--target-tokens` counts prompt tokens.
   `is_fresh_loop_param` alone (the IR table trains at the trunk's rate by choice).
 - Per-conversation loss weighting is off for `SFTConfig`, on for repair and evidence.
   `p_max`/`top1_acc` stay unweighted. The global token counter continues.
+- `--data-dir`, `--train-split`, `--val-split` override the profile's data for any profile (logged
+  as `data overrides`, not stored in the checkpoint, so a relaunch passes them again).
+  `--ceiling-json` reads `evidence_ceiling_probe.py --fixed-split` output and prints the gold gain
+  against the same-rows ceiling, pooled and per source. The from-scratch micro runs are
+  `TINY_LLM_CONFIG=config_micro.yaml sft.py --evidence -c ckpts/inject/seed_micro.pt` with
+  `conversation_loss_weighting: false`: the span weight travels through `.mask` (0 on unsupported
+  fact spans), so the MTP targets carry it too; `.factspan` (uint8 per token: 0 none, 1 to 5 the
+  attribute, 6 name, 7 placeholder) is eval-only.
 - Chat control tokens are resolved from the tokenizer and asserted. Only assistant text + EOS is
   supervised; conversations with roles outside system/user/assistant are dropped.
 - **`eval_abstention.py` generates**: left-padded batched decode, no KV cache, numbers comparable
   only at fixed `--batch-size`. **Read the generated-answers block first** (token-level
   calibration passed while behaviour failed). `--evidence-port`: G3 is answer-span CE with the real
   answer under every condition; G3b is external-mass AUROC at the last prompt position, per loop.
+  The `counterfactual` condition (needs `gold` in the same run) swaps the answer entity in the gold
+  chunk for a same-type entity from a gazetteer built over the slice's own answers
+  (`modules/data/entity_swap.py`, no NER model; PROPER answers are mostly ineligible by design)
+  and reports follow rate, `mr_gen` (Longpre) and `mr_ll` by frequency stratum counted in
+  `data/prepared/ir.bin` (`entity_frequency.py`, cached under `data/benchmarks/entity_freq/`).
+  `--json-out` writes per-record entries in evidence mode; `memory_mass_by_expert` reads every IR
+  expert (the old `last`/`by_loop` keep reading expert 0).
 - Abstention phrasings are a closed set (`abstention.py`): 5 forced by the eval inside 15 used by
   corpora.
 
