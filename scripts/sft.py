@@ -47,6 +47,7 @@ Run from the repo root:
 import os
 import re
 import sys
+import json
 import time
 import math
 import random
@@ -86,7 +87,7 @@ from scripts.pretrain import (
 from scripts.eval_calibration import roc_auc
 # imported rather than restated, so the condition index -> name mapping used for validation and
 # training logs can never drift from what the corpus builder actually wrote into `.cond`
-from scripts.prepare_evidence_data import CONDITIONS
+from scripts.prepare_evidence_data import CONDITIONS, SOURCE_KEYS
 from utils import (BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, load_model_state,
                    logger, model_params_for_state_dict)
 
@@ -549,6 +550,11 @@ def load_pretrained_weights(model, path: str):
     return token_count
 
 
+def source_name(index: int) -> str:
+    """``SOURCE_KEYS`` name of a ``.src`` byte, ``"unknown"`` for 255 or anything past the table."""
+    return SOURCE_KEYS[index] if 0 <= index < len(SOURCE_KEYS) else "unknown"
+
+
 def _within_buffer_auroc(share: torch.Tensor, gold: torch.Tensor, vis: torch.Tensor) -> torch.Tensor:
     """``[P]`` AUROC of gold against distractor chunks inside each token's own visible buffer.
 
@@ -686,6 +692,12 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     With a groundedness head, ``grounded_auroc`` is read over every answer start and
     ``grounded_auroc_evidence`` over those whose buffer holds at least one visible chunk.
 
+    When a batch also carries ``source_ids`` (the held-out splits with a ``.src`` sidecar), the
+    per condition pass is repeated per source: ``per_source_condition_ce`` is
+    ``{source: {condition: CE}}`` over the same tokens and weights, whose token weighted average over
+    sources equals ``per_condition_ce``, and ``per_source_tokens`` is ``{source: supervised tokens}``
+    summed over every row of the source (a fixed split counts a question's answer once per condition).
+
     Args:
         selector_by_loop: also collect the selector's per loop readings at the answer start
             positions (see ``_selector_readings_by_loop``), returned as ``selector_by_loop``. Needs
@@ -704,6 +716,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     cond_ce_sum = {c: 0.0 for c in CONDITIONS}
     cond_weight_sum = {c: 0.0 for c in CONDITIONS}
     cond_ce_by_loop_sum = {}
+    source_cond_sum, source_cond_weight, source_token_sum = {}, {}, {}
     # plain per-batch mean: the selection loss is already a mean over a batch's supervised,
     # evidence-bearing positions, and weighting it by supervised TOKENS would weight it by answer
     # length, which has nothing to do with how many chunks were ranked
@@ -807,6 +820,17 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 # compute_mtp_loss), so skipping it halves the cost of this per-condition pass for
                 # nothing lost.
                 base_weight = loss_weights if loss_weights is not None else (labels != -100).float()
+                source_ids = batch.get("source_ids")
+                present_sources = []
+                if source_ids is not None:
+                    source_ids = source_ids.to(device)
+                    present_sources = [s for s in torch.unique(source_ids).tolist() if s >= 0]
+                    supervised = labels[:, 1:] != -100
+                    for src in present_sources:
+                        name = source_name(src)
+                        source_token_sum[name] = source_token_sum.get(name, 0) + int(
+                            (supervised & (source_ids[:, 1:] == src)).sum().item()
+                        )
                 for idx, cond in enumerate(CONDITIONS):
                     cond_weight = base_weight * (condition_ids == idx).float()
                     weight_total = float(cond_weight[:, 1:].sum().item())
@@ -830,6 +854,30 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                     for loop_idx, loop_ce in enumerate(cond_metrics["per_loop_ce"]):
                         loop_sums = cond_ce_by_loop_sum.setdefault(loop_idx, {})
                         loop_sums[cond] = loop_sums.get(cond, 0.0) + loop_ce.item() * weight_total
+
+                    # the same condition's tokens split by the source of their conversation. The
+                    # weights partition cond_weight exactly, so the token weighted average over
+                    # sources reproduces the pooled number above
+                    if source_ids is not None:
+                        for src in present_sources:
+                            src_weight = cond_weight * (source_ids == src).float()
+                            src_total = float(src_weight[:, 1:].sum().item())
+                            if src_total <= 0.0:
+                                continue
+                            _, src_ce = compute_mtp_loss(
+                                hidden, labels,
+                                lambda_mtp=TrainingConfig.lambda_mtp,
+                                main_lm_head=model.lm_head,
+                                pad_mask=pad_mask,
+                                loop_ce_weights=TrainingConfig.loop_ce_weights,
+                                loop_ce_subsample=1.0,
+                                loss_weights=src_weight,
+                            )
+                            name = source_name(src)
+                            sums = source_cond_sum.setdefault(name, {})
+                            weights_ = source_cond_weight.setdefault(name, {})
+                            sums[cond] = sums.get(cond, 0.0) + src_ce.item() * src_total
+                            weights_[cond] = weights_.get(cond, 0.0) + src_total
 
         # weight each batch by its supervised token count: rows differ a lot in how much of them
         # is prompt, so an unweighted mean over batches is not the corpus mean. Under
@@ -869,6 +917,12 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
             loop_idx: {cond: total / cond_weight_sum[cond] for cond, total in sums.items()}
             for loop_idx, sums in sorted(cond_ce_by_loop_sum.items())
         }
+    if source_cond_sum:
+        result["per_source_condition_ce"] = {
+            name: {cond: total / source_cond_weight[name][cond] for cond, total in sums.items()}
+            for name, sums in source_cond_sum.items()
+        }
+        result["per_source_tokens"] = dict(source_token_sum)
     if selection_batches:
         result["selection"] = selection_sum / selection_batches
     if grounded_batches:
@@ -906,6 +960,26 @@ def sft(args):
         cfg, phase, checkpoint_dir = RepairConfig, REPAIR_PHASE, REPAIR_CHECKPOINT_DIR
     else:
         cfg, phase, checkpoint_dir = SFTConfig, SFT_PHASE, SFT_CHECKPOINT_DIR
+    # a subclass rather than a mutation, so every other attribute keeps inheriting and the config
+    # class other code imports is untouched. Not saved in the checkpoint: a resumed run is
+    # relaunched with the same flags, like --reader-no-rotary
+    overrides = {name: value for name, value in (
+        ("data_dir", getattr(args, "data_dir", None)),
+        ("train_split", getattr(args, "train_split", None)),
+        ("val_split", getattr(args, "val_split", None)),
+    ) if value}
+    if overrides:
+        cfg = type(cfg.__name__, (cfg,), overrides)
+        logger.info(f"data overrides: {overrides}")
+    ceiling_by_source, ceiling_all = {}, None
+    if getattr(args, "ceiling_json", None):
+        with open(args.ceiling_json, "r", encoding="utf-8") as f:
+            ceiling = json.load(f)
+        ceiling_all = (ceiling.get("all") or {}).get("ceiling")
+        ceiling_by_source = {name: entry["ceiling"] for name, entry in
+                             (ceiling.get("by_source") or {}).items() if "ceiling" in entry}
+        logger.info(f"in-context ceiling read from {args.ceiling_json}: pooled {ceiling_all}, "
+                    f"by source {ceiling_by_source}")
     # two variants of the same profile (different seeds, identical everything else) would otherwise
     # share a directory, and the second would silently RESUME the first instead of starting from
     # its own seed -- the resume path only checks the phase label, which is the same for both
@@ -1226,6 +1300,9 @@ def sft(args):
             f"gold gain {gold_gain / EVIDENCE_CEILING_NATS:.1%} of the {EVIDENCE_CEILING_NATS:.2f}"
             f" nat SQuAD in-context ceiling (different rows)",
         ]
+        if ceiling_all:
+            parts.append(f"gold gain {gold_gain / ceiling_all:.1%} of the {ceiling_all:.2f} nat "
+                         f"in-context ceiling (same split)")
         if grounded_str(stats):
             parts.append(grounded_str(stats))
         parts.append(f"{stats['tokens']:,} answer tokens over {stats['batches']} batches")
@@ -1258,6 +1335,26 @@ def sft(args):
                 if key in reading:
                     fields.append(f"{label} {reading[key]:.4f}")
             logger.info(f"[eval fixed] loop {loop_idx + 1} | " + " | ".join(fields))
+        # the pooled numbers above are what the decision reads; these only say which source moves them
+        by_source = stats.get("per_source_condition_ce") or {}
+        for name, source_ce in by_source.items():
+            if "none" not in source_ce:
+                continue
+            source_gains = {c: source_ce["none"] - v for c, v in source_ce.items() if c != "none"}
+            source_content = (source_ce["distractors"] - source_ce["gold"]
+                              if "distractors" in source_ce and "gold" in source_ce else None)
+            fields = [
+                f"[eval fixed] source {name} | answer CE {{"
+                + ", ".join(f"{c}: {v:.4f}" for c, v in source_ce.items()) + "}",
+                "gain vs none {" + ", ".join(f"{c}: {v:+.4f}" for c, v in source_gains.items()) + "}",
+                "content gain " + (f"{source_content:+.4f}" if source_content is not None else "n/a"),
+            ]
+            source_ceiling = ceiling_by_source.get(name)
+            if source_ceiling and "gold" in source_gains:
+                fields.append(f"gold gain {source_gains['gold'] / source_ceiling:.1%} of the "
+                              f"{source_ceiling:.2f} nat in-context ceiling (same split)")
+            fields.append(f"{stats['per_source_tokens'].get(name, 0):,} answer tokens")
+            logger.info(" | ".join(fields))
         return gold_gain, content_gain
 
     def run_validation(epoch, step):
@@ -1700,6 +1797,18 @@ def main():
                              "writes ckpts/ir_random. Required to run two seeds of one profile "
                              "against each other: a shared directory means the second run resumes "
                              "the first instead of starting from its own seed")
+    parser.add_argument("--data-dir", default=None,
+                        help="override the profile's data_dir (relative paths resolve against the "
+                             "repo root). Not saved in the checkpoint: pass it on every launch")
+    parser.add_argument("--train-split", default=None,
+                        help="override the profile's train split. Pass it on every launch")
+    parser.add_argument("--val-split", default=None,
+                        help="override the profile's validation split. Pass it on every launch")
+    parser.add_argument("--ceiling-json", default=None,
+                        help="--evidence only: the in-context ceiling file written by "
+                             "scripts/evidence_ceiling_probe.py --fixed-split; each source's gold "
+                             "gain in [eval fixed] is then also printed as a share of its own "
+                             "ceiling on the same split")
     parser.add_argument("--checkpoint", "-c", default=None,
                         help="checkpoint to initialize from (ignored when resuming a run from this "
                              "profile's own checkpoint directory)")

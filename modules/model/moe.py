@@ -211,6 +211,10 @@ def is_fresh_loop_param(name: str) -> bool:
 
 class LoopMixtureOfExperts(nn.Module):
     """a Mixture of Experts module that routes tokens to a mixture of attention and feedforward experts in multiple loops"""
+    # how many sequential evidence reads one loop makes; read_ablation numbers sites as
+    # loop * read_sites_per_loop + 1, so a reader inside a sublayer changes this, nothing else
+    read_sites_per_loop = 1
+
     def __init__(
         self,
         hidden_size: int, 
@@ -720,9 +724,26 @@ class LoopMixtureOfExperts(nn.Module):
         exit_check=None,
         evidence: EvidenceBatch = None,
         token_mask: torch.Tensor = None,
+        reader_sites_kept: int = None,
     ):
         """
         Args:
+            reader_sites_kept (int, optional): read ablation. Evidence read sites are numbered 1, 2,
+                ... in execution order across the whole recurrence (``read_sites_per_loop`` per
+                loop, so site k is loop k on the built model). Every site numbered above this value
+                reads nothing: its reader adds exactly zero to the residual and its selector scores
+                no external chunk, so both routes by which chunk content reaches the stream are cut.
+                The memory, the visibility mask and the trackers are still built from the full
+                ``evidence``. After an ablated loop ``last_reader_output`` still holds the last live
+                loop's read (None when no site was live, so 0 is bit-identical to ``evidence=None``
+                on the residual stream), every IR module's ``memory_weights_by_loop`` and
+                ``memory_mass_by_loop`` have no entry for the ablated loops, and its
+                ``last_memory_mass`` / ``last_memory_weights`` are None when the final loop was
+                ablated (an ablated selector reads no store). ``last_memory_visible`` still comes
+                from the full evidence. None (the default) is the forward this model ran
+                before the argument existed, bit for bit, and a value at or above the total site
+                count is the same forward. Inference only: asserted off in training, with a KV
+                cache and with ``exit_check``.
             evidence (EvidenceBatch, optional): retrieved evidence for this batch, read by the
                 always-on evidence port at **every** loop rather than consumed once -- a later loop
                 returns to the same evidence with a query the earlier loops have moved. Defaults to
@@ -768,6 +789,9 @@ class LoopMixtureOfExperts(nn.Module):
             "convergence exit and the KV cache are mutually exclusive: an exited loop appends no "
             "K/V for this token, which corrupts every later step. Run with use_kv_cache=False."
         )
+        assert reader_sites_kept is None or (
+            reader_sites_kept >= 0 and not self.training and kv_cache is None and exit_check is None
+        ), "reader_sites_kept is a non negative inference-only argument, exclusive with the KV cache and exit_check"
         total_load_balancing_loss = 0.0
         hidden_states_all = []
 
@@ -803,16 +827,19 @@ class LoopMixtureOfExperts(nn.Module):
         # same rule for the reader's output: a batch that attaches no evidence never enters the
         # reader branch below, so without this a groundedness readout would score the last
         # evidence-bearing batch's activations against this batch's labels
-        if evidence is None:
+        if evidence is None or reader_sites_kept == 0:
             self.last_reader_output = None
 
         loops_run = 0
         for loop in range(n_loops):
             loop_cache = kv_cache[loop] if kv_cache is not None else None
+            read_live = reader_sites_kept is None or loop * self.read_sites_per_loop + 1 <= reader_sites_kept
+            step_evidence = evidence if read_live else None
+            step_memory = memory if read_live else None
             if self.training and use_checkpointing:
                 hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, memory, token_mask, use_reentrant=False)
             else:
-                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=evidence, memory=memory, token_mask=token_mask)
+                hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=step_evidence, memory=step_memory, token_mask=token_mask)
             total_load_balancing_loss += load_balancing_loss
             hidden_states_all.append(hidden_states)
             loops_run += 1

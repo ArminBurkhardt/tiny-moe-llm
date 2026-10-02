@@ -1,7 +1,9 @@
+import os
+
 import yaml
 
 
-with open("config.yaml", "r") as f:
+with open(os.environ.get("TINY_LLM_CONFIG", "config.yaml"), "r") as f:
     Config = yaml.safe_load(f)
 
 

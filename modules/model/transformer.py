@@ -590,6 +590,7 @@ class TinyMoETransformer(nn.Module):
         skip_mtp: bool = False,
         evidence: EvidenceBatch = None,
         token_mask: torch.Tensor = None,
+        reader_sites_kept: int = None,
     ):
         """forward pass of the model
 
@@ -634,6 +635,10 @@ class TinyMoETransformer(nn.Module):
                 corpus's rows, closing early on their evidence budget, vary a lot more than
                 document-packed pretraining ones do. Defaults to None, which is the aux loss this
                 model trained under, bit for bit.
+            reader_sites_kept (int, optional): read ablation, see ``LoopMixtureOfExperts.forward``:
+                every evidence read site numbered above this value reads nothing. 0 is the residual
+                stream of ``evidence=None``; None (the default) is today's forward, bit for bit.
+                Inference only. Defaults to None.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -649,6 +654,7 @@ class TinyMoETransformer(nn.Module):
 
             If delayed_mtp_loss is False, the shape of each element in extra_token_outputs is [batch_size, seq_len, vocab_size]
         """
+        assert reader_sites_kept is None or not self.training, "reader_sites_kept is inference-only"
         self._token_tracker.count_tokens(input_ids)
         if self.training and self.use_checkpointing:
             assert converge_tol is None, "converge_tol is inference-only"
@@ -667,7 +673,7 @@ class TinyMoETransformer(nn.Module):
             moe_cache = kv_cache.moe if kv_cache is not None else None
             exit_check = None if converge_tol is None else self._convergence_exit(converge_tol, min_loops)
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
-            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence, token_mask=token_mask)
+            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence, token_mask=token_mask, reader_sites_kept=reader_sites_kept)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=False)

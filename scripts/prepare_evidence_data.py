@@ -54,6 +54,14 @@ same pair of axes:
     {split}.evgold    uint8    per chunk (same axis as .evkey/.evkeyidx): 1 = gold, 0 = distractor
     {split}.cond      uint8    per document (same axis as .idx/.evidx): index into CONDITIONS
     {split}.ans       uint8    per document: 1 = the target is the real answer, 0 = a refusal
+    {split}.src       uint8    per document, optional: index into SOURCE_KEYS (255 unknown). Written
+                               only by the held-out build and the backfill below; the trainer's
+                               per-source evaluation reads it when present
+
+The held-out splits carry ``.src`` so every gain can be read per source. A split built before the
+sidecar existed gets it from ``--heldout --sources-only``, which replays the build into a scratch
+directory with a zero embedder, requires the replay to match the existing split byte for byte on
+every file the embedder does not touch, and copies nothing but ``{split}.src`` next to them.
 
 A document with no evidence writes nothing and leaves both offsets equal to the previous entry.
 That is a genuinely empty evidence segment at train time, which flash answers with exact zeros --
@@ -112,8 +120,10 @@ import sys
 import json
 import time
 import random
+import shutil
 import hashlib
 import argparse
+import tempfile
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, List, Optional, Sequence, Tuple
@@ -136,6 +146,10 @@ MANIFEST_PATH = os.path.join(BASE_DIR, "manifest.json")
 
 EMBED_DIM = 384          # bge-small-en-v1.5, which is also ir_dim -- see the adapters in moe.py
 CONDITIONS = ("gold", "mixed", "many", "distractors", "none")
+# the index into this tuple is the byte a document's `.src` entry holds. Append only: a reorder
+# would silently relabel every split that already carries the sidecar
+SOURCE_KEYS = ("squad_v2", "hotpot_qa", "webtext", "smoltalk2", "ultrachat", "no_robots")
+SOURCE_UNKNOWN = 255
 
 
 @dataclass
@@ -467,6 +481,8 @@ EVIDENCE_SUFFIXES = ("bin", "idx", "mask", "ev", "evidx", "evchunk", "evkey", "e
 def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
     """Drop bytes past the last confirmed checkpoint, in all ten files at once.
 
+    The optional ``.src`` sidecar is trimmed to the document count when it exists.
+
     They are indexed by the same document number (or the same chunk axis for the two chunk-level
     files), so they have to be trimmed together or a resume would pair document *i*'s prompt with
     document *i+1*'s evidence -- which is not an error any length check catches, because both files
@@ -486,6 +502,7 @@ def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
         "evgold": chunks,
         "cond": docs,
         "ans": docs,
+        "src": docs,
     }
     for suffix, target in targets.items():
         path = os.path.join(data_dir, f"{split}.{suffix}")
@@ -497,11 +514,20 @@ def truncate_to_state(data_dir: str, split: str, split_state: dict) -> None:
 
 
 class EvidenceWriter:
-    """Append-only writer for one split's ten files."""
+    """Append-only writer for one split's eleven files, twelve with the source sidecar."""
 
-    def __init__(self, data_dir: str, split: str, state: dict):
+    def __init__(self, data_dir: str, split: str, state: dict, with_source: bool = False):
+        """
+        Args:
+            data_dir: directory the split's files live in.
+            split: split name, the file prefix.
+            state: resume state for this split, updated in place.
+            with_source: also append one byte per document to ``{split}.src``. False writes exactly
+                the eleven files a training build always has and ignores ``source_idx``.
+        """
         self.split = split
         self.state = state
+        self.with_source = with_source
         for key in ("doc_count", "tokens_written", "ev_tokens", "chunks_written"):
             state.setdefault(key, 0)
         truncate_to_state(data_dir, split, state)
@@ -509,6 +535,8 @@ class EvidenceWriter:
             suffix: open(os.path.join(data_dir, f"{split}.{suffix}"), "ab")
             for suffix in EVIDENCE_SUFFIXES
         }
+        if with_source:
+            self.files["src"] = open(os.path.join(data_dir, f"{split}.src"), "ab")
         # the three offset files each carry a leading 0 so a document's span is always
         # offsets[i]..offsets[i+1], with no special case for document 0. evgold/cond need no
         # leading entry -- they hold one value per chunk/document directly, not an offset pair
@@ -519,7 +547,7 @@ class EvidenceWriter:
 
     def write(self, ids: Sequence[int], mask: Sequence[int], ev_ids: Sequence[int],
               ev_chunk: Sequence[int], keys: np.ndarray, ev_gold: Sequence[int],
-              condition_idx: int, answerable: int) -> None:
+              condition_idx: int, answerable: int, source_idx: int = SOURCE_UNKNOWN) -> None:
         assert len(ids) == len(mask), "prompt ids and mask disagree"
         assert len(ev_ids) == len(ev_chunk), "evidence ids and chunk ids disagree"
         assert keys.shape[0] == 0 or keys.shape[1] == EMBED_DIM, f"bad key width {keys.shape}"
@@ -538,6 +566,8 @@ class EvidenceWriter:
         # Recorded here, where apply_condition's own decision is still in hand, rather than
         # re-derived downstream by matching the target text against the abstention phrasings
         self.files["ans"].write(np.asarray([answerable], dtype=np.uint8).tobytes())
+        if self.with_source:
+            self.files["src"].write(np.asarray([source_idx], dtype=np.uint8).tobytes())
 
         self.state["tokens_written"] += len(ids)
         self.state["ev_tokens"] += len(ev_ids)
@@ -1181,13 +1211,17 @@ def _source_stats(split_stats: dict, key: str) -> dict:
     })
 
 
+def _source_index(key: str) -> int:
+    return SOURCE_KEYS.index(key) if key in SOURCE_KEYS else SOURCE_UNKNOWN
+
+
 def _write_records(records: List[dict], writer: EvidenceWriter, split_stats: dict) -> None:
     for record in records:
         if record.get("dropped"):
             continue
         writer.write(record["ids"], record["mask"], record["ev_ids"], record["ev_chunk"],
                      record["keys"], record["ev_gold"], CONDITIONS.index(record["condition"]),
-                     int(record["answerable"]))
+                     int(record["answerable"]), _source_index(record["source"]))
         s = _source_stats(split_stats, record["source"])
         s["docs"] += 1
         s["prompt_tokens"] += len(record["ids"])
@@ -1213,6 +1247,7 @@ def build_heldout(
     seed: int = 42,
     split_prefix: str = "evidence",
     max_questions: Optional[int] = None,
+    with_source: bool = True,
 ) -> dict:
     """Write the two held-out splits, ``{prefix}_dev`` and ``{prefix}_fixed``.
 
@@ -1236,6 +1271,7 @@ def build_heldout(
             (``squad_v2`` or ``hotpot_qa``) or already-built ``EvidenceRow`` objects.
         embedder: any object with ``.encode(list[str]) -> [N, 384]``.
         max_questions: cap on usable questions per source, or None for all.
+        with_source: write the per-document ``.src`` sidecar from each record's source key.
 
     Returns:
         ``{"splits": {name: stats}, "render_dropped": {key: n}, "gold_rejected": {key: n},
@@ -1269,7 +1305,8 @@ def build_heldout(
     cond_rng, draw_rng = random.Random(seed + 1), random.Random(seed + 2)
     scratch = {"skipped": {s["key"]: {"too_long": 0, "unrenderable": 0} for s in sources}}
     stats = {dev_split: _new_split_stats(), fixed_split: _new_split_stats()}
-    writers = {s: EvidenceWriter(data_dir, s, {}) for s in (dev_split, fixed_split)}
+    writers = {s: EvidenceWriter(data_dir, s, {}, with_source=with_source)
+               for s in (dev_split, fixed_split)}
 
     def condition_record(key, row, condition, answer_override=None):
         chunks, flags, answer, answerable = apply_condition(
@@ -1357,27 +1394,16 @@ def log_heldout_report(result: dict) -> None:
 
 
 def _delete_split(data_dir: str, split: str) -> None:
-    for suffix in EVIDENCE_SUFFIXES:
+    for suffix in EVIDENCE_SUFFIXES + ("src",):
         path = os.path.join(data_dir, f"{split}.{suffix}")
         if os.path.exists(path):
             os.remove(path)
 
 
-def _main_heldout(args) -> None:
-    splits = [f"{args.split_prefix}_dev", f"{args.split_prefix}_fixed"]
-    for split in splits:
-        if os.path.exists(os.path.join(args.data_dir, f"{split}.bin")):
-            if not args.overwrite:
-                raise SystemExit(f"{split}.bin already exists in {args.data_dir}; pass --overwrite")
-            _delete_split(args.data_dir, split)
-
-    scratch_dir = os.path.join(args.data_dir, "_evidence_scratch")
-    os.makedirs(scratch_dir, exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
-    template = ChatTemplate(tokenizer)
+def _download_heldout_sources(scratch_dir: str) -> List[dict]:
+    """The two dev parquets, pinned to the current dataset revisions, as ``build_heldout`` sources."""
     hf_token = get_hf_token()
     hf_api = HfApi(token=hf_token)
-
     sources = []
     for key, render, repo_id, filename in (
         ("squad_v2", "squad_v2", "rajpurkar/squad_v2", "squad_v2/validation-00000-of-00001.parquet"),
@@ -1393,6 +1419,133 @@ def _main_heldout(args) -> None:
         except OSError:
             pass
         sources.append({"key": key, "render": render, "rows": rows})
+    return sources
+
+
+class ZeroEmbedder:
+    """Stands in for ``ChunkEmbedder`` where only the shape of the keys matters.
+
+    The keys never decide which rows are written, which chunks they carry or which rows are
+    dropped, so a replay that compares everything except the keys can skip the model.
+    """
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """[len(texts), 384] zeros."""
+        return np.zeros((len(texts), EMBED_DIM), dtype=np.float32)
+
+
+# files a replay with a zero embedder must reproduce exactly; evkey is the one it cannot
+REPLAY_COMPARED_SUFFIXES = ("bin", "idx", "mask", "ev", "evchunk", "evidx", "evkeyidx", "evgold",
+                            "cond", "ans")
+
+
+def first_mismatching_file(dir_a: str, dir_b: str, split: str,
+                           suffixes: Sequence[str] = REPLAY_COMPARED_SUFFIXES,
+                           block: int = 64 * 1024 * 1024) -> Optional[str]:
+    """Name of the first ``{split}.{suffix}`` that differs between two directories, or None.
+
+    Args:
+        dir_a: first directory.
+        dir_b: second directory.
+        split: split name.
+        suffixes: file suffixes to compare, in order.
+        block: bytes read per step, so a large file is never held in memory whole.
+    """
+    for suffix in suffixes:
+        a, b = os.path.join(dir_a, f"{split}.{suffix}"), os.path.join(dir_b, f"{split}.{suffix}")
+        if not os.path.isfile(a) or not os.path.isfile(b):
+            return f"{split}.{suffix} (missing)"
+        if os.path.getsize(a) != os.path.getsize(b):
+            return f"{split}.{suffix} (size {os.path.getsize(a)} vs {os.path.getsize(b)})"
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                ba, bb = fa.read(block), fb.read(block)
+                if ba != bb:
+                    return f"{split}.{suffix} (content)"
+                if not ba:
+                    break
+    return None
+
+
+def backfill_sources(sources: List[dict], template: ChatTemplate, data_dir: str, scratch_root: str,
+                     split_prefix: str = "evidence", **build_kwargs) -> List[str]:
+    """Add ``{split}.src`` to existing held-out splits without rebuilding them.
+
+    Replays ``build_heldout`` into a scratch directory with a zero embedder, requires every file
+    but the keys to match the existing split byte for byte, and only then copies the replay's
+    ``.src`` next to the existing files. Nothing already in ``data_dir`` is opened for writing.
+
+    Args:
+        sources: the same ``build_heldout`` sources the original build used.
+        template: chat template of the original build.
+        data_dir: directory holding the existing splits.
+        scratch_root: directory to create the replay's scratch directory in.
+        split_prefix: prefix of the two held-out splits.
+        build_kwargs: the original build's flags (``seed``, ``max_evidence_tokens``, ...).
+
+    Returns:
+        The names of the sidecar files written.
+
+    Raises:
+        SystemExit: when a split is missing or the replay does not reproduce it.
+    """
+    names = [f"{split_prefix}_dev", f"{split_prefix}_fixed"]
+    for name in names:
+        if not os.path.isfile(os.path.join(data_dir, f"{name}.bin")):
+            raise SystemExit(f"{name}.bin is not in {data_dir}; nothing to backfill")
+    os.makedirs(scratch_root, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="sources_only_", dir=scratch_root)
+    try:
+        build_heldout(sources, template, ZeroEmbedder(), work, split_prefix=split_prefix,
+                      with_source=True, **build_kwargs)
+        for name in names:
+            bad = first_mismatching_file(data_dir, work, name)
+            if bad is not None:
+                raise SystemExit(
+                    f"replay does not reproduce the existing split: {bad}. The usual causes are a "
+                    f"dataset revision that moved since the original build or a flag that differs "
+                    f"from it (--max-evidence-tokens, --seed, --num-distractors, "
+                    f"--many-distractors, --heldout-max-questions). Nothing was written."
+                )
+        written = []
+        for name in names:
+            dest = os.path.join(data_dir, f"{name}.src")
+            part = dest + ".part"
+            shutil.copyfile(os.path.join(work, f"{name}.src"), part)
+            os.replace(part, dest)
+            written.append(f"{name}.src")
+            logger.info(f"wrote {dest} ({os.path.getsize(dest):,} documents)")
+        return written
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _main_sources_only(args) -> None:
+    scratch_dir = os.path.join(args.data_dir, "_evidence_scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+    template = ChatTemplate(AutoTokenizer.from_pretrained(TOKENIZER_DIR))
+    sources = _download_heldout_sources(scratch_dir)
+    backfill_sources(
+        sources, template, args.data_dir, scratch_dir, split_prefix=args.split_prefix,
+        max_doc_tokens=args.max_doc_tokens, max_evidence_tokens=args.max_evidence_tokens,
+        num_distractors=args.num_distractors, many_distractors=tuple(args.many_distractors),
+        render_batch=args.render_batch, seed=args.seed, max_questions=args.heldout_max_questions,
+    )
+
+
+def _main_heldout(args) -> None:
+    splits = [f"{args.split_prefix}_dev", f"{args.split_prefix}_fixed"]
+    for split in splits:
+        if os.path.exists(os.path.join(args.data_dir, f"{split}.bin")):
+            if not args.overwrite:
+                raise SystemExit(f"{split}.bin already exists in {args.data_dir}; pass --overwrite")
+            _delete_split(args.data_dir, split)
+
+    scratch_dir = os.path.join(args.data_dir, "_evidence_scratch")
+    os.makedirs(scratch_dir, exist_ok=True)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    template = ChatTemplate(tokenizer)
+    sources = _download_heldout_sources(scratch_dir)
 
     logger.info(f"loading the external embedder ({ChunkEmbedder.REPO})")
     embedder = ChunkEmbedder(device=args.device)
@@ -1472,11 +1625,18 @@ def main():
                         help="with --heldout, replace existing held-out splits")
     parser.add_argument("--heldout-max-questions", type=int, default=None,
                         help="with --heldout, cap usable questions per source (default: all)")
+    parser.add_argument("--sources-only", action="store_true",
+                        help="with --heldout, add only the per-document .src sidecar to existing "
+                             "held-out splits: replay the build with a zero embedder, require it to "
+                             "match the existing files byte for byte, copy nothing else. Needs the "
+                             "original build's flags and the network; CPU only")
     args = parser.parse_args()
+    if args.sources_only and not args.heldout:
+        raise SystemExit("--sources-only is a mode of --heldout")
 
     os.makedirs(args.data_dir, exist_ok=True)
     if args.heldout:
-        _main_heldout(args)
+        (_main_sources_only if args.sources_only else _main_heldout)(args)
         return
     scratch_dir = os.path.join(args.data_dir, "_evidence_scratch")
     os.makedirs(scratch_dir, exist_ok=True)

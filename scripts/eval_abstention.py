@@ -74,6 +74,10 @@ from modules.model.transformer import TinyMoETransformer
 from modules.model.attention import cu_seqlens_from_doc_ids, _segment_ids
 from modules.data import abstention
 from modules.data.chat import ChatTemplate
+from modules.data.entity_swap import (
+    Gazetteer, counterfactual_readings, frequency_stratum, prepare_counterfactual, record_for_json,
+    sigmoid_ratio,
+)
 from modules.data.evidence_dataset import EMBED_DIM
 from config import ModelConfig, SFTConfig
 from scripts.eval_calibration import expected_calibration_error, roc_auc
@@ -84,9 +88,19 @@ from utils import BASE_DIR, BF16, TOKENIZER_DIR, get_hf_token, load_model_state,
 SQUAD_REPO = "rajpurkar/squad_v2"
 SFT_CHECKPOINT_DIR = os.path.join(BASE_DIR, "ckpts", "sft")
 CE_CHUNK_SIZE = 2048
-# the port's four conditions this script can attach on the eval side ("many" is corpus-only -- it
-# exists to put a large buffer in TRAINING somewhere, which an eval slice this small has no use for)
-EVIDENCE_CONDITIONS = ("gold", "none", "distractors", "mixed")
+# the port's conditions this script can attach on the eval side ("many" is corpus-only -- it
+# exists to put a large buffer in TRAINING somewhere, which an eval slice this small has no use
+# for). "counterfactual" is gold evidence with the answer swapped for another of the same type: it
+# scores whether the model repeats what the evidence says or what it remembers, and needs "gold" in
+# the same run to know which items the model answers correctly with the unswapped chunk
+EVIDENCE_CONDITIONS = ("gold", "none", "distractors", "mixed", "counterfactual")
+DEFAULT_FREQUENCY_BIN = os.path.join(BASE_DIR, "data", "prepared", "ir.bin")
+FREQUENCY_CACHE_DIR = os.path.join(BASE_DIR, "data", "benchmarks", "entity_freq")
+DEFAULT_FACTS = os.path.join(BASE_DIR, "data", "prepared_inject", "inject_facts.jsonl")
+DEFAULT_POOLS = os.path.join(BASE_DIR, "data", "prepared_inject", "inject_pools.json")
+DEFAULT_STORE_DIR = os.path.join(BASE_DIR, "data", "index", "inject_bios")
+# which record field holds the text of each answer whose log-probability is scored
+ANSWER_TEXT_FIELDS = {"orig": "cf_original", "swap": "cf_substitute"}
 
 
 # ---------------------------------------------------------------------------- data
@@ -363,6 +377,9 @@ def _capture_memory_mass(model, batch: int, seq_len: int, mass_out: List[Optiona
     ``None`` per row where the checkpoint carries no IR module, or the forward carried no evidence
     at all (the module clears its own mass then, rather than leaving a stale value from an earlier
     batch, which is exactly what lets this tell the two cases apart).
+
+    ``"last"`` and ``"by_loop"`` read IR expert 0, as they always have, so older outputs stay
+    comparable. ``"by_expert"`` is ``{expert index: last}`` over every IR expert that carried mass.
     """
     ir_modules = getattr(model.moe, "ir_modules", [])
     ir_module = ir_modules[0] if ir_modules else None
@@ -376,8 +393,13 @@ def _capture_memory_mass(model, batch: int, seq_len: int, mass_out: List[Optiona
         loop_idx: tensor.view(batch, seq_len)[:, -1].float().cpu().tolist()
         for loop_idx, tensor in by_loop.items()
     }
+    expert_last = {
+        idx: module.last_memory_mass.view(batch, seq_len)[:, -1].float().cpu().tolist()
+        for idx, module in enumerate(ir_modules) if module.last_memory_mass is not None
+    }
     for i in range(batch):
-        mass_out[i] = {"last": last[i], "by_loop": {idx: vals[i] for idx, vals in loop_last.items()}}
+        mass_out[i] = {"last": last[i], "by_loop": {idx: vals[i] for idx, vals in loop_last.items()},
+                       "by_expert": {idx: vals[i] for idx, vals in expert_last.items()}}
 
 
 # ------------------------------------------------------------------------ generation
@@ -501,8 +523,8 @@ def run_generation(model, tokenizer, template: ChatTemplate, records: List[dict]
 
     ``attach_evidence`` (``--evidence-port`` mode) reads each record's ``evidence_row`` (set by
     ``attach_condition`` for whichever condition is currently being scored) and also fills in
-    ``memory_mass``/``memory_mass_by_loop`` -- the external store's share of the read at the row's
-    last prompt position, read by ``generate_batch``'s ``mass_out``.
+    ``memory_mass``/``memory_mass_by_loop``/``memory_mass_by_expert`` -- the external store's share
+    of the read at the row's last prompt position, read by ``generate_batch``'s ``mass_out``.
     """
     max_seq_len = ModelConfig.Params["max_seq_len"]
     order = sorted(range(len(records)), key=lambda i: len(records[i]["prompt_ids"]))
@@ -525,6 +547,7 @@ def run_generation(model, tokenizer, template: ChatTemplate, records: List[dict]
             for record, mass in zip(chunk, mass_out):
                 record["memory_mass"] = mass["last"] if mass else None
                 record["memory_mass_by_loop"] = mass["by_loop"] if mass else {}
+                record["memory_mass_by_expert"] = mass.get("by_expert", {}) if mass else {}
         done += len(chunk)
         if done % (batch_size * 10) < batch_size:
             logger.info(f"[eval_abstention] generated {done:,}/{len(records):,} answers")
@@ -851,6 +874,9 @@ def attach_condition(records: List[dict], condition: str, template: ChatTemplate
                 (t, i, False)
                 for t, i in _sample_distractors(pool, record["context_key"], num_distractors, rng)
             ]
+        elif condition == "counterfactual":
+            # the gold passage with the answer swapped, built once by prepare_counterfactual
+            chosen = [(t, i, True) for t, i in record["cf"]["chunks"]]
         else:  # mixed
             distract = _sample_distractors(pool, record["context_key"], num_distractors, rng)
             chosen = [(t, i, True) for t, i in gold] + [(t, i, False) for t, i in distract]
@@ -858,10 +884,16 @@ def attach_condition(records: List[dict], condition: str, template: ChatTemplate
 
         record["condition_unanswerable"] = record["unanswerable"] or condition in ("distractors", "none")
         use_real_answer = condition in ("gold", "mixed") and not record["condition_unanswerable"]
-        target = (
-            record["references"][0] if use_real_answer
-            else abstention.pick(abstention.ABSTENTIONS_PASSAGE, rng)
-        )
+        if condition == "counterfactual":
+            # the swapped evidence supports the substitute, so that is the span a faithful reader
+            # produces; nothing downstream reads the teacher forced pass for this condition, but
+            # the forced pair must not be left over from the previous condition
+            target = record["cf"]["substitute"]
+        else:
+            target = (
+                record["references"][0] if use_real_answer
+                else abstention.pick(abstention.ABSTENTIONS_PASSAGE, rng)
+            )
 
         ev_ids: List[int] = []
         ev_chunk_ids: List[int] = []
@@ -951,6 +983,19 @@ def report_evidence_condition(condition: str, records: List[dict], forced: dict,
         "f1_answerable": float(f1[answerable].mean()) if answerable.any() else None,
     }
 
+    if condition in ("distractors", "none"):
+        # here an abstention is the right answer, so the readings that matter are the ones that
+        # say how often the model answered anyway and whether that answer was the real one, which
+        # on a buffer without the answer can only have come from its weights
+        native_answerable = ~unanswerable_native
+        non_abstain = 1.0 - scores["abstention_rate"]
+        em_real = float(em[native_answerable].mean()) if native_answerable.any() else None
+        print(f"  non-abstain rate: {non_abstain:.4f}   EM against the real answer on natively "
+              f"answerable rows (an answer from memory): "
+              + (f"{em_real:.4f}" if em_real is not None else "n/a"))
+        result["non_abstain_rate"] = non_abstain
+        result["em_real_answer"] = em_real
+
     if forced:
         print(f"  teacher forced, answer span: CE {forced['ce']:.4f}  top-1 {forced['top1_acc']:.4f}  "
               f"ECE(pmax) {forced['ece_p_max']:.4f}  AUROC(pmax) {forced['auroc_p_max']:.4f}")
@@ -983,11 +1028,230 @@ def report_evidence_condition(condition: str, records: List[dict], forced: dict,
             per_loop[loop_idx] = {"mean": float(vals[mask].mean()), "auroc": auroc_loop}
         if per_loop:
             result["memory_mass_by_loop"] = per_loop
+        expert_idxs = sorted({idx for r in records for idx in (r.get("memory_mass_by_expert") or {})})
+        per_expert = {}
+        for expert_idx in expert_idxs:
+            vals = np.array(
+                [(r.get("memory_mass_by_expert") or {}).get(expert_idx, np.nan) for r in records],
+                dtype=np.float64,
+            )
+            if np.isnan(vals).all():
+                continue
+            per_expert[expert_idx] = float(np.nanmean(vals))
+        if len(per_expert) > 1:
+            print("    per IR expert mean mass: "
+                  + ", ".join(f"expert {i}: {v:.4f}" for i, v in per_expert.items()))
+        if per_expert:
+            result["memory_mass_by_expert"] = per_expert
     else:
         print("  external memory mass: not available (no IR module, or this condition attaches "
               "no evidence at all)")
 
     return result
+
+
+# -------------------------------------------------------------------- counterfactual condition
+
+
+@torch.inference_mode()
+def answer_logprobs(model, template: ChatTemplate, records: List[dict], *, pad_id: int,
+                    batch_size: int, device: str, max_seq_len: int, use_evidence: bool,
+                    answer_key: str) -> None:
+    """Fill ``record["ll_<answer_key>"]`` with the log-probability of one answer, teacher forced.
+
+    The score is the sum over the answer tokens plus the closing EOS (the supervised span of the
+    chat template), given the evidence prompt and, with ``use_evidence``, each record's current
+    ``evidence_row``. A sum rather than a mean, because the two answers being compared differ in
+    length and the question is which sequence the model would emit.
+
+    Args:
+        records: records with ``evidence_prompt_text``, the answer text field named by
+            ``answer_key`` and, with ``use_evidence``, ``evidence_row``.
+        use_evidence: attach each record's evidence row through the port (False scores the answer
+            with no evidence at all).
+        answer_key: ``"orig"`` scores ``cf_original``, ``"swap"`` scores ``cf_substitute``.
+    """
+    field = ANSWER_TEXT_FIELDS.get(answer_key)
+    if field is None:
+        raise ValueError(f"answer_key {answer_key!r} is not one of {sorted(ANSWER_TEXT_FIELDS)}")
+    key = f"ll_{answer_key}"
+    for record in records:
+        record[key] = float("nan")
+    pairs = template.encode_batch([
+        [{"role": "user", "content": r["evidence_prompt_text"]},
+         {"role": "assistant", "content": r[field]}] for r in records
+    ])
+    order = sorted((i for i, pair in enumerate(pairs) if pair is not None),
+                   key=lambda i: len(pairs[i][0]))
+    for start in range(0, len(order), batch_size):
+        chosen = order[start:start + batch_size]
+        width = max(len(pairs[i][0]) for i in chosen)
+        if use_evidence:
+            width += 1
+        width = min(width, max_seq_len)
+        ids = torch.full((len(chosen), width), pad_id, dtype=torch.long, device=device)
+        doc = torch.zeros((len(chosen), width), dtype=torch.long, device=device)
+        labels = torch.full((len(chosen), width), -100, dtype=torch.long, device=device)
+        for row_idx, i in enumerate(chosen):
+            row = torch.tensor(pairs[i][0][:width], dtype=torch.long, device=device)
+            supervised = torch.tensor(pairs[i][1][:width], dtype=torch.bool, device=device)
+            ids[row_idx, :row.numel()] = row
+            doc[row_idx, :row.numel()] = 1
+            labels[row_idx, :row.numel()] = torch.where(supervised, row, torch.full_like(row, -100))
+        evidence_batch = None
+        if use_evidence:
+            cu_seqlens, _ = cu_seqlens_from_doc_ids(doc)
+            seg = _segment_ids(cu_seqlens, len(chosen), width, device)
+            evidence_batch = _pack_evidence_batch(
+                model, seg[:, 0], seg[:, -1], [records[i].get("evidence_row") for i in chosen],
+                num_segments=int(cu_seqlens.numel() - 1), device=device,
+            )
+        hidden = _final_hidden(model, ids, doc, evidence=evidence_batch)
+        target = labels[:, 1:]
+        rows, cols = (target != -100).nonzero(as_tuple=True)
+        logits = model.lm_head(hidden[:, :-1][rows, cols]).float()
+        logp = torch.log_softmax(logits, dim=-1).gather(-1, target[rows, cols].unsqueeze(-1)).squeeze(-1)
+        sums = torch.zeros(len(chosen), dtype=torch.float32, device=device).index_add_(0, rows, logp)
+        for row_idx, i in enumerate(chosen):
+            records[i][key] = float(sums[row_idx])
+
+
+def assign_frequency_strata(records: List[dict], tokenizer, bin_path: str) -> None:
+    """Set ``stratum`` (and ``cf_freq``) on every eligible record from the original answer's count.
+
+    The count is the answer's token sequence in a reference corpus (see ``entity_frequency.py``).
+    A missing corpus leaves every record in one stratum, "all", and says so.
+    """
+    eligible = [r for r in records if r.get("cf")]
+    if not os.path.isfile(bin_path):
+        logger.warning(f"{bin_path} does not exist: no frequency strata, one pooled stratum")
+        for record in eligible:
+            record["stratum"] = "all"
+        return
+    from scripts.entity_frequency import answer_frequencies
+
+    counts = answer_frequencies(bin_path, [r["cf_original"] for r in eligible], tokenizer,
+                                cache_dir=FREQUENCY_CACHE_DIR)
+    for record in eligible:
+        record["cf_freq"] = counts[record["cf_original"]]
+        record["stratum"] = frequency_stratum(counts[record["cf_original"]])
+
+
+class LookupEmbedder:
+    """Chunk keys from a table of known texts, for an evidence source whose keys already exist.
+
+    An injected-fact store ships one canonical key per card, and its swapped card is read through
+    the same key (the selector chooses by person, the reader reads the swapped text), so nothing is
+    re-embedded.
+    """
+
+    def __init__(self, keys_by_text: dict):
+        self.keys_by_text = keys_by_text
+
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """[len(texts), 384] float32; a text that is not in the table is an error."""
+        return np.stack([self.keys_by_text[t] for t in texts]).astype(np.float32)
+
+
+def build_biography_records(args, template: ChatTemplate, tokenizer, *, max_examples: Optional[int],
+                            seed: int) -> Tuple[List[dict], "LookupEmbedder"]:
+    """Records for the counterfactual condition over injected biographies (the facts-file source).
+
+    One record per (person, entity-valued attribute): the question, the person's store card as the
+    gold chunk, and the card re-rendered with that attribute swapped for another pool value as the
+    counterfactual chunk. The stratum is the person's exposure tier. Meaningful on a checkpoint that
+    was trained to answer in the chat format.
+
+    Args:
+        args: needs ``facts``, ``pools`` and ``store_dir``.
+        max_examples: cap on records, or None for every (person, attribute).
+        seed: seeds the sample and the substitute draw.
+    """
+    try:
+        from modules.data import biographies as bio
+        from modules.data.store import load_store
+    except ImportError as e:
+        raise SystemExit(f"--counterfactual-source bios needs the biography and store modules: {e}")
+    people = bio.load_facts(args.facts)
+    pools = bio.load_pools(args.pools)
+    store = load_store(args.store_dir)
+    rng = random.Random(seed)
+    pairs = [(p, a) for p in people for a in bio.ENTITY_ATTRIBUTES]
+    rng.shuffle(pairs)
+    if max_examples is not None:
+        pairs = pairs[:max_examples]
+
+    keys_by_text, records = {}, []
+    for person, attribute in pairs:
+        value = person.attributes[attribute]
+        candidates = [v for v in pools[attribute] if v != value]
+        substitute = candidates[rng.randrange(len(candidates))]
+        card = store.chunks[person.person_id]["text"]
+        swapped = bio.render_store_chunk(person, {attribute: substitute})
+        key = np.asarray(store.keys[person.person_id], dtype=np.float32)
+        keys_by_text[card] = keys_by_text[swapped] = key
+        question = bio.question_for(attribute, person.name)
+        prompt_text = evidence_prompt(question)
+        card_ids = tokenizer(card, add_special_tokens=False)["input_ids"]
+        swapped_ids = tokenizer(swapped, add_special_tokens=False)["input_ids"]
+        records.append({
+            "id": f"bio{person.person_id}:{attribute}", "question": question,
+            "references": [value], "unanswerable": False,
+            "prompt_ids": template.encode_prompt([{"role": "user", "content": prompt_text}]),
+            "evidence_prompt_text": prompt_text, "gold_chunks": [(card, card_ids)],
+            "context_key": str(person.person_id), "stratum": str(person.tier),
+            "cf": {"original": value, "substitute": substitute, "type": attribute,
+                   "chunks": [(swapped, swapped_ids)], "count": 1},
+            "cf_original": value, "cf_substitute": substitute, "cf_type": attribute,
+        })
+    for i, record in enumerate(records):
+        record["index"] = i
+    # distractor chunks come from other people's cards, which a --max-examples slice leaves out
+    for text, key in zip((c["text"] for c in store.chunks), store.keys):
+        keys_by_text.setdefault(text, np.asarray(key, dtype=np.float32))
+    logger.info(f"{len(records):,} biography records over {len(people):,} people")
+    return records, LookupEmbedder(keys_by_text)
+
+
+def report_counterfactual(records: List[dict], ineligible: dict, n_total: int) -> dict:
+    """Print and return the counterfactual condition's readings.
+
+    One line per stratum, over the items answered correctly with the unswapped chunk (the
+    population the memorization ratio is defined on) and again over every eligible item.
+
+    Args:
+        records: the eligible records, after generation and ``answer_logprobs``.
+        ineligible: ``{reason: count}`` for the records that took no part.
+        n_total: how many records the slice had.
+    """
+    readings = counterfactual_readings(records)
+    print("\n=== counterfactual evidence: gold chunk with the answer swapped for another of its type ===")
+    print(f"  {len(records):,} of {n_total:,} questions eligible; skipped by reason: "
+          + (", ".join(f"{k} {v:,}" for k, v in sorted(ineligible.items())) or "none"))
+
+    def fmt(value, spec):
+        return "n/a" if value is None else format(value, spec)
+
+    for label, title in (("correct_with_gold", "items answered correctly with the unswapped chunk"),
+                         ("all_eligible", "every eligible item")):
+        print(f"  --- {title} ---")
+        print(f"  {'stratum':<10} {'n':>6} {'follow':>8} {'mr_gen':>8} {'mr_ll':>8} {'other':>8}  gate")
+        for name, r in readings[label].items():
+            gate = f"{r['gate']} (n={r['n']})" if label == "correct_with_gold" else ""
+            print(f"  {name:<10} {r['n']:>6} {fmt(r['follow_rate'], '.3f'):>8} "
+                  f"{fmt(r['mr_gen'], '.3f'):>8} {fmt(r['mr_ll'], '.3f'):>8} "
+                  f"{fmt(r['other_rate'], '.3f'):>8}  {gate}")
+    print("  follow = the completion is the substitute; mr_gen = stuck / (stuck + follow), stuck = "
+          "the original answer; mr_ll = sigmoid(ll_orig - ll_swap); gate PASS = mr_gen <= 0.05 and "
+          "follow >= 0.90")
+    return {"eligible": len(records), "total": n_total, "ineligible": dict(ineligible),
+            "readings": readings}
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"{type(value)} is not JSON serializable")
 
 
 def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.DataFrame) -> None:
@@ -1004,6 +1268,12 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
         raise SystemExit(f"unknown --evidence-condition {bad} -- choose from {EVIDENCE_CONDITIONS}")
     if not conditions:
         raise SystemExit("--evidence-condition resolved to an empty list")
+    if "counterfactual" in conditions:
+        if "gold" not in conditions:
+            raise SystemExit("counterfactual needs gold in the same run: the memorization ratio is "
+                             "read over the items answered correctly with the unswapped chunk")
+        # last, so every record's gold-condition correctness is recorded before it is needed
+        conditions = [c for c in conditions if c != "counterfactual"] + ["counterfactual"]
 
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = load_model(args.checkpoint, args.device)
@@ -1013,37 +1283,65 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
             f"scripts/migrate_evidence_port.py before running --evidence-port"
         )
 
-    records = build_evidence_records(
-        frame, template, tokenizer, max_examples=args.max_examples,
-        max_prompt_tokens=args.max_prompt_tokens, chunk_tokens=args.chunk_tokens,
-        max_evidence_tokens=args.max_evidence_tokens, seed=args.seed, offset=args.example_offset,
-    )
+    biographies = args.counterfactual_source == "bios"
+    if biographies:
+        if "counterfactual" not in conditions:
+            raise SystemExit("--counterfactual-source bios only makes sense with the counterfactual "
+                             "condition")
+        records, embedder = build_biography_records(
+            args, template, tokenizer, max_examples=args.max_examples, seed=args.seed,
+        )
+    else:
+        records = build_evidence_records(
+            frame, template, tokenizer, max_examples=args.max_examples,
+            max_prompt_tokens=args.max_prompt_tokens, chunk_tokens=args.chunk_tokens,
+            max_evidence_tokens=args.max_evidence_tokens, seed=args.seed, offset=args.example_offset,
+        )
     if not records:
         raise SystemExit("no usable validation questions for --evidence-port -- check "
                          "--max-prompt-tokens / --max-evidence-tokens / --squad-dir")
 
-    logger.info(f"loading the external embedder ({ChunkEmbedder.REPO}) for chunk keys")
-    embedder = ChunkEmbedder(device=args.device)
+    if not biographies:
+        logger.info(f"loading the external embedder ({ChunkEmbedder.REPO}) for chunk keys")
+        embedder = ChunkEmbedder(device=args.device)
     pool = _build_distractor_pool(records)
     # one rng shared across conditions (like build_records', but seeded off it rather than reused)
     # so the distractor draw and the abstention-phrase draw are reproducible run to run without
     # colliding with the shuffle seed the records themselves were drawn with
     rng = random.Random(args.seed + 7)
 
-    results = {}
+    ineligible = {}
+    if "counterfactual" in conditions:
+        # decided once, before any condition runs: eligibility must not depend on what a condition
+        # did to the record
+        gazetteer = Gazetteer.from_pairs(
+            (r["question"], r["references"][0]) for r in records if r["references"]
+        )
+        counts = prepare_counterfactual(records, gazetteer, random.Random(args.seed + 11), tokenizer)
+        ineligible = {k: v for k, v in counts.items() if k != "eligible"}
+        logger.info(f"counterfactual: {counts['eligible']:,} of {len(records):,} records eligible "
+                    f"({ineligible})")
+        if counts["eligible"] == 0:
+            raise SystemExit("no record is eligible for the counterfactual condition")
+        if not biographies:
+            # an injected-fact source stratifies by exposure tier, set when its records were built
+            assign_frequency_strata(records, tokenizer, args.counterfactual_freq_bin)
+
+    results, records_by_condition = {}, {}
     for condition in conditions:
         logger.info(f"=== --evidence-port condition: {condition} ===")
-        attach_condition(records, condition, template, embedder, pool,
+        scored = [r for r in records if r.get("cf")] if condition == "counterfactual" else records
+        attach_condition(scored, condition, template, embedder, pool,
                          num_distractors=args.num_distractors, rng=rng)
 
-        logger.info(f"Generating {len(records):,} answers under condition {condition!r} "
+        logger.info(f"Generating {len(scored):,} answers under condition {condition!r} "
                     f"(batch {args.batch_size}, <= {args.max_new_tokens} new tokens)")
         run_generation(
-            model, tokenizer, template, records, batch_size=args.batch_size,
+            model, tokenizer, template, scored, batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k,
             device=args.device, attach_evidence=True,
         )
-        for record in records:
+        for record in scored:
             completion = record["completion"]
             record["abstained"] = abstention.is_abstention(completion)
             record["em"] = exact_match(completion, record["references"]) if record["references"] else 0.0
@@ -1052,6 +1350,27 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
                 float(record["abstained"]) if record["condition_unanswerable"]
                 else (0.0 if record["abstained"] else record["em"])
             )
+            if condition == "gold":
+                record["gold_em"] = record["em"]
+
+        if condition == "counterfactual":
+            for record in scored:
+                record["cf_follow"] = exact_match(record["completion"], [record["cf_substitute"]])
+                record["cf_stuck"] = exact_match(record["completion"], record["references"])
+                record["cf_other"] = 1.0 - record["cf_follow"] - record["cf_stuck"]
+            for answer_key in ANSWER_TEXT_FIELDS:
+                answer_logprobs(
+                    model, template, scored, pad_id=tokenizer.pad_token_id,
+                    batch_size=args.batch_size, device=args.device,
+                    max_seq_len=ModelConfig.Params["max_seq_len"], use_evidence=True,
+                    answer_key=answer_key,
+                )
+            for record in scored:
+                both = (record["ll_orig"], record["ll_swap"])
+                record["mr_ll"] = None if any(math.isnan(v) for v in both) else sigmoid_ratio(*both)
+            results[condition] = report_counterfactual(scored, ineligible, len(records))
+            records_by_condition[condition] = [record_for_json(r) for r in scored]
+            continue
 
         forced = {}
         if not args.skip_forced:
@@ -1064,6 +1383,8 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
             )
 
         results[condition] = report_evidence_condition(condition, records, forced, args.n_bins)
+        # copied now: the next condition rewrites the same record objects
+        records_by_condition[condition] = [record_for_json(r) for r in records]
 
         # the fixed-target pass: the real answer span, scored under this condition's evidence. This
         # is the quantity the gold-vs-none gap is read on -- see attach_condition for why the
@@ -1095,10 +1416,12 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
               f"--evidence-port exists to read")
 
     if args.json_out:
-        payload = {"checkpoint": args.checkpoint, "conditions": conditions, "results": results}
+        payload = {"checkpoint": args.checkpoint, "conditions": conditions, "results": results,
+                   "records": records_by_condition}
         with open(args.json_out, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        logger.info(f"wrote per-condition results to {args.json_out}")
+            json.dump(payload, f, indent=2, default=_json_default)
+        logger.info(f"wrote per-condition results and {sum(map(len, records_by_condition.values())):,} "
+                    f"per-record entries to {args.json_out}")
 
 
 def report(records: List[dict], forced: dict, baseline: Optional[dict], n_bins: int,
@@ -1212,6 +1535,21 @@ def main():
                              "prepare_evidence_data.py's default")
     parser.add_argument("--max-evidence-tokens", type=int, default=2048,
                         help="drop a question if its own gold chunks exceed this many tokens")
+    parser.add_argument("--counterfactual-source", choices=("squad", "bios"), default="squad",
+                        help="records for the counterfactual condition: SQuAD questions whose answer "
+                             "is swapped inside the passage (default), or injected biographies from "
+                             "--facts / --pools / --store-dir (meaningful on a chat trained "
+                             "checkpoint only)")
+    parser.add_argument("--counterfactual-freq-bin", default=DEFAULT_FREQUENCY_BIN,
+                        help="token corpus the SQuAD answers are counted in to stratify the "
+                             "counterfactual readings by how common the answer is (a missing file "
+                             "means one pooled stratum)")
+    parser.add_argument("--facts", default=DEFAULT_FACTS,
+                        help="bios source: the facts file written by prepare_injection_data.py")
+    parser.add_argument("--pools", default=DEFAULT_POOLS,
+                        help="bios source: the value pools written next to the facts file")
+    parser.add_argument("--store-dir", default=DEFAULT_STORE_DIR,
+                        help="bios source: the biography store (one card and key per person)")
     args = parser.parse_args()
 
     if args.checkpoint is None:
@@ -1224,7 +1562,10 @@ def main():
     # the eval split lives with the other benchmark downloads, not under data/prepared: the corpus
     # builders delete shards from there and archive_corpus.py packs it wholesale
     scratch_dir = os.path.join(BASE_DIR, "data", "benchmarks", "squad_v2_validation")
-    frame = load_squad_split(scratch_dir, args.hf_token or get_hf_token(), args.squad_dir)
+    # the injected-fact source never reads SQuAD, so it needs no download
+    frame = None
+    if not (args.evidence_port and args.counterfactual_source == "bios"):
+        frame = load_squad_split(scratch_dir, args.hf_token or get_hf_token(), args.squad_dir)
 
     if args.evidence_port:
         run_evidence_port_eval(args, tokenizer, template, frame)
