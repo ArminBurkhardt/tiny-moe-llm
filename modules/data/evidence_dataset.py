@@ -43,6 +43,12 @@ Batches carry, on top of the SFT keys:
                                         NOT derivable from condition_ids -- a natively unanswerable
                                         SQuAD row is built under `gold` and still abstains
 
+    source_ids          [B, S]         same axis, only when ``{split}.src`` exists: index into
+                                        prepare_evidence_data.SOURCE_KEYS of the conversation's source
+                                        (255 where unknown), -1 on row padding. Independent of the
+                                        three-file rule above, since the sidecar can be backfilled onto
+                                        a corpus that is already being trained from
+
 A batch in which nothing retrieved anything omits the first five of those (``evidence_ids`` through
 ``chunk_gold``), which is how a pure replay batch takes the bit-identical no-evidence forward rather
 than an all-padding one. ``condition_ids``/``answerable_ids`` do not follow that rule -- they describe
@@ -122,6 +128,7 @@ class EvidenceDataset(SFTDataset):
         self.evgold_path = os.path.join(data_dir, f"{split}.evgold")
         self.cond_path = os.path.join(data_dir, f"{split}.cond")
         self.ans_path = os.path.join(data_dir, f"{split}.ans")
+        self.src_path = os.path.join(data_dir, f"{split}.src")
         for path in (self.ev_path, self.evidx_path, self.evchunk_path,
                      self.evkey_path, self.evkeyidx_path):
             if not os.path.isfile(path):
@@ -180,6 +187,17 @@ class EvidenceDataset(SFTDataset):
                 f"with scripts/prepare_evidence_data.py to get them."
             )
 
+        self.has_source_labels = os.path.isfile(self.src_path)
+        if self.has_source_labels:
+            if os.path.getsize(self.src_path) != self.num_docs:
+                raise ValueError(
+                    f"{split}.src has {os.path.getsize(self.src_path):,} entries but "
+                    f"{split}.idx has {self.num_docs:,} documents -- the corpus is out of sync, "
+                    f"rebuild it or rerun the --sources-only backfill"
+                )
+        else:
+            logger.info(f"EvidenceDataset[{split}]: no {split}.src, source_ids will be omitted")
+
         logger.info(
             f"EvidenceDataset[{split}]: {os.path.getsize(self.ev_path) // 2:,} evidence tokens, "
             f"{n_chunks:,} chunks"
@@ -202,6 +220,8 @@ class EvidenceDataset(SFTDataset):
                     if self.has_condition_labels else None)
         ans_mmap = (np.memmap(self.ans_path, dtype=np.uint8, mode="r")
                    if self.has_condition_labels else None)
+        src_mmap = (np.memmap(self.src_path, dtype=np.uint8, mode="r")
+                    if self.has_source_labels else None)
 
         num_docs = idx_mmap.shape[0] - 1
         order = self.document_order(num_docs)
@@ -221,7 +241,7 @@ class EvidenceDataset(SFTDataset):
 
         rows: List[dict] = []
         current = {"seq": [], "labels": [], "weights": [], "sections": [], "evidence": [],
-                   "conditions": [], "answerable": []}
+                   "conditions": [], "answerable": [], "sources": []}
         committed_position = first - num_workers
         skipped_too_long = 0
         # how full the rows actually come out. A row costs a full width forward whatever fraction of
@@ -262,13 +282,15 @@ class EvidenceDataset(SFTDataset):
                 out.extend([-1] * (self.max_length - len(out)))
                 return out
 
-            condition_ids = answerable_ids = None
+            condition_ids = answerable_ids = source_ids = None
             if self.has_condition_labels:
                 condition_ids = expand(current["conditions"])
                 # the groundedness label's second axis, carried the same way and for the same
                 # reason: it is a fact about the conversation, and the loss reads it at one chosen
                 # position inside that conversation's own block
                 answerable_ids = expand(current["answerable"])
+            if self.has_source_labels:
+                source_ids = expand(current["sources"])
 
             rows.append({
                 "input_ids": padded, "document_ids": doc_ids,
@@ -277,6 +299,7 @@ class EvidenceDataset(SFTDataset):
                 "evidence": list(current["evidence"]),
                 "condition_ids": condition_ids,
                 "answerable_ids": answerable_ids,
+                "source_ids": source_ids,
                 "num_segments": seg,
             })
             packed["rows"] += 1
@@ -291,7 +314,7 @@ class EvidenceDataset(SFTDataset):
                     f"closed by the evidence budget"
                 )
             for key in ("seq", "labels", "weights", "sections", "evidence", "conditions",
-                        "answerable"):
+                        "answerable", "sources"):
                 current[key].clear()
 
         def yield_batch():
@@ -310,6 +333,8 @@ class EvidenceDataset(SFTDataset):
                 batch["answerable_ids"] = torch.tensor(
                     [r["answerable_ids"] for r in rows], dtype=torch.long
                 )
+            if self.has_source_labels:
+                batch["source_ids"] = torch.tensor([r["source_ids"] for r in rows], dtype=torch.long)
             batch.update(_pack_evidence(rows))
             rows.clear()
             return batch
@@ -335,6 +360,7 @@ class EvidenceDataset(SFTDataset):
             ev_gold = evgold_mmap[key_start:key_end].tolist() if self.has_condition_labels else None
             condition_idx = int(cond_mmap[doc]) if self.has_condition_labels else -1
             answerable_idx = int(ans_mmap[doc]) if self.has_condition_labels else -1
+            source_idx = int(src_mmap[doc]) if self.has_source_labels else -1
 
             block_len = len(tokens) + self.num_mtp_tokens
             if block_len > usable or len(ev_tokens) > self.max_evidence_tokens:
@@ -377,6 +403,7 @@ class EvidenceDataset(SFTDataset):
             )
             current["conditions"].append(condition_idx)
             current["answerable"].append(answerable_idx)
+            current["sources"].append(source_idx)
             committed_position = position
 
             if len(current["seq"]) >= usable:

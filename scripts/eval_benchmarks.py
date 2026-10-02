@@ -21,6 +21,15 @@ What it measures
     reports pass@k instead -- GSM8K's is the number that decides whether RL is worth attempting
     at this size, so it gets a standing measurement rather than a guess.
 
+  * **Closed-book rank.** PopQA (``popqa``, kind ``rank``): the gold object is ranked among
+    distinct objects of the same relation by summed log-probability, split by subject popularity
+    (``tail`` / ``mid`` / ``head`` thirds). The metric is ``norm_rank`` (0 = gold first, chance 0.5,
+    lower is better); the shared tables print ``1 - norm_rank`` so higher is better everywhere.
+    The same candidates are scored again with the subject replaced by ``X``: that prior control, not
+    0.5, is the floor, because PopQA's objects are not uniform within a relation. Scoring lives in
+    ``scripts/closed_book_rank.py``. Not part of ``--tasks all`` (the frozen suite); ask for it with
+    ``--tasks popqa`` or ``--tasks rank``.
+
 Prompt formats are the EleutherAI harness's, verbatim, task by task (see each ``render_*``). That
 is not cosmetic: it is what makes ``PUBLISHED`` below a real check. ``--validate`` scores a peer
 against numbers that harness published for it and prints the per-task gap -- a harness that cannot
@@ -65,12 +74,14 @@ python scripts/eval_benchmarks.py -c ckpts/repair/checkpoint_repair_final.pt \\
 """
 import os
 import re
+import ast
 import sys
 import glob
 import json
 import math
 import time
 import random
+import hashlib
 import argparse
 import datetime
 from dataclasses import dataclass
@@ -153,11 +164,11 @@ class GenDoc:
 @dataclass
 class Task:
     name: str
-    kind: str                       # "mc" | "gen"
+    kind: str                       # "mc" | "gen" | "rank"
     repo: str
     file_prefix: str                # parquet paths under the repo that make up the eval split
     render: Callable[[dict], Optional[object]]
-    metric: str                     # headline metric: acc | acc_norm | em
+    metric: str                     # headline metric: acc | acc_norm | em | norm_rank (lower is better)
     chance: float                   # score a uniform random guesser gets, for the headroom column
     revision: Optional[str] = None  # e.g. "refs/convert/parquet" for script-only dataset repos
     shots: int = 0
@@ -295,6 +306,55 @@ def render_gsm8k(row: dict) -> Optional[GenDoc]:
     return GenDoc(f"Question: {row['question']}\nAnswer:", [gold])
 
 
+POPQA_REPO = "akariasai/PopQA"
+POPQA_FILE = "test.tsv"
+POPQA_COLUMNS = ("id", "subj", "prop", "obj", "s_pop", "o_pop", "possible_answers", "question")
+# the relations whose object is a named entity: the headline. the others take a value from a short
+# list of common nouns, where a model with no knowledge of the subject still scores well on priors
+POPQA_ENTITY_RELATIONS = ("place of birth", "father", "mother", "producer", "director", "screenwriter",
+                          "composer", "author", "capital", "capital of", "country")
+POPQA_ATTRIBUTE_RELATIONS = ("occupation", "genre", "color", "religion", "sport")
+POPQA_TIERS = ("tail", "mid", "head")
+POPQA_POP_BINS = ("<2", "2-3", "3-4", ">=4")
+
+
+def _popqa_answers(value) -> List[str]:
+    """``possible_answers`` arrives as a JSON (or python) list in a string, or already a sequence."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return []
+    if isinstance(value, str):
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                value = parse(value)
+                break
+            except (ValueError, SyntaxError):
+                continue
+        else:
+            return [value.strip()] if value.strip() else []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
+def render_popqa(row: dict) -> Optional[dict]:
+    """Normalize one PopQA row to the fields the rank task uses; None when it is unusable.
+
+    ``answers`` is every string that counts as the right object (``possible_answers`` plus ``obj``):
+    a distractor equal to any of them would be a second correct answer.
+    """
+    subj, obj = str(row["subj"]).strip(), str(row["obj"]).strip()
+    question, prop = str(row["question"]).strip(), str(row["prop"]).strip()
+    if not subj or not obj or not question or not prop:
+        return None
+    try:
+        s_pop = float(row["s_pop"])
+    except (TypeError, ValueError):
+        return None
+    answers = list(dict.fromkeys(_popqa_answers(row.get("possible_answers")) + [obj]))
+    return {"id": str(row["id"]), "subj": subj, "prop": prop, "obj": obj, "question": question,
+            "answers": answers, "s_pop": s_pop}
+
+
 TASKS: Dict[str, Task] = {
     "hellaswag": Task("hellaswag", "mc", "Rowan/hellaswag", "data/validation",
                       render_hellaswag, "acc_norm", 0.25),
@@ -320,10 +380,12 @@ TASKS: Dict[str, Task] = {
     "gsm8k": Task("gsm8k", "gen", "openai/gsm8k", "main/test", render_gsm8k, "em", 0.0,
                   shots=5, shot_prefix="main/train", max_new_tokens=256,
                   stop=("\nQuestion:", "\n\n"), answer_style="gsm8k"),
+    "popqa": Task("popqa", "rank", POPQA_REPO, POPQA_FILE, render_popqa, "norm_rank", 0.5),
 }
 
 MC_TASKS = [name for name, task in TASKS.items() if task.kind == "mc"]
 GEN_TASKS = [name for name, task in TASKS.items() if task.kind == "gen"]
+RANK_TASKS = [name for name, task in TASKS.items() if task.kind == "rank"]
 
 
 # ---------------------------------------------------------------------------- data loading
@@ -841,6 +903,247 @@ def score_gen_task(backend: Backend, task: Task, docs: List[GenDoc], prefix: str
     }
 
 
+# ------------------------------------------------------------------------------- rank tasks
+
+
+def popqa_class(prop: str) -> str:
+    """``entity`` (the headline), ``attribute`` or ``other`` for a PopQA relation name."""
+    if prop in POPQA_ENTITY_RELATIONS:
+        return "entity"
+    return "attribute" if prop in POPQA_ATTRIBUTE_RELATIONS else "other"
+
+
+def popqa_tier_cutoffs(s_pops: Sequence[float]) -> Tuple[float, float]:
+    """Subject-popularity cutoffs that split the whole test set into thirds.
+
+    Args:
+        s_pops: ``s_pop`` of every usable row, before any ``--limit``.
+
+    Returns:
+        ``(upper edge of tail, upper edge of mid)``. Ties go to the lower tier.
+    """
+    low, high = np.quantile(np.asarray(s_pops, dtype=np.float64), [1 / 3, 2 / 3])
+    return float(low), float(high)
+
+
+def popqa_tier(s_pop: float, cutoffs: Tuple[float, float]) -> str:
+    """``tail`` / ``mid`` / ``head`` for a popularity under the cutoffs."""
+    if s_pop <= cutoffs[0]:
+        return "tail"
+    return "mid" if s_pop <= cutoffs[1] else "head"
+
+
+def popqa_pop_bin(s_pop: float) -> str:
+    """The log10 bin of a popularity: ``<2``, ``2-3``, ``3-4`` or ``>=4``."""
+    value = math.log10(max(s_pop, 1.0))
+    return POPQA_POP_BINS[0] if value < 2 else POPQA_POP_BINS[1] if value < 3 else (
+        POPQA_POP_BINS[2] if value < 4 else POPQA_POP_BINS[3])
+
+
+def popqa_prior_question(question: str, subj: str) -> Optional[str]:
+    """The question with the subject's surface form replaced by ``X``; None when it is not in it."""
+    replaced, count = re.subn(r"(?<!\w)" + re.escape(subj) + r"(?!\w)", "X", question, flags=re.IGNORECASE)
+    return replaced if count else None
+
+
+def popqa_candidates(row: dict, pool: Sequence[Tuple[str, str]], n_candidates: int) -> Optional[List[str]]:
+    """The gold object plus ``n_candidates - 1`` distractors of the same relation.
+
+    Args:
+        row: a ``render_popqa`` row.
+        pool: ``(normalized, surface)`` distinct objects of the row's relation.
+        n_candidates: candidate count including the gold.
+
+    Returns:
+        Gold first, then distractors drawn by a generator seeded from the row id, none of which
+        normalizes equal to any accepted answer. None when the pool cannot fill the set.
+    """
+    gold = normalize_answer(row["obj"])
+    if not gold:
+        return None
+    banned = {normalize_answer(a) for a in row["answers"]} | {gold}
+    usable = [surface for norm, surface in pool if norm not in banned]
+    if len(usable) < n_candidates - 1:
+        return None
+    rng = random.Random(int(hashlib.sha1(row["id"].encode("utf-8")).hexdigest()[:12], 16))
+    return [row["obj"]] + rng.sample(usable, n_candidates - 1)
+
+
+def plan_popqa(rows: List[dict], n_candidates: int, seed: int, limit: Optional[int]) -> dict:
+    """Everything the rank scorer needs from a PopQA frame, as plain data.
+
+    Pools and tier cutoffs are built from every usable row; ``limit`` then takes a seeded subsample
+    of the rows to score, so a limited run sees the same candidate sets and tiers as a full one.
+
+    Args:
+        rows: ``render_popqa`` rows.
+        n_candidates: candidates per item (the gold included).
+        seed: seeds the ``limit`` subsample.
+        limit: cap on scored rows, or None.
+
+    Returns:
+        ``{"items": [...], "excluded_relations": {prop: distinct objects}, "skipped": {...},
+        "cutoffs": (a, b)}``; each item is a dict with ``item_id, context, prior_context, gold,
+        candidates, tier, group, cls, pop_bin``.
+    """
+    rows = [r for r in rows if r is not None]
+    pools: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        norm = normalize_answer(row["obj"])
+        if norm:
+            pools.setdefault(row["prop"], {}).setdefault(norm, row["obj"])
+    pool_lists = {prop: sorted(((n, s) for n, s in pool.items()), key=lambda ns: ns[1])
+                  for prop, pool in pools.items()}
+    excluded = {prop: len(pool) for prop, pool in pool_lists.items() if len(pool) < n_candidates}
+    cutoffs = popqa_tier_cutoffs([r["s_pop"] for r in rows])
+
+    chosen = list(rows)
+    if limit is not None and len(chosen) > limit:
+        random.Random(seed).shuffle(chosen)
+        chosen = chosen[:limit]
+    items, skipped = [], {"excluded_relation": 0, "too_few_candidates": 0, "prior_missing": 0}
+    for row in chosen:
+        if row["prop"] in excluded:
+            skipped["excluded_relation"] += 1
+            continue
+        candidates = popqa_candidates(row, pool_lists.get(row["prop"], []), n_candidates)
+        if candidates is None:
+            skipped["too_few_candidates"] += 1
+            continue
+        prior = popqa_prior_question(row["question"], row["subj"])
+        if prior is None:
+            skipped["prior_missing"] += 1
+        items.append({
+            "item_id": row["id"], "context": f"Q: {row['question']}\nA:",
+            "prior_context": None if prior is None else f"Q: {prior}\nA:",
+            "gold": row["obj"], "candidates": candidates, "tier": popqa_tier(row["s_pop"], cutoffs),
+            "group": row["prop"], "cls": popqa_class(row["prop"]), "pop_bin": popqa_pop_bin(row["s_pop"]),
+        })
+    return {"items": items, "excluded_relations": excluded, "skipped": skipped, "cutoffs": cutoffs}
+
+
+def build_rank_plan(task: Task, cache_dir: str, hf_token: Optional[str], limit: Optional[int],
+                    seed: int, n_candidates: int) -> Tuple[dict, str]:
+    """Download PopQA, check its header, render and plan it.
+
+    Returns:
+        ``(plan_popqa result, dataset revision sha)``.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    revision = HfApi(token=hf_token).dataset_info(task.repo).sha
+    local_dir = os.path.join(cache_dir, task.repo.replace("/", "__"))
+    os.makedirs(local_dir, exist_ok=True)
+    path = hf_hub_download(repo_id=task.repo, filename=task.file_prefix, repo_type="dataset",
+                           local_dir=local_dir, token=hf_token, revision=revision)
+    frame = pd.read_csv(path, sep="\t")
+    missing = [c for c in POPQA_COLUMNS if c not in frame.columns]
+    if missing:
+        raise SystemExit(f"PopQA columns are {list(frame.columns)}, missing {missing}")
+    rows = [task.render(row) for row in frame.to_dict("records")]
+    return plan_popqa(rows, n_candidates, seed, limit), revision
+
+
+def _compact(results: List[dict]) -> List[dict]:
+    return [{k: (round(v, 5) if isinstance(v, float) else v) for k, v in r.items()} for r in results]
+
+
+def score_rank_task(backend: Backend, plan: dict, n_candidates: int, batch_size: int, max_len: int,
+                    progress: str) -> dict:
+    """Rank the gold object among same-relation objects, with and without the subject.
+
+    Every item is scored twice over the same candidates: with its question, and with the subject's
+    surface form replaced by ``X``. The second reading is the prior control. ``delta_prior_minus_real``
+    is paired by item; a positive value means the subject carried information beyond what the
+    candidates' base rates give.
+
+    Args:
+        backend: any ``Backend`` (this model or a peer).
+        plan: ``plan_popqa`` output.
+        n_candidates: candidates per item, for the report.
+        batch_size: scorer batch size.
+        max_len: context truncation budget.
+        progress: log label.
+
+    Returns:
+        Results dict whose ``norm_rank`` / ``norm_rank_stderr`` are the entity-relation headline,
+        plus per-tier, per-relation, per-class, prior and paired-delta breakdowns, and the
+        per-item results (enough to pair two runs).
+    """
+    from scripts.closed_book_rank import RankItem, paired_compare, rank_items, summarize
+
+    started = time.time()
+    entries = plan["items"]
+    items = [RankItem(item_id=e["item_id"], context=e["context"], gold=e["gold"],
+                      candidates=e["candidates"], terminator="\n", tier=e["tier"], group=e["group"])
+             for e in entries]
+    prior_items = [RankItem(item_id=e["item_id"], context=e["prior_context"], gold=e["gold"],
+                            candidates=e["candidates"], terminator="\n", tier=e["tier"], group=e["group"])
+                   for e in entries if e["prior_context"] is not None]
+    # the corpus stores documents BOS-less and the dataset prepends one, as score_mc_task does for this model
+    bos = isinstance(backend, TinyBackend)
+    logger.info(f"[{progress}] scoring {len(items):,} items x {n_candidates} candidates, then the prior control")
+    real = rank_items(backend, items, batch_size=batch_size, max_len=max_len, prepend_bos=bos)
+    prior = rank_items(backend, prior_items, batch_size=batch_size, max_len=max_len, prepend_bos=bos)
+
+    cls_of = {e["item_id"]: e["cls"] for e in entries}
+    pop_bin_of = {e["item_id"]: e["pop_bin"] for e in entries}
+
+    def of_class(results, cls):
+        return [r for r in results if cls_of[r["item_id"]] == cls]
+
+    def cell(summary, key):
+        if key in summary:
+            return summary[key]
+        for name, value in summary.items():
+            if name != "all" and key in str(name).split("|"):
+                return value
+        return None
+
+    out = {"n_candidates": n_candidates, "chance_norm_rank": 0.5}
+    for cls in ("entity", "attribute", "other"):
+        mine, mine_prior = of_class(real, cls), of_class(prior, cls)
+        if not mine:
+            continue
+        by_tier = summarize(mine, by=("tier",))
+        out[cls] = {
+            "all": by_tier["all"],
+            "tier": {t: cell(by_tier, t) for t in POPQA_TIERS if cell(by_tier, t) is not None},
+            "relation": {k: v for k, v in summarize(mine, by=("group",)).items() if k != "all"},
+            "prior_tier": {}, "prior_all": None, "delta_prior_minus_real": {},
+        }
+        if mine_prior:
+            prior_by_tier = summarize(mine_prior, by=("tier",))
+            out[cls]["prior_all"] = prior_by_tier["all"]
+            out[cls]["prior_tier"] = {t: cell(prior_by_tier, t) for t in POPQA_TIERS
+                                      if cell(prior_by_tier, t) is not None}
+            paired = paired_compare(mine_prior, mine, by=("tier",))
+            out[cls]["delta_prior_minus_real"] = {"all": paired.get("all"),
+                                                  **{t: cell(paired, t) for t in POPQA_TIERS
+                                                     if cell(paired, t) is not None}}
+
+    headline_cell = out["entity"]["all"] if "entity" in out else summarize(real, by=("tier",))["all"]
+    bins = {}
+    for r in real:
+        bins.setdefault(pop_bin_of[r["item_id"]], []).append(r["norm_rank"])
+    out.update({
+        "n": headline_cell["n"],
+        "norm_rank": headline_cell["norm_rank"],
+        "norm_rank_stderr": headline_cell["norm_rank_sigma"],
+        "top1": headline_cell["top1"],
+        "chance_top1": headline_cell["chance_top1"],
+        "by_pop_bin": {b: {"n": len(bins[b]), "norm_rank": float(np.mean(bins[b]))}
+                       for b in POPQA_POP_BINS if b in bins},
+        "tier_cutoffs_s_pop": list(plan["cutoffs"]),
+        "excluded_relations": plan["excluded_relations"],
+        "skipped": plan["skipped"],
+        "items": _compact(real),
+        "items_prior": _compact(prior),
+        "seconds": time.time() - started,
+    })
+    return out
+
+
 # ---------------------------------------------------------------------------- pretty output
 
 
@@ -883,8 +1186,41 @@ def fmt(value, digits: int = 4, dash: str = "--") -> str:
 
 
 def headline(result: dict, task: Task) -> Optional[float]:
+    """The task's headline score, oriented so higher is better (a rank task reports ``1 - norm_rank``)."""
     value = result.get(task.metric)
-    return None if value is None or (isinstance(value, float) and math.isnan(value)) else value
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return 1.0 - value if task.kind == "rank" else value
+
+
+def metric_label(task: Task) -> str:
+    """The metric name as the shared tables print it."""
+    return f"1-{task.metric}" if task.kind == "rank" else task.metric
+
+
+def print_rank_report(name: str, result: dict) -> None:
+    """Per-tier readings for a rank task: the real score, the prior control and their paired gap."""
+    print(f"\n  {name} closed-book rank over {result.get('n_candidates')} candidates "
+          f"(norm_rank: 0 = gold first, chance 0.5, lower is better; the table above prints 1 - norm_rank)")
+    rows = []
+    for cls in ("entity", "attribute", "other"):
+        block = result.get(cls)
+        if not block:
+            continue
+        tiers = list(block["tier"]) + ["all"]
+        for tier in tiers:
+            real = block["all"] if tier == "all" else block["tier"][tier]
+            prior = block["prior_all"] if tier == "all" else block["prior_tier"].get(tier)
+            delta = block["delta_prior_minus_real"].get(tier)
+            rows.append([cls, tier, f"{real['n']:,}", fmt(real["norm_rank"]), fmt(real["norm_rank_sigma"]),
+                         fmt(prior["norm_rank"]) if prior else "--",
+                         fmt(delta["diff_norm_rank"]) if delta else "--",
+                         fmt(delta["z"], 1) if delta else "--", fmt(real["top1"])])
+    print(table(["class", "tier", "n", "norm_rank", "sigma", "prior", "prior-real", "z", "top1"], rows,
+                aligns="llrrrrrrr"))
+    if result.get("excluded_relations"):
+        listed = ", ".join(f"{k} ({v})" for k, v in sorted(result["excluded_relations"].items()))
+        print(f"  relations with too few distinct objects, excluded: {listed}")
 
 
 def print_model_diagnostic(payload: dict) -> None:
@@ -915,7 +1251,7 @@ def print_task_report(payload: dict) -> None:
         headroom = None if score is None or task.chance >= 1 else (score - task.chance) / (1 - task.chance)
         stderr = result.get(f"{task.metric}_stderr")
         rows.append([
-            name, task.metric, f"{result.get('n', 0):,}",
+            name, metric_label(task), f"{result.get('n', 0):,}",
             fmt(score), fmt(stderr), fmt(task.chance, 2), fmt(headroom),
             fmt(result.get("acc"), 4), fmt(result.get("acc_norm"), 4),
             fmt(result.get("ppl"), 2), f"{result.get('seconds', 0):.0f}s",
@@ -937,6 +1273,8 @@ def print_task_report(payload: dict) -> None:
             print(f"\n  {name} — first generations (greedy):")
             for text in result["examples"]:
                 print(f"    {text[:160]!r}")
+        if TASKS[name].kind == "rank":
+            print_rank_report(name, result)
 
 
 def print_comparison(payloads: List[dict]) -> None:
@@ -955,7 +1293,7 @@ def print_comparison(payloads: List[dict]) -> None:
                 cells.append("--")
             else:
                 cells.append(f"{score:.4f}" + ("*" if best is not None and score == best else " "))
-        rows.append([name, task.metric, fmt(task.chance, 2)] + cells)
+        rows.append([name, metric_label(task), fmt(task.chance, 2)] + cells)
     print(table(["task", "metric", "chance"] + names, rows))
     print("  * best in row. every column was scored by this file, on the same subsample, at the "
           "same flags.")
@@ -1124,6 +1462,19 @@ def run_suite(backend: Backend, task_names: Sequence[str], args, hf_token: Optio
 
     for name in task_names:
         task = TASKS[name]
+        if task.kind == "rank":
+            plan, revision = build_rank_plan(task, args.cache_dir, hf_token, args.limit, args.seed,
+                                             args.rank_candidates)
+            revisions[name] = revision
+            if not plan["items"]:
+                logger.warning(f"[{name}] no usable items, skipped")
+                continue
+            logger.info(f"[{backend.name}] {name}: {len(plan['items']):,} items "
+                        f"({task.kind}, headline metric {task.metric}, lower is better)")
+            results[name] = score_rank_task(backend, plan, args.rank_candidates, args.batch_size,
+                                            args.max_context, f"{backend.name}/{name}")
+            results[name]["dataset_revision"] = revision
+            continue
         limit = args.gen_limit if task.kind == "gen" else args.limit
         docs, revision, prefix = build_docs(task, args.cache_dir, hf_token, limit, args.seed)
         revisions[name] = revision
@@ -1151,6 +1502,8 @@ def run_suite(backend: Backend, task_names: Sequence[str], args, hf_token: Optio
             "batch_size": args.batch_size, "max_context": args.max_context,
             "limit": args.limit, "gen_limit": args.gen_limit, "seed": args.seed,
             "pass_k": args.pass_k, "temperature": args.temperature,
+            **({"rank_candidates": args.rank_candidates}
+               if any(TASKS[n].kind == "rank" for n in results) else {}),
         },
         "environment": {
             "device": (torch.cuda.get_device_name(0) if args.device.startswith("cuda") else args.device),
@@ -1177,9 +1530,12 @@ def main():
     parser.add_argument("--compare", nargs="*", default=[],
                         help="previously written results JSONs to fold into the comparison table")
     parser.add_argument("--tasks", default="all",
-                        help=f"comma-separated subset of: {', '.join(TASKS)} (also 'mc' / 'gen')")
+                        help=f"comma-separated subset of: {', '.join(TASKS)} (also 'mc' / 'gen' / "
+                             "'rank'). 'all' is the frozen suite: every mc and gen task, no rank task")
     parser.add_argument("--limit", type=int, default=None,
                         help="cap multiple-choice docs per task (seeded subsample; default: all)")
+    parser.add_argument("--rank-candidates", type=int, default=20,
+                        help="candidates per closed-book rank item, the gold included")
     parser.add_argument("--gen-limit", type=int, default=1000,
                         help="cap generative docs per task -- generation has no KV cache on this "
                              "model, so cost is quadratic in answer length")
@@ -1218,7 +1574,9 @@ def main():
     os.makedirs(args.cache_dir, exist_ok=True)
 
     if args.tasks == "all":
-        task_names = list(TASKS)
+        task_names = MC_TASKS + GEN_TASKS
+    elif args.tasks == "rank":
+        task_names = list(RANK_TASKS)
     elif args.tasks == "mc":
         task_names = list(MC_TASKS)
     elif args.tasks == "gen":
