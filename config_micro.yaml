@@ -66,8 +66,8 @@ evidence:
   num_epochs: 1                        # the corpus is the token budget; exposures are explicit
   weight_decay: 0.1
   dropout: 0.0
-  batch_size: 16
-  grad_accumulation_steps: 2           # ~32k tokens per optimizer step at full rows
+  batch_size: 32                       # at 35M the step is host bound: batch 16 x accum 2 ran 45k tok/s
+  grad_accumulation_steps: 1           # ~32k tokens per optimizer step at full rows
   warmup_fraction: 0.02
   lr_min_factor: 0.1
   seed: 1234

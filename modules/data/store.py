@@ -31,7 +31,7 @@ import numpy as np
 EMBED_DIM = 384
 EMBEDDER = "BAAI/bge-small-en-v1.5"
 
-_PUNCTUATION = set(string.punctuation)
+_STRIP_PUNCTUATION = str.maketrans("", "", string.punctuation)
 _ARTICLES = {"a", "an", "the"}
 
 
@@ -63,8 +63,8 @@ def normalize_text(text: str) -> str:
     The same rule as the answer normalization the QA evals use, restated here because nothing under
     ``modules/`` may import a script. Gold labeling and the evals must agree on it.
     """
-    text = "".join(ch for ch in text.lower() if ch not in _PUNCTUATION)
-    return " ".join(t for t in text.split() if t not in _ARTICLES)
+    text = text.lower().translate(_STRIP_PUNCTUATION)
+    return " ".join([t for t in text.split() if t not in _ARTICLES])
 
 
 def contains_answer(chunk_text: str, answer: str) -> bool:

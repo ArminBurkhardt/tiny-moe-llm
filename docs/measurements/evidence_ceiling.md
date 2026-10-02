@@ -74,3 +74,30 @@ and says the bound is generous; it says nothing about how much of that bound the
 
 The probe is read-only and reuses `eval_abstention`'s loader, renderer, slice and scorer by import.
 Raw output in `ckpts/repair/evidence_ceiling.log` (gitignored, as eval logs are).
+
+## 5. The ceiling on `evidence_fixed` (2026-10-02)
+
+The same probe on the held-out kill split, so every later arm's port gain has an in-context
+reference on the same questions: `evidence_ceiling_probe.py --fixed-split evidence_fixed
+--max-questions 2000`, seed `checkpoint_repair_final_irrandom_evidence_grounded.pt`, answer-span CE
+with the real answer as the target under every condition, split by the `.src` sidecar.
+
+| source | gold | mixed | distractors | none | ceiling | content | questions |
+|---|---|---|---|---|---|---|---|
+| hotpot_qa | 1.5252 | 1.7512 | 4.7686 | 4.5857 | 3.0604 | 3.2434 | 1,118 |
+| squad_v2 | 1.6061 | 1.8652 | 5.4485 | 4.9131 | 3.3070 | 3.8424 | 882 |
+| all | 1.5639 | 1.8058 | 5.0942 | 4.7425 | **3.1785** | **3.5303** | 2,000 |
+
+ceiling = CE(none) - CE(gold); content = CE(distractors) - CE(gold).
+
+- The pooled ceiling, 3.18 nats, agrees with the 3.23 in section 1 on a different slice and a
+  different checkpoint. The number is a property of the data, not of the slice.
+- In context, selection is nearly solved: gold among distractors (`mixed`) costs only 0.24 nats over
+  gold alone. A distractor alone costs 0.35 nats over nothing, about half the 0.63 in section 3.
+- Against this reference the killed 10M arms reached roughly a sixth of the ceiling on gold gain
+  (arm A 0.545, arm B 0.571) and about 2% of it on content gain (0.058 and 0.081). The arms' fixed
+  pass scored its own batch cap, not these 2,000 rows, so the ratios are approximate. Every later
+  run reads its gain against this file through `sft.py --ceiling-json`, on the same rows.
+
+The JSON is `docs/measurements/ceiling_fixed.json`. It is gitignored like every `*.json`, so this
+table is the tracked record; regenerate the file with the command above before any arm needs it.
