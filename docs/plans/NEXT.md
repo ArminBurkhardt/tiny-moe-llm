@@ -10,125 +10,96 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-01)
+## Now (2026-10-03)
 
-**Phase 4 ran on 2026-10-01 and both arms were killed by the rule at 10.08M tokens**
-([evidence_arm_a.md](../measurements/evidence_arm_a.md),
-[evidence_arm_b.md](../measurements/evidence_arm_b.md)). Fixed-target gold gain +0.545 (arm A) /
-+0.571 (arm B, no rotary), content gain +0.058 / +0.081 against the 0.1 survival bar and the 1.6
-pass bar. Of the gold gain about 0.49 nats is condition-independent (distractors gain +0.49): the
-reader learned that an attached buffer means "answer, do not abstain", which is the training mix's
-prior, not retrieval. The selector learned: per-token chunk AUROC 0.515 to 0.650 at loop 1,
-over the 0.59 bar at every loop from 7.5M; mass/chunk AUROC 0.57 (bar 0.674); the external mass
-stayed at about 5%. The rotary offset is not the block (B's content gain runs 40% above A's, both
-an order of magnitude under the bar). Per "What it decides", the first pilot reader arm is a reader
-per loop or dense prelude reads, without rotary. Nothing here bears on where facts live. The
-content gain was still rising in both arms (B: 0.016, 0.036, 0.051, 0.081), so a longer graft
-would read higher, but the plan's budget for the graft question was 10M and the answer is "no".
+**The from-scratch reader reads, once it is the model's own attention.** R0b ran on 2026-10-02 and
+2026-10-03 ([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the micro shape (35M,
+`config_micro.yaml`), from one seed, on `data/prepared_inject`:
 
-**Phase 4b and the R0b tooling were built on 2026-10-01** (four parallel packages, every test
-passes, nothing has run on real data yet): the biography generator, the three-arm injection corpus
-builder, the micro shape (`config_micro.yaml` through `TINY_LLM_CONFIG`, 35M total / 12M
-non-embedding), the scratch seed, the closed-book rank scorer with paired compare; the chain
-generator, the `reader_sites_kept` forward argument and `eval_chains.py`; the `.src` sidecar with a
-byte-checked backfill, per-source `[eval fixed]` lines, `--ceiling-json`, the counterfactual
-condition with per-record JSON, `evidence_ceiling_probe.py --fixed-split`; the store format,
-`build_store.py`, `eval_store.py` (recall, pathway, edit) and the PopQA rank task with a prior
-control. Left for later: R1b, per-loop training-log readouts, G9, the PLE ablation, the CE
-bootstrap sigma, the SciQ/BoolQ evidence path (A6), HotpotQA by read site. Runbooks are in
-CLAUDE.md "Commands".
+- **Arm (a), full CE, 300M tokens: the instrument reads.** Closed-book entity `delta` in
+  distribution 0.009 / 0.063 / 0.378 / 0.467 at tiers 1 / 10 / 100 / 1000 (tier 1000 rank 0,
+  top-1 1.000); on the held-out template only 0.001 / 0.009 / 0.023 / 0.104. Memorization is mostly
+  surface form. In context, the same checkpoint copies a card from its prompt at 0.29 / 0.26 / 0.12
+  / 0.003 (in distribution) and 0.20 flat over tiers (held out).
+- **The 20M arm (c) smoke was read before any copy circuit existed.** The new prompt read
+  (`closed_book_rank.py bios --evidence prompt`, the card as prompt text, no port) equals the
+  closed-book read for entities at every tier on that save (0.491 / 0.496 / 0.480 / 0.394), so the
+  smoke said nothing about the reader.
+- **At matched 100M tokens the cross attention reader does not copy and the key/value reader
+  does.** The key/value reader (`sft.py --reader-kv`: the evidence states become leading keys and
+  values of `shared_attn` in every loop, through its own projections, rotated as if the evidence
+  were the text right before the document) ranks the gold card's value at 0.003 / 0.003 / 0.002 /
+  0.000 in distribution (top-1 0.92, flat in exposure) and 0.02 held out, and follows a swapped card
+  92% of the time with a memorization ratio under 0.03. The cross reader, resumed to 100M as the
+  matched control, ranks it at 0.47 / 0.46 / 0.35 / 0.02 and follows a swapped card 2% of the time,
+  although the same model copies from its prompt at 0.10 to 0.13. Training the key/value read also
+  trained in-context copying (prompt 0.003). The selector separated in both runs by 100M on the
+  selection loss alone (gate frozen): external mass 0.39 to 0.46 with gold, 0.02 to 0.12 without.
+- **Arm (c) already leaks at 100M under either reader.** Closed-book `delta` in distribution at
+  tier 100 / 1000: cross 0.037 (z 10.5) / 0.203 (z 20.3), key/value 0.026 (z 5.2) / 0.149 (z 12.3),
+  arm (a) at the same tokens 0.099 / 0.332. The reader that copies leaks least but still fails the
+  pass rule at tier 100. These are mid-cosine readings; the full arms decide.
 
-**Reading the record so far.** Seven gates have failed (G1, G2, G2b, G2c, R0, arm A, arm B) and
-every one of them measured a graft: a zero-initialised pathway on the converged 16B-token
-checkpoint, trunk at 1e-5, at most 10M tokens. That is one fact measured seven times, not seven
-independent failures, and it is the fact the plan already concluded on 2026-09-18: the real run
-pretrains with retrieval from token 0. For scale, RETRO-fitting a cross-attention reader onto a
-pretrained model took about 3% of pretraining, roughly 12B tokens, three orders of magnitude over
-the 10M arms. The graft branch is closed. Every GPU hour from here goes to the from-scratch
-branch, where no result exists yet in either direction. In order:
+Earlier, still binding: Phase 4's graft arms were killed at 10.08M tokens on the content gain
+(+0.058 / +0.081, [evidence_arm_a.md](../measurements/evidence_arm_a.md),
+[evidence_arm_b.md](../measurements/evidence_arm_b.md)); the graft branch is closed (seven failed
+gates, one graft condition). The in-context ceiling on `evidence_fixed` is 3.18 nats pooled
+([evidence_ceiling.md](../measurements/evidence_ceiling.md) section 5), so the 10M arms reached a
+sixth of it on gold gain and 2% on content gain. R0 failed: `loop_scale` stays at the trunk's rate
+in graft arms.
 
-1. **Cheap seed-side instruments first, about one GPU hour.** The in-context ceiling on
-   `evidence_fixed` (`evidence_ceiling_probe.py --fixed-split`, minutes; every later arm's gain is
-   then read against the same split through `--ceiling-json`), the `.src` backfill (CPU), then
-   the counterfactual eval and PopQA on the seed and on both 10M checkpoints (the 50-swap audit
-   reads 0 errors in 50 after the alias fix; PROPER answers are mostly ineligible by design).
-   These calibrate the instruments before anything is read through them. The store build, the
-   edit store and the chain eval splits are CPU work and run while the GPU trains in step 2;
-   `eval_store.py recall` / `pathway` and `eval_chains.py` on the 10M checkpoints come after
-   step 2 (R2 will read "not readable" there: no chain training, so the 1-hop curve will not
-   saturate).
-2. **R0b, the externalization micro-pilot, arm (a) first and alone.** Build `data/prepared_inject`
-   (0.3B tokens: filler from the local `ir`, `phase1`, `phase2` bins, about 270M distinct tokens,
-   plus 3,600 people rendered `tier` times, about 15M tokens; about 20 minutes), the scratch seed,
-   then `inject_full` under `TINY_LLM_CONFIG=config_micro.yaml` with `sft.py --evidence` (C2 flags
-   `--data-dir/--train-split/--val-split`), in the background under a Monitor watch teed to a
-   gitignored log; read peak memory and fill in minute one. Arm (a) decides whether the instrument
-   is readable at all: if a 35M model trained on 1,000 exposures of a fact under five templates
-   does not climb above its prior control at tier 1000, nothing in (b) or (c) can be read and the
-   fix is the generator (more templates, more exposures), not the recipe. One to two 5090 hours.
-3. **A 20M-token smoke of arm (c) before its full run.** Launch `inject_retrieval`, stop it by
-   hand after about 20M tokens (`touch ckpts/evidence_inject_retrieval/STOP`), and read
-   `closed_book_rank.py bios --evidence gold` on the save: can the from-scratch reader copy a value
-   from an attached card? This is the first time the port trains from token 0 and it is the
-   precondition for everything after. If the open-book rank is near 0 the reader reads; run (b)
-   and (c) in full (resume the same run directory with the same flags). If it is near 0.5 the arm
-   is uninformative and the reader design is what failed: fix it at micro scale (a reader per
-   loop, or reads in the dense prelude layers), where an arm costs an hour, before any pilot
-   spend. About half an hour.
-4. **Arms (b) and (c) in full, then `compare full masked retrieval`.** Read `closed_book_rank.py
-   bios --form both` per arm; on (c) also `--evidence swapped` for the follow rate. `compare`
-   prints one verdict per probe form. Chance is not 0.5: values are drawn uniformly per person,
-   but corpus value frequency is exposure-weighted (a tier-1000 person's city gets about 2.2x the
-   mean count), so a model with value marginals and no name binding ranks heavy-tier gold above
-   0.5, and arm (c) trains on value targets. Every closed-book item therefore has a paired prior
-   control with a fresh name that occurs nowhere in the corpus; the reading is `delta =
-   norm_rank_prior - norm_rank` with a paired bootstrap sigma, on entity attributes. Pass: (b) and
-   (c) within 3 sigma of delta 0 through tier 100 while (a) is 3 sigma above at tier 100 or 1000.
-   The control exists only under `--evidence none` (a fresh name has no card); the open-book
-   readings are against 0.5, which is fine because copying from a card lands near 0. Each outcome
-   names its next action: (a) climbs and (b), (c) at chance means the recipe holds and the pilot
-   proceeds; (b) climbs means seeing the fact as input leaks it into the weights, so the lever is
-   the anonymization rate (`--suffix s15a90`); only (c) climbs means copying from the card teaches
-   the binding, so the lever is the swap rate (`--suffix s30a50`). One sweep arm per leak, 0.3B
-   tokens each, not both. About a day of 5090 time for the whole rung.
-5. **Then the pilot** (Phase 5), with the reader arm settled in step 3 and no rotary, after R0b
-   passes. Before launching it, cut the ladder below to the budget: R4 alone is 4 x 2 x 1B tokens,
-   four to six days of 5090 time at a plausible 20 to 30k tok/s at the pilot shape, before R4b and
-   R6. Decide the arm count and the rung order from the R0b and R1b readings, not at launch.
+**The ladder, in order** (done steps kept so the order reads whole):
 
-Relaunching: a killed or stopped arm is relaunched with the same `-c` and the same flags
-(including the C2 flags). Without `-c` the yaml builds a model without the port and the strict
-resume load fails; `kill_checked` is persisted in the checkpoint, so a resumed arm does not decide
-twice. `ckpts/evidence_armA.log` and `ckpts/evidence_armB.log` (gitignored) hold the full 10M runs:
-6.6k to 18.3k tok/s, about 11k typical, peak 26.42 GB, fill 61 to 67%.
+1. **Done 2026-10-02: arm (a) in full.** The instrument reads (above).
+2. **Done 2026-10-03: the copy control.** `--evidence prompt` on the 20M arm (c) save and on arm
+   (a) final. It showed the 20M smoke was read before copying existed.
+3. **Done 2026-10-03: the reader redesign and its matched control.** The key/value reader built and
+   tested (`tests/test_evidence_kv_reader.py`), a 100M arm (c) smoke with it, and the cross reader
+   resumed to the same 100M. The key/value reader copies; the cross reader does not.
+4. **Arm (b), `inject_masked`, in full** (0.3B tokens, about 90 minutes, no reader involved). The
+   input-side leak test, and the third arm `compare` needs.
+5. **Arm (c) in full with the key/value reader.** Resume `inject_retrieval_kv` from its 100M save
+   with the same flags (`--reader-kv` included; the mode is in the checkpoint and a relaunch
+   without the flag fails the strict load). Every arm (c) save gets four reads, `--evidence gold`,
+   `swapped`, `none` and `prompt`, at `--batch-size 1024`, json to
+   `ckpts/inject/rank_<run><tokens>_<mode>.json`. Then `compare full masked retrieval_kv`, one
+   verdict per form, under the pass rule (R0b in the Phase 5 ladder: tier 1000 in distribution
+   read alongside tier 100). The cross reader is closed at micro scale; its 100M save stays as the control.
+6. **If (c) still climbs at 300M**, the plan's lever for "only (c) climbs" applies: one sweep arm
+   at the higher swap rate (`--suffix s30a50`), key/value reader. If (b) climbs, the anonymization
+   rate (`s15a90`). One sweep arm per leak.
+7. **The loop reading on arm (a), cheap and eval only.** The storage half of the loop axiom
+   (Decisions): closed-book rank by loop count, `n_loops` 1, 2, 3 on arm (a) final (needs an
+   `--n-loops` flag on `closed_book_rank.py bios`; the micro arms trained every exit through
+   `loop_count_sampling`, so depths 1 and 2 are trained readouts).
+8. **Learned depth allocation on the loop axis**, after the reader works on the full arm (c):
+   an entropy-regularized exit distribution over depths, as in Ouro (arXiv 2510.25741), in place of
+   the fixed depth draw, as a micro arm against the fixed schedule.
+9. **The seed-side instruments still open**: the counterfactual eval and PopQA on the seed and both
+   10M checkpoints. Both 10M arms abstain on 99.9% of answerable rows and the seed on 46.5%, so the
+   counterfactual is read with `eval_abstention.py --counterfactual-likelihood-only` (mr_ll by
+   stratum, no generation, no gold condition needed). The store build, the edit store and the
+   chain splits are CPU work that can run beside any GPU arm.
+10. **Then the pilot** (Phase 5), with the key/value reader and its rotation, after R0b passes;
+    the ladder is cut to the budget before launch.
 
-Seed baselines, read before step 1 on the new splits: fixed-target gold gain **-0.0020 nats**
-(noise from packing, the reader is exactly neutral: `eval_abstention.py --evidence-port` reads
-+0.0000 on 400 SQuAD rows); pooled chunk AUROC 0.434 / 0.415 / 0.415 by loop, which is the old
-metric whose chance level under a uniform selector is 0.421, so the seed selector is uniform (gold
-share of the external mass 0.334), not ranking gold below distractors. The per-token chunk AUROC
-(chance 0.5) reads 0.515 / 0.484 / 0.490 by loop on the seed (smoke2, 2026-09-30), mass/chunk
-AUROC 0.481 / 0.470 / 0.469, content gain -0.0009, per-loop reader gain -0.0016 / -0.0021 /
--0.0020 (loop 3 equals the headline). Grounded AUROC 0.5000 on all rows and on evidence rows
-(zero head).
-The per-condition `[eval]` gold minus none of -3.25 nats was read on the old leaked split;
-`evidence_dev` reads about -2.3, and neither is the kill number. **R0 failed on both
-checkpoints** ([loop_scale_probe.md](../measurements/loop_scale_probe.md)): every multiplier makes
-loop 3 worse, so `loop_scale` stays out of the fresh group in graft arms. The seed's `g_proj` and
-`direct_gate` are both exactly zero and hold each other there: the IR value path is dead for this
-run, which matches the real-run decision (selector without a value read); the selector trains
-from the selection loss alone (`value_adapter` gradient 0 at step 10, `key_adapter` 1.4e-3).
+Batch caveat: `config_micro.yaml` moved from batch 16 x accumulate 2 to 32 x 1 for throughput.
+That changes nothing the induction-head result keys on: formation is set by tokens per update x
+updates (batch x context, arXiv 2511.16893), and both settings put 32 rows of 1024 tokens into
+every optimizer step. Copying emerged between 20M and 100M here, so nothing is blocking. If a later
+arm copies late or weakly, the lever is fewer tokens per optimizer step (16 x 1, twice the updates
+per token, a larger batch giving weaker heads), not the accumulation split.
 
-Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
-3.75. Held-out `evidence_dev` 18,966 rows (ratio 11.2, QA only) and `evidence_fixed` 13,333
-questions x 4 conditions (ratio 6.25), from `prepare_evidence_data.py --heldout`. `evidence_val`
-is a train-loss slice. `EvidenceConfig`: batch 2, accumulate 8, `max_evidence_tokens: 14336`,
-`eval_every_tokens: 2500000`, `checkpoint_every_tokens: 10000000` (a save lands at the 10M
-decision). About 42k real prompt tokens per optimizer step at 64% fill (65k is capacity), warmup
-99 steps, about 4.2M tokens. Smoke (`ckpts/instrsmoke.log`): 26.36 GB peak allocated over 110
-micro steps, 6.0k to 14.8k tok/s, about 10k typical; about 0.5 s per micro step, 4 s per
-optimizer step, 10M tokens in 11 to 19 min. `ckpts/evidence/` does not exist, so the first launch
-honours `-c`.
+Relaunching: a stopped arm is relaunched with the same `-c` and every flag (`--data-dir`,
+`--train-split`, `--val-split`, `--reader-kv`, `--run-name`). The STOP file stays in the run
+directory after a stop (`ckpts/evidence_inject_retrieval/STOP`, `.../evidence_inject_retrieval_kv/STOP`);
+delete it before a resume or the run exits at its first poll. Throughput at the micro shape: 55k to
+60k tok/s typical, 13.3 GB peak with the card buffer, under either reader.
+
+Seed baselines for the graft lineage (2026-09-30, unchanged): fixed-target gold gain -0.0020 nats,
+per-token chunk AUROC 0.515 / 0.484 / 0.490 by loop, mass/chunk AUROC 0.481 / 0.470 / 0.469,
+grounded AUROC 0.5000; `g_proj` and `direct_gate` exactly zero. Corpus `evidence_train` 963,011
+conversations, ratio 3.75; held-out `evidence_dev` and `evidence_fixed` from `--heldout`.
 
 ## The goal
 
@@ -223,12 +194,12 @@ cannot see the chains.
 | decision | choice |
 |---|---|
 | goal | The reworded goal above. Strong form is not a gate; A1 with A3, A4 and A7 is. |
-| roles | Selector = the IR path, chooses by embedding. Reader = cross-attention over chunk tokens, carries content. |
+| roles | Selector = the IR path, chooses by embedding. Reader = the evidence tokens as leading keys and values of the shared self-attention in every loop, carries content. Measured 2026-10-03 at micro scale: at matched 100M tokens this read copies (gold card top-1 0.92, swapped card followed 92%) where the separate cross-attention reader does not (top-1 0.01, followed 2%). The cross reader stays loadable as the legacy mode. |
 | learned IR table | Dropped from the real run. Zeroing its read costs 0.0002 nats on every arm. |
 | selector in the real run | Always on, not routed; scores raw bge keys plus one learned null key; no value read, no key adapter. |
-| selector to reader coupling | The selector's own logit enters the reader's attention logit through a one-hot chunk channel, per token, causal. Replaces the document-mean sigmoid gate. |
-| reader positions | No rotary in the reader; the encoder already positioned chunk tokens. Arm B of Phase 4 tests it. |
-| reader output | After `post_norm`: `h = h + g_loop[k] * RMSNorm(o_proj(read))`, `o_proj` at default init; `g_loop` 0 on a graft, 1 from scratch. Neutrality lives in `g_loop`; a norm after a zero-init projection would break it after one step. |
+| selector to reader coupling | The selector's own logit enters the reader's attention logit through a one-hot chunk channel, per token, causal. Replaces the document-mean sigmoid gate. Carries over to the key/value read as a head-dim extension: the channel on the evidence keys, zeros on the segment's own keys. |
+| reader positions | Prefix rotation: each segment's evidence keys are rotated at the positions the evidence would hold as the text right before the segment, so a query sees the offsets of in-context copying. Supersedes "no rotary", which was a cross-reader decision (Phase 4 arm B: +40% content gain without rotary, still an order under the bar). |
+| reader output | No separate output: the read lands through the shared self-attention's own `o_proj`, inside the always-on seed; `evidence_loop_scale[k]` (init 1) scales the evidence values per loop. Not neutral when evidence is attached (the read shares the softmax), which from-scratch training does not need; with no evidence attached the forward is bit-identical to the model without the port. |
 | evidence encoder | The trunk's own dense decoder, chunk-causal. All 8 layers in the POC; the first 4 prelude layers under TE checkpoint from scratch. No cached encoder states in the store. |
 | readout | A 2-layer coda after the loop, own KV slots. The loop refines, the coda reads out. |
 | loss placement | One CE on the last pass run, through the coda. Per-loop CE is the control arm, not the default. |
@@ -241,7 +212,8 @@ cannot see the chains.
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
 | real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
-| loops (axiom) | "Loops buy computation, not storage" is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Falsifier (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong for this design. Looping stays a requirement either way. |
+| loops (axiom) | "Loops buy computation, not storage" is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
+| depth allocation | The planned loop fix, after the reader works on the full arm (c): learned depth allocation on the loop axis, an entropy-regularized exit distribution over depths (Ouro), tried as a micro arm against the fixed depth draw before it replaces the draw in the pilot. |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
 | POC role | Phase 4 is a mechanism check of the reader, read per loop. It decides nothing about externalization. |
 | matched compute | SMELT's definition: equal compute per token, equal non-embedding parameters and equal KV-cache size, or the comparison is not quoted as compute-matched. |
@@ -286,6 +258,10 @@ Done, with the full records linked:
   established that the corpus and the old real-run recipe both keep rewarding recall from weights.
   Its loop section found the objective and the migrated `loop_scale` working against depth, and
   merged three loop designs into the one in Decisions.
+- **R0b, first from-scratch runs** (2026-10-02 and 03,
+  [r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)): arm (a) reads the instrument; the
+  key/value reader copies from the card at 100M where the cross reader does not; arm (c) leaks at
+  tier 100 at 100M under both. Arms (b) and (c) in full are open.
 
 ## Binding measurements
 
@@ -508,7 +484,10 @@ Every item is in the design page's from-scratch blueprint. Grouped by what it to
   per-pass share. Returned from `forward_step` like the aux loss, so gradient checkpointing can
   stay on.
 
-**Reader.**
+**Reader.** Superseded in form on 2026-10-03: the measured reader is the key/value read in the shared
+self-attention (Decisions, roles and reader positions). The items below carry over to it where they
+are about the keys (the one-hot channel, the sink slot, 4 KV heads) and lapse where they are about a
+separate module (its own `o_proj`, its own output gate).
 - `k'_j = [W_k e_j ; onehot(rank(chunk(j)))]`, `q'_t = [W_q x_t ; sqrt(d) * b_t]`, head dim
   `d + M` rounded to a multiple of 8, `softmax_scale = d^-0.5` passed explicitly, so
   `logit(t, j) = content + b[t, chunk(j)]`. `b[t, c] = gamma_h z[t, c] - lambda log n_c + vis[t, c]`,
@@ -591,7 +570,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 |---|---|---|---|---|---|
 | R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
 | R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop. **Read 2026-10-01**: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 by loop and the per-loop content gain 0.070 / 0.078 / 0.081 (arm B), so loop 1 reads best and later loops add little |
-| R0b | 3 x 0.3B | externalization micro-pilot, about 30M params, a few 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; swap and anonymization rates swept in (c) | closed-book likelihood rank among 100 same-type candidates, by exposure; counterfactual follow in (c) | (b) and (c) at chance up to 100 exposures while (a) climbs | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
+| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; swap and anonymization rates swept in (c) | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
 | R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable |
 | R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
 | R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
@@ -745,6 +724,29 @@ above are a different, live series).
 - **Stale numbers.** Every FLOP, parameter and ratio figure in this plan is an estimate until the
   constructor and the builder print it. Budget math keyed to an estimate goes stale silently.
 
+## Literature behind the 2026-10-03 changes
+
+- Ouro, "Scaling Latent Reasoning via Looped Language Models" (arXiv 2510.25741): looped and
+  non-looped models store about 2 bits per parameter alike, the loop gain is knowledge
+  manipulation, and depth is allocated by an entropy-regularized learned exit. The storage half of
+  the loop falsifier and the depth allocation arm.
+- Allen-Zhu and Li, Physics of Language Models 3.3 (arXiv 2404.05405): about 1000 exposures reach
+  2 bits per parameter; junk data without domain tags cuts capacity. Why tier 1000 is read
+  alongside tier 100 on a 95% filler corpus.
+- Allen-Zhu and Li, Physics of Language Models 3.1 (arXiv 2309.14316): unaugmented facts are
+  memorized but not extractable. Matches arm (a): tier 1000 perfect on the training templates, 0.10
+  on a held-out one.
+- "Predicting the Emergence of Induction Heads in Language Model Pretraining" (arXiv 2511.16893):
+  the formation point is set by batch size x context size in updates, independent of model size,
+  and a larger batch gives weaker heads. The batch caveat in "Now", and the reason a reader that
+  reuses the model's own attention inherits copying instead of relearning it.
+- Ram et al., "In-Context Retrieval-Augmented Language Models" (arXiv 2302.00083): documents
+  prepended to an unchanged LM are read. The prompt copy control, and the design the key/value
+  read imitates inside the loop.
+- Memorization Sinks (arXiv 2507.09937) and the goldfish loss (Hans et al., NeurIPS 2024, arXiv
+  2406.10209): alternative levers against memorization, held for the case where the swap and
+  anonymization rates do not stop arm (c) from leaking.
+
 ## Parked
 
 - **Learned halting.** Only trainable if halting skips real compute; unparks after the exit and KV
@@ -777,6 +779,13 @@ above are a different, live series).
   plus a fact-injection probe, A3 a memorization ratio, A4 goes through the store, A7 is added,
   L1 and L2 are scored by read ablation at fixed depth, R0b is added, and the budget is recomputed
   at about 1.3 GFLOP per token.
+- 2026-10-03: R0b arm (a) read the instrument; the copy control showed the 20M arm (c) smoke was
+  read before copying existed; the key/value reader (evidence as leading keys of the shared
+  self-attention, prefix rotation) copies at 100M where the cross reader does not at matched
+  tokens, and replaces it in the plan; arm (c) leaks at tier 100 at 100M under both readers; the
+  pass rule reads tier 1000 in distribution alongside tier 100; the loop axiom gets a storage-half
+  falsifier (closed-book rank by loop count on arm (a)) and learned depth allocation is the planned
+  loop fix; `eval_abstention.py --counterfactual-likelihood-only` reads abstaining checkpoints.
 - 2026-10-01: Phase 4 ran and both arms were killed on the content gain; the pilot's first reader
   arm is a reader per loop or dense prelude reads, without rotary. The graft branch is closed:
   all seven failed gates measured the same graft condition, and no from-scratch result exists yet

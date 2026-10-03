@@ -8,79 +8,53 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 
 ## Now (keep current)
 
-Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-01
-the Phase 4 arms have run and both were killed by the rule; the Phase 4b instruments and the R0b
-micro-pilot tooling are built and tested but have not run on data. The plan was rewritten on
-2026-09-30 around the goal "facts in the store through the retrieval pathway, reasoning in the
-looped trunk"; the design is `docs/evidence_path_design.html`, the findings are
-`docs/review_2026-09-29.md`.
+Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-03
+R0b arm (a) has run, and the arm (c) reader question is answered at micro scale: the key/value
+reader copies, the cross attention reader does not. The plan was rewritten on 2026-09-30 around
+the goal "facts in the store through the retrieval pathway, reasoning in the looped trunk"; the
+design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
+record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
 
-- **Arms A and B killed at 10.08M tokens** ([evidence_arm_a.md](docs/measurements/evidence_arm_a.md),
-  [evidence_arm_b.md](docs/measurements/evidence_arm_b.md)): gold gain +0.545 / +0.571, content
-  gain +0.058 / +0.081 (bar 0.1 to survive, 1.6 to pass). About 0.49 nats of the gold gain is
-  "a buffer is attached" (distractors gain +0.49), the abstain-versus-answer prior, not content.
-  The selector learned (per-token chunk AUROC 0.515 to 0.650 at loop 1, over the 0.59 bar at every
-  loop from 7.5M); mass/chunk AUROC 0.57 (bar 0.674). No rotary is the better reader (+40% content
-  gain) but not the block. Per the plan the first pilot reader arm is a reader per loop or dense
-  prelude reads. Checkpoints `ckpts/evidence/` and `ckpts/evidence_norope/` (10M, `kill_checked`).
-
-- Corpus `evidence_train`: 963,011 conversations, 140.1M prompt / 525.6M evidence tokens, ratio
-  3.75. Held out (`prepare_evidence_data.py --heldout`, SQuAD v2 dev + HotpotQA dev):
-  `evidence_dev` 18,966 rows (the objective's held-out copy, ratio 11.2) and `evidence_fixed`
-  13,333 questions x gold/mixed/distractors/none, real answer every time (the kill number).
-  `evidence_val` is a train-loss slice for QA.
-- Seed: `ckpts/repair/checkpoint_repair_final_irrandom_evidence_grounded.pt`. Step-0 readings:
-  fixed-target gold gain -0.0020 (noise), pooled chunk AUROC 0.43 / 0.41 / 0.42 by loop (the old
-  metric, uniform-selector chance 0.421: the selector is uniform, gold share 0.334), grounded
-  AUROC 0.5000 (zero head). Per-token chunk AUROC (chance 0.5) 0.515 / 0.484 / 0.490 by loop,
-  mass/chunk AUROC 0.481 / 0.470 / 0.469, content gain -0.0009, per-loop reader gain about
-  -0.002 at every loop (smoke2, 2026-09-30). `g_proj` and `direct_gate` both exactly 0: the IR
-  value path is dead for this run, the selector trains from the selection loss alone.
-  `evidence_fixed` ratio 6.25.
-- **R0 failed** ([loop_scale_probe.md](docs/measurements/loop_scale_probe.md)): any `loop_scale`
-  multiplier makes loop 3 worse; `loop_scale` stays at the trunk's rate in graft arms.
-- **Built 2026-10-01, untested on real data** (every GPU-free and GPU test passes): the fact
-  injection micro-pilot tooling (`modules/data/biographies.py`, `prepare_injection_data.py`,
-  `init_scratch_seed.py`, `closed_book_rank.py`, `config_micro.yaml` via `TINY_LLM_CONFIG`: 35M
-  total, 12M non-embedding); the chain generator and read-ablation eval (`chains.py`,
-  `prepare_chain_data.py`, `eval_chains.py`, forward kwarg `reader_sites_kept`); the source
-  sidecar `.src` with a byte-checked backfill, per-source `[eval fixed]` lines, `--ceiling-json`,
-  the `counterfactual` condition with per-record JSON in `eval_abstention.py --evidence-port`,
-  `evidence_ceiling_probe.py --fixed-split`; the store format `data/index/<name>/`,
-  `build_store.py`, `eval_store.py` (recall, pathway, edit) and the PopQA `rank` task. Runbooks in
-  the Commands block. `sft.py` takes `--data-dir/--train-split/--val-split` (relaunch with them).
-- **The graft branch is closed.** All seven failed gates (G1, G2, G2b, G2c, R0, arms A and B)
-  measured a zero-init pathway grafted onto the converged checkpoint at 10M tokens or less; RETRO
-  fitting needed about 12B. Every GPU hour from here goes to the from-scratch branch.
-- **Next, in order:**
-  1. Cheap seed-side instruments, about one GPU hour: the in-context ceiling on `evidence_fixed`
-     (`--ceiling-json` for every later arm), the `.src` backfill (CPU), the counterfactual eval
-     and PopQA on the seed and both 10M checkpoints. Store build, edit store and chain eval
-     splits are CPU work that runs while step 2 trains; `eval_store.py` and `eval_chains.py`
-     readings on the 10M checkpoints after it (R2 reads "not readable" without chain training).
-  2. R0b arm (a) alone first: build `data/prepared_inject` (0.3B tokens, three arms, about 20
-     minutes), the scratch seed, then `inject_full` under `TINY_LLM_CONFIG=config_micro.yaml`
-     with `sft.py --evidence`, in the background under a Monitor watch teed to a gitignored log.
-     It decides whether the instrument is readable: if (a) does not climb above its prior
-     control at tier 1000, fix the generator, not the recipe. One to two hours.
-  3. A 20M-token smoke of arm (c) (`inject_retrieval`, STOP by hand, resume later with the same
-     flags): `closed_book_rank.py bios --evidence gold` on the save must land near rank 0. If it
-     is near 0.5 the from-scratch reader does not read and the fix is the reader at micro scale
-     (a reader per loop or dense prelude reads) before any pilot spend.
-  4. Arms (b) and (c) in full, then `compare full masked retrieval` (one verdict per probe form).
-     Chance is not 0.5: corpus value frequency is exposure-weighted, so every closed-book item
-     has a paired fresh-name prior control and the reading is `delta = norm_rank_prior -
-     norm_rank` with a paired bootstrap sigma, on entity attributes. Pass: (b) and (c) within 3
-     sigma of delta 0 through tier 100 while (a) is 3 sigma above. (b) climbs: raise the
-     anonymization rate (`--suffix s15a90`); only (c) climbs: raise the swap rate (`s30a50`); one
-     sweep arm per leak. About a day of 5090 time for the rung.
-  5. The pilot (Phase 5) with the reader settled in step 3, no rotary, after R0b passes; cut the
-     ladder (R4 is 8 x 1B tokens, four to six 5090 days) to the budget before launching it.
-- Relaunch a killed or stopped arm with the same `-c` and flags (without `-c` the strict load
-  fails; `kill_checked` is persisted). `ckpts/instrsmoke.log` is the memory and throughput
-  reference (batch 2 x 4096, cap 14336, 26.36 GB peak allocated over 110 micro steps, 6.0k to
-  14.8k tok/s, about 10k typical, about 42k real prompt tokens per optimizer step at 64% fill);
-  `ckpts/evidence_armA.log` and `ckpts/evidence_armB.log` (2026-10-01) are the full 10M runs.
+- **Arm (a), full CE, 300M tokens, reads the instrument**: closed-book entity `delta` in
+  distribution 0.009 / 0.063 / 0.378 / 0.467 by tier 1 / 10 / 100 / 1000 (tier 1000 rank 0),
+  held-out template 0.001 / 0.009 / 0.023 / 0.104 (surface-form memorization). Checkpoints
+  `ckpts/evidence_inject_full/` (50M steps to final).
+- **The 20M arm (c) smoke was read before copying existed**: `closed_book_rank.py --evidence
+  prompt` (the card as prompt text, no port) equals the closed-book read for entities on that save.
+- **Matched 100M, arm (c): the key/value reader copies, the cross reader does not.**
+  `sft.py --reader-kv` (evidence as leading keys of `shared_attn` every loop, prefix rotation):
+  gold card 0.003 / 0.003 / 0.002 / 0.000 in distribution (top-1 0.92), 0.02 held out, swapped card
+  followed 92%, `mr_ll` under 0.03. Cross reader resumed to 100M: 0.47 / 0.46 / 0.35 / 0.02,
+  followed 2%, while its own prompt copy reads 0.10 to 0.13. Saves
+  `ckpts/evidence_inject_retrieval_kv/checkpoint_evidence_tok100M_loss7.7670.pt` and
+  `ckpts/evidence_inject_retrieval/checkpoint_evidence_tok100M_loss8.4518.pt`; reads in
+  `ckpts/inject/rank_*100M_*`.
+- **Arm (c) leaks at 100M under both readers**: closed-book `delta` in distribution at tier 100 /
+  1000 key/value 0.026 (z 5.2) / 0.149 (z 12.3), cross 0.037 / 0.203, arm (a) 0.099 / 0.332 at the
+  same tokens. Mid-cosine; the full arms decide.
+- Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
+  in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
+- **Next, in order** (the full ladder with its done steps is in NEXT.md):
+  1. Arm (b), `inject_masked`, in full (0.3B, about 90 minutes).
+  2. Arm (c) in full with the key/value reader: resume `inject_retrieval_kv` with the same flags
+     (`--reader-kv` included; delete the leftover `STOP` first). Every arm (c) save gets `gold`,
+     `swapped`, `none` and `prompt` reads at `--batch-size 1024`. Then `compare full masked
+     retrieval_kv`; pass: (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3
+     sigma above, tier 1000 in distribution read alongside (3 sigma off there is a leak).
+  3. If (c) climbs: one sweep arm at the higher swap rate (`s30a50`); if (b) climbs, the
+     anonymization rate (`s15a90`).
+  4. The storage half of the loop axiom on arm (a): closed-book rank at `n_loops` 1, 2, 3 (needs an
+     `--n-loops` flag on `closed_book_rank.py bios`).
+  5. Learned depth allocation on the loop axis (entropy-regularized exit, Ouro) as a micro arm,
+     after the full arm (c).
+  6. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
+     abstaining 10M arms) and PopQA on the seed and both 10M checkpoints.
+  7. The pilot (Phase 5) with the key/value reader, after R0b passes, ladder cut to budget.
+- Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
+  `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
+  emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same
+  `-c` and every flag; a stop leaves `STOP` in the run directory. `ckpts/instrsmoke.log` stays the
+  full-shape memory reference (batch 2 x 4096, 26.36 GB peak).
 
 ## Ending a turn
 
@@ -246,10 +220,12 @@ python scripts/evidence_ceiling_probe.py -c SEED --fixed-split evidence_fixed --
 python scripts/prepare_evidence_data.py --heldout --sources-only --max-evidence-tokens 4608   # byte-checked .src backfill, CPU
 python scripts/sft.py --evidence -c SEED --ceiling-json docs/measurements/ceiling_fixed.json [--data-dir D --train-split S --val-split V]
 python scripts/eval_abstention.py -c CKPT --evidence-port --evidence-condition gold,counterfactual,distractors,none --json-out OUT.json
+python scripts/eval_abstention.py -c CKPT --evidence-port --evidence-condition counterfactual --counterfactual-likelihood-only   # mr_ll only, abstaining checkpoints
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 0.15 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --device cuda
 TINY_LLM_CONFIG=config_micro.yaml python scripts/init_scratch_seed.py --out ckpts/inject/seed_micro.pt --seed 0
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence -c ckpts/inject/seed_micro.pt --run-name inject_full --data-dir data/prepared_inject --train-split inject_full_train --val-split inject_val   # also inject_masked, inject_retrieval
-TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped --json-out ckpts/inject/rank_full.json
+TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv --data-dir data/prepared_inject --train-split inject_retrieval_train --val-split inject_val   # the key/value reader arm (c)
+TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped|prompt --batch-size 1024 --json-out ckpts/inject/rank_full.json
 python scripts/closed_book_rank.py compare rank_full.json rank_masked.json rank_retrieval.json
 python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits eval,heldout_tmpl,hop4 --eval-questions-per-hop 1000 --seed 42 --device cpu   # train,val on cuda
 python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --json-out OUT.json
@@ -312,9 +288,12 @@ Constraints:
 - **The checkpoint, not the yaml, decides shape and mode.** `model_params_for_state_dict` reads IR
   sizes from `z_keys`, forces `ir_num_clusters=0` without centroids, infers `loop_inject`,
   `evidence_port`, `ir_direct_read`, groundedness head, and reader rotary (off iff the buffer
-  `moe.evidence_reader_rotary_off` exists; `sft.py --reader-no-rotary` sets it on a seed) from tensor
-  presence. `load_model_state` is strict except `IR_TEMPERATURE_KEYS` and `NEUTRAL_LOOP_KEYS`
-  (whose inits are the old behaviour) and `READER_MODE_KEYS` (a marker with no learned value).
+  `moe.evidence_reader_rotary_off` exists; `sft.py --reader-no-rotary` sets it on a seed) and the
+  reader kind (`evidence_reader` "kv" iff `moe.evidence_reader_kv` exists, which also implies the
+  port; `sft.py --reader-kv` sets it and drops a cross seed's `shared_evidence.*` and
+  `evidence_query_bias` by name) from tensor presence. `load_model_state` is strict except
+  `IR_TEMPERATURE_KEYS` and `NEUTRAL_LOOP_KEYS` (whose inits are the old behaviour) and
+  `READER_MODE_KEYS` (markers with no learned value).
   Resume paths (`utils.load_checkpoint`, `sft.load_sft_checkpoint`) are fully strict.
   `evidence_encoder` always comes from the yaml.
 - Hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL` 20 (pretrain) / 10 (sft), expert heads 16/4,
@@ -396,6 +375,17 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   `1 + evidence_gate_scale * sigmoid(selector mass)` before `k_proj`/`v_proj` (zero-init scale is
   exactly neutral). IR experts run before the shared seed so this loop's selector gates. No KV
   slot; cached and uncached greedy decodes can diverge by reduction order (`--no-kv-cache`).
+- **Key/value reader** (`evidence_reader="kv"`, marker buffer `moe.evidence_reader_kv`, `sft.py
+  --reader-kv`): no `shared_evidence`, no `evidence_query_bias`. The evidence states go through
+  `shared_attn`'s own norm, the same chunk gate (after the norm, which would divide it out), and
+  its own `k_proj`/`v_proj`, and become leading keys of each query segment under one softmax
+  (`attention.prefix_varlen_attention`: keys interleaved `[prefix_s, own_s]`, one flash call,
+  causal bottom-right alignment). Prefix keys are rotated at `start_s - E_s + i`
+  (`evidence.prefix_position_ids`, negative allowed, `rotary_emb.at` rebuilds fp32 frequencies
+  because `model.to(bf16)` casts `inv_freq`). `evidence_loop_scale` scales the evidence values.
+  Not neutral with evidence attached; bit-identical without. `last_reader_output` is
+  `shared_attn`'s output. No KV cache with evidence (asserted; `inference.py` turns it off).
+  `tests/test_evidence_kv_reader.py`.
 - Nothing ragged leaves the dataloader: `chunk_keys [B, C, 384]` + `[B, C]` slot map, flattened
   in-thread by `evidence_from_batch`. `chunk_gold` / `condition_ids` ride along when the corpus
   has `.evgold`/`.cond` (warned once otherwise). `chunk_segments` comes from packing, never
