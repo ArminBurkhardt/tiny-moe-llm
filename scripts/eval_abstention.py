@@ -59,7 +59,7 @@ import random
 import string
 import argparse
 import collections
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
@@ -1248,6 +1248,42 @@ def report_counterfactual(records: List[dict], ineligible: dict, n_total: int) -
             "readings": readings}
 
 
+def report_counterfactual_likelihood(records: List[dict], ineligible: dict, n_total: int) -> dict:
+    """Print and return the counterfactual readings that need no generation.
+
+    Every eligible item, by stratum: ``mr_ll`` (mean of ``sigmoid(ll_orig - ll_swap)``, near 1 when
+    the model keeps its memory, near 0 when it takes the swapped chunk) and ``prefers_swap``, the
+    share of items whose substitute outscores the original. ``mr_gen`` and the gate are generation
+    readings and are absent.
+
+    Args:
+        records: the eligible records after ``answer_logprobs`` for both answer fields.
+        ineligible: ``{reason: count}`` for the records that took no part.
+        n_total: how many records the slice had.
+    """
+    pooled = counterfactual_readings(records)["all_eligible"]
+    by_stratum: Dict[str, List[dict]] = {}
+    for r in records:
+        by_stratum.setdefault(str(r.get("stratum", "all")), []).append(r)
+    by_stratum["all"] = list(records)
+    print("\n=== counterfactual evidence, likelihood only: gold chunk with the answer swapped ===")
+    print(f"  {len(records):,} of {n_total:,} questions eligible; skipped by reason: "
+          + (", ".join(f"{k} {v:,}" for k, v in sorted(ineligible.items())) or "none"))
+    print(f"  {'stratum':<10} {'n':>6} {'mr_ll':>8} {'prefers_swap':>13}")
+    readings = {}
+    for name in pooled:
+        rows = [r for r in by_stratum.get(name, []) if r.get("mr_ll") is not None]
+        prefers = (sum(1 for r in rows if r["ll_swap"] > r["ll_orig"]) / len(rows)) if rows else None
+        mr_ll = pooled[name]["mr_ll"]
+        readings[name] = {"n": pooled[name]["n"], "mr_ll": mr_ll, "prefers_swap": prefers}
+        print(f"  {name:<10} {pooled[name]['n']:>6} "
+              f"{'n/a' if mr_ll is None else format(mr_ll, '.3f'):>8} "
+              f"{'n/a' if prefers is None else format(prefers, '.3f'):>13}")
+    print("  mr_ll = sigmoid(ll_orig - ll_swap), 1 keeps memory, 0 follows the chunk; no generation ran")
+    return {"eligible": len(records), "total": n_total, "ineligible": dict(ineligible),
+            "likelihood_only": True, "readings": {"all_eligible": readings}}
+
+
 def _json_default(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -1268,16 +1304,20 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
         raise SystemExit(f"unknown --evidence-condition {bad} -- choose from {EVIDENCE_CONDITIONS}")
     if not conditions:
         raise SystemExit("--evidence-condition resolved to an empty list")
+    likelihood_only = getattr(args, "counterfactual_likelihood_only", False)
+    if likelihood_only and "counterfactual" not in conditions:
+        raise SystemExit("--counterfactual-likelihood-only needs the counterfactual condition")
     if "counterfactual" in conditions:
-        if "gold" not in conditions:
+        if "gold" not in conditions and not likelihood_only:
             raise SystemExit("counterfactual needs gold in the same run: the memorization ratio is "
-                             "read over the items answered correctly with the unswapped chunk")
+                             "read over the items answered correctly with the unswapped chunk "
+                             "(--counterfactual-likelihood-only reads mr_ll without it)")
         # last, so every record's gold-condition correctness is recorded before it is needed
         conditions = [c for c in conditions if c != "counterfactual"] + ["counterfactual"]
 
     logger.info(f"Loading checkpoint from {args.checkpoint}")
     model = load_model(args.checkpoint, args.device)
-    if model.moe.shared_evidence is None:
+    if not model.moe.evidence_port:
         raise SystemExit(
             f"{args.checkpoint} has no evidence port -- build one with "
             f"scripts/migrate_evidence_port.py before running --evidence-port"
@@ -1333,6 +1373,21 @@ def run_evidence_port_eval(args, tokenizer, template: ChatTemplate, frame: pd.Da
         scored = [r for r in records if r.get("cf")] if condition == "counterfactual" else records
         attach_condition(scored, condition, template, embedder, pool,
                          num_distractors=args.num_distractors, rng=rng)
+
+        if condition == "counterfactual" and likelihood_only:
+            for answer_key in ANSWER_TEXT_FIELDS:
+                answer_logprobs(
+                    model, template, scored, pad_id=tokenizer.pad_token_id,
+                    batch_size=args.batch_size, device=args.device,
+                    max_seq_len=ModelConfig.Params["max_seq_len"], use_evidence=True,
+                    answer_key=answer_key,
+                )
+            for record in scored:
+                both = (record["ll_orig"], record["ll_swap"])
+                record["mr_ll"] = None if any(math.isnan(v) for v in both) else sigmoid_ratio(*both)
+            results[condition] = report_counterfactual_likelihood(scored, ineligible, len(records))
+            records_by_condition[condition] = [record_for_json(r) for r in scored]
+            continue
 
         logger.info(f"Generating {len(scored):,} answers under condition {condition!r} "
                     f"(batch {args.batch_size}, <= {args.max_new_tokens} new tokens)")
@@ -1540,6 +1595,11 @@ def main():
                              "is swapped inside the passage (default), or injected biographies from "
                              "--facts / --pools / --store-dir (meaningful on a chat trained "
                              "checkpoint only)")
+    parser.add_argument("--counterfactual-likelihood-only", action="store_true",
+                        help="score the counterfactual condition by likelihood alone: no generation "
+                             "for it, no gold condition required, mr_ll by stratum over every "
+                             "eligible item. For checkpoints whose generations read nothing (they "
+                             "abstain, or were never chat trained)")
     parser.add_argument("--counterfactual-freq-bin", default=DEFAULT_FREQUENCY_BIN,
                         help="token corpus the SQuAD answers are counted in to stratify the "
                              "counterfactual readings by how common the answer is (a missing file "

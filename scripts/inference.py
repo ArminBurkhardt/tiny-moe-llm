@@ -64,7 +64,7 @@ def build_evidence_batch(model: TinyMoETransformer, tokenizer, chunks: list[str]
     ``--converge-tol`` on a checkpoint that predates it would fail loudly instead of quietly doing
     nothing.
     """
-    if model.moe.shared_evidence is None:
+    if not model.moe.evidence_port:
         raise SystemExit(
             "this checkpoint has no evidence port -- build one with scripts/migrate_evidence_port.py "
             "before passing --evidence"
@@ -214,6 +214,9 @@ def stream_generate(
     # the two are mutually exclusive at the model level; resolve it here rather than letting the
     # assertion fire deep inside the loop
     if converge_tol is not None and use_kv_cache:
+        use_kv_cache = False
+    if evidence is not None and model.moe.reader_kv and use_kv_cache:
+        # the key/value reader puts evidence inside shared_attn, which then has no cacheable slot
         use_kv_cache = False
     kv_cache = KVCache.for_model(model, n_loops=n_loops) if use_kv_cache else None
 

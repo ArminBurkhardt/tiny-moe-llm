@@ -71,6 +71,11 @@ class EvidenceBatch:
             ``information_retrieval.evidence_selection_loss`` has it at the same axis the module's
             own weights and ``evidence_memory``'s ``visible`` mask use, rather than having to
             re-derive the ``chunk_keys`` flattening a second time from the raw batch).
+        prefix_position_embeddings: ``(cos, sin)`` ``[B, 1, S_ev, D]`` for the key/value reader,
+            which reads the evidence as extra keys in front of each query segment: each evidence
+            token sits at the position it would hold if its segment's evidence were the text right
+            before the document (``prefix_position_ids``). Set by ``LoopMixtureOfExperts.forward``
+            once per recurrence; None for the cross attention reader.
     """
 
     states: torch.Tensor
@@ -81,6 +86,7 @@ class EvidenceBatch:
     chunk_keys: torch.Tensor = None
     chunk_segments: torch.Tensor = None
     chunk_gold: torch.Tensor = None
+    prefix_position_embeddings: tuple[torch.Tensor, torch.Tensor] = None
 
     @property
     def num_tokens(self) -> int:
@@ -143,6 +149,33 @@ def evidence_cu_seqlens(segment_ids: torch.Tensor, num_segments: int) -> tuple[t
     cu = torch.zeros(num_segments + 1, dtype=torch.int32, device=flat.device)
     cu[1:] = counts.cumsum(0).to(torch.int32)
     return cu, int(segment_ids.shape[1])
+
+
+def prefix_position_ids(evidence_cu_seqlens: torch.Tensor, query_cu_seqlens: torch.Tensor,
+                        B: int, S: int, S_ev: int) -> torch.Tensor:
+    """Row positions of the evidence tokens as a prefix of their own query segment. ``[B, S_ev]``.
+
+    The key/value reader puts segment ``s``'s ``E_s`` evidence tokens in front of that segment's
+    own keys. Its queries are rotated at their row positions, so evidence token ``i`` is rotated at
+    ``start_s - E_s + i``, where ``start_s`` is the segment's first row position: the relative
+    offset between a query and an evidence key is then exactly what it would be had the evidence
+    been the text right before the document, which is the geometry a copy circuit learned in
+    context. The values can be negative; the caller computes the rotation from the frequencies,
+    never from the cache.
+
+    Args:
+        evidence_cu_seqlens: ``[num_segments + 1]`` over the flattened ``B * S_ev`` evidence axis.
+        query_cu_seqlens: ``[num_segments + 1]`` over the flattened ``B * S`` query axis.
+        B: rows.
+        S: query row length.
+        S_ev: evidence row length.
+    """
+    device = evidence_cu_seqlens.device
+    seg = _segment_ids(evidence_cu_seqlens, B, S_ev, device).reshape(-1)
+    flat = torch.arange(B * S_ev, device=device)
+    query_start = query_cu_seqlens.long()[seg] % S
+    segment_end = evidence_cu_seqlens.long()[seg + 1]
+    return (query_start - segment_end + flat).view(B, S_ev)
 
 
 def chunk_mean_mass(weights: torch.Tensor, visible: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:

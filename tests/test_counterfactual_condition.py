@@ -229,6 +229,13 @@ def main():
             conditions = ast.literal_eval(node.value)
     assert conditions == ("gold", "none", "distractors", "mixed", "counterfactual"), conditions
     assert "counterfactual needs gold in the same run" in source
+    # the likelihood-only read: a flag, its own report, and no generation call on its branch
+    assert "--counterfactual-likelihood-only" in source
+    report_fn = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "report_counterfactual_likelihood"]
+    assert report_fn, "report_counterfactual_likelihood is missing"
+    branch = source.split('if condition == "counterfactual" and likelihood_only:')[1].split("continue")[0]
+    assert "run_generation" not in branch and "answer_logprobs" in branch, branch
     try:
         old = subprocess.run(["git", "show", f"{BASELINE_COMMIT}:scripts/eval_abstention.py"],
                              cwd=ROOT, capture_output=True, timeout=30, check=True).stdout.decode("utf-8")

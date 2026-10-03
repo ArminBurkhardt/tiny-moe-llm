@@ -215,7 +215,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
     template = ChatTemplate(tokenizer)
     model = load_model(args.checkpoint, device)
-    assert model.moe.shared_evidence is not None, "this checkpoint has no evidence port"
+    assert model.moe.evidence_port, "this checkpoint has no evidence port"
     depths = [int(d) for d in args.depths.split(",")]
     pad_id = template.eos_id
     common = dict(pad_id=pad_id, batch_size=args.batch_size, device=device, max_seq_len=args.max_seq_len)

@@ -100,6 +100,7 @@ class TinyMoETransformer(nn.Module):
         ir_direct_read: bool = True,
         groundedness_head: bool = False,
         evidence_reader_rotary: bool = True,
+        evidence_reader: str = "cross",
     ):
         super().__init__()
 
@@ -177,6 +178,7 @@ class TinyMoETransformer(nn.Module):
             evidence_port=evidence_port,
             ir_direct_read=ir_direct_read,
             evidence_reader_rotary=evidence_reader_rotary,
+            evidence_reader=evidence_reader,
         )
 
         self.norm = RMSNorm(hidden_size)
@@ -293,8 +295,8 @@ class TinyMoETransformer(nn.Module):
         else:
             decoder_layer_params = 0
         # meaningless (and never run) without the port at all -- build_evidence short-circuits to
-        # None the moment self.moe.shared_evidence is None, so _encode_evidence never executes
-        if self.moe.shared_evidence is None or self.evidence_encoder_layers is None:
+        # None the moment the block has no port, so _encode_evidence never executes
+        if not self.moe.evidence_port or self.evidence_encoder_layers is None:
             encoder_layers_run = 0
         elif self.evidence_encoder_layers == 0:
             encoder_layers_run = num_layers
@@ -465,7 +467,7 @@ class TinyMoETransformer(nn.Module):
         Returns:
             An ``EvidenceBatch``, or None when this model has no evidence port.
         """
-        if self.moe.shared_evidence is None:
+        if not self.moe.evidence_port:
             return None
         assert chunk_keys is None or chunk_segments is not None, (
             "chunk_keys without chunk_segments -- the selector would have no way to tell which "

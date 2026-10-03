@@ -105,8 +105,9 @@ def model_params_for_state_dict(state_dict, params: dict) -> dict:
     ``centroids`` buffer exists at all (absent => the exact full-table path the old checkpoints
     were trained under, so clusters are forced to 0), whether the per-loop input injection,
     the evidence reader and the groundedness readout are present (absent => a checkpoint from
-    before they existed, which must keep loading), and whether the reader runs without rotary
-    (the ``moe.evidence_reader_rotary_off`` marker buffer; absent => rotary on).
+    before they existed, which must keep loading), whether the reader runs without rotary
+    (the ``moe.evidence_reader_rotary_off`` marker buffer; absent => rotary on) and which reader
+    the port has (the ``moe.evidence_reader_kv`` marker; absent => the cross attention reader).
 
     Args:
         state_dict: the checkpoint's ``model_state_dict``.
@@ -114,13 +115,17 @@ def model_params_for_state_dict(state_dict, params: dict) -> dict:
 
     Returns:
         A copy with ``num_ir_entries`` / ``ir_dim`` / ``ir_num_clusters`` / ``loop_inject`` /
-        ``evidence_port`` / ``evidence_reader_rotary`` / ``groundedness_head`` set to match.
+        ``evidence_port`` / ``evidence_reader_rotary`` / ``evidence_reader`` /
+        ``groundedness_head`` set to match.
     """
     out = dict(params)
     # set before the no-IR-table early return below: both are independent of the table, and a
     # checkpoint written before they existed has no tensor to load into one
     out["loop_inject"] = any(k.endswith("moe.inject.weight") for k in state_dict)
-    out["evidence_port"] = any("moe.shared_evidence." in k for k in state_dict)
+    # the key/value reader has no reader module of its own, only its marker buffer
+    kv_reader = any(k.endswith("moe.evidence_reader_kv") for k in state_dict)
+    out["evidence_port"] = kv_reader or any("moe.shared_evidence." in k for k in state_dict)
+    out["evidence_reader"] = "kv" if kv_reader else "cross"
     # rotary on is the absence of the marker buffer, so every checkpoint written before it existed
     # keeps the reader it was trained with
     out["evidence_reader_rotary"] = not any(k.endswith("moe.evidence_reader_rotary_off") for k in state_dict)
@@ -164,7 +169,7 @@ NEUTRAL_LOOP_KEYS = (
 # when the model is built, so seeding a no-rotary model from a rotary checkpoint (which lacks the
 # marker) leaves the freshly built zero in place. Resume paths use plain load_state_dict and stay
 # strict, so a run cannot silently change mode across a restart.
-READER_MODE_KEYS = ("moe.evidence_reader_rotary_off",)
+READER_MODE_KEYS = ("moe.evidence_reader_rotary_off", "moe.evidence_reader_kv")
 
 
 def load_model_state(model, state_dict):

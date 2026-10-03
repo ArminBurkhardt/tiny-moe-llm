@@ -527,6 +527,10 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
     }
 
 
+# the cross attention reader's own tensors, which a key/value reader model does not have
+LEGACY_READER_PREFIXES = ("moe.shared_evidence.", "moe.evidence_query_bias.")
+
+
 def load_pretrained_weights(model, path: str):
     """Seed SFT from a pretraining checkpoint: weights and bookkeeping, no optimizer state.
 
@@ -538,10 +542,18 @@ def load_pretrained_weights(model, path: str):
         The pretraining token count, carried forward on purpose -- see this module's docstring.
     """
     checkpoint = torch.load(path, map_location="cpu")
+    state = checkpoint["model_state_dict"]
+    if getattr(model.moe, "reader_kv", False):
+        # a key/value reader seeded from a cross reader seed: the old reader's tensors have no
+        # place in this model. Named and logged rather than a non strict load
+        dropped = [k for k in state if k.startswith(LEGACY_READER_PREFIXES)]
+        if dropped:
+            state = {k: v for k, v in state.items() if k not in set(dropped)}
+            logger.info(f"key/value reader: dropped {len(dropped)} cross reader tensors from the seed")
     # through load_model_state, not load_state_dict: a seed built before the retrieval temperature
     # became learned carries neither temperature tensor, and their inits ARE the 1.0 it was hardcoded
     # to. Still strict about everything else -- a trunk tensor left random here would train anyway
-    load_model_state(model, checkpoint["model_state_dict"])
+    load_model_state(model, state)
     token_count = checkpoint.get("token_count", 0)
     logger.info(
         f"Initialized from pretrained checkpoint {os.path.basename(path)} "
@@ -1054,6 +1066,15 @@ def sft(args):
         # The run's own checkpoints do, so its resumes must pass the flag again or fail to load
         model_params["evidence_reader_rotary"] = False
         logger.info("evidence reader: no rotary (query and evidence keys unrotated)")
+    if args.reader_kv:
+        if not args.evidence:
+            raise SystemExit("--reader-kv only applies to --evidence")
+        if args.reader_no_rotary:
+            raise SystemExit("--reader-kv places evidence by rotation and has no no-rotary mode")
+        if not model_params.get("evidence_port"):
+            raise SystemExit("--reader-kv needs a seed with the evidence port")
+        model_params["evidence_reader"] = "kv"
+        logger.info("evidence reader: key/value (evidence as leading keys of shared_attn, every loop)")
     model = TinyMoETransformer(**model_params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
@@ -1625,6 +1646,11 @@ def sft(args):
                     if grounded is not None:
                         ir_entropy_str += f"grounded: {grounded.item():.4f} | "
                     evidence_module = unwrapped_model.moe.shared_evidence
+                    if unwrapped_model.moe.reader_kv:
+                        # no zero-init tensor to watch in this mode: the read shares shared_attn's
+                        # softmax from step 0. The per loop value gains are what it owns
+                        gains = unwrapped_model.moe.evidence_loop_scale.detach().float().tolist()
+                        ir_entropy_str += "evidence gain: [" + ", ".join(f"{g:.3f}" for g in gains) + "] | "
                     if evidence_module is not None:
                         # the reader's own neutrality zero, same reason as |g_proj|rms above: if
                         # this never leaves zero the port never wrote anything to the residual
@@ -1792,6 +1818,12 @@ def main():
                              "query and keys (the encoder already positions chunk tokens). The "
                              "mode is saved in the run's checkpoints, so pass it on every launch of "
                              "that run, and give the run its own --run-name")
+    parser.add_argument("--reader-kv", action="store_true",
+                        help="--evidence only: read the evidence as leading keys and values of the "
+                             "shared self attention in every loop instead of through the separate "
+                             "cross attention reader. A cross reader seed loads with its reader "
+                             "tensors dropped. The mode is saved in the run's checkpoints, so pass "
+                             "it on every launch of that run, and give the run its own --run-name")
     parser.add_argument("--run-name", default=None,
                         help="suffix the profile's checkpoint directory, e.g. --run-name random "
                              "writes ckpts/ir_random. Required to run two seeds of one profile "

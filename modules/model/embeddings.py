@@ -97,6 +97,23 @@ class RotaryPositionEmbeddingsFrequency(nn.Module):
         sin = self.sin_cached[0, 0].to(dtype=dtype)[position_ids]
         return cos.unsqueeze(1), sin.unsqueeze(1)                   # broadcast over heads
 
+    def at(self, position_ids: torch.Tensor, dtype: torch.dtype):
+        """cos/sin computed at any integer positions ``[B, S]``, negative ones included, ->
+        ``[B, 1, S, dim]``.
+
+        Same arithmetic as the cache (fp32 angle, then cast), so a non negative position reads
+        what ``gather`` would up to the host/device cos difference. No table lookup, so no position
+        can overrun it. The frequencies are rebuilt in fp32 rather than read from ``inv_freq``:
+        ``model.to(bf16)`` casts that buffer, and a bf16 frequency is off by radians at position
+        1000.
+        """
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=position_ids.device,
+                                                     dtype=torch.float32) / self.dim))
+        angles = position_ids.to(torch.float32).unsqueeze(-1) * inv_freq             # [B, S, dim/2]
+        emb = torch.cat((angles, angles), dim=-1)
+        return emb.cos().to(dtype).unsqueeze(1), emb.sin().to(dtype).unsqueeze(1)
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]

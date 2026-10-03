@@ -1,4 +1,5 @@
 import math
+import dataclasses
 
 import torch
 from torch import nn
@@ -12,7 +13,11 @@ from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
 from modules.model.information_retrieval import RetrievalEntropyTracking, evidence_selection_loss
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
-from modules.model.evidence import EvidenceBatch, evidence_memory, chunk_mean_mass, apply_chunk_gate
+from modules.model.evidence import (
+    EvidenceBatch, evidence_memory, chunk_mean_mass, apply_chunk_gate, prefix_position_ids,
+    scatter_chunk_score_to_tokens,
+)
+from modules.model.attention import _default_cu_seqlens
 
 
 
@@ -241,6 +246,7 @@ class LoopMixtureOfExperts(nn.Module):
         evidence_port: bool = False,
         ir_direct_read: bool = True,
         evidence_reader_rotary: bool = True,
+        evidence_reader: str = "cross",
     ):
         """Mixture of Experts module with multiple loops of routing to a mixture of attention and feedforward experts
 
@@ -299,6 +305,20 @@ class LoopMixtureOfExperts(nn.Module):
                 ``evidence_reader_rotary_off`` so the checkpoint carries the mode; True registers
                 nothing, which leaves every existing checkpoint unchanged. Only meaningful with
                 ``evidence_port``. Defaults to True.
+            evidence_reader (str, optional): how the port reads the evidence tokens. ``"cross"``
+                is the separate always-on cross attention ``shared_evidence`` (every checkpoint
+                before the key/value reader). ``"kv"`` builds no separate reader: the evidence
+                states become leading keys and values of ``shared_attn`` in every loop, projected
+                by its own ``k_proj``/``v_proj`` and read under one softmax with the segment's own
+                causal keys, so whatever copies from context also copies from evidence. Positions:
+                each segment's evidence sits right before the segment (see
+                ``evidence.prefix_position_ids``). Keeps ``evidence_loop_scale`` (a per loop gain
+                on the evidence values) and ``evidence_gate_scale``; has no
+                ``evidence_query_bias``, which would have to bias the shared query and so change
+                the forward without evidence. Not neutral when evidence is attached (the read
+                shares the softmax), which a from-scratch run does not need. Registers the
+                persistent marker ``evidence_reader_kv`` so a checkpoint carries the mode. Only
+                meaningful with ``evidence_port``. Defaults to ``"cross"``.
             ir_direct_read (bool, optional): give every IR expert a direct, per token output stage
                 instead of the inner attention that averages a document's reads over its whole
                 prefix (see ``InformationRetrievalExpert``'s docstring for why the averaged path
@@ -438,11 +458,23 @@ class LoopMixtureOfExperts(nn.Module):
         self.shared_evidence = None
         self.evidence_query_bias = None
         self.evidence_loop_scale = None
-        # a plain python bool, so the forward branches without reading a tensor
+        if evidence_reader not in ("cross", "kv"):
+            raise ValueError(f"evidence_reader must be 'cross' or 'kv', got {evidence_reader!r}")
+        # plain python bools, so the forward branches without reading a tensor
+        self.evidence_port = bool(evidence_port)
+        self.reader_kv = self.evidence_port and evidence_reader == "kv"
+        if self.reader_kv and not evidence_reader_rotary:
+            raise ValueError("the key/value reader places evidence by rotation; it has no no-rotary mode")
         self.reader_rotary = bool(evidence_reader_rotary) or not evidence_port
         if evidence_port and not evidence_reader_rotary:
             self.register_buffer("evidence_reader_rotary_off", torch.zeros(()), persistent=True)
-        if evidence_port:
+        if self.reader_kv:
+            self.register_buffer("evidence_reader_kv", torch.zeros(()), persistent=True)
+            # one-init per loop gain on the evidence values; ndim 1, so no weight decay
+            self.evidence_loop_scale = nn.Parameter(torch.ones(n_loops))
+            # the per chunk gate on the evidence states, zero-init so the gate is exactly 1.0
+            self.evidence_gate_scale = nn.Parameter(torch.zeros(()))
+        elif evidence_port:
             self.shared_evidence = CrossAttention(
                 input_size=hidden_size, dropout=dropout, num_heads=n_heads, num_kv_heads=n_kv_heads
             )
@@ -628,7 +660,25 @@ class LoopMixtureOfExperts(nn.Module):
 
         # seed with the always-on shared experts (Step 2) before accumulating routed outputs
         shared_attn_cache = kv_cache.shared_attn if kv_cache is not None else None
-        output = self.shared_mlp(step_input) + self.shared_attn(step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
+        if self.reader_kv and evidence is not None:
+            # the key/value reader: the evidence joins shared_attn's own keys. Same gate as the
+            # cross reader below (this loop's selector chunk mass, exactly 1.0 at a zero scale),
+            # applied per token after shared_attn's norm
+            chunk_mass = self._selector_chunk_mass(memory) if memory is not None else None
+            token_gate = None
+            if chunk_mass is not None:
+                gate = 1.0 + self.evidence_gate_scale * torch.sigmoid(chunk_mass)
+                token_gate = scatter_chunk_score_to_tokens(evidence, gate)
+            evidence_gain = self.evidence_loop_scale[min(int(loop_idx), self.evidence_loop_scale.numel() - 1)]
+            shared_attn_output = self.shared_attn(
+                step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache,
+                evidence=evidence, evidence_token_gate=token_gate, evidence_value_scale=evidence_gain,
+            )
+            # the groundedness readout's input in this mode: the attention that did the read
+            self.last_reader_output = shared_attn_output
+            output = self.shared_mlp(step_input) + shared_attn_output
+        else:
+            output = self.shared_mlp(step_input) + self.shared_attn(step_input, cu_seqlens, max_seqlen, position_embeddings, kv_cache=shared_attn_cache)
         # the evidence read joins the always-on seed when a corpus is attached. Both conditions are
         # structural, not a flag: a checkpoint without the port has no module, and a batch without
         # evidence never enters this branch, so the no-corpus forward is the one that already ran.
@@ -821,6 +871,16 @@ class LoopMixtureOfExperts(nn.Module):
         memory = evidence_memory(
             evidence, cu_seqlens, hidden_states.shape[0], hidden_states.shape[1], hidden_states.device
         )
+        if self.reader_kv and evidence is not None:
+            assert kv_cache is None, (
+                "the key/value evidence reader has no KV cache slot; decode with evidence uncached"
+            )
+            B, S = hidden_states.shape[0], hidden_states.shape[1]
+            query_cu = cu_seqlens if cu_seqlens is not None else _default_cu_seqlens(B, S, hidden_states.device)
+            prefix_pos = prefix_position_ids(evidence.cu_seqlens, query_cu, B, S, evidence.states.shape[1])
+            evidence = dataclasses.replace(
+                evidence, prefix_position_embeddings=self.rotary_emb.at(prefix_pos, hidden_states.dtype)
+            )
         # cleared rather than left alone on a batch with no external store, so a trainer reading it
         # after the forward cannot pair this batch's read weights with the last batch's mask
         self.last_memory_visible = None if memory is None else memory[1]

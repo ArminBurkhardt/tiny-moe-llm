@@ -20,8 +20,32 @@ class SelfAttention(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor = None, max_seqlen: int = None, position_embeddings: tuple[torch.Tensor, torch.Tensor] = None, kv_cache=None, evidence: EvidenceBatch = None, evidence_token_gate: torch.Tensor = None, evidence_value_scale: torch.Tensor = None) -> torch.Tensor:
+        """``evidence`` adds the evidence tokens as leading keys of each query's own segment.
+
+        The evidence states go through this expert's own norm, then the optional per token gate
+        ``evidence_token_gate`` ``[B, S_ev]`` (after the norm, which would otherwise divide it back
+        out), then its own ``k_proj``/``v_proj``, placed by ``evidence.prefix_position_embeddings``.
+        ``evidence_value_scale`` scales their values. None is the forward this expert always ran.
+        """
         x_norm = self.norm(x)
+        if evidence is not None:
+            states = self.norm(evidence.states)
+            if evidence_token_gate is not None:
+                states = states * evidence_token_gate.unsqueeze(-1).to(states.dtype)
+            attn_output = self.attn(
+                hidden_states=x_norm,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_embeddings=position_embeddings,
+                kv_cache=kv_cache,
+                prefix_states=states,
+                prefix_cu_seqlens=evidence.cu_seqlens,
+                prefix_max_seqlen=evidence.max_seqlen,
+                prefix_position_embeddings=evidence.prefix_position_embeddings,
+                prefix_value_scale=evidence_value_scale,
+            )
+            return self.dropout(attn_output)
         attn_output = self.attn(
             hidden_states=x_norm,
             cu_seqlens=cu_seqlens,

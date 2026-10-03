@@ -10,7 +10,7 @@ from modules.model.embeddings import (
     apply_rotary_pos_emb_single,
 )
 from modules.model.utils import EncoderOutput
-from modules.model.attention import varlen_attention, cached_attention
+from modules.model.attention import varlen_attention, cached_attention, prefix_varlen_attention
 
 # adapted from https://github.com/huggingface/transformers/tree/main/src/transformers/models/gemma4
 # https://github.com/huggingface/blog/blob/main/gemma4.md#overview-of-capabilities-and-architecture 
@@ -69,7 +69,26 @@ class Gemma4TextAttention(nn.Module):
         max_seqlen_k: int | None = None,
         other_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         causal: bool = True,
+        prefix_states: torch.Tensor | None = None,
+        prefix_cu_seqlens: torch.Tensor | None = None,
+        prefix_max_seqlen: int | None = None,
+        prefix_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prefix_value_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``prefix_*`` turn self attention into self attention over extra leading keys.
+
+        ``prefix_states`` ``[B, S_p, H]`` are projected by this attention's own ``k_proj`` and
+        ``v_proj``, rotated by ``prefix_position_embeddings`` and read by every query of the paired
+        segment in front of its own causal keys (``prefix_varlen_attention``).
+        ``prefix_value_scale`` multiplies the prefix values. None (the default) is the forward
+        this module always ran.
+        """
+        if prefix_states is not None:
+            return self._forward_with_prefix(
+                hidden_states, cu_seqlens, max_seqlen, position_embeddings, prefix_states,
+                prefix_cu_seqlens, prefix_max_seqlen, prefix_position_embeddings, prefix_value_scale,
+                kv_cache,
+            )
         bsz, q_len, _ = hidden_states.size()
 
         if other_states is None:
@@ -126,6 +145,34 @@ class Gemma4TextAttention(nn.Module):
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
         return self.o_proj(attn_output)
+
+    def _forward_with_prefix(self, hidden_states, cu_seqlens, max_seqlen, position_embeddings,
+                             prefix_states, prefix_cu_seqlens, prefix_max_seqlen,
+                             prefix_position_embeddings, prefix_value_scale, kv_cache):
+        assert kv_cache is None, "a prefix read has no KV cache slot; decode it uncached"
+        assert position_embeddings is not None and prefix_position_embeddings is not None, (
+            "the prefix keys are placed by rotation, so both sides need position embeddings"
+        )
+        bsz, q_len, _ = hidden_states.size()
+        p_len = prefix_states.shape[1]
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        prefix_keys = self.k_proj(prefix_states).view(bsz, p_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        prefix_values = self.v_proj(prefix_states).view(bsz, p_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        prefix_cos, prefix_sin = prefix_position_embeddings
+        prefix_keys = apply_rotary_pos_emb_single(prefix_keys, prefix_cos, prefix_sin)
+        if prefix_value_scale is not None:
+            prefix_values = prefix_values * prefix_value_scale.to(prefix_values.dtype)
+        attn_output = prefix_varlen_attention(
+            query_states, key_states, value_states, prefix_keys, prefix_values,
+            cu_seqlens, max_seqlen, prefix_cu_seqlens, prefix_max_seqlen,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            softmax_scale=self.scaling,
+        )
+        return self.o_proj(attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim))
 
 class Gemma4TextDecoderLayer(nn.Module):
     def __init__(

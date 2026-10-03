@@ -143,6 +143,101 @@ def varlen_attention(
                           cu_seqlens_k, S_kv)
 
 
+def prefix_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    max_seqlen: int | None,
+    cu_seqlens_prefix: torch.Tensor,
+    max_seqlen_prefix: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Document packed causal self attention with extra keys in front of every segment.
+
+    Segment *i* of the queries attends to segment *i* of the prefix in full and to its own tokens
+    causally, under one softmax: the prefix reads as text that came before the document. Built as
+    one flash call: the two key sets are interleaved into ``[prefix_0, own_0, prefix_1, own_1, ...]``
+    and flash's causal mask, which aligns the last query with the last key when a segment has more
+    keys than queries, lets query ``j`` of a segment with ``E`` prefix keys see keys ``0..E + j``.
+    A segment with an empty prefix is plain causal attention over its own tokens.
+
+    Args:
+        q: ``[B, Hq, S, D]``.
+        k, v: ``[B, Hkv, S, D]``, the queries' own keys and values.
+        k_prefix, v_prefix: ``[B, Hkv, S_p, D]``, laid out sorted by segment over the flattened
+            ``B * S_p`` axis.
+        cu_seqlens: ``[n + 1]`` over the query axis; ``None`` is one segment per row.
+        max_seqlen: longest query segment (an upper bound).
+        cu_seqlens_prefix: ``[n + 1]`` over the prefix axis, zero length segments allowed, the same
+            ``n`` as ``cu_seqlens``.
+        max_seqlen_prefix: longest prefix segment (an upper bound).
+        dropout_p: attention dropout probability.
+        softmax_scale: defaults to ``D ** -0.5``.
+
+    Returns:
+        ``[B, S, Hq, D]``.
+    """
+    B, Hq, S, D = q.shape
+    Hkv, S_p = k_prefix.shape[1], k_prefix.shape[2]
+    device = q.device
+    if softmax_scale is None:
+        softmax_scale = D ** -0.5
+    if cu_seqlens is None:
+        cu_seqlens = _default_cu_seqlens(B, S, device)
+        max_seqlen = S
+    assert cu_seqlens.shape == cu_seqlens_prefix.shape, (
+        "the prefix must carry one segment per query segment, paired by position"
+    )
+    cu_q = cu_seqlens.to(device=device, dtype=torch.long)
+    cu_p = cu_seqlens_prefix.to(device=device, dtype=torch.long)
+    seg_q = _segment_ids(cu_q, B, S, device).reshape(-1)
+    seg_p = _segment_ids(cu_p, B, S_p, device).reshape(-1)
+    n_q, n_p = B * S, B * S_p
+    # where each own key and each prefix key lands in the interleaved key axis
+    dest_q = torch.arange(n_q, device=device) + cu_p[seg_q + 1]
+    dest_p = torch.arange(n_p, device=device) + cu_q[seg_p]
+    source = torch.empty(n_q + n_p, dtype=torch.long, device=device)
+    source[dest_q] = torch.arange(n_q, device=device)
+    source[dest_p] = torch.arange(n_p, device=device) + n_q
+    cu_k = cu_q + cu_p
+
+    kf = torch.cat([k.transpose(1, 2).reshape(n_q, Hkv, D), k_prefix.transpose(1, 2).reshape(n_p, Hkv, D)])
+    vf = torch.cat([v.transpose(1, 2).reshape(n_q, Hkv, D), v_prefix.transpose(1, 2).reshape(n_p, Hkv, D)])
+    kf, vf = kf.index_select(0, source), vf.index_select(0, source)
+    qf = q.transpose(1, 2).reshape(n_q, Hq, D)
+
+    if _HAS_FLASH:
+        out = flash_attn_varlen_func(
+            qf, kf, vf,
+            cu_q.to(torch.int32), cu_k.to(torch.int32),
+            int(max_seqlen), int(max_seqlen) + int(max_seqlen_prefix),
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        return out.reshape(B, S, Hq, D)
+
+    # fallback: one dense mask over the flattened axes, written out from the same layout
+    seg_k = _segment_ids(cu_k, 1, n_q + n_p, device).reshape(-1)
+    is_prefix = torch.zeros(n_q + n_p, dtype=torch.bool, device=device)
+    is_prefix[dest_p] = True
+    own_offset_k = torch.arange(n_q + n_p, device=device) - cu_k[seg_k] - (cu_p[seg_k + 1] - cu_p[seg_k])
+    offset_q = torch.arange(n_q, device=device) - cu_q[seg_q]
+    mask = (seg_q[:, None] == seg_k[None, :]) & (is_prefix[None, :] | (own_offset_k[None, :] <= offset_q[:, None]))
+    if Hkv != Hq:
+        kf = kf.repeat_interleave(Hq // Hkv, dim=1)
+        vf = vf.repeat_interleave(Hq // Hkv, dim=1)
+    out = F.scaled_dot_product_attention(
+        qf.transpose(0, 1)[None], kf.transpose(0, 1)[None], vf.transpose(0, 1)[None],
+        attn_mask=mask[None, None], dropout_p=dropout_p, scale=softmax_scale,
+    )                                                            # [1, Hq, n_q, D]
+    return out[0].transpose(0, 1).reshape(B, S, Hq, D)
+
+
 def cached_attention(
     q: torch.Tensor,
     k_new: torch.Tensor,
