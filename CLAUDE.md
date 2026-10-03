@@ -15,6 +15,13 @@ the goal "facts in the store through the retrieval pathway, reasoning in the loo
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
 record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
 
+**The design page moves with the architecture and the plan.** Any change to the architecture (a
+tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
+gate, a measured verdict) is also made in `docs/evidence_path_design.html` in the same turn, and
+the page is republished to its artifact, https://claude.ai/artifact/GS2S79cV2ACydtXaaHzemW (the
+Artifact tool with that `url`; a new session reads the artifact first). The repo file is the
+source and the artifact stays identical to it; the file goes into the same commit line.
+
 - **Arm (a), full CE, 300M tokens, reads the instrument**: closed-book entity `delta` in
   distribution 0.009 / 0.063 / 0.378 / 0.467 by tier 1 / 10 / 100 / 1000 (tier 1000 rank 0),
   held-out template 0.001 / 0.009 / 0.023 / 0.104 (surface-form memorization). Checkpoints

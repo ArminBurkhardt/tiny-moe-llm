@@ -112,9 +112,9 @@ footer{font-size:12.5px;color:var(--mut);border-top:1px solid var(--line);paddin
 <div class="wrap">
 
 <header class="top">
-  <div class="eyebrow">tiny-moe-llm · design proposal · 2026-09-29 · updated 2026-09-30 · nothing here has trained</div>
-  <h1>Embeddings choose. Cross-attention reads. The trunk reasons.</h1>
-  <p class="lede">A 384-d embedding search picks candidate chunks because it is cheap. A cross-attention reader then attends over the tokens of those chunks, so exact wording reaches the model. World facts live in the store. The trunk keeps language, common sense and reasoning.</p>
+  <div class="eyebrow">tiny-moe-llm · design proposal · 2026-09-29 · updated 2026-10-03 · micro-scale readings in, the pilot has not trained</div>
+  <h1>Embeddings choose. Self-attention reads. The trunk reasons.</h1>
+  <p class="lede">A 384-d embedding search picks candidate chunks because it is cheap. The tokens of those chunks then enter the looped block's shared self-attention as leading keys and values, so exact wording reaches the model through the circuit that already copies from a prompt. World facts live in the store. The trunk keeps language, common sense and reasoning.</p>
   <div class="legend">
     <span><i class="sw" style="background:var(--trunk)"></i>token stream (trunk)</span>
     <span><i class="sw" style="background:var(--ev)"></i>evidence path</span>
@@ -125,14 +125,58 @@ footer{font-size:12.5px;color:var(--mut);border-top:1px solid var(--line);paddin
     <span><b class="chip c-drop">DROP</b> removed</span>
   </div>
   <nav aria-label="Sections">
-    <a href="#pipeline">Pipeline</a><a href="#reader">Reader math</a><a href="#block">Looped block</a><a href="#components">Components</a><a href="#blueprints">Blueprints</a><a href="#poc">POC finetune</a><a href="#scratch">From-scratch run</a><a href="#datasets">Datasets</a><a href="#loop">Loop reasoning</a><a href="#cost">Cost</a><a href="#gates">Gates</a><a href="#review">Opus review</a><a href="#risks">Risks</a>
+    <a href="#status">Status</a><a href="#pipeline">Pipeline</a><a href="#reader">Reader math</a><a href="#block">Looped block</a><a href="#components">Components</a><a href="#blueprints">Blueprints</a><a href="#poc">POC finetune</a><a href="#scratch">From-scratch run</a><a href="#datasets">Datasets</a><a href="#loop">Loop reasoning</a><a href="#cost">Cost</a><a href="#gates">Gates</a><a href="#review">Opus review</a><a href="#risks">Risks</a>
   </nav>
 </header>
+
+<section id="status">
+  <div class="eyebrow">0 · status · 2026-10-03</div>
+  <h2>What has been measured since the proposal</h2>
+  <p class="sub">The graft check ran and failed. The first from-scratch runs (R0b: 35M parameters, fictional biographies at 1 / 10 / 100 / 1000 exposures) then changed the reader: a separate cross-attention module does not learn to copy at this scale, the model's own self-attention does. Sections 1 to 5 describe the design after that change. The POC section is kept as the record of what ran.</p>
+  <div class="kv">
+    <div><span class="l">graft POC</span><span class="v">killed at 10M</span><span class="s">content gain +0.058 (arm A) and +0.081 (arm B, no rotary) against a 0.1 nat bar; the graft branch is closed</span></div>
+    <div><span class="l">in-context ceiling</span><span class="v">3.18 nats</span><span class="s">pooled on <code>evidence_fixed</code>; the arms reached a sixth of it on gold gain and 2% on content gain</span></div>
+    <div><span class="l">arm (a), full CE, 300M</span><span class="v">0.378 at tier 100</span><span class="s">closed-book delta, z 51, and 0.467 at tier 1000: the instrument reads</span></div>
+    <div><span class="l">key/value read, 100M</span><span class="v">top-1 0.92</span><span class="s">gold card, flat in exposure; a swapped card is followed 92% of the time, memorization ratio under 0.03</span></div>
+    <div><span class="l">cross-attention reader, 100M</span><span class="v">top-1 0.01</span><span class="s">swapped card followed 2%, while the same model copies from its prompt; closed at micro scale</span></div>
+    <div><span class="l">arm (c) leak, 100M</span><span class="v">0.026, z 5.2</span><span class="s">closed-book delta at tier 100 with the key/value read, 0.149 at tier 1000; fails the pass rule mid-cosine</span></div>
+  </div>
+
+  <h3>The two readers at matched 100M tokens</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>arm (c) reader</th><th>no evidence</th><th>gold card through the port</th><th>card as prompt text</th><th>swapped card followed</th></tr></thead>
+    <tbody>
+      <tr><td class="k">cross-attention</td><td>.493 .491 .438 .193</td><td>.472 .463 .350 .019</td><td>.131 .118 .103 .052</td><td>.017 .020 .020 .006</td></tr>
+      <tr><td class="k">key/value</td><td>.489 .499 .454 .257</td><td>.003 .003 .002 .000</td><td>.003 .002 .001 .000</td><td>.925 .920 .913 .880</td></tr>
+    </tbody></table></div>
+  <p class="sub">Entity class, in distribution, by exposure tier 1 / 10 / 100 / 1000. The first three columns are the normalized rank of the true value among 100 same-type candidates (0 is best, 0.5 is chance); the last is the share of items where the swapped value wins. On the held-out template the key/value read ranks the gold card at 0.02 and follows a swapped card 70% of the time. A copy that works does not care how often a person was seen, which is the flat row. The cross reader's tier-1000 gain is memory cued by the card: under the swapped card it still ranks the original value at 0.023.</p>
+
+  <h3>The leak at 100M</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>arm</th><th>tier 1</th><th>tier 10</th><th>tier 100</th><th>tier 1000</th></tr></thead>
+    <tbody>
+      <tr><td class="k">(a) full CE, no retrieval</td><td>0.007 (1.3)</td><td>0.012 (2.1)</td><td>0.099 (17.3)</td><td>0.332 (24.0)</td></tr>
+      <tr><td class="k">(c) cross-attention reader</td><td>-0.006 (-1.7)</td><td>0.003 (0.9)</td><td>0.037 (10.5)</td><td>0.203 (20.3)</td></tr>
+      <tr><td class="k">(c) key/value read</td><td>0.001 (0.1)</td><td>-0.000 (-0.0)</td><td>0.026 (5.2)</td><td>0.149 (12.3)</td></tr>
+    </tbody></table></div>
+  <p class="sub">Closed-book delta (fresh-name prior minus real, entity class, in distribution), paired z in brackets. The pass rule wants (b) and (c) within 3 sigma of their prior through tier 100, with tier 1000 read alongside. The reader that copies leaks least, but arm (c) is already over the bar at tier 100. These are readings a third of the way down the cosine; the full arms decide. Record: <span class="mono">docs/measurements/r0b_micro_pilot.md</span>.</p>
+
+  <h3>Next, in order</h3>
+  <div class="flow">
+    <div class="step t"><div class="n">1</div><div class="d"><b>Arm (b) in full.</b> <code>inject_masked</code>, 0.3B tokens, about 90 minutes. The input-side leak test and the third arm the comparison needs.</div></div>
+    <div class="step e"><div class="n">2</div><div class="d"><b>Arm (c) in full with the key/value read.</b> Resumed from the 100M save. Every save gets gold, swapped, none and prompt reads; then the three arms are compared under the pass rule.</div></div>
+    <div class="step e"><div class="n">3</div><div class="d"><b>One sweep arm per leak.</b> If (c) still climbs at 300M, the higher swap rate; if (b) climbs, the anonymization rate.</div></div>
+    <div class="step t"><div class="n">4</div><div class="d"><b>The storage half of the loop axiom.</b> Closed-book rank at 1, 2 and 3 loops on arm (a) final. Eval only.</div></div>
+    <div class="step t"><div class="n">5</div><div class="d"><b>Learned depth allocation.</b> An entropy-regularized exit distribution over depths as a micro arm against the fixed depth draw.</div></div>
+    <div class="step s"><div class="n">6</div><div class="d"><b>Seed-side instruments.</b> The likelihood-only counterfactual and PopQA on the seed and both 10M graft checkpoints.</div></div>
+    <div class="step t"><div class="n">7</div><div class="d"><b>The pilot.</b> With the key/value read and its rotation, after R0b passes; the ladder is cut to the budget before launch.</div></div>
+  </div>
+</section>
 
 <section id="pipeline">
   <div class="eyebrow">1 · pipeline</div>
   <h2>Two streams, three hand-offs</h2>
-  <p class="sub">The split between choosing by embedding and reading by cross-attention stays. The additions are a clean way for the selector to steer the reader, and a training recipe that stops rewarding recall from weights.</p>
+  <p class="sub">The split between choosing by embedding and reading token states stays. Since 2026-10-03 the read is no longer a separate cross-attention module: the chunk tokens are leading keys and values of the shared self-attention. The other additions are a clean way for the selector to steer the read, and a training recipe that stops rewarding recall from weights.</p>
   <figure>
     <div class="scroll">
     <svg viewBox="0 0 980 430" role="img" aria-label="Token stream on top, evidence path below. The looped block sends a 384-d query to the selector, the selector sends a chunk prior to the reader, the reader returns exact tokens to the block.">
@@ -150,7 +194,7 @@ footer{font-size:12.5px;color:var(--mut);border-top:1px solid var(--line);paddin
       <text x="285" y="90" text-anchor="middle" class="ts">8 layers, 768 wide</text>
       <rect x="410" y="40" width="330" height="70" rx="4" class="bt"/>
       <text x="575" y="70" text-anchor="middle" class="tx">MoE block, applied 3 times</text>
-      <text x="575" y="90" text-anchor="middle" class="ts">shared + routed experts + reader</text>
+      <text x="575" y="90" text-anchor="middle" class="ts">shared + routed experts, read in shared_attn</text>
       <rect x="780" y="40" width="180" height="70" rx="4" class="bt"/>
       <text x="870" y="70" text-anchor="middle" class="tx">LM head + MTP</text>
       <text x="870" y="90" text-anchor="middle" class="ts">per-loop readout</text>
@@ -163,9 +207,9 @@ footer{font-size:12.5px;color:var(--mut);border-top:1px solid var(--line);paddin
       <text x="365" y="237" text-anchor="middle" class="ts">cosine of q against k keys + null</text>
       <text x="365" y="252" text-anchor="middle" class="ts">per token, per loop</text>
       <rect x="590" y="190" width="230" height="74" rx="4" class="be"/>
-      <text x="705" y="218" text-anchor="middle" class="tx">Reader</text>
-      <text x="705" y="237" text-anchor="middle" class="ts">cross-attention over chunk tokens</text>
-      <text x="705" y="252" text-anchor="middle" class="ts">16 heads, 4 KV heads, no rotary</text>
+      <text x="705" y="218" text-anchor="middle" class="tx">Key/value read</text>
+      <text x="705" y="237" text-anchor="middle" class="ts">chunk tokens as leading keys</text>
+      <text x="705" y="252" text-anchor="middle" class="ts">of shared_attn, prefix rotation</text>
 
       <line x1="450" y1="110" x2="400" y2="188" class="ls" marker-end="url(#as)"/>
       <text x="300" y="150" class="lab-s">q: 384-d query from h</text>
@@ -215,24 +259,29 @@ footer{font-size:12.5px;color:var(--mut);border-top:1px solid var(--line);paddin
       <li>Always on. The router never specialized, so relevance must not depend on it.</li>
       <li>No value read. It carries gist only.</li></ul></div>
     <div class="card ev"><h3>Reader</h3><ul>
-      <li>Cross-attention, 16 query heads x 48, 4 KV heads.</li>
-      <li>Reads encoded chunk tokens, so spans can be copied.</li>
-      <li>Selector prior enters the attention logit per token. It is causal by construction.</li>
-      <li>One learned sink slot per segment with a zero value, so the reader can attend nowhere.</li>
-      <li>K and V are loop invariant, so one cache per buffer serves all loops.</li></ul></div>
+      <li>No module of its own. The encoded chunk tokens become leading keys and values of the shared self-attention in every loop, under one softmax with the segment's own causal keys.</li>
+      <li>They pass through that attention's own norm, <code>k_proj</code> and <code>v_proj</code>, so spans are copied by the circuit that copies from a prompt.</li>
+      <li>Prefix rotation: the evidence keys sit at the positions the text right before the segment would hold.</li>
+      <li>Selector prior enters the attention logit per token, on the evidence keys only. It is causal by construction.</li>
+      <li>One learned sink slot per segment with a zero value.</li>
+      <li>Measured at 35M parameters and 100M tokens: gold card top-1 0.92, where the cross-attention reader reads 0.01.</li></ul></div>
   </div>
 </section>
 
 <section id="reader">
   <div class="eyebrow">2 · reader math</div>
   <h2>How the selector steers the reader</h2>
-  <p class="sub">The repo's current coupling is <code>1 + evidence_gate_scale * sigmoid(chunk_mean_mass)</code>. It averages over the whole document, so it leaks future tokens in training, and its input range makes it nearly constant. The replacement adds the selector's own logit to the attention logit through a one-hot channel. It needs no attention bias argument, so flash-attn varlen still works.</p>
-<pre><span class="cm"># M = max chunks per segment (static). head_dim grows from 48 to 48 + M, rounded to a multiple of 8</span>
-k'[j] = [ W_k e[j] ; onehot(rank(chunk(j))) ]        <span class="cm"># evidence token j, v padded with zeros</span>
-q'[t] = [ W_q x[t] ; sqrt(48) * b[t, 1..M] ]         <span class="cm"># query token t</span>
-logit(t, j) = q'[t] · k'[j] / sqrt(48)
-            = content(t, j) + b[t, chunk(j)]          <span class="cm"># softmax_scale = 48^-0.5 passed explicitly</span>
+  <p class="sub">The repo's current coupling is <code>1 + evidence_gate_scale * sigmoid(chunk_mean_mass)</code>. It averages over the whole document, so it leaks future tokens in training, and its input range makes it nearly constant. The replacement adds the selector's own logit to the attention logit through a one-hot channel. It needs no attention bias argument, so flash-attn varlen still works. With the key/value read the channel is a head-dim extension of the shared self-attention: the one-hot sits on the evidence keys and the segment's own keys carry zeros. The key/value read is built and measured; the channel and the sink are not built yet.</p>
+<pre><span class="cm"># one softmax per query token over [ evidence prefix of its segment ; the segment's own causal keys ]</span>
+<span class="cm"># d = head dim (48 today, 64 at shape L). M = max chunks per segment (static). head_dim grows to d + M, a multiple of 8</span>
+k'[j] = [ W_k norm(e[j]) ; onehot(rank(chunk(j))) ]  <span class="cm"># evidence token j, v padded with zeros</span>
+k'[i] = [ W_k norm(x[i]) ; 0 ]                       <span class="cm"># the segment's own token i, causal</span>
+q'[t] = [ W_q norm(x[t]) ; sqrt(d) * b[t, 1..M] ]    <span class="cm"># query token t</span>
+logit(t, j) = content(t, j) + b[t, chunk(j)]         <span class="cm"># softmax_scale = d^-0.5 passed explicitly</span>
+logit(t, i) = content(t, i)                          <span class="cm"># own keys see no prior</span>
 
+pos(j)  = start_s - E_s + j                          <span class="cm"># prefix rotation on the content dims: the E_s evidence tokens of segment s</span>
+                                                     <span class="cm"># sit where the text right before the segment would; negative positions allowed</span>
 b[t, c] = gamma[h] * z[t, c]  -  lambda * log(n_c)  +  vis[t, c]
 z[t, c] = cos(q_sel[t], key[c]) / tau                <span class="cm"># the selector's own logit, already [T, M]</span>
 vis     = 0 where chunk c is visible to token t, else -1e4
@@ -244,12 +293,13 @@ sink    = one extra slot per segment: learned key, value 0</pre>
       <li><code>lambda * log(n_c)</code> removes the length bias. A chunk three times longer otherwise gets 1.1 nats for free.</li>
       <li>The visibility mask also expresses the per-window staircase of the from-scratch run.</li></ul></div>
     <div class="card"><h3>Init and cost</h3><ul>
-      <li>POC arm C only (arms A and B run without the channel): <code>gamma = 0</code>, <code>lambda = 0</code>. The reader is unchanged at step 0.</li>
+      <li>The graft's arm C (the channel at <code>gamma = 0</code>) never ran: arms A and B were killed at 10M.</li>
       <li>From scratch: <code>gamma = 1</code>, <code>lambda = 0</code>.</li>
-      <li>M = 16 gives head_dim 64, about +33% on the reader's attention.</li>
-      <li>M = 40 covers 16 windows at top 2 (32 chunks) with room to spare and gives head_dim 88. The pilot's QA buffer is capped at 8 chunks and has no <code>many</code> condition.</li>
-      <li>A read site is about 7 MFLOP per token, 1.4% of the body. This is an estimate.</li></ul></div>
+      <li>At d = 48, M = 16 gives head_dim 64 and M = 40 gives 88; at shape L (d = 64) they give 80 and 104. The extension now widens the shared self-attention itself, on its own keys as well.</li>
+      <li>M = 40 covers 16 windows at top 2 (32 chunks) with room to spare. The pilot's QA buffer is capped at 8 chunks and has no <code>many</code> condition.</li>
+      <li>The earlier estimate of 7 MFLOP per read site was for a separate cross-attention. The key/value read instead lengthens the key axis of an attention that already runs; its cost is not re-derived.</li></ul></div>
   </div>
+  <div class="note ok">Why the read moved into the self-attention (2026-10-03). At matched 100M tokens the cross-attention reader ranked the gold card's value at 0.47 at tier 1 and followed a swapped card 2% of the time, although the same model copied a card from its prompt at 0.10 to 0.13. A separate module has to relearn copying; evidence presented as leading keys of the model's own attention inherits it. Training that read also trained in-context copying (prompt read 0.003), and filler validation CE is unchanged (4.481 against 4.509).</div>
   <div class="note">The first draft added <code>P * key</code> to the reader's keys and <code>Q * q_sel</code> to its queries. The Opus review showed that this mostly learns content-by-selector cross terms, and that the pure selector term is a new bilinear form unrelated to the cosine the selection loss trains. The one-hot channel replaces it.</div>
 </section>
 
@@ -259,21 +309,21 @@ sink    = one extra slot per segment: learned key, value 0</pre>
   <div class="flow">
     <div class="step t"><div class="n">0</div><div class="d"><b>Input.</b> <code>step_input = h</code>, shape <code>[B, S, 768]</code>. <code>cu_seqlens</code> is built in-thread from <code>document_ids</code>.</div></div>
     <div class="step s"><div class="n">1</div><div class="d"><b>Selector.</b> Scores the visible candidate keys for every token. Produces <code>z [T, M]</code> and the null mass. Runs first so this loop's scores steer this loop's read.</div></div>
-    <div class="step e"><div class="n">2</div><div class="d"><b>Reader.</b> <code>read = CrossAttn(x = step_input + evidence_query_bias[loop], K/V = encoded chunks, prior = b)</code>. Skipped entirely when no evidence is attached, which keeps that path bit-identical.</div></div>
-    <div class="step t"><div class="n">3</div><div class="d"><b>Always-on experts.</b> <code>acc = shared_mlp(h) + shared_attn(h)</code>.</div></div>
+    <div class="step e"><div class="n">2</div><div class="d"><b>Evidence keys.</b> The encoded chunk states go through <code>shared_attn</code>'s own norm, <code>k_proj</code> and <code>v_proj</code>, are rotated at their prefix positions, and the values are scaled by <code>evidence_loop_scale[loop]</code>. Skipped entirely when no evidence is attached, which keeps that path bit-identical.</div></div>
+    <div class="step t"><div class="n">3</div><div class="d"><b>Always-on experts, with the read.</b> <code>acc = shared_mlp(h) + shared_attn(h, prefix = evidence K/V, prior = b)</code>. One softmax per token over the evidence prefix and the segment's own causal keys, one flash call. There is no reader query bias.</div></div>
     <div class="step t"><div class="n">4</div><div class="d"><b>Routed experts.</b> Self-attention and cross-attention experts run densely. 32 MLP experts run sparse at top-k 2 through one grouped GEMM. The router is loop conditioned by <code>loop_router_bias</code>.</div></div>
     <div class="step t"><div class="n">5</div><div class="d"><b>Block update.</b> <code>h = h + loop_scale[loop] * dropout(post_norm(acc))</code>.</div></div>
-    <div class="step e"><div class="n">6</div><div class="d"><b>Evidence update.</b> <code>h = h + g_loop[loop] * RMSNorm(o_proj(read))</code>, <code>o_proj</code> at default init, <code>g_loop</code> 0 on a graft and 1 from scratch. The read enters after <code>post_norm</code>, so it keeps its own share of the residual. <b class="chip c-change">CHANGE</b></div></div>
-    <div class="step t"><div class="n">7</div><div class="d"><b>Readout.</b> The normed state of every loop goes to the chunked CE. The groundedness head reads <code>read</code> and the null mass at the last prompt token of each answer span.</div></div>
+    <div class="step e"><div class="n">6</div><div class="d"><b>No separate evidence update.</b> The read lands through <code>shared_attn</code>'s own <code>o_proj</code> inside step 3. The earlier <code>g_loop[loop] * RMSNorm(o_proj(read))</code> add after <code>post_norm</code> went with the cross-attention module. <b class="chip c-drop">DROP</b></div></div>
+    <div class="step t"><div class="n">7</div><div class="d"><b>Readout.</b> The normed state of every loop goes to the chunked CE. The groundedness head reads the output of the reading attention and the null mass at the last prompt token of each answer span.</div></div>
   </div>
-  <div class="note bad">Neutrality moves from <code>o_proj</code> to <code>g_loop</code>. A norm placed after a zero-init <code>o_proj</code> has a gradient near 1/sqrt(eps) at zero, so one optimizer step would put a unit-RMS read into the residual. With <code>g_loop = 0</code> and a default-init <code>o_proj</code>, the first step is still exactly neutral and <code>g_loop</code> gets a real gradient. From scratch <code>g_loop</code> starts at 1.</div>
+  <div class="note bad">Neutrality with evidence attached is given up. The read shares the softmax with the segment's own keys, so attaching evidence changes the forward from the first step. From-scratch training does not need a neutral start; the zero-init gain existed for grafts, and the graft branch is closed. With no evidence attached the forward is still bit-identical to the model without the port. The cross-attention reader stays loadable as the legacy mode.</div>
 </section>
 
 <section id="components">
   <div class="eyebrow">4 · components</div>
   <h2>What changes, per run</h2>
   <div class="scroll"><table>
-    <thead><tr><th>component</th><th>repo today</th><th>POC finetune</th><th>from-scratch run</th></tr></thead>
+    <thead><tr><th>component</th><th>repo today</th><th>POC finetune, as run</th><th>from-scratch run</th></tr></thead>
     <tbody>
     <tr><td class="k">token embedding</td><td>65536 x 768, 50.3M, input side only</td><td><b class="chip c-built">BUILT</b> as is</td><td>one table, tied to the head, no weight decay</td></tr>
     <tr><td class="k">LM head</td><td>untied: 768 x 768 projection plus four block-diagonal 192 to 16384 heads, 13.2M, rank 192 per vocab quarter</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> tied: <code>norm(h) @ A @ E^T</code>, one 768 x 768 adapter, 0.59M</td></tr>
@@ -283,7 +333,7 @@ sink    = one extra slot per segment: learned key, value 0</pre>
     <tr><td class="k">looped block</td><td>n_loops 3, 32 MLP experts top-k 2, 1 self-attn, 1 cross-attn, 1 IR expert</td><td><b class="chip c-built">BUILT</b> as is</td><td>IR expert leaves the routed pool</td></tr>
     <tr><td class="k">readout</td><td>none, the head reads every loop state</td><td>as is</td><td><b class="chip c-new">NEW</b> 2-layer coda with its own KV slots</td></tr>
     <tr><td class="k">loss placement</td><td>per-loop CE 0.2 / 0.3 / 1.0</td><td>as is</td><td><b class="chip c-change">CHANGE</b> last loop only, tested against per-loop</td></tr>
-    <tr><td class="k">depth sampling</td><td>30% of steps stop at loop 1 or 2</td><td>as is</td><td><b class="chip c-change">CHANGE</b> depth 3 to 5, gradient window of 3</td></tr>
+    <tr><td class="k">depth sampling</td><td>30% of steps stop at loop 1 or 2</td><td>as is</td><td><b class="chip c-change">CHANGE</b> depth 3 to 5, gradient window of 3; a learned, entropy-regularized exit distribution is tried as a micro arm against the fixed draw first</td></tr>
     <tr><td class="k">loop_scale</td><td>seed 0.504 / 0.238 / 0.112 (phase2_final migrated 0.637 / 0.326 / 0.098)</td><td>as is, trunk LR: the rescale probe (R0) failed</td><td><b class="chip c-change">CHANGE</b> length 5, fresh 1/sqrt(5)</td></tr>
     <tr><td class="k">loop_inject</td><td>off in the current checkpoint</td><td>off</td><td><b class="chip c-change">CHANGE</b> on</td></tr>
     <tr><td class="k">selection loss</td><td>same gold for every loop, uniform mean</td><td>as is</td><td><b class="chip c-change">CHANGE</b> union over loops</td></tr>
@@ -291,10 +341,11 @@ sink    = one extra slot per segment: learned key, value 0</pre>
     <tr><td class="k">selector</td><td>routed IR expert, union softmax with the table</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> always on, candidates plus null key</td></tr>
     <tr><td class="k">key_adapter</td><td>trained square map on bge keys</td><td>as is</td><td><b class="chip c-drop">DROP</b> keys stay raw bge</td></tr>
     <tr><td class="k">selector value read</td><td>value_adapter, g_proj, up_proj, direct_gate</td><td>as is, direct_gate starts at zero</td><td><b class="chip c-drop">DROP</b> gist only</td></tr>
-    <tr><td class="k">selector to reader</td><td>1 + scale * sigmoid(document mean mass)</td><td><b class="chip c-change">CHANGE</b> scale frozen at 0</td><td><b class="chip c-new">NEW</b> one-hot chunk channel</td></tr>
-    <tr><td class="k">reader positions</td><td>rotary on query and key, unrelated bases</td><td><b class="chip c-change">CHANGE</b> arm B: no rotary</td><td>no rotary, if arm B wins</td></tr>
+    <tr><td class="k">selector to reader</td><td>1 + scale * sigmoid(document mean mass)</td><td><b class="chip c-change">CHANGE</b> scale frozen at 0</td><td><b class="chip c-new">NEW</b> one-hot chunk channel on the evidence keys, zeros on the segment's own keys</td></tr>
+    <tr><td class="k">reader</td><td>two modes: the <code>shared_evidence</code> cross-attention, and since 2026-10-03 the key/value read inside <code>shared_attn</code> (<code>--reader-kv</code>)</td><td>cross-attention; both arms killed at 10M</td><td><b class="chip c-change">CHANGE</b> key/value read: evidence tokens as leading keys and values of the shared self-attention. The cross-attention reader stays loadable</td></tr>
+    <tr><td class="k">reader positions</td><td>cross reader: rotary on query and key, unrelated bases, optional off; key/value read: prefix rotation</td><td><b class="chip c-change">CHANGE</b> arm B: no rotary, +40% content gain, still under the bar</td><td><b class="chip c-change">CHANGE</b> prefix rotation: evidence keys sit where the text right before the segment would. Supersedes "no rotary", a cross-reader decision</td></tr>
     <tr><td class="k">reader sink</td><td>none</td><td>none</td><td><b class="chip c-new">NEW</b> one slot per segment</td></tr>
-    <tr><td class="k">reader output</td><td>zero-init o_proj, summed before post_norm</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> g_loop * RMSNorm(o_proj(read)) after post_norm, o_proj default init, g_loop 1</td></tr>
+    <tr><td class="k">reader output</td><td>cross reader: zero-init o_proj, summed before post_norm; key/value read: none of its own</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-drop">DROP</b> no separate output: the read lands through the shared self-attention's own o_proj; <code>evidence_loop_scale[k]</code> scales the evidence values</td></tr>
     <tr><td class="k">read sites</td><td>once per loop</td><td>once per loop</td><td>sublayers 1 and 3 of every pass, plus dense layers 3 and 6 as a pilot A/B</td></tr>
     <tr><td class="k">chunk encoder</td><td>all 8 dense layers, gradient on, no checkpointing</td><td><b class="chip c-built">BUILT</b> as is</td><td><b class="chip c-change">CHANGE</b> first 4 layers, TE checkpoint</td></tr>
     <tr><td class="k">first-stage search</td><td>none, the corpus builder picks chunks</td><td>none, oracle buffers</td><td><b class="chip c-new">NEW</b> offline bge in training, model query in serving</td></tr>
@@ -344,11 +395,11 @@ sink    = one extra slot per segment: learned key, value 0</pre>
 <rect x="20" y="1164" width="960" height="58" rx="4" class="bn"/><text x="30" y="1183" class="tx">size</text><text x="30" y="1200" class="ts">383.5M total, 224.2M active, about 502 MFLOP per prompt token plus 118 per evidence token; four token tables 85.7M; learned table and</text><text x="30" y="1214" class="ts">adapters about 51M at ir_dim 384</text>
 </svg>
     </div>
-    <figcaption>POC finetune on the grafted checkpoint. The three FIX tags are the pre-launch changes, all made on 2026-09-30: the chunk gate frozen at zero, the reader's rotary made optional for arm B, and the kill moved to the fixed-target gold gain and content gain. Everything else runs as built.</figcaption>
+    <figcaption>POC finetune on the grafted checkpoint. The three FIX tags are the pre-launch changes, all made on 2026-09-30: the chunk gate frozen at zero, the reader's rotary made optional for arm B, and the kill moved to the fixed-target gold gain and content gain. Everything else ran as built. Both arms ran on 2026-10-01 and were killed at 10.08M tokens on the content gain.</figcaption>
   </figure>
   <figure>
     <div class="scroll">
-<svg viewBox="0 0 1000 1466" role="img" aria-label="Blueprint of the from-scratch run: one tied token table, an 8-layer prelude whose first four layers encode chunks, a looped core of three sublayers with an always-on selector and one-hot chunk channel readers, a two-layer coda, tied heads, one loss on the last pass.">
+<svg viewBox="0 0 1000 1466" role="img" aria-label="Blueprint of the from-scratch run: one tied token table, an 8-layer prelude whose first four layers encode chunks, a looped core of three sublayers with an always-on selector and a key/value evidence read inside the shared self-attention, a two-layer coda, tied heads, one loss on the last pass.">
 <defs>
 <marker id="ar-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="mt"/></marker>
 <marker id="ar-e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="me"/></marker>
@@ -357,7 +408,7 @@ sink    = one extra slot per segment: learned key, value 0</pre>
 <rect x="20" y="400" width="960" height="544" rx="6" class="frame"/><text x="32" y="420" class="tx">looped core, D passes (3 to 5), 3 sublayers per pass; every weight below is shared across the passes</text>
 <rect x="40" y="554" width="920" height="268" rx="6" class="frame"/><text x="52" y="574" class="tx">sublayer, repeated 3 times per pass</text>
 <rect x="20" y="20" width="420" height="128" rx="4" class="bt"/><text x="30" y="39" class="tx">one token table E</text><text x="30" y="56" class="ts">65536 x 1024, 67.1M, init std 1 / sqrt(1024)</text><text x="30" y="70" class="ts">tied to the LM head and the MTP head; no weight decay</text><text x="30" y="84" class="ts">on E</text><text x="30" y="98" class="ts">per-layer table = E W_ple (1024 x 256) and router table = E</text><text x="30" y="112" class="ts">W_moe (1024 x 32), gated on a zero-ablation of the</text><text x="30" y="126" class="ts">per-layer table on the seed</text><rect x="378" y="27" width="54" height="14" rx="2" class="tag-change"/><text x="405" y="37.5" text-anchor="middle" class="tg">CHANGE</text>
-<rect x="460" y="20" width="180" height="128" rx="4" class="bn"/><text x="470" y="39" class="tx">dropped</text><text x="470" y="56" class="ts">learned IR table</text><text x="470" y="70" class="ts">key_adapter</text><text x="470" y="84" class="ts">value_adapter, g_proj,</text><text x="470" y="98" class="ts">up_proj, direct_gate</text><text x="470" y="112" class="ts">factored heads</text><text x="470" y="126" class="ts">chunk gate</text><rect x="592" y="27" width="40" height="14" rx="2" class="tag-drop"/><text x="612" y="37.5" text-anchor="middle" class="tg">DROP</text>
+<rect x="460" y="20" width="180" height="128" rx="4" class="bn"/><text x="470" y="39" class="tx">dropped</text><text x="470" y="56" class="ts">learned IR table</text><text x="470" y="70" class="ts">key_adapter</text><text x="470" y="84" class="ts">value_adapter, g_proj,</text><text x="470" y="98" class="ts">up_proj, direct_gate</text><text x="470" y="112" class="ts">factored heads</text><text x="470" y="126" class="ts">chunk gate</text><text x="470" y="140" class="ts">cross-attention reader</text><rect x="592" y="27" width="40" height="14" rx="2" class="tag-drop"/><text x="612" y="37.5" text-anchor="middle" class="tg">DROP</text>
 <rect x="660" y="20" width="320" height="128" rx="4" class="be"/><text x="670" y="39" class="tx">chunk store</text><text x="670" y="56" class="ts">128-token chunks, sentence aligned, MinHash</text><text x="670" y="70" class="ts">deduplicated</text><text x="670" y="84" class="ts">raw bge-small key 384-d fp16 per chunk,</text><text x="670" y="98" class="ts">global id</text><text x="670" y="112" class="ts">at least 0.4B tokens, built from the</text><text x="670" y="126" class="ts">training corpus</text><text x="670" y="140" class="ts">no cached encoder states</text><rect x="938" y="27" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="37.5" text-anchor="middle" class="tg">NEW</text>
 <rect x="20" y="170" width="620" height="100" rx="4" class="bt"/><text x="30" y="189" class="tx">prelude: dense decoder, 8 layers</text><text x="30" y="206" class="ts">1024 wide, 16 heads x 64, 4 KV heads, rotary, MLP 1024 to 3072 gated, about 109M</text><text x="30" y="220" class="ts">output h0; layers 1 to 4 double as the chunk encoder</text><rect x="578" y="177" width="54" height="14" rx="2" class="tag-change"/><text x="605" y="187.5" text-anchor="middle" class="tg">CHANGE</text>
 <rect x="660" y="170" width="320" height="100" rx="4" class="be"/><text x="670" y="189" class="tx">retrieval</text><text x="670" y="206" class="ts">training: offline bge query of the previous</text><text x="670" y="220" class="ts">256-token window, top 2, the document itself</text><text x="670" y="234" class="ts">excluded, near duplicates dropped</text><text x="670" y="248" class="ts">serving: the model's own q through an ANN</text><text x="670" y="262" class="ts">over the raw keys</text><rect x="938" y="177" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="187.5" text-anchor="middle" class="tg">NEW</text>
@@ -366,13 +417,13 @@ sink    = one extra slot per segment: learned key, value 0</pre>
 <line x1="820" y1="270" x2="820" y2="292" class="le" marker-end="url(#ar-e)"/>
 <line x1="330" y1="270" x2="330" y2="400" class="lt" marker-end="url(#ar-t)"/>
 <text x="338" y="339" class="lab-t">h0</text>
-<rect x="40" y="432" width="300" height="100" rx="4" class="bn"/><text x="50" y="451" class="tx">loop conditioning</text><text x="50" y="468" class="ts">loop code clamped to the trained depth</text><text x="50" y="482" class="ts">zero-init biases: router, selector query,</text><text x="50" y="496" class="ts">reader query</text><text x="50" y="510" class="ts">loop_inject on: h0 re-presented every</text><text x="50" y="524" class="ts">pass</text><rect x="278" y="439" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="449.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="40" y="432" width="300" height="100" rx="4" class="bn"/><text x="50" y="451" class="tx">loop conditioning</text><text x="50" y="468" class="ts">loop code clamped to the trained depth</text><text x="50" y="482" class="ts">zero-init biases: router and selector</text><text x="50" y="496" class="ts">query; the read has no query bias</text><text x="50" y="510" class="ts">loop_inject on: h0 re-presented every</text><text x="50" y="524" class="ts">pass</text><rect x="278" y="439" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="449.5" text-anchor="middle" class="tg">CHANGE</text>
 <rect x="360" y="432" width="600" height="100" rx="4" class="bs"/><text x="370" y="451" class="tx">selector, always on, not routed</text><text x="370" y="468" class="ts">q = normalize(down_proj(norm h) 1024 to 384 + loop_query_bias[k])</text><text x="370" y="482" class="ts">z[t, c] = cos(q_t, raw bge key_c) / tau over the candidates plus one learned null key</text><text x="370" y="496" class="ts">no value read; the null mass feeds the groundedness head; z feeds the reader and the</text><text x="370" y="510" class="ts">losses</text><rect x="898" y="439" width="54" height="14" rx="2" class="tag-change"/><text x="925" y="449.5" text-anchor="middle" class="tg">CHANGE</text>
-<rect x="60" y="586" width="280" height="128" rx="4" class="bt"/><text x="70" y="605" class="tx">self-attention</text><text x="70" y="622" class="ts">16 heads x 64, 4 KV heads, rotary</text><text x="70" y="636" class="ts">shared across the three sublayers and</text><text x="70" y="650" class="ts">across passes</text><rect x="278" y="593" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="603.5" text-anchor="middle" class="tg">CHANGE</text>
-<rect x="360" y="586" width="580" height="128" rx="4" class="be"/><text x="370" y="605" class="tx">reader in sublayers 1 and 3</text><text x="370" y="622" class="ts">q' = [W_q x ; sqrt(64) * b_t]   k' = [W_k e ; onehot(chunk)]   head 64 + M, M up to</text><text x="370" y="636" class="ts">40, softmax_scale 64^-0.5</text><text x="370" y="650" class="ts">b[t, c] = gamma_h * z[t, c] - lambda * log n_c + vis[t, c];  gamma init 1, lambda</text><text x="370" y="664" class="ts">init 0, vis is the window staircase</text><text x="370" y="678" class="ts">one sink slot per segment with value 0; no rotary; 4 KV heads; K and V are</text><text x="370" y="692" class="ts">pass-invariant, one cache per buffer</text><text x="370" y="706" class="ts">after post_norm: h = h + g_loop[k] * RMSNorm(o_proj(read)); o_proj default init, g_loop 1</text><rect x="898" y="593" width="34" height="14" rx="2" class="tag-new"/><text x="915" y="603.5" text-anchor="middle" class="tg">NEW</text>
+<rect x="60" y="586" width="280" height="128" rx="4" class="bt"/><text x="70" y="605" class="tx">shared self-attention</text><text x="70" y="622" class="ts">16 heads x 64, 4 KV heads, rotary</text><text x="70" y="636" class="ts">shared across the three sublayers and</text><text x="70" y="650" class="ts">across passes</text><text x="70" y="664" class="ts">in sublayers 1 and 3 its key axis</text><text x="70" y="678" class="ts">starts with the evidence</text><rect x="278" y="593" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="603.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="360" y="586" width="580" height="128" rx="4" class="be"/><text x="370" y="605" class="tx">key/value read in sublayers 1 and 3</text><text x="370" y="622" class="ts">evidence states pass the attention's own norm, k_proj and v_proj and become leading</text><text x="370" y="636" class="ts">keys and values of each segment: one softmax over [evidence ; own causal keys]</text><text x="370" y="650" class="ts">prefix rotation: evidence key i sits at start_s - E_s + i, the offsets of in-context</text><text x="370" y="664" class="ts">copying; evidence_loop_scale[k] scales the evidence values; no separate o_proj</text><text x="370" y="678" class="ts">k' = [W_k e ; onehot(chunk)]   own k' = [W_k x ; 0]   q' = [W_q x ; sqrt(64) * b_t]</text><text x="370" y="692" class="ts">head 64 + M, M up to 40; b[t, c] = gamma_h * z[t, c] - lambda * log n_c + vis[t, c]</text><text x="370" y="706" class="ts">gamma init 1, lambda init 0, vis is the window staircase; one sink slot per segment</text><rect x="878" y="593" width="54" height="14" rx="2" class="tag-change"/><text x="905" y="603.5" text-anchor="middle" class="tg">CHANGE</text>
 <line x1="340" y1="650" x2="360" y2="650" class="lt" marker-end="url(#ar-t)"/>
 <rect x="60" y="736" width="280" height="72" rx="4" class="bt"/><text x="70" y="755" class="tx">MLP</text><text x="70" y="772" class="ts">always-on MLP 1024 to 3072 gated</text><text x="70" y="786" class="ts">+ 8 routed experts, top 2, aux 0.01</text><text x="70" y="800" class="ts">grouped GEMM; cut from 32 experts</text><rect x="278" y="743" width="54" height="14" rx="2" class="tag-change"/><text x="305" y="753.5" text-anchor="middle" class="tg">CHANGE</text>
-<rect x="360" y="736" width="580" height="72" rx="4" class="bt"/><text x="370" y="755" class="tx">sublayer update</text><text x="370" y="772" class="ts">delta = dropout(post_norm(self-attention + MLP + routed))</text><text x="370" y="786" class="ts">h = h + loop_scale[k] * delta,  loop_scale length 5, fresh init 1 / sqrt(5)</text><text x="370" y="800" class="ts">then the reader add above, so the read keeps its own share of the residual</text><rect x="878" y="743" width="54" height="14" rx="2" class="tag-change"/><text x="905" y="753.5" text-anchor="middle" class="tg">CHANGE</text>
+<rect x="360" y="736" width="580" height="72" rx="4" class="bt"/><text x="370" y="755" class="tx">sublayer update</text><text x="370" y="772" class="ts">delta = dropout(post_norm(self-attention + MLP + routed))</text><text x="370" y="786" class="ts">h = h + loop_scale[k] * delta,  loop_scale length 5, fresh init 1 / sqrt(5)</text><text x="370" y="800" class="ts">the read is part of the self-attention term, so there is no separate evidence add</text><rect x="878" y="743" width="54" height="14" rx="2" class="tag-change"/><text x="905" y="753.5" text-anchor="middle" class="tg">CHANGE</text>
 <rect x="40" y="844" width="920" height="86" rx="4" class="bn"/><text x="50" y="863" class="tx">depth schedule</text><text x="50" y="880" class="ts">D drawn per step: 3 with p 0.7, 4 with p 0.2, 5 with p 0.1;  minimum 3, so no pass is trained as an early exit; expected 3.4</text><text x="50" y="894" class="ts">the first D - 3 passes run under no_grad and are detached; the last 3 carry gradient; memory stays at 3 passes of activations</text><text x="50" y="908" class="ts">log steps run D = 3; inference runs 3, up to 4 for evidence queries once a held-out 4-hop gain is shown; no convergence exit</text><text x="50" y="922" class="ts">hops are bounded by sequential read sites before readout (2 per pass), so 2 hops fit in one pass; L1 tests the loop by read ablation</text><rect x="918" y="851" width="34" height="14" rx="2" class="tag-new"/><text x="935" y="861.5" text-anchor="middle" class="tg">NEW</text>
 <line x1="330" y1="944" x2="330" y2="966" class="lt" marker-end="url(#ar-t)"/>
 <text x="338" y="959" class="lab-t">h_D, last pass only</text>
@@ -380,12 +431,12 @@ sink    = one extra slot per segment: learned key, value 0</pre>
 <rect x="340" y="966" width="300" height="86" rx="4" class="bt"/><text x="350" y="985" class="tx">LM head, tied</text><text x="350" y="1002" class="ts">logits = norm(h) @ A @ E^T</text><text x="350" y="1016" class="ts">A 1024 x 1024, 1.0M new parameters</text><text x="350" y="1030" class="ts">fused linear + cross-entropy kernel</text><text x="350" y="1044" class="ts">one loss, on the coda output</text><rect x="578" y="973" width="54" height="14" rx="2" class="tag-change"/><text x="605" y="983.5" text-anchor="middle" class="tg">CHANGE</text>
 <rect x="660" y="966" width="320" height="86" rx="4" class="bt"/><text x="670" y="985" class="tx">MTP head, tied</text><text x="670" y="1002" class="ts">512 to 1024 adapter, 0.5M, onto E^T</text><text x="670" y="1016" class="ts">2 extra tokens, weight 0.1, CE on a 25%</text><text x="670" y="1030" class="ts">token subsample</text><text x="670" y="1044" class="ts">reads the coda output</text><rect x="918" y="973" width="54" height="14" rx="2" class="tag-change"/><text x="945" y="983.5" text-anchor="middle" class="tg">CHANGE</text>
 <line x1="320" y1="1009" x2="340" y2="1009" class="lt" marker-end="url(#ar-t)"/>
-<rect x="20" y="1074" width="960" height="128" rx="4" class="bn"/><text x="30" y="1093" class="tx">objective</text><text x="30" y="1110" class="ts">L = CE * span_weight + 0.1 MTP (span-weighted) + 0.01 aux + 0.1 L_sel + 0.1 contrastive + 0.1 groundedness</text><text x="30" y="1124" class="ts">L_sel: u_c = 1 - prod over passes in the gradient window of (1 - p_hat[k, c]);  BCE(u_c, gold_c) over visible chunks; p_hat renormalized</text><text x="30" y="1138" class="ts">over visible chunks</text><text x="30" y="1152" class="ts">contrastive: q vs gold-chunk bge key, multi-positive; in-batch and store-mined hard negatives; same-doc and near-dup negatives masked</text><text x="30" y="1166" class="ts">groundedness: reader output + null mass at the answer start; label gold present AND answerable</text><text x="30" y="1180" class="ts">span weights (main CE and MTP): language 1, supported fact span 1, unsupported 0; swap on 15% of supported spans, every chunk and</text><text x="30" y="1194" class="ts">later mention; tail entities anonymized in 50% of documents, re-drawn per epoch; rates swept in R0b</text><rect x="938" y="1081" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="1091.5" text-anchor="middle" class="tg">NEW</text>
+<rect x="20" y="1074" width="960" height="128" rx="4" class="bn"/><text x="30" y="1093" class="tx">objective</text><text x="30" y="1110" class="ts">L = CE * span_weight + 0.1 MTP (span-weighted) + 0.01 aux + 0.1 L_sel + 0.1 contrastive + 0.1 groundedness</text><text x="30" y="1124" class="ts">L_sel: u_c = 1 - prod over passes in the gradient window of (1 - p_hat[k, c]);  BCE(u_c, gold_c) over visible chunks; p_hat renormalized</text><text x="30" y="1138" class="ts">over visible chunks</text><text x="30" y="1152" class="ts">contrastive: q vs gold-chunk bge key, multi-positive; in-batch and store-mined hard negatives; same-doc and near-dup negatives masked</text><text x="30" y="1166" class="ts">groundedness: output of the reading attention + null mass at the answer start; label gold present AND answerable</text><text x="30" y="1180" class="ts">span weights (main CE and MTP): language 1, supported fact span 1, unsupported 0; swap on 15% of supported spans, every chunk and</text><text x="30" y="1194" class="ts">later mention; tail entities anonymized in 50% of documents, re-drawn per epoch; rates swept in R0b</text><rect x="938" y="1081" width="34" height="14" rx="2" class="tag-new"/><text x="955" y="1091.5" text-anchor="middle" class="tg">NEW</text>
 <rect x="20" y="1224" width="960" height="114" rx="4" class="bn"/><text x="30" y="1243" class="tx">data and optimizer</text><text x="30" y="1260" class="ts">45% web and edu text, 10% code and math, 15% evidence QA (five conditions plus partial hop, buffer capped at 8 chunks), 10% synthetic</text><text x="30" y="1274" class="ts">fictional chains, 20% chat replay; retrieval attached to every slice</text><text x="30" y="1288" class="ts">AdamW, schedule in tokens: pilot warmup 2 to 5% of its tokens, noise anneal and checkpoint cadence scaled, LR from a width-512 sweep</text><text x="30" y="1302" class="ts">cosine to 0.1 lr; weight decay 0.02 on ndim &gt;= 2 except E and the loop scales; clip 1.0; BF16, FP8 only after a short validation</text><text x="30" y="1316" class="ts">pilot: about 120M parameters at width 512, 1 to 2B tokens, matched control without retrieval;  real run: shape L below, about 2.5k H100</text><text x="30" y="1330" class="ts">hours</text>
-<rect x="20" y="1360" width="960" height="86" rx="4" class="bn"/><text x="30" y="1379" class="tx">shape L, estimates</text><text x="30" y="1396" class="ts">width 1024, 16 heads x 64, 4 KV heads; prelude 8 layers, core 3 sublayers x 8 experts, coda 2 layers</text><text x="30" y="1410" class="ts">about 470M total, about 300M active per token at one pass:  E 67M  |  prelude 109M  |  looped core 265M  |  coda 27M  |  selector, readers,</text><text x="30" y="1424" class="ts">heads about 3M</text><text x="30" y="1438" class="ts">about 1.3 GFLOP per token forward at 3 passes; about 270 to 290B tokens in 2.5k H100 hours at today's MFU, evidence included</text>
+<rect x="20" y="1360" width="960" height="86" rx="4" class="bn"/><text x="30" y="1379" class="tx">shape L, estimates</text><text x="30" y="1396" class="ts">width 1024, 16 heads x 64, 4 KV heads; prelude 8 layers, core 3 sublayers x 8 experts, coda 2 layers</text><text x="30" y="1410" class="ts">about 470M total, about 300M active per token at one pass:  E 67M  |  prelude 109M  |  looped core 265M  |  coda 27M  |  selector and</text><text x="30" y="1424" class="ts">heads about 3M (counted with the cross-attention reader, not recounted)</text><text x="30" y="1438" class="ts">about 1.3 GFLOP per token forward at 3 passes; about 270 to 290B tokens in 2.5k H100 hours at today's MFU, evidence included</text>
 </svg>
     </div>
-    <figcaption>From-scratch run. One token table serves the input, both heads and the two small per-token tables. The looped core is three sublayers deep per pass instead of one block, the selector is always on and reads raw store keys, and the reader receives the selector's logit through the one-hot chunk channel. One loss on the last pass through the coda.</figcaption>
+    <figcaption>From-scratch run. One token table serves the input, both heads and the two small per-token tables. The looped core is three sublayers deep per pass instead of one block, the selector is always on and reads raw store keys, and the evidence is read by the shared self-attention itself in sublayers 1 and 3 (leading keys and values, prefix rotation), with the selector's logit entering through the one-hot chunk channel. One loss on the last pass through the coda. The key/value read is built and measured at micro scale; the channel, the sink and the three-sublayer core are not built.</figcaption>
   </figure>
 </section>
 
@@ -393,6 +444,7 @@ sink    = one extra slot per segment: learned key, value 0</pre>
   <div class="eyebrow">6 · POC finetune · RTX 5090</div>
   <h2>A mechanism check on the grafted checkpoint</h2>
   <p class="sub">This run answers one question: can the port be read at all. It runs the architecture as built, with the gate frozen. It cannot show where facts live, because the seed already scores near zero closed-book and the corpus has no counterfactual rows.</p>
+  <div class="note bad"><b>Ran 2026-10-01, failed.</b> Both arms were killed at 10.08M tokens on the content gain: +0.058 nats in arm A and +0.081 in arm B (no rotary, about 40% above A at every reading), against 0.1 to survive and 1.6 to pass. The gold gain reached about 0.55 nats, but nearly all of it is the abstain-versus-answer prior, independent of the chunk's content. The selector did learn: per-token chunk AUROC 0.650 / 0.643 / 0.644 by loop in arm B. Measured afterwards, the in-context ceiling on the same <code>evidence_fixed</code> rows is 3.18 nats pooled. The graft branch is closed: seven failed gates, all on one graft condition. The rest of this section is the record of the run as it was specified.</div>
 
   <div class="kv">
     <div><span class="l">seed</span><span class="v">repair + port</span><span class="s">checkpoint_repair_final_irrandom_evidence_grounded.pt</span></div>
@@ -461,8 +513,8 @@ depth: with probability 0.3 a step runs 1 or 2 loops; log steps run all 3</pre>
       <li><b>Stop by hand:</b> <code>touch ckpts/evidence/STOP</code> (arm A) or <code>touch ckpts/evidence_norope/STOP</code> (arm B), polled every 10 micro steps. A glob creates nothing. Relaunch with the same <code>-c</code> and flags.</li>
       <li><b>Pass:</b> gold gain at least 1.6 nats (50% of the 3.23 nat ceiling), distractors gain at least 0.</li>
       <li>A rising <code>o_proj</code> RMS with a flat gain means the reader learned a bias, not retrieval.</li>
-      <li>Under 50%: test a reader per loop or dense-layer reads before more data.</li>
-      <li><b>Arm C, only after a pass:</b> the one-hot chunk channel with <code>gamma = 0</code>.</li></ul></div>
+      <li>Under 50%: test a reader per loop or dense-layer reads before more data. Overtaken on 2026-10-03 by the key/value read.</li>
+      <li><b>Arm C, only after a pass:</b> the one-hot chunk channel with <code>gamma = 0</code>. Never ran.</li></ul></div>
   </div>
 </section>
 
@@ -474,6 +526,7 @@ depth: with probability 0.3 a step runs 1 or 2 loops; log steps run all 3</pre>
   <div class="kv">
     <div><span class="l">pilot</span><span class="v">~120M params</span><span class="s">1 to 2B tokens, RTX 5090</span></div>
     <div><span class="l">control</span><span class="v">matched tokens</span><span class="s">same shape and data, no retrieval</span></div>
+    <div><span class="l">reader</span><span class="v">key/value read</span><span class="s">with prefix rotation; the pilot waits for R0b to pass at 35M parameters</span></div>
     <div><span class="l">real run</span><span class="v">shape L</span><span class="s">about 470M, about 2.5k H100 hours</span></div>
     <div><span class="l">optimizer</span><span class="v">AdamW</span><span class="s">pilot spec in tokens: warmup 2 to 5% of tokens, noise anneal and checkpoint cadence scaled, LR from a width-512 sweep, cosine to 0.1 lr</span></div>
     <div><span class="l">weight decay</span><span class="v">0.02</span><span class="s">on ndim 2 and above except E and the loop scales, clip 1.0</span></div>
@@ -585,7 +638,17 @@ last 15% of the pilot: candidates are re-fetched with the model's own q; recall@
 <section id="datasets">
   <div class="eyebrow">8 · datasets</div>
   <h2>What each run trains on</h2>
-  <p class="sub">The POC corpus exists and stays as built, with its evaluation fixed. The from-scratch corpus is a new builder mode.</p>
+  <p class="sub">The POC corpus exists and stays as built, with its evaluation fixed. The micro-pilot corpus is built and in use. The from-scratch pilot corpus is a new builder mode.</p>
+
+  <h3>Micro-pilot corpus (R0b), as built</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>arm</th><th>split</th><th>fact spans</th><th>evidence</th></tr></thead>
+    <tbody>
+      <tr><td class="k">(a) full</td><td><code>inject_full_train</code></td><td>in the loss</td><td>none</td></tr>
+      <tr><td class="k">(b) masked</td><td><code>inject_masked_train</code>, same bytes as (a)</td><td>weight 0 through <code>.mask</code>, so the MTP targets carry it too</td><td>none</td></tr>
+      <tr><td class="k">(c) retrieval</td><td><code>inject_retrieval_train</code></td><td>supported spans weight 1, swaps on 15%, name placeholders in 50% of documents</td><td>the person's store card plus 3 distractors; the gold card is dropped in 20% of rows</td></tr>
+    </tbody></table></div>
+  <p class="sub">300M tokens per arm at sequence length 1024. 3,600 fictional people at 1 / 10 / 100 / 1000 exposures make up 4.6% of the tokens; the rest is filler from the local <code>ir</code>, <code>phase1</code> and <code>phase2</code> bins. <code>inject_val</code> is filler only and identical across arms. Biography values are drawn uniformly per person, but exposure weighting skews the corpus marginals, so every closed-book read is paired against a fresh-name prior and only the delta is a measurement.</p>
 
   <h3>POC finetune corpus, as built</h3>
   <div class="scroll"><table>
@@ -602,7 +665,7 @@ last 15% of the pilot: candidates are re-fetched with the model's own q; recall@
       <li>Held-out rows from SQuAD dev and HotpotQA dev by source id (<code>prepare_evidence_data.py --heldout</code>: <code>evidence_dev</code> and <code>evidence_fixed</code>). The old split had every QA question in both halves.</li>
       <li>The primary eval reading uses one chunk per passage, as trained.</li>
       <li>Same-context passages were excluded from the eval distractor pool.</li></ul></div>
-    <div class="card"><h3>Cheap second corpus, if the mechanism check passes</h3><ul>
+    <div class="card"><h3>Cheap second corpus (not built: the check failed)</h3><ul>
       <li>A counterfactual condition: swap the answer entity in the gold chunk, label follows the chunk.</li>
       <li>bge hard negatives for half the distractors.</li>
       <li>Two passes over the QA sources instead of four.</li>
@@ -646,7 +709,7 @@ last 15% of the pilot: candidates are re-fetched with the model's own q; recall@
 <section id="loop">
   <div class="eyebrow">9 · internal reasoning</div>
   <h2>Making the loop reason over what it reads</h2>
-  <p class="sub">There is good reason to expect the loop to compose facts it reads. There is no clean measurement yet that it does. Every per-loop number on record comes from a checkpoint whose third loop passed only 8% of its update for all 16B pretraining tokens.</p>
+  <p class="sub">There is good reason to expect the loop to compose facts it reads. There is no clean measurement yet that it does. Every per-loop number on the 16B lineage comes from a checkpoint whose third loop passed only 8% of its update for all pretraining tokens. The micro arms are from scratch and free of that gate, but they hold one loop reading so far and none with a depth curve over evidence.</p>
 
   <figure>
     <div class="scroll">
@@ -782,8 +845,8 @@ loop_enc    : clamped to the trained depth at inference</pre>
     <thead><tr><th>rung</th><th>tokens</th><th>what runs</th><th>number to read</th><th>pass</th><th>decides</th></tr></thead>
     <tbody>
       <tr><td class="k">R0</td><td>0</td><td>existing checkpoints, <code>loop_scale</code> multiplied by 1, 2, 3.5, 5.9 at eval</td><td>CE gain from loop 2 to 3</td><td>0.02 nats, loops 1 and 2 not worse</td><td><b>failed 2026-09-30</b>: graft arms keep <code>loop_scale</code> at the trunk's rate</td></tr>
-      <tr><td class="k">R1</td><td>10M</td><td>the planned evidence finetune</td><td>chunk AUROC (per token) and reader gain per loop</td><td>descriptive, read and not decided: a 0.02 bar is under one sigma of the 0.030 floor and the POC objective gives every loop the same target; a decided form needs 0.09</td><td>nothing; describes whether reads differ by loop</td></tr>
-      <tr><td class="k">R0b</td><td>3 x 0.3B</td><td>externalization micro-pilot, about 30M params, a few 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval; (c) span weights, swaps and anonymization with store retrieval; fictional biographies at 1 / 10 / 100 / 1000 exposures; rates swept in (c)</td><td>closed-book likelihood rank among 100 same-type candidates by exposure; counterfactual follow in (c)</td><td>(b) and (c) at chance up to 100 exposures while (a) climbs</td><td>if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend</td></tr>
+      <tr><td class="k">R1</td><td>10M</td><td>the evidence finetune, arms A and B</td><td>chunk AUROC (per token) and reader gain per loop</td><td>descriptive, read and not decided: a 0.02 bar is under one sigma of the 0.030 floor and the POC objective gives every loop the same target; a decided form needs 0.09</td><td>nothing; describes whether reads differ by loop. <b>Read 2026-10-01</b>: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 and content gain 0.070 / 0.078 / 0.081 by loop (arm B), so loop 1 reads best and later loops add little</td></tr>
+      <tr><td class="k">R0b</td><td>3 x 0.3B</td><td>externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights, swaps and anonymization with store retrieval through the key/value read; fictional biographies at 1 / 10 / 100 / 1000 exposures; rates swept in (c)</td><td>closed-book likelihood rank among 100 same-type candidates by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads</td><td>(b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution is read alongside, and 3 sigma off the prior there is a leak even when tier 100 holds. <b>(a) read 2026-10-02</b>: 0.378 (z 51) at tier 100, 0.467 at tier 1000. <b>(c) at 100M</b>: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000</td><td>if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend</td></tr>
       <tr><td class="k">R1b</td><td>0</td><td>one micro step at depth 3 and at depth 5 with the prefix, pilot shape</td><td>peak memory</td><td>fits the card</td><td>whether the depth-5 schedule is trainable</td></tr>
       <tr><td class="k">R2</td><td>0</td><td>synthetic chains scored on the R1 checkpoint</td><td>accuracy by hops and read sites (loops, on the POC)</td><td>after the 1-hop curve saturates: chance wherever read sites are fewer than hops</td><td>whether the instrument is valid</td></tr>
       <tr><td class="k">R3</td><td>2 x 30M</td><td>graft: proposed objective against current recipe, 15% synthetic, migrated <code>loop_scale</code> kept</td><td>2-hop accuracy at 3 loops minus 1 loop</td><td>+0.15 and proposed beats current</td><td>a pass helps; a null decides nothing</td></tr>
@@ -794,14 +857,14 @@ loop_enc    : clamped to the trained depth at inference</pre>
       <tr><td class="k">L1</td><td>eval</td><td>synthetic chains, read ablation at fixed D = 3</td><td>accuracy by hops and read sites</td><td>fewer sites than hops at chance; held-out-template 2-hop above the read-ablated or per-loop-CE control; sites past the first pass add at least 5 points</td><td>whether the loop composes</td></tr>
       <tr><td class="k">L2</td><td>eval</td><td>held-out 4-hop and HotpotQA bridge, by read sites, D = 4 against D = 3</td><td>accuracy, bridge answer CE</td><td>rises with read sites past the first pass; at least 0.05 nats</td><td>whether depth pays</td></tr>
     </tbody></table></div>
-  <p class="sub">R4 replaces the existing planned test, which changes loss placement, depth sampling and the coda in a single arm and so cannot attribute a result. All four arms share fresh <code>loop_scale</code>, input re-presentation and data. The run times for R4 are unmeasured. R0b runs right after the Phase 4 arms, before any 1B-token rung.</p>
+  <p class="sub">R4 replaces the existing planned test, which changes loss placement, depth sampling and the coda in a single arm and so cannot attribute a result. All four arms share fresh <code>loop_scale</code>, input re-presentation and data. The run times for R4 are unmeasured. R0b is under way: arm (a) is done, arms (b) and (c) in full come next, before any 1B-token rung. The ladder below R0b is cut to the budget before the pilot launches, from the bottom of the table.</p>
 
   <div class="grid g3">
     <div class="card"><h3>Strong evidence</h3><p>The read structure bounds hops by sequential read sites before readout. Small looped models compose on synthetic tasks, including at 124M parameters and below.</p></div>
     <div class="card"><h3>Weak evidence</h3><p>Transfer to natural multi-hop questions at this size. Published second hops fail off template, and this model reads BoolQ below chance.</p></div>
-    <div class="card"><h3>No evidence</h3><p>Any loop measurement here without the halt gate confound. Any looped model with an evidence port showing a depth curve on real questions.</p></div>
+    <div class="card"><h3>No evidence</h3><p>Any looped model with an evidence port showing a depth curve on real questions. Without the halt gate confound there is one reading: in micro arm (a), from scratch with per-loop CE, <code>loop_scale</code> settled at 1.61 / 0.63 / 0.21 and loop 3 reads about 0.05 nats under loop 2 by 275M tokens.</p></div>
   </div>
-  <div class="note">Hops are bounded by sequential read sites before readout: 2 per pass (sublayers 1 and 3), so 2 hops fit in one pass and 3 passes offer 6 sites, more with the prelude-read arm. "Loops buy computation, not storage" is an axiom, not a measurement; the L1 falsifier is read sites past the first pass adding under 5 points on held-out 2-hop. The schedule to 5 trains the block to keep working from its own output; inference stays at 3 passes, 4 at most. At 3 sublayers per pass, shape L is 19 / 22 / 25 layer-equivalents per token at 3 / 4 / 5 passes (shape M 17 / 20 / 23) against 11 today. Whether 2 or 3 sublayers per pass is right is a pilot arm at matched compute.</div>
+  <div class="note">Hops are bounded by sequential read sites before readout: 2 per pass (sublayers 1 and 3), so 2 hops fit in one pass and 3 passes offer 6 sites, more with the prelude-read arm. "Loops buy computation, not storage" is an axiom, not a measurement, with two falsifiers. Computation half (L1): read sites past the first pass add under 5 points on held-out 2-hop. Storage half, added 2026-10-03: closed-book rank at 1, 2 and 3 loops on micro arm (a), where every exit was trained; if the tier 100 and 1000 delta grows with depth beyond its paired sigma, later loops carry stored facts. The planned loop fix is learned depth allocation, an entropy-regularized exit distribution over depths, tried as a micro arm against the fixed draw before it replaces the draw in the pilot. The schedule to 5 trains the block to keep working from its own output; inference stays at 3 passes, 4 at most. At 3 sublayers per pass, shape L is 19 / 22 / 25 layer-equivalents per token at 3 / 4 / 5 passes (shape M 17 / 20 / 23) against 11 today. Whether 2 or 3 sublayers per pass is right is a pilot arm at matched compute.</div>
 </section>
 
 <section id="cost">
@@ -822,6 +885,7 @@ loop_enc    : clamped to the trained depth at inference</pre>
     <li>The coda and steps deeper than 3 passes add body cost that is not in this table. Expected depth is 3.4 passes, and the prefix passes run forward only. Shape L is about 1.3 GFLOP per token forward at 3 passes: body 2 x (109 + 3 x 98 + 27)M = 860M, tied head 134M, MTP at 25% x 2 tokens 67M, attention 160M, reader sites 80M, about 2.6x today.</li>
     <li>At today's MFU (the 16B run's 97k tokens per second at 502 MFLOP per token), with evidence, shape M buys about 235B tokens per 1k H100 hours and shape L about 270 to 290B in 2.5k H100 hours. The data cap is 400B, so G8 at 2x makes the run data-bound: the run spec fixes a token target and derives hours.</li>
     <li>Memory was 0.61 MiB per evidence token with 8 layers and no checkpointing. With 4 layers and checkpointing the estimate is about 0.25 MiB.</li>
+    <li>The read-site figures (the "read sites" column and the 80M line) were derived for a separate cross-attention. The key/value read has no module of its own and instead adds the evidence tokens to the key axis of the shared self-attention; that cost is not re-derived. Measured at the micro shape, either reader runs at 55k to 60k tokens per second with a 13.3 GB peak, and filler validation CE is the same.</li>
     <li>Offline preparation at 100B tokens: tagging is about 15 H100 hours, bge queries about a third of that.</li>
   </ul>
 </section>
@@ -832,11 +896,11 @@ loop_enc    : clamped to the trained depth at inference</pre>
   <div class="scroll"><table>
     <thead><tr><th>gate</th><th>metric</th><th>bar</th><th>POC</th><th>pilot</th></tr></thead>
     <tbody>
-      <tr><td class="k">A1</td><td>(a) closed-book likelihood rank (or MC accuracy) of the gold answer among at least 20 same-type candidates, pathway off, neutral prompt, head and tail obscurity tiers, entity-valued relations; (b) fictional biographies (bioS style, Physics of Language Models 3.1) at 1 / 10 / 100 / 1000 exposures with their chunks in the store</td><td>(a) tail-tier rank worse than the matched no-retrieval control by 3 sigma (bootstrap); (b) rank at chance up to 100 exposures where the control memorizes</td><td>not read: a closed-book EM bar cannot separate externalized from too small to know (pythia-410m reads TriviaQA 0.021, NQ 0.000)</td><td>R0b, then decisive against the control; PopQA, tiers and the rank scorer are a Phase 4b build item</td></tr>
-      <tr><td class="k">A2</td><td>fixed-target answer CE on held-out rows, gain = CE(none) - CE(cond)</td><td>gold gain at least 1.6 nats (50% of the 3.23 nat ceiling), distractors gain at least 0</td><td>the run's main reading, <code>[eval fixed]</code></td><td>yes</td></tr>
-      <tr><td class="k">A3</td><td>memorization ratio p_orig / (p_orig + p_swap) (Longpre et al. 2021) on items answered correctly with the unswapped chunk, by entity frequency, injected high-exposure facts included; n per stratum</td><td>memorization ratio at most 0.05, follow rate at least 90%, in every stratum</td><td>eval only</td><td>yes, at every checkpoint</td></tr>
+      <tr><td class="k">A1</td><td>(a) closed-book likelihood rank (or MC accuracy) of the gold answer among at least 20 same-type candidates, pathway off, neutral prompt, head and tail obscurity tiers, entity-valued relations; (b) fictional biographies (bioS style, Physics of Language Models 3.1) at 1 / 10 / 100 / 1000 exposures with their chunks in the store</td><td>(a) tail-tier rank worse than the matched no-retrieval control by 3 sigma (bootstrap); (b) rank within 3 sigma of the fresh-name prior through 100 exposures where the control memorizes, tier 1000 read alongside</td><td>not read: a closed-book EM bar cannot separate externalized from too small to know (pythia-410m reads TriviaQA 0.021, NQ 0.000)</td><td>R0b under way: the control memorizes (0.378 at tier 100), arm (c) at 100M is already 3 sigma off its prior at tier 100. Then decisive against the control. The rank scorer and PopQA are built</td></tr>
+      <tr><td class="k">A2</td><td>fixed-target answer CE on held-out rows, gain = CE(none) - CE(cond)</td><td>gold gain at least 1.6 nats (50% of the 3.23 nat ceiling), distractors gain at least 0</td><td><b>failed 2026-10-01</b>: gold gain about 0.55 nats, content gain +0.058 / +0.081</td><td>yes</td></tr>
+      <tr><td class="k">A3</td><td>memorization ratio p_orig / (p_orig + p_swap) (Longpre et al. 2021) on items answered correctly with the unswapped chunk, by entity frequency, injected high-exposure facts included; n per stratum</td><td>memorization ratio at most 0.05, follow rate at least 90%, in every stratum</td><td>eval only</td><td>yes, at every checkpoint. Micro, in-distribution probe at 100M with the key/value read: follow 0.92, ratio under 0.03; held out, follow 0.70</td></tr>
       <tr><td class="k">A4</td><td>store edit: change or delete the chunk and its neighbours in the store, re-retrieve with the model's own query</td><td>flip rate at least 70% on items known before the edit</td><td>not applicable: oracle buffers</td><td>yes</td></tr>
-      <tr><td class="k">A5</td><td>chunk AUROC (per token, chance 0.5) per loop; mass/chunk AUROC gold-present vs distractors; grounded AUROC (evidence rows)</td><td>chunk AUROC at least 0.59 per loop (3 sigma of 0.030 over 0.5); mass/chunk and grounded AUROC at least 0.674 (0.584 + 3 x 0.030)</td><td>yes, <code>sft.py</code> <code>[eval fixed]</code>; <code>eval_abstention.py</code> cross-check</td><td>yes</td></tr>
+      <tr><td class="k">A5</td><td>chunk AUROC (per token, chance 0.5) per loop; mass/chunk AUROC gold-present vs distractors; grounded AUROC (evidence rows)</td><td>chunk AUROC at least 0.59 per loop (3 sigma of 0.030 over 0.5); mass/chunk and grounded AUROC at least 0.674 (0.584 + 3 x 0.030)</td><td>read at 10M in <code>sft.py</code> <code>[eval fixed]</code>: chunk AUROC 0.65 per loop, over the bar; mass/chunk 0.57 (arm A) and grounded 0.55 (arm B), under it</td><td>yes</td></tr>
       <tr><td class="k">A6</td><td>HotpotQA, BoolQ, SciQ through the port against in-prompt, only tasks whose in-prompt score is 3 sigma above chance (BoolQ in-prompt reads 0.42 to 0.46, below chance)</td><td>port at least in-prompt minus 2 points at the binomial sigma; control is the model's own in-prompt score</td><td>yes</td><td>yes</td></tr>
       <tr><td class="k">A7</td><td>store-level retrieval: held-out NQ, TriviaQA, HotpotQA with gold passages in the store; recall@k of the model's query; open-book EM through the whole pathway</td><td>model-query recall@k at least bge-query recall@k; pathway EM read against oracle-buffer EM</td><td>not applicable</td><td>yes</td></tr>
       <tr><td class="k">L1</td><td>synthetic k-hop chains, accuracy by hops and by sequential read sites, read ablation at fixed D = 3</td><td>fewer sites than hops at chance, 1 / (type-matched candidates in the buffer); held-out-template 2-hop above the read-ablated or per-loop-CE control</td><td>R2 validity only</td><td>yes</td></tr>
@@ -861,6 +925,7 @@ loop_enc    : clamped to the trained depth at inference</pre>
     </tbody></table></div>
   <p class="sub">A second Opus 5.5 verdict merged three competing loop designs into the one under loop reasoning. It dropped five ideas, among them the draft's suggestion to make the second-hop chunk visible only from loop 2, because the read structure already bounds hops by sequential read sites.</p>
   <p class="sub">It also corrected three statements about the current code: the reader uses 16 heads of 48 with 4 KV heads, the external store is scored densely and not through the two-stage path, and the 118 MFLOP figure covers the encoder only.</p>
+  <p class="sub">Measurement has since overtaken two rows. The reader the review refined was a separate cross-attention module; at 100M tokens it did not copy, and the key/value read replaced it, so the zero-init gain after the norm lapsed with the module. The one-hot chunk channel, the sink slot, the raw bge keys and the recipe changes stand.</p>
 </section>
 
 <section id="risks">
@@ -868,7 +933,8 @@ loop_enc    : clamped to the trained depth at inference</pre>
   <h2>What can still fail</h2>
   <div class="grid g3">
     <div class="card"><h3>Facts leak in through the input</h3><p>Without the counterfactual swaps A1 is expected to fail. The swap rate and the anonymization rate are first guesses and get a sweep in the micro-pilot (R0b), whose arm (b) is the input-side leak test.</p></div>
-    <div class="card"><h3>Small models ignore evidence</h3><p>Models of 7B and under have been measured ignoring oracle passages most of the time. At about 120M the pilot may come out flat. The matched control and A6 decide.</p></div>
+    <div class="card"><h3>Arm (c) leaks</h3><p>At 100M tokens arm (c) is 3 sigma off its prior at tier 100 under both readers. If that holds at 300M the swap rate is the first lever; memorization sinks and the goldfish loss are held in reserve.</p></div>
+    <div class="card"><h3>Small models ignore evidence</h3><p>Models of 7B and under have been measured ignoring oracle passages most of the time. At 35M the key/value read follows a swapped card 92% of the time, but on fictional cards. On natural text the pilot may still come out flat. The matched control and A6 decide.</p></div>
     <div class="card"><h3>Retrieval mismatch and leakage</h3><p>The reader trains on bge's errors and serves on its own. Near-duplicate continuations inflate the language-model gain. Report gains by overlap tier.</p></div>
     <div class="card"><h3>Reader bandwidth</h3><p>One read per loop in the POC, two per pass in the pilot design, is narrow next to designs that read in every layer. The dense-layer reads are the prepared answer, not a measured one.</p></div>
     <div class="card"><h3>Coverage</h3><p>With the document itself excluded, a fact that appears in one document only is never supported. It is masked, never memorized and never practised.</p></div>
@@ -876,7 +942,7 @@ loop_enc    : clamped to the trained depth at inference</pre>
   </div>
 </section>
 
-<footer>Sources: <span class="mono">config.yaml</span>, <span class="mono">modules/model/{moe,evidence,information_retrieval,experts,gemma4,transformer}.py</span>, <span class="mono">docs/review_2026-09-29.md</span>. Numbers marked as estimates were derived, not measured.</footer>
+<footer>Sources: <span class="mono">config.yaml</span>, <span class="mono">modules/model/{moe,evidence,information_retrieval,experts,gemma4,transformer}.py</span>, <span class="mono">modules/model/attention.py</span>, <span class="mono">docs/review_2026-09-29.md</span>, <span class="mono">docs/plans/NEXT.md</span>, <span class="mono">docs/measurements/{r0b_micro_pilot,evidence_arm_a,evidence_arm_b,evidence_ceiling}.md</span>. Numbers marked as estimates were derived, not measured.</footer>
 </div>
 
 </body>
