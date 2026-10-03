@@ -71,7 +71,7 @@ def main():
     ev = micro["evidence"]
     assert ev["train_split"] == "inject_full_train" and ev["val_split"] == "inject_val"
     assert ev["fixed_split"] == "" and ev["kill_tokens"] == 0
-    assert ev["batch"] == 16 and ev["accum"] == 2 and ev["max_evidence_tokens"] == 3072
+    assert ev["batch"] == 32 and ev["accum"] == 1 and ev["max_evidence_tokens"] == 3072
     assert ev["lr"] == ev["fresh_lr"] == 1e-3 and ev["conversation_loss_weighting"] is False
     assert ev["cluster_refresh_tokens"] == 0 and ev["dead_quantile"] == 0.0
     # the constructor's own assertions, restated: a bad shape would otherwise fail on the GPU box
