@@ -231,7 +231,19 @@ def main():
     assert not any(r["follow"] for r in rememberer) and all(r["mr_ll"] > 0.99 for r in rememberer)
     annotate(follower)
     assert follower[0]["cls"] in ("entity", "date", "noun") and follower[0]["form"] == "indist"
-    print("7. bio items: candidates, sha1 seeds, major pool, swapped readings        PASS")
+    # the prompt mode: the card text precedes the probe, nothing rides the port, same candidates
+    prompt_items, _ = make_bio_items(people, pools, forms=["indist", "heldout"], evidence="prompt")
+    assert [i.candidates for i in prompt_items] == [i.candidates for i in items_a]
+    for i, plain in zip(prompt_items, items_a):
+        card = people[int(i.item_id.split(":")[0])].store_chunk
+        assert i.evidence is None and i.context == card + "\n" + plain.context
+    refused = False
+    try:
+        make_bio_items(people, pools, forms=["indist"], evidence="prompt", fresh_names=object())
+    except AssertionError:
+        refused = True
+    assert refused, "a prior control was built for an open-book reading"
+    print("7. bio items: candidates, sha1 seeds, major pool, swapped and prompt      PASS")
 
     # 8. the three arm verdict, read against the paired prior control
     def synthetic(mean_by_tier, seed, prior_by_tier=None, n_per_tier=300, form="indist"):

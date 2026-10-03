@@ -31,7 +31,9 @@ The CLI half builds items from the biography facts and scores a checkpoint throu
 ``--evidence gold`` attaches the person's own card: the open-book precondition (a model that cannot
 read the card it is handed has an uninformative closed-book reading). ``--evidence swapped`` attaches
 the card with that item's attribute replaced by another pool value and records whether the model
-follows the card or its memory.
+follows the card or its memory. ``--evidence prompt`` writes the same card text into the prompt
+before the probe and attaches nothing to the port: the in-context copy control, which says whether
+the model can copy a value it is shown at all, independent of the reader.
 
 Args:
     (cli) bios: score one checkpoint on the biography items.
@@ -464,10 +466,12 @@ def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, for
         pools: ``{attribute: [values]}``.
         forms: any of ``"indist"``, ``"heldout"``.
         n_candidates: candidates per item, gold included.
-        evidence: ``"none"``, ``"gold"`` (the person's card) or ``"swapped"`` (the card with the
-            probed attribute replaced by a substitute, which is made one of the candidates).
-        card_evidence: ``fn(person, text) -> evidence row``; required unless ``evidence`` is
-            ``"none"``.
+        evidence: ``"none"``, ``"gold"`` (the person's card through the port), ``"swapped"`` (the
+            card with the probed attribute replaced by a substitute, which is made one of the
+            candidates) or ``"prompt"`` (the same card text as plain prompt text before the probe,
+            no port: the in-context copy control).
+        card_evidence: ``fn(person, text) -> evidence row``; required for ``"gold"`` and
+            ``"swapped"``.
         fresh_names: when given, every item gets a paired prior control: the same candidates, tier,
             group and context template with the name replaced by ``fresh_names.name(item_id)``, id
             ``item_id + PRIOR_SUFFIX``, placed right after its item. Only for ``evidence="none"``.
@@ -475,9 +479,10 @@ def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, for
     Returns:
         ``(items, swaps)`` where ``swaps`` maps an item id to ``{"substitute"}`` in swapped mode.
     """
-    assert evidence in ("none", "gold", "swapped"), evidence
+    assert evidence in ("none", "gold", "swapped", "prompt"), evidence
+    if evidence in ("gold", "swapped"):
+        assert card_evidence is not None, "port evidence modes need card_evidence"
     if evidence != "none":
-        assert card_evidence is not None, "evidence modes need card_evidence"
         assert fresh_names is None, "the prior control is a closed-book reading, evidence must be none"
     items, swaps = [], {}
     for person in people:
@@ -488,6 +493,8 @@ def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, for
                 item_id = f"{person.person_id}:{attribute}:{form}"
                 rng = _seeded(item_id)
                 context, terminator = bio.probe_prompt(attribute, person.name, form)
+                if evidence == "prompt":
+                    context = person.store_chunk + "\n" + context
                 row, picks = None, None
                 if evidence == "swapped":
                     substitute = _seeded(item_id + ":swap").choice(others)
@@ -691,7 +698,7 @@ def run_bios(args) -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     card_evidence = None
-    if args.evidence != "none":
+    if args.evidence in ("gold", "swapped"):
         from modules.data.store import load_store
         store = load_store(_resolve(args.store))
         assert len(store.chunks) == len(people), "the store and the facts disagree on the people"
@@ -766,7 +773,8 @@ def main():
     p.add_argument("--store", default="data/index/inject_bios",
                    help="the biography store, read for the card keys when evidence is attached")
     p.add_argument("--form", choices=("indist", "heldout", "both"), default="both")
-    p.add_argument("--evidence", choices=("none", "gold", "swapped"), default="none")
+    p.add_argument("--evidence", choices=("none", "gold", "swapped", "prompt"), default="none",
+                   help="prompt puts the card text in the prompt before the probe, no port")
     p.add_argument("--candidates", type=int, default=100)
     p.add_argument("--max-persons-per-tier", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=64)
