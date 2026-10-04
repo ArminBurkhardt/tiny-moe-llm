@@ -345,18 +345,21 @@ class TinyEvidenceBackend:
 
     Rows are right padded plus one extra pad column, so every row has a trailing pad segment of its
     own to take the extra width of the rectangular evidence tensor (see ``_pack_evidence_batch``).
-    The final loop's hidden state is gathered at the positions that predict the continuation before
-    the LM head, never materializing ``[B, S, vocab]``.
+    The last loop run's hidden state is gathered at the positions that predict the continuation
+    before the LM head, never materializing ``[B, S, vocab]``.
 
     Args:
         model: a model from ``scripts.eval_abstention.load_model``.
         tokenizer: the pruned tokenizer.
         device: the model's device.
         max_seq_len: the model's context length.
+        n_loops: run the MoE block this many times and read the last loop run; None keeps the
+            configured depth.
     """
 
-    def __init__(self, model, tokenizer, device: str, max_seq_len: int):
+    def __init__(self, model, tokenizer, device: str, max_seq_len: int, n_loops: Optional[int] = None):
         self.model = model
+        self.n_loops = n_loops
         self.tokenizer = tokenizer
         self.device = device
         self.max_seq_len = max_seq_len
@@ -412,7 +415,8 @@ class TinyEvidenceBackend:
                     num_segments=int(cu_seqlens.numel() - 1), device=self.device,
                 )
             out = self.model(input_ids=ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
-                             return_hidden=True, skip_mtp=True, evidence=evidence)
+                             return_hidden=True, skip_mtp=True, evidence=evidence,
+                             n_loops=self.n_loops)
             hidden = (out[0] if isinstance(out, tuple) else out)[-1]
             gathered = hidden.reshape(-1, hidden.size(-1)).index_select(0, predict_at)
             logprobs = self.model.lm_head(gathered).float().log_softmax(-1)
@@ -686,11 +690,26 @@ def _resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
 
 
+def check_n_loops(n_loops: Optional[int], depth: int) -> None:
+    """Assert a ``--n-loops`` value is None or inside ``1..depth``.
+
+    Args:
+        n_loops: the requested loop count, None for the model's own depth.
+        depth: the trained loop count the bound comes from.
+    """
+    assert n_loops is None or 1 <= n_loops <= depth, (
+        f"--n-loops {n_loops} is outside 1..{depth}; depths past the trained count are "
+        f"untrained readouts and not what this flag is for")
+
+
 def run_bios(args) -> None:
     import torch
     from transformers import AutoTokenizer
     from scripts.eval_abstention import load_model
 
+    from config import ModelConfig
+    trained_loops = ModelConfig.Params["n_loops"]
+    check_n_loops(args.n_loops, trained_loops)
     people = bio.load_facts(_resolve(args.facts))
     pools = bio.load_pools(_resolve(args.pools))
     chosen = select_people(people, args.max_persons_per_tier)
@@ -713,11 +732,13 @@ def run_bios(args) -> None:
                                   evidence=args.evidence, card_evidence=card_evidence,
                                   fresh_names=fresh_names)
     logger.info(f"{len(items):,} items (prior controls included) from {len(chosen):,} people, forms {forms}, "
-                f"evidence {args.evidence}, {args.candidates} candidates")
+                f"evidence {args.evidence}, {args.candidates} candidates, "
+                f"loops {args.n_loops if args.n_loops is not None else f'{trained_loops} (configured)'}")
 
     model = load_model(_resolve(args.checkpoint), args.device)
-    from config import ModelConfig
-    backend = TinyEvidenceBackend(model, tokenizer, args.device, ModelConfig.Params["max_seq_len"])
+    check_n_loops(args.n_loops, model.moe.loop_scale.numel())
+    backend = TinyEvidenceBackend(model, tokenizer, args.device, ModelConfig.Params["max_seq_len"],
+                                  n_loops=args.n_loops)
     results = rank_items(backend, items, batch_size=args.batch_size, max_len=ModelConfig.Params["max_seq_len"] - 1,
                          keep_scores=args.evidence == "swapped")
     if args.evidence == "swapped":
@@ -728,7 +749,9 @@ def run_bios(args) -> None:
     for form in forms:
         subset = [r for r in results if r["form"] == form]
         summaries[form] = print_summary(f"{os.path.basename(args.checkpoint)} {form} "
-                                        f"evidence={args.evidence}", subset, args.n_boot)
+                                        f"evidence={args.evidence}"
+                                        + (f" loops={args.n_loops}" if args.n_loops is not None else ""),
+                                        subset, args.n_boot)
     if args.json_out:
         path = _resolve(args.json_out)
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -775,6 +798,8 @@ def main():
     p.add_argument("--form", choices=("indist", "heldout", "both"), default="both")
     p.add_argument("--evidence", choices=("none", "gold", "swapped", "prompt"), default="none",
                    help="prompt puts the card text in the prompt before the probe, no port")
+    p.add_argument("--n-loops", type=int, default=None,
+                   help="run the MoE block this many times and read the last loop run (default: configured depth)")
     p.add_argument("--candidates", type=int, default=100)
     p.add_argument("--max-persons-per-tier", type=int, default=500)
     p.add_argument("--batch-size", type=int, default=64)

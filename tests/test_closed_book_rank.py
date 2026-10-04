@@ -17,9 +17,11 @@
    sit at the prior, one verdict per probe form): HOLDS, FAILS and UNINFORMATIVE on constructed results;
 9. the prior control: a scorer that knows only value frequencies ranks heavy tiers well above 0.5 yet
    has delta 0, a scorer that binds names to values has a large delta;
-10. ``compare`` on three files prints the verdict.
+10. ``compare`` on three files prints the verdict;
+11. ``--n-loops`` reaches the model forward through ``TinyEvidenceBackend.score`` (a CPU stub model),
+    and the range check rejects 0 and anything past the depth.
 
-GPU free; imports no model code.
+GPU free; check 11 imports the model modules (no CUDA initialised) but loads no model.
 """
 import os, sys, math, random, zlib
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -371,6 +373,45 @@ def main():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("10. compare on three files prints the verdict                            PASS")
+
+    # 11. the loop depth reaches the model forward (None keeps the configured one) and the range is checked
+    import torch
+    from scripts.closed_book_rank import TinyEvidenceBackend, check_n_loops
+
+    class StubTokenizer:
+        bos_token_id = None
+        pad_token_id = 1
+
+    class StubModel:
+        hidden = 4
+        vocab = 7
+
+        def __init__(self):
+            self.seen = []
+
+        def __call__(self, input_ids, **kwargs):
+            self.seen.append(kwargs["n_loops"])
+            return torch.zeros(2, *input_ids.shape, self.hidden)
+
+        def lm_head(self, x):
+            return torch.zeros(x.size(0), self.vocab)
+
+    batch = [([2, 3, 4], [5, 6]), ([2, 3], [4])]
+    for requested in (None, 2):
+        stub = StubModel()
+        backend = TinyEvidenceBackend(stub, StubTokenizer(), "cpu", 128, n_loops=requested)
+        scored = backend.score(batch)
+        assert stub.seen == [requested] and len(scored) == len(batch), (stub.seen, requested)
+
+    for ok in (None, 1, 2, 3):
+        check_n_loops(ok, 3)
+    for bad in (0, 4, -1):
+        try:
+            check_n_loops(bad, 3)
+        except AssertionError:
+            continue
+        raise AssertionError(f"n_loops {bad} accepted at depth 3")
+    print("11. n_loops reaches the forward, range check rejects 0 and past depth    PASS")
     print("all closed-book rank checks passed")
 
 
