@@ -53,8 +53,8 @@ source and the artifact stays identical to it; the file goes into the same commi
   0.14 for the prior); held out nothing grows. Tier 1000 is saturated after one pass (rank 0.0008);
   its `delta` growth (0.393 / 0.453 / 0.467) is the prior drifting, not recall. The storage
   falsifier's condition is met at tier 100; the weights are shared across passes, so it reads as
-  two-step recall, not capacity. The axiom's wording is an open decision (NEXT.md Decisions). Leak
-  reads stay at full depth.
+  two-step recall, not capacity. The axiom is reworded to say so (NEXT.md Decisions). Leak reads
+  stay at full depth.
 - Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
   in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
 - **Next, in order** (the full ladder with its done steps is in NEXT.md):
@@ -69,12 +69,11 @@ source and the artifact stays identical to it; the file goes into the same commi
      dropped: (b) did not climb, and anonymization only touches the gold-absent documents, under 1%
      of the supervised spans that see the real name. If the swap rate is not enough: a placeholder
      name in gold-present documents, with the card carrying the same placeholder.
-  3. Decide the loop axiom's wording after the loop reading (NEXT.md Decisions, loops).
-  4. Learned depth allocation on the loop axis (entropy-regularized exit, Ouro) as a micro arm,
+  3. Learned depth allocation on the loop axis (entropy-regularized exit, Ouro) as a micro arm,
      after the full arm (c).
-  5. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
+  4. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
      abstaining 10M arms) and PopQA on the seed and both 10M checkpoints.
-  6. The pilot (Phase 5) with the key/value reader, after R0b passes, ladder cut to budget.
+  5. The pilot (Phase 5) with the key/value reader, after R0b passes, ladder cut to budget.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
   emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same
@@ -186,10 +185,11 @@ the run spec fixes a token target and derives hours). Pre-Phase-4 review:
 - `p_max` carries no answerability signal; a linear trunk probe reads 0.584 everywhere.
   Abstention precision is pinned at ~0.578 by the data lever.
 - Looping is a requirement; a weak later loop is a defect to fix, never a reason to cut depth.
-  "Loops buy computation, not storage" is an axiom, not a measurement (NEXT.md Decisions, with its
-  L1 falsifier). Its storage-half read on the micro arm (a) found closed-book recall of weakly
-  stored facts (tier 100) growing with depth, mostly in pass 2, so leak reads are taken at full
-  depth and the wording is an open decision.
+  "Passes add computation, not capacity; recalling a weakly stored fact can take more than one
+  pass" is an axiom, not a measurement (NEXT.md Decisions, with its L1 falsifier; reworded
+  2026-10-04 from "loops buy computation, not storage"). On the micro arm (a) closed-book recall of
+  weakly stored facts (tier 100) grows with depth, mostly in pass 2, so every leak read is taken at
+  full depth.
 
 ## Layout
 

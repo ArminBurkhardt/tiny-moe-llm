@@ -202,10 +202,13 @@ Tier 1000: top-1 0.980 / 1.000 / 1.000, gold log-probability -0.92 / -0.20 / -0.
   independent of depth here and a leak test has to be read at full depth, which is what every other
   read in this file does. Whether that makes the axiom "wrong for this design" or shows that the
   falsifier measured recall depth instead of storage is a plan decision, not settled by this read.
+  Decided 2026-10-04: the axiom is reworded to "passes add computation, not capacity; recalling a
+  weakly stored fact can take more than one pass" (NEXT.md Decisions).
 - Confound that remains: the depth 1 and 2 exits are trained less (weights 0.2 and 0.3 on a quarter
   of the positions, plus 15% of steps each as the last pass). The prior control rules out a generic
   readout gain; whether the early exits recall stored facts worse because they are trained less
-  needs a last-loop-only CE arm.
+  needs an arm with equal CE weight on every exit and no subsampling (a last-loop-only arm would
+  not do: its early exits are untrained and read at chance).
 
 Raw output: `ckpts/inject/rank_full_loops{1,2}` and `rank_full` (depth 3).
 

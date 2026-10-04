@@ -58,8 +58,8 @@ stores nothing at the 3 sigma bar.** R0b ran from 2026-10-02 to 2026-10-04
   depth. At tier 1000 the real name is saturated after one pass (rank 0.0008, top-1 0.98); the
   `delta` there grows (0.393 / 0.453 / 0.467) only because the prior drifts toward chance. The
   block's weights are shared across passes, so this reads as recall of a weakly stored fact being a
-  two-step computation, not as extra capacity in later passes; what it means for the axiom is an
-  open decision (Decisions, loops).
+  two-step computation, not as extra capacity in later passes. The axiom is reworded to say so
+  (Decisions, loops), and every closed-book leak read is taken at full depth.
 
 Earlier, still binding: Phase 4's graft arms were killed at 10.08M tokens on the content gain
 (+0.058 / +0.081, [evidence_arm_a.md](../measurements/evidence_arm_a.md),
@@ -99,8 +99,8 @@ in graft arms.
    placeholder.
 7. **Done 2026-10-04: the loop reading on arm (a).** `closed_book_rank.py bios --n-loops 1|2|3` on
    arm (a) final. At tier 100 the `delta` grows with depth beyond its paired sigma, almost all of it
-   in the second pass; at tier 1000 the real name is saturated after one pass (above). The axiom's
-   wording is an open decision (Decisions, loops), to settle before the pilot's loop arms.
+   in the second pass; at tier 1000 the real name is saturated after one pass (above). The axiom
+   was reworded on the same day (Decisions, loops).
 8. **Learned depth allocation on the loop axis**, after the reader works on the full arm (c):
    an entropy-regularized exit distribution over depths, as in Ouro (arXiv 2510.25741), in place of
    the fixed depth draw, as a micro arm against the fixed schedule.
@@ -241,7 +241,7 @@ cannot see the chains.
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
 | real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
-| loops (axiom) | "Loops buy computation, not storage" is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Open: whether the axiom is reworded ("passes add no capacity; recall may need more than one") or the falsifier is replaced by one that separates storage from recall depth (a last-loop-only CE arm removes the weaker training of the early exits). Until decided, every closed-book leak read is taken at full depth. Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
+| loops (axiom) | "Passes add computation, not capacity; recalling a weakly stored fact can take more than one pass" (reworded 2026-10-04 from "loops buy computation, not storage") is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Decided 2026-10-04: the axiom is reworded as above and the storage-half falsifier is retired as read, since it measured recall depth, not capacity. The rule it leaves: every closed-book leak read is taken at full depth. Not planned, available if the axiom ever has to be quoted as measured: an arm with equal CE weight on every exit, which removes the weaker training of the early exits (a last-loop-only arm cannot be read by depth at all). Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
 | depth allocation | The planned loop fix, after the reader works on the full arm (c): learned depth allocation on the loop axis, an entropy-regularized exit distribution over depths (Ouro), tried as a micro arm against the fixed depth draw before it replaces the draw in the pilot. |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
 | POC role | Phase 4 is a mechanism check of the reader, read per loop. It decides nothing about externalization. |
@@ -317,7 +317,9 @@ Each measured, each recorded; a retry must move the ablation, not the entropy.
   ([loop_scale_probe.md](../measurements/loop_scale_probe.md), "Depth past the trained 3").
 
 "Loops buy computation, not storage" is no longer listed here: nothing measured supports it, so it
-is an axiom under Decisions, next to its falsifier.
+is an axiom under Decisions, next to its falsifier. It was reworded on 2026-10-04 to "passes add
+computation, not capacity; recalling a weakly stored fact can take more than one pass" after the
+loop reading on micro arm (a).
 
 ---
 
@@ -814,8 +816,10 @@ above are a different, live series).
   likely on its supervised spans and the anonymization sweep arm is dropped (it reaches under 1% of
   the supervised spans that see the real name); the loop reading on arm (a) met the storage
   falsifier's condition at tier 100 (closed-book `delta` grows with depth, almost all in the second
-  pass, on the real name only; tier 1000 is saturated after one pass), which opens a decision on
-  the axiom's wording; `closed_book_rank.py bios --n-loops` reads a trained exit depth.
+  pass, on the real name only; tier 1000 is saturated after one pass), and the axiom is reworded
+  to "passes add computation, not capacity; recalling a weakly stored fact can take more than one
+  pass", with leak reads at full depth; `closed_book_rank.py bios --n-loops` reads a trained exit
+  depth.
 - 2026-10-03: R0b arm (a) read the instrument; the copy control showed the 20M arm (c) smoke was
   read before copying existed; the key/value reader (evidence as leading keys of the shared
   self-attention, prefix rotation) copies at 100M where the cross reader does not at matched
