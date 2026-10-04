@@ -8,9 +8,10 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 
 ## Now (keep current)
 
-Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-03
-R0b arm (a) has run, and the arm (c) reader question is answered at micro scale: the key/value
-reader copies, the cross attention reader does not. The plan was rewritten on 2026-09-30 around
+Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-04
+R0b arms (a) and (b) have run in full, the arm (c) reader question is answered at micro scale (the
+key/value reader copies, the cross attention reader does not), and the loop reading on arm (a) is
+in. The full arm (c) is next and has not started. The plan was rewritten on 2026-09-30 around
 the goal "facts in the store through the retrieval pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
 record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
@@ -38,25 +39,42 @@ source and the artifact stays identical to it; the file goes into the same commi
   `ckpts/inject/rank_*100M_*`.
 - **Arm (c) leaks at 100M under both readers**: closed-book `delta` in distribution at tier 100 /
   1000 key/value 0.026 (z 5.2) / 0.149 (z 12.3), cross 0.037 / 0.203, arm (a) 0.099 / 0.332 at the
-  same tokens. Mid-cosine; the full arms decide.
+  same tokens. Mid-cosine; the full arm (c) decides.
+- **Arm (b), masked spans, 300M: nothing stored at 3 sigma.** Closed-book entity `delta` in
+  distribution 0.001 / 0.003 / 0.002 / 0.011 (z at most 1.7), held out at most 0.013 (z 2.4); flat
+  at 100M too. Watch the tier 1000 entity cell (0.012 at z 2.8 pooled over forms, rising from
+  100M). The in-context input path does not leak, so the arm (c) leak is most likely on its
+  supervised spans. Prompt copy 0.15 in distribution, 0.05 held out, worse at tier 1000.
+  Checkpoints `ckpts/evidence_inject_masked/`, reads `ckpts/inject/rank_masked*`. `compare` at
+  matched 100M: held out holds, in distribution fails on (c) at tier 100.
+- **Loop reading on arm (a) final (`--n-loops`): at tier 100 recall grows with depth, mostly in
+  pass 2.** Entity `delta` in distribution at depth 1 / 2 / 3: 0.269 / 0.369 / 0.378; paired 1 to 2
+  +0.100 (z 19.7), 2 to 3 +0.008 (z 6.5), prior unmoved. On the real name only (1.21 nats against
+  0.14 for the prior); held out nothing grows. Tier 1000 is saturated after one pass (rank 0.0008);
+  its `delta` growth (0.393 / 0.453 / 0.467) is the prior drifting, not recall. The storage
+  falsifier's condition is met at tier 100; the weights are shared across passes, so it reads as
+  two-step recall, not capacity. The axiom's wording is an open decision (NEXT.md Decisions). Leak
+  reads stay at full depth.
 - Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
   in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
 - **Next, in order** (the full ladder with its done steps is in NEXT.md):
-  1. Arm (b), `inject_masked`, in full (0.3B, about 90 minutes).
-  2. Arm (c) in full with the key/value reader: resume `inject_retrieval_kv` with the same flags
-     (`--reader-kv` included; delete the leftover `STOP` first). Every arm (c) save gets `gold`,
+  1. Arm (c) in full with the key/value reader: resume `inject_retrieval_kv` with the same flags
+     (`--reader-kv` included; delete the leftover `STOP` first). Staged as
+     `ckpts/inject/launch_kv_resume.sh` and `reads_kv_full.sh`. Every arm (c) save gets `gold`,
      `swapped`, `none` and `prompt` reads at `--batch-size 1024`. Then `compare full masked
      retrieval_kv`; pass: (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3
-     sigma above, tier 1000 in distribution read alongside (3 sigma off there is a leak).
-  3. If (c) climbs: one sweep arm at the higher swap rate (`s30a50`); if (b) climbs, the
-     anonymization rate (`s15a90`).
-  4. The storage half of the loop axiom on arm (a): closed-book rank at `n_loops` 1, 2, 3 (needs an
-     `--n-loops` flag on `closed_book_rank.py bios`).
-  5. Learned depth allocation on the loop axis (entropy-regularized exit, Ouro) as a micro arm,
+     sigma above, tier 1000 in distribution read alongside (3 sigma off there is a leak). (b)
+     already passes.
+  2. If (c) climbs: one sweep arm at the higher swap rate (`s30a50`). The anonymization arm is
+     dropped: (b) did not climb, and anonymization only touches the gold-absent documents, under 1%
+     of the supervised spans that see the real name. If the swap rate is not enough: a placeholder
+     name in gold-present documents, with the card carrying the same placeholder.
+  3. Decide the loop axiom's wording after the loop reading (NEXT.md Decisions, loops).
+  4. Learned depth allocation on the loop axis (entropy-regularized exit, Ouro) as a micro arm,
      after the full arm (c).
-  6. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
+  5. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
      abstaining 10M arms) and PopQA on the seed and both 10M checkpoints.
-  7. The pilot (Phase 5) with the key/value reader, after R0b passes, ladder cut to budget.
+  6. The pilot (Phase 5) with the key/value reader, after R0b passes, ladder cut to budget.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
   emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same
@@ -169,7 +187,9 @@ the run spec fixes a token target and derives hours). Pre-Phase-4 review:
   Abstention precision is pinned at ~0.578 by the data lever.
 - Looping is a requirement; a weak later loop is a defect to fix, never a reason to cut depth.
   "Loops buy computation, not storage" is an axiom, not a measurement (NEXT.md Decisions, with its
-  L1 falsifier).
+  L1 falsifier). Its storage-half read on the micro arm (a) found closed-book recall of weakly
+  stored facts (tier 100) growing with depth, mostly in pass 2, so leak reads are taken at full
+  depth and the wording is an open decision.
 
 ## Layout
 
@@ -232,7 +252,7 @@ python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target
 TINY_LLM_CONFIG=config_micro.yaml python scripts/init_scratch_seed.py --out ckpts/inject/seed_micro.pt --seed 0
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence -c ckpts/inject/seed_micro.pt --run-name inject_full --data-dir data/prepared_inject --train-split inject_full_train --val-split inject_val   # also inject_masked, inject_retrieval
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv --data-dir data/prepared_inject --train-split inject_retrieval_train --val-split inject_val   # the key/value reader arm (c)
-TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped|prompt --batch-size 1024 --json-out ckpts/inject/rank_full.json
+TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped|prompt --batch-size 1024 [--n-loops N] --json-out ckpts/inject/rank_full.json
 python scripts/closed_book_rank.py compare rank_full.json rank_masked.json rank_retrieval.json
 python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits eval,heldout_tmpl,hop4 --eval-questions-per-hop 1000 --seed 42 --device cpu   # train,val on cuda
 python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --json-out OUT.json

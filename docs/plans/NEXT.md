@@ -10,10 +10,11 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-03)
+## Now (2026-10-04)
 
-**The from-scratch reader reads, once it is the model's own attention.** R0b ran on 2026-10-02 and
-2026-10-03 ([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the micro shape (35M,
+**The from-scratch reader reads, once it is the model's own attention, and masking the fact spans
+stores nothing at the 3 sigma bar.** R0b ran from 2026-10-02 to 2026-10-04
+([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the micro shape (35M,
 `config_micro.yaml`), from one seed, on `data/prepared_inject`:
 
 - **Arm (a), full CE, 300M tokens: the instrument reads.** Closed-book entity `delta` in
@@ -38,7 +39,27 @@ and the new references). The design itself, with blueprints of both runs, is
 - **Arm (c) already leaks at 100M under either reader.** Closed-book `delta` in distribution at
   tier 100 / 1000: cross 0.037 (z 10.5) / 0.203 (z 20.3), key/value 0.026 (z 5.2) / 0.149 (z 12.3),
   arm (a) at the same tokens 0.099 / 0.332. The reader that copies leaks least but still fails the
-  pass rule at tier 100. These are mid-cosine readings; the full arms decide.
+  pass rule at tier 100. These are mid-cosine readings; the full arm (c) decides.
+- **Arm (b), masked fact spans, 300M tokens: nothing stored at 3 sigma** (2026-10-04). Closed-book
+  entity `delta` in distribution 0.001 / 0.003 / 0.002 / 0.011 (z at most 1.7), held out -0.001 /
+  0.001 / -0.000 / 0.013 (z at most 2.4); flat at matched 100M as well. The tier 1000 entity cell
+  is the one to watch (0.012 at z 2.8 pooled over forms, up from 0.001 and 0.003 at 100M). The
+  in-context input path does not leak, so the arm (c) leak most likely comes from the spans arm
+  (c) supervises (81% of the fact tokens, real name in the prompt, unswapped target 85% of the
+  time). The masked arm copies from its prompt at 0.15 in distribution and 0.05 held out, flat over
+  tiers 1 to 100 and worse at 1000; better than arm (a) held out and at tiers 1 and 10. `compare`
+  at matched 100M: held-out form holds, in-distribution form fails on arm (c) at tier 100.
+- **The loop reading on arm (a): a weakly stored fact is recalled better after two passes**
+  (2026-10-04, `closed_book_rank.py bios --n-loops`). In distribution the entity `delta` at depth
+  1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100: paired, depth 1 to 2 is +0.100 (z 19.7), depth 2
+  to 3 +0.008 (z 6.5), with the prior unmoved, so the storage falsifier's condition is met at tier
+  100 (in every class). The gain is on the real name (1.21 nats at tier 100 against 0.14 for the
+  fresh-name prior), depth 1 reaches 71% of the depth 3 `delta`, and held out nothing grows with
+  depth. At tier 1000 the real name is saturated after one pass (rank 0.0008, top-1 0.98); the
+  `delta` there grows (0.393 / 0.453 / 0.467) only because the prior drifts toward chance. The
+  block's weights are shared across passes, so this reads as recall of a weakly stored fact being a
+  two-step computation, not as extra capacity in later passes; what it means for the axiom is an
+  open decision (Decisions, loops).
 
 Earlier, still binding: Phase 4's graft arms were killed at 10.08M tokens on the content gain
 (+0.058 / +0.081, [evidence_arm_a.md](../measurements/evidence_arm_a.md),
@@ -56,22 +77,30 @@ in graft arms.
 3. **Done 2026-10-03: the reader redesign and its matched control.** The key/value reader built and
    tested (`tests/test_evidence_kv_reader.py`), a 100M arm (c) smoke with it, and the cross reader
    resumed to the same 100M. The key/value reader copies; the cross reader does not.
-4. **Arm (b), `inject_masked`, in full** (0.3B tokens, about 90 minutes, no reader involved). The
-   input-side leak test, and the third arm `compare` needs.
-5. **Arm (c) in full with the key/value reader.** Resume `inject_retrieval_kv` from its 100M save
+4. **Done 2026-10-04: arm (b), `inject_masked`, in full.** Within 3 sigma of its prior at every
+   tier on both forms; the in-context input path does not leak (above).
+5. **Next: arm (c) in full with the key/value reader.** Resume `inject_retrieval_kv` from its 100M save
    with the same flags (`--reader-kv` included; the mode is in the checkpoint and a relaunch
    without the flag fails the strict load). Every arm (c) save gets four reads, `--evidence gold`,
    `swapped`, `none` and `prompt`, at `--batch-size 1024`, json to
    `ckpts/inject/rank_<run><tokens>_<mode>.json`. Then `compare full masked retrieval_kv`, one
    verdict per form, under the pass rule (R0b in the Phase 5 ladder: tier 1000 in distribution
-   read alongside tier 100). The cross reader is closed at micro scale; its 100M save stays as the control.
+   read alongside tier 100). The cross reader is closed at micro scale; its 100M save stays as the
+   control. Staged: `ckpts/inject/launch_kv_resume.sh` (removes the `STOP`) and `reads_kv_full.sh`
+   (the four reads on every save past 100M). About 13.3 GB on the card, about 70 minutes plus the
+   reads.
 6. **If (c) still climbs at 300M**, the plan's lever for "only (c) climbs" applies: one sweep arm
-   at the higher swap rate (`--suffix s30a50`), key/value reader. If (b) climbs, the anonymization
-   rate (`s15a90`). One sweep arm per leak.
-7. **The loop reading on arm (a), cheap and eval only.** The storage half of the loop axiom
-   (Decisions): closed-book rank by loop count, `n_loops` 1, 2, 3 on arm (a) final (needs an
-   `--n-loops` flag on `closed_book_rank.py bios`; the micro arms trained every exit through
-   `loop_count_sampling`, so depths 1 and 2 are trained readouts).
+   at the higher swap rate (`--suffix s30a50`), key/value reader. The anonymization arm (`s15a90`)
+   is dropped: arm (b) did not climb, and anonymization only touches the 20% of biography documents
+   without the gold card, where it reaches at most about 0.7% of the supervised spans that see the
+   real name (value collisions with a distractor card; 10% of biography documents carry a
+   placeholder name). If the swap rate is not enough, the next lever acts on the supervised spans:
+   a placeholder name in documents that have the gold card, with the card carrying the same
+   placeholder.
+7. **Done 2026-10-04: the loop reading on arm (a).** `closed_book_rank.py bios --n-loops 1|2|3` on
+   arm (a) final. At tier 100 the `delta` grows with depth beyond its paired sigma, almost all of it
+   in the second pass; at tier 1000 the real name is saturated after one pass (above). The axiom's
+   wording is an open decision (Decisions, loops), to settle before the pilot's loop arms.
 8. **Learned depth allocation on the loop axis**, after the reader works on the full arm (c):
    an entropy-regularized exit distribution over depths, as in Ouro (arXiv 2510.25741), in place of
    the fixed depth draw, as a micro arm against the fixed schedule.
@@ -212,7 +241,7 @@ cannot see the chains.
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
 | real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
-| loops (axiom) | "Loops buy computation, not storage" is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
+| loops (axiom) | "Loops buy computation, not storage" is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Open: whether the axiom is reworded ("passes add no capacity; recall may need more than one") or the falsifier is replaced by one that separates storage from recall depth (a last-loop-only CE arm removes the weaker training of the early exits). Until decided, every closed-book leak read is taken at full depth. Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
 | depth allocation | The planned loop fix, after the reader works on the full arm (c): learned depth allocation on the loop axis, an entropy-regularized exit distribution over depths (Ouro), tried as a micro arm against the fixed depth draw before it replaces the draw in the pilot. |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
 | POC role | Phase 4 is a mechanism check of the reader, read per loop. It decides nothing about externalization. |
@@ -261,7 +290,9 @@ Done, with the full records linked:
 - **R0b, first from-scratch runs** (2026-10-02 and 03,
   [r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)): arm (a) reads the instrument; the
   key/value reader copies from the card at 100M where the cross reader does not; arm (c) leaks at
-  tier 100 at 100M under both. Arms (b) and (c) in full are open.
+  tier 100 at 100M under both. Arm (b) in full (2026-10-04) stores nothing at 3 sigma, and the loop
+  reading on arm (a) shows closed-book recall at tier 100 growing with depth, mostly in the second
+  pass. Arm (c) in full is open.
 
 ## Binding measurements
 
@@ -570,7 +601,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 |---|---|---|---|---|---|
 | R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
 | R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop. **Read 2026-10-01**: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 by loop and the per-loop content gain 0.070 / 0.078 / 0.081 (arm B), so loop 1 reads best and later loops add little |
-| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; swap and anonymization rates swept in (c) | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
+| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; swap rate swept in (c), the anonymization sweep dropped 2026-10-04 | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
 | R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable |
 | R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
 | R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
@@ -779,6 +810,12 @@ above are a different, live series).
   plus a fact-injection probe, A3 a memorization ratio, A4 goes through the store, A7 is added,
   L1 and L2 are scored by read ablation at fixed depth, R0b is added, and the budget is recomputed
   at about 1.3 GFLOP per token.
+- 2026-10-04: R0b arm (b) ran in full and stores nothing at 3 sigma, so the arm (c) leak is most
+  likely on its supervised spans and the anonymization sweep arm is dropped (it reaches under 1% of
+  the supervised spans that see the real name); the loop reading on arm (a) met the storage
+  falsifier's condition at tier 100 (closed-book `delta` grows with depth, almost all in the second
+  pass, on the real name only; tier 1000 is saturated after one pass), which opens a decision on
+  the axiom's wording; `closed_book_rank.py bios --n-loops` reads a trained exit depth.
 - 2026-10-03: R0b arm (a) read the instrument; the copy control showed the 20M arm (c) smoke was
   read before copying existed; the key/value reader (evidence as leading keys of the shared
   self-attention, prefix rotation) copies at 100M where the cross reader does not at matched

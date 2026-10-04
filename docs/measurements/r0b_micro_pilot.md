@@ -1,4 +1,4 @@
-# Fact injection micro-pilot: arm (a) and the arm (c) reader smoke (2026-10-02)
+# Fact injection micro-pilot: arms (a) and (b), the arm (c) readers at 100M, the loop reading (2026-10-02 to 10-04)
 
 The first from-scratch runs. Model: `config_micro.yaml`, 35.5M parameters (12.6M outside the
 embeddings), random init from `init_scratch_seed.py --seed 0`. Corpus: `data/prepared_inject`, 300M
@@ -147,3 +147,119 @@ Raw output: `ckpts/inject/rank_retrieval20M_{prompt,swapped}`, `rank_full_prompt
 `rank_retrieval100M_{gold,none,prompt,swapped}`, `rank_retrieval_kv100M_{gold,none,prompt,swapped}`,
 `rank_full_100M` (`.json` and `.log`); training logs `inject_retrieval_kv.log`,
 `inject_retrieval_resume.log`.
+
+## The loop reading on arm (a): a weakly stored fact is recalled better after two passes (2026-10-04)
+
+The storage half of the loop axiom (NEXT.md Decisions). `closed_book_rank.py bios --n-loops N` runs
+the block N times and reads the last loop run; loop k never depends on the total depth, so this is
+the readout a training step at sampled depth N supervised (`loop_count_sampling` 0.3,
+`loop_ce_weights` 0.2 / 0.3 / 1.0). `--n-loops 3` reproduces the default read item for item on an
+800-item smoke. Arm
+(a) final, closed book, `delta` at depth 1 / 2 / 3 with the paired difference between depths (same
+items, bootstrap sigma of the difference of deltas, z in brackets):
+
+| class, form | tier | depth 1 | depth 2 | depth 3 | 1 to 2 | 2 to 3 |
+|---|---|---|---|---|---|---|
+| entity, indist | 1 | 0.006 | 0.008 | 0.009 | +0.002 (0.3) | +0.001 (0.8) |
+| entity, indist | 10 | 0.047 | 0.063 | 0.063 | +0.016 (3.1) | -0.001 (-0.4) |
+| entity, indist | 100 | 0.269 | 0.369 | 0.378 | +0.100 (19.7) | +0.008 (6.5) |
+| entity, indist | 1000 | 0.393 | 0.453 | 0.467 | +0.059 (6.4) | +0.014 (5.0) |
+| date, indist | 100 | 0.221 | 0.312 | 0.318 | +0.090 (11.8) | +0.006 (2.9) |
+| date, indist | 1000 | 0.249 | 0.295 | 0.306 | +0.046 (3.1) | +0.011 (2.9) |
+| noun, indist | 100 | 0.362 | 0.447 | 0.450 | +0.085 (9.6) | +0.003 (1.2) |
+| noun, indist | 1000 | 0.477 | 0.521 | 0.525 | +0.045 (2.3) | +0.004 (0.8) |
+| entity, heldout | 100 | 0.029 | 0.024 | 0.023 | -0.004 (-2.8) | -0.001 (-1.8) |
+| entity, heldout | 1000 | 0.107 | 0.105 | 0.104 | -0.002 (-0.6) | -0.001 (-0.8) |
+
+Entity class in distribution, tier 100: top-1 0.141 / 0.388 / 0.415; summed gold log-probability
+-4.47 / -3.26 / -3.15 nats for the real name against -6.71 / -6.57 / -6.64 for the fresh-name prior.
+Tier 1000: top-1 0.980 / 1.000 / 1.000, gold log-probability -0.92 / -0.20 / -0.16, real-name
+`norm_rank` 0.0008 / 0.0000 / 0.0000 against a prior of 0.394 / 0.453 / 0.467.
+
+- **The falsifier's condition is met at tier 100, in every class.** The `delta` grows with depth
+  beyond the paired sigma in distribution: +0.100 (z 19.7) for entities, +0.090 (z 11.8) for dates,
+  +0.085 (z 9.6) for nouns from the first pass to the second. The third pass adds 2% of the total
+  (+0.008, z 6.5, entities). The prior does not move at tier 100 (0.435 / 0.434 / 0.436), so this
+  is the real name ranking better.
+- **The tier 1000 rows are not recall.** The real name is saturated after one pass (rank 0.0008,
+  top-1 0.98), and the growth in `delta` (+0.059, +0.014) is the fresh-name prior drifting toward
+  chance (0.394 / 0.453 / 0.467); the same holds for dates and nouns, whose real rank is 0 at every
+  depth. Tier 1000 says a fact seen a thousand times is fully readable after one pass.
+- **At tier 100 the gain is specific to the stored fact.** From depth 1 to 2 the real name gains
+  1.21 nats on the answer (summed over about 5 tokens) while the fresh-name prior, same items and
+  same units, gains 0.14. For scale, the general per-loop CE gap on the training stream is 0.09
+  nats per token (3.96 / 3.87 / 3.86 over the last 200 log lines), so about 0.5 nats over an answer
+  of that length, and 0.007 per token from loop 2 to 3.
+- **Depth 1 reaches 71% of the depth 3 `delta` at tier 100.**
+- **Held out, nothing grows with depth** (tier 100: 0.029 / 0.024 / 0.023, falling slightly, z -3.2
+  from depth 1 to 3). The part of the memory that survives a change of template is fully readable
+  after one pass; what the second pass adds is the surface-form recall.
+- **What it does and does not say.** The block's weights are the same in every pass, so a second
+  pass adds no capacity; it adds a second step of computation over the same weights. The reading is
+  that recalling a weakly stored fact (100 exposures) is a two-step computation in this model, and
+  that the one-pass exit is a worse reader of the same store. It does meet the falsifier's
+  condition (the `delta` grows with depth beyond its paired sigma), so closed-book recall is not
+  independent of depth here and a leak test has to be read at full depth, which is what every other
+  read in this file does. Whether that makes the axiom "wrong for this design" or shows that the
+  falsifier measured recall depth instead of storage is a plan decision, not settled by this read.
+- Confound that remains: the depth 1 and 2 exits are trained less (weights 0.2 and 0.3 on a quarter
+  of the positions, plus 15% of steps each as the last pass). The prior control rules out a generic
+  readout gain; whether the early exits recall stored facts worse because they are trained less
+  needs a last-loop-only CE arm.
+
+Raw output: `ckpts/inject/rank_full_loops{1,2}` and `rank_full` (depth 3).
+
+## Arm (b), masked fact spans, no retrieval: nothing stored at 3 sigma (2026-10-04)
+
+`inject_masked`, the same documents and order as arm (a) with the loss mask at 0 on every token of
+an attribute value (1.56% of tokens against 0.19% in arm (a)); the facts are still in the context.
+299.44M tokens in 86.8 minutes, final filler validation CE 3.877 (arm (a) 3.904), `loop_scale`
+[1.63, 0.59, 0.18]. Saves in `ckpts/evidence_inject_masked/` (50M steps to final).
+
+Closed-book `delta` with its paired z, final save:
+
+| class | form | tier 1 | tier 10 | tier 100 | tier 1000 |
+|---|---|---|---|---|---|
+| entity | indist | 0.001 (0.5) | 0.003 (1.3) | 0.002 (0.6) | 0.011 (1.7) |
+| entity | heldout | -0.001 (-0.4) | 0.001 (0.5) | -0.000 (-0.1) | 0.013 (2.4) |
+| date | indist | -0.004 (-0.5) | 0.002 (0.3) | -0.009 (-1.1) | -0.010 (-0.6) |
+| date | heldout | -0.007 (-1.4) | -0.004 (-0.9) | 0.001 (0.1) | -0.015 (-1.2) |
+| noun | indist | 0.000 (0.1) | 0.004 (1.1) | 0.002 (0.4) | 0.002 (0.3) |
+| noun | heldout | -0.003 (-0.7) | 0.000 (0.0) | 0.003 (0.7) | -0.020 (-2.4) |
+
+At matched 100M tokens (`checkpoint_evidence_tok100M_loss7.7500.pt`), entity class: in distribution
+-0.000 (-0.1) / 0.001 (0.6) / -0.003 (-1.1) / 0.001 (0.2), held out 0.001 (0.5) / 0.002 (0.6) /
+0.001 (0.4) / 0.003 (0.5).
+
+- **Arm (b) passes its half of the rule.** Every cell is within 3 sigma of the fresh-name prior, on
+  both forms, at 100M and at 300M, where arm (a) reads 0.378 (z 51) at tier 100 and 0.467 at tier
+  1000. Paired against arm (a) on the same items (`compare`, all classes and forms): norm rank
+  difference -0.242 (z -47.4) at tier 100 and -0.311 (z -27.9) at tier 1000. A fact that is read
+  but never predicted is not stored at any size this read resolves: the input side does not leak
+  at the 3 sigma bar.
+- **The tier 1000 entity cells are the ones to watch.** They are the largest and both positive
+  (0.011 and 0.013, z 1.7 and 2.4), 0.012 at z 2.8 pooled over the two forms, and they rose from
+  100M (0.001 and 0.003). The two forms share the same 100 people, so they are not independent
+  evidence. Under the bar, against arm (a)'s 0.467 in distribution, and the cell to reread on any
+  longer run.
+- **The masked arm copies from its prompt** (`--evidence prompt`, entity `norm_rank` by tier): 0.153 /
+  0.144 / 0.154 / 0.220 in distribution (top-1 0.29) and 0.051 / 0.055 / 0.053 / 0.094 held out
+  (top-1 0.56): flat over tiers 1 to 100, worse at tier 1000 by about 4 sigma. Arm (a) reads 0.287 /
+  0.264 / 0.122 / 0.003 and 0.19 held out: it answers the frequent people from memory and copies
+  worse for the rest. The masked arm copies better than arm (a) held out and at tiers 1 and 10.
+- **`compare` on the three arms at matched 100M** (full, masked, key/value arm (c)): the held-out
+  form HOLDS, the in-distribution form FAILS on arm (c) at tier 100 (0.026, z 5.2), with tier 1000 at
+  0.149 (z 12.3) read alongside. Since arm (b) is flat at the same tokens, the arm (c) leak is not
+  the in-context input path. Most likely it comes from the spans arm (c) supervises, 81% of the
+  fact tokens, with the real name in the prompt and the unswapped value as the target 85% of the
+  time; arm (b) does not test the card path, which arm (c) attends in every loop.
+- **What the corpus levers act on** (`inject_build.json`): anonymization only applies to the 20% of
+  biography documents without the gold card (16,294 of 162,000 documents, 10%, carry a placeholder
+  name). In those documents a span is supervised only when its value also occurs in a distractor
+  card (5.6% of their spans), so anonymization reaches at most about 0.7% of the supervised spans
+  that see the real name. The other 99% are in documents with the gold card, which always show the
+  real name. The anonymization rate therefore cannot materially reduce the arm (c) leak; the swap
+  rate acts on the supervised spans and can.
+
+Raw output: `ckpts/inject/rank_masked`, `rank_masked_prompt`, `rank_masked_100M`, `compare_100M.log`,
+`compare_full_masked.log`; training log `inject_masked.log`.
