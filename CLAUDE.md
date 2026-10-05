@@ -8,11 +8,13 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 
 ## Now (keep current)
 
-Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-04
-R0b arms (a) and (b) have run in full, the arm (c) reader question is answered at micro scale (the
-key/value reader copies, the cross attention reader does not), and the loop reading on arm (a) is
-in. The full arm (c) is next and has not started. The plan was rewritten on 2026-09-30 around
-the goal "facts in the store through the retrieval pathway, reasoning in the looped trunk"; the
+Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-05
+R0b arms (a), (b) and (c) have run in full: the key/value reader copies completely in distribution
+and arm (c) fails, on a leak present before copying existed. With a copy-first warm-up the R0b
+rule holds through tier 100 and tier 1000 still leaks; the gate verdict is the user's (open
+decision A). The learned depth allocation arm is held on open decisions after the per-exit read.
+The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
+pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
 record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
 
@@ -39,14 +41,34 @@ source and the artifact stays identical to it; the file goes into the same commi
   `ckpts/inject/rank_*100M_*`.
 - **Arm (c) leaks at 100M under both readers**: closed-book `delta` in distribution at tier 100 /
   1000 key/value 0.026 (z 5.2) / 0.149 (z 12.3), cross 0.037 / 0.203, arm (a) 0.099 / 0.332 at the
-  same tokens. Mid-cosine; the full arm (c) decides.
+  same tokens. Mid-cosine then; the full arm (c) confirmed it.
 - **Arm (b), masked spans, 300M: nothing stored at 3 sigma.** Closed-book entity `delta` in
   distribution 0.001 / 0.003 / 0.002 / 0.011 (z at most 1.7), held out at most 0.013 (z 2.4); flat
   at 100M too. Watch the tier 1000 entity cell (0.012 at z 2.8 pooled over forms, rising from
   100M). The in-context input path does not leak, so the arm (c) leak is most likely on its
-  supervised spans. Prompt copy 0.15 in distribution, 0.05 held out, worse at tier 1000.
-  Checkpoints `ckpts/evidence_inject_masked/`, reads `ckpts/inject/rank_masked*`. `compare` at
-  matched 100M: held out holds, in distribution fails on (c) at tier 100.
+  supervised spans, sharpened 2026-10-05 by the warm-up arm: written by supervised real-value
+  spans, not the input or card path, and also after the reader copies. Prompt
+  copy 0.15 in distribution, 0.05 held out, worse at tier 1000. Checkpoints
+  `ckpts/evidence_inject_masked/`, reads `ckpts/inject/rank_masked*`. `compare` at matched 100M:
+  held out holds, in distribution fails on (c) at tier 100 (the held-out hold did not last).
+- **Arm (c) in full, key/value reader, 300M: it copies, and fails on both forms** (2026-10-05).
+  299.22M tokens, final filler CE 3.8842 (arm (a) 3.9037, arm (b) 3.8769). In distribution gold
+  card top-1 1.000 at every tier and class (0.999 for entities at tier 10), swapped card followed
+  on every item, `mr_ll` 0.000; held out gold 0.010 to 0.024 (top-1 0.58 to 0.74), followed 0.61
+  to 0.64. Closed-book entity `delta` in distribution 0.002 / 0.003 / 0.027 (z 4.1) / 0.120
+  (z 8.8), held out 0.000 / -0.001 / 0.013 (z 3.6) / 0.071 (z 8.2). `compare full masked
+  retrieval_kv` FAILS on both forms at tier 100; tier 1000 leaks on both. Saves
+  `ckpts/evidence_inject_retrieval_kv/` (50M steps to final), reads
+  `ckpts/inject/rank_retrieval_kv*`, `compare_full_masked_kv.log`.
+- **The arm (c) leak is present before copying and flat after 100M.** Entity `delta` in
+  distribution at 100 / 150 / 200 / 250 / 300M: tier 100 0.026 / 0.029 / 0.023 / 0.024 / 0.027,
+  tier 1000 0.149 / 0.140 / 0.115 / 0.112 / 0.120; paired 100M to final +0.001 (z 0.2) and -0.029
+  (z -2.0), arm (a) +0.279 / +0.134 over the same tokens. Gold top-1 0.91 at 100M, 1.00 from 150M.
+  At 50M no copying (gold top-1 0.007 to 0.013 through tier 100) and already 0.010 (z 4.0) / 0.105
+  (z 14.4), equal to arm (a) at 50M at tier 100 (paired +0.000, z 0.1). Established: present before
+  copying, no growth after 100M; read by the warm-up arm (next bullet) as both an offset written
+  before copying and a level training maintains. A dose prediction (about 0.68 of spans carry the real value
+  with the real name) failed on `delta`. Copying emerged between 50M and 100M.
 - **Loop reading on arm (a) final (`--n-loops`): at tier 100 recall grows with depth, mostly in
   pass 2.** Entity `delta` in distribution at depth 1 / 2 / 3: 0.269 / 0.369 / 0.378; paired 1 to 2
   +0.100 (z 19.7), 2 to 3 +0.008 (z 6.5), prior unmoved. On the real name only (1.21 nats against
@@ -55,25 +77,59 @@ source and the artifact stays identical to it; the file goes into the same commi
   falsifier's condition is met at tier 100; the weights are shared across passes, so it reads as
   two-step recall, not capacity. The axiom is reworded to say so (NEXT.md Decisions). Leak reads
   stay at full depth.
+- **Per-exit read (`eval_exit.py`, 2026-10-05): depth pays evenly on this corpus.** Arm (a) final
+  on `inject_val`: CE 4.0072 / 3.9132 / 3.9071 at exits 1 / 2 / 3 (+0.0940, then +0.0061). Gain 1
+  to 3 is +0.107 to +0.122 over the seven least confident deciles at exit 1, +0.072 in the ninth,
+  +0.024 in the most confident; a confidence exit rule is no better than fixed depths at the same
+  passes (3.9237 against 3.9106 at tau 0.5); the beta 0.1 optimum is near uniform (0.343 / 0.286 /
+  0.371, a bound). Arm (c) reads the same. Reads `ckpts/inject/exit_full.*`, `exit_retrieval_kv.*`.
+- **The copy-first warm-up arm, done 2026-10-05: the rule holds through tier 100, tier 1000
+  leaks** (`inject_retrieval_kv_cf`, `ckpts/evidence_inject_retrieval_kv_cf/`): arm (c) with
+  `--reader-kv` from `seed_micro.pt`, first 100M on `inject_retrieval_s100a50_train` (swap rate
+  1.0: every span in a gold-present document carries a substitute the card also carries), then
+  `--train-split inject_retrieval_train` to 299.19M (logs `inject_retrieval_kv_cf_warm.log`,
+  `inject_retrieval_kv_cf_main.log`); final filler CE 3.9106 against 3.8842 for the original arm,
+  a 0.026 gap that opens after the switch and that the logs do not explain. Switch criteria met:
+  gold top-1 in distribution 0.973 / 0.973 / 0.959 / 0.953 at 100M, closed-book `delta` within 3
+  sigma in every cell at 50M and 100M (original arm (c) at 50M 0.010, z 4.0 / 0.105, z 14.4).
+  Entity `delta` in distribution at 100 / 150 / 200 / 250 / 300M: tier 100 -0.006 / 0.011 / 0.013 /
+  0.013 / 0.015 (z 2.6), tier 1000 -0.001 / 0.081 / 0.095 / 0.087 / 0.085 (z 6.4); held out final 0.007 (z 2.0) /
+  0.047 (z 5.1); paired 200M to final -0.011 (z -1.2) at tier 1000. `compare full masked
+  retrieval_kv_cf` HOLDS on both forms through tier 100; tier 1000 leaks on both; dates 0.106
+  (z 3.6) at tier 1000. The 0.03 expectation failed; the falsifier triggered at tier 1000 (and,
+  100M to final, at tier 100: +0.020, z 3.3). Against the original arm at the final save, paired
+  per form: tier 100 -0.012 (z -1.5) / -0.006 (z -1.4), tier 1000 -0.035 (z -2.2) / -0.024
+  (z -2.2): lower in every cell, under 3 sigma per form. Copying final: gold top-1 0.999 to 1.000
+  and swapped followed on every item in distribution, held out followed 0.66 to 0.69, prompt
+  copy held out 0.008 (top-1 0.84, original 0.017 / 0.76). Established: nothing stored without a
+  real-value target; real-value supervision after copying still writes frequent facts (tier 1000
+  to 0.08 to 0.10, then flat); tier 100 inside 3 sigma on both forms. The original arm's leak is
+  in part written before copying, in part a level training maintains. Open: what sets that level
+  (the swap rate, the gold-drop documents, residual span loss after copying).
 - Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
   in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
 - **Next, in order** (the full ladder with its done steps is in NEXT.md):
-  1. Arm (c) in full with the key/value reader: resume `inject_retrieval_kv` with the same flags
-     (`--reader-kv` included; delete the leftover `STOP` first). Staged as
-     `ckpts/inject/launch_kv_resume.sh` and `reads_kv_full.sh`. Every arm (c) save gets `gold`,
-     `swapped`, `none` and `prompt` reads at `--batch-size 1024`. Then `compare full masked
-     retrieval_kv`; pass: (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3
-     sigma above, tier 1000 in distribution read alongside (3 sigma off there is a leak). (b)
-     already passes.
-  2. If (c) climbs: one sweep arm at the higher swap rate (`s30a50`). The anonymization arm is
-     dropped: (b) did not climb, and anonymization only touches the gold-absent documents, under 1%
-     of the supervised spans that see the real name. If the swap rate is not enough: a placeholder
-     name in gold-present documents, with the card carrying the same placeholder.
-  3. Learned depth allocation on the loop axis (entropy-regularized exit, Ouro) as a micro arm,
-     after the full arm (c).
+  1. Open decision A (the user's): accept R0b on the warm-up arm's read (rule holds through tier
+     100, tier 1000 leaks) and carry "no real-value fact supervision before the reader copies" into
+     the pilot as a requirement (a new element of the pilot's schedule), or first act on tier 1000.
+     The `gold`, `swapped`, `prompt` reads at 150M, 200M and 250M were still landing.
+  2. If tier 1000 is acted on, cheapest first: (1) a second phase at swap rate 0.30 branched from
+     the warm-up arm's 100M save: build `--suffix s30a50`, copy the 100M save and `run_state.json`
+     into a new run directory, relaunch with `--train-split inject_retrieval_s30a50_train`; no
+     code; about 60 minutes plus reads; read as paired tier 1000 against the warm-up arm at the
+     same saves (does the maintained level follow the swap rate). (2) The placeholder name in
+     gold-present documents with the card carrying the same placeholder (about 25 lines in the
+     builder and `biographies.render_store_chunk`). Then a span weight by a copy criterion. The
+     goldfish loss is expected no better than a dose cut (renders are paraphrased).
+  3. Held: learned depth allocation (Ouro gate, designed, not built). Open, the user's: an
+     exemption from the Parked halting rule and `docs/looped-transformers.md` 4.1 (the gate skips
+     nothing); the equal-weight control arm (the one "loops (axiom)" lists as not planned); the
+     pilot spec has no per-pass exits. Recommendation: no gate arm on the biography corpus; read
+     depth on the chain splits (only the eval splits are built).
   4. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
      abstaining 10M arms) and PopQA on the seed and both 10M checkpoints.
-  5. The pilot (Phase 5) with the key/value reader, after R0b passes, ladder cut to budget.
+  5. The pilot (Phase 5) with the key/value reader, after the R0b verdict (decision A), ladder cut
+     to budget.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
   emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same
@@ -212,6 +268,7 @@ scripts/
   eval_benchmarks.py  fixed 13-task suite, one scoring path for this model and the peers; popqa is a rank task outside `all`
   closed_book_rank.py likelihood rank of the gold among same-type candidates (bios: by exposure tier; compare: paired)
   eval_chains.py      accuracy by hops and by kept read sites (reader_sites_kept) at fixed depth
+  eval_exit.py        per-exit CE without evidence: paired gains, oracle and beta optimum bounds, confidence exit vs fixed depths
   eval_store.py       store recall of the model's query vs bge, open-book pathway EM vs oracle, store-edit flip rate
   entity_frequency.py exact token-sequence counts in a .bin (the counterfactual strata)
   eval_calibration.py eval_probe.py eval_stage0.py evidence_ceiling_probe.py (--fixed-split: ceiling on evidence_fixed)
@@ -252,8 +309,11 @@ python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target
 TINY_LLM_CONFIG=config_micro.yaml python scripts/init_scratch_seed.py --out ckpts/inject/seed_micro.pt --seed 0
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence -c ckpts/inject/seed_micro.pt --run-name inject_full --data-dir data/prepared_inject --train-split inject_full_train --val-split inject_val   # also inject_masked, inject_retrieval
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv --data-dir data/prepared_inject --train-split inject_retrieval_train --val-split inject_val   # the key/value reader arm (c)
+python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --arms retrieval --suffix s100a50 --device cuda   # the copy-first warm-up split
+TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv_cf --data-dir data/prepared_inject --train-split inject_retrieval_s100a50_train --val-split inject_val   # warm-up to 100M, then the same line with --train-split inject_retrieval_train
 TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped|prompt --batch-size 1024 [--n-loops N] --json-out ckpts/inject/rank_full.json
 python scripts/closed_book_rank.py compare rank_full.json rank_masked.json rank_retrieval.json
+TINY_LLM_CONFIG=config_micro.yaml python scripts/eval_exit.py -c CKPT --data-dir data/prepared_inject --split inject_val --max-batches 40 --json-out OUT.json
 python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits eval,heldout_tmpl,hop4 --eval-questions-per-hop 1000 --seed 42 --device cpu   # train,val on cuda
 python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --json-out OUT.json
 python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max-questions 3000 --chunk-tokens 128 --device cuda --seed 42
@@ -269,7 +329,7 @@ GPU-free tests: the `modules/runtime/` ones (`test_checkpoint_lifecycle`, `test_
 plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_token_tracker`,
 `test_prepare_evidence_heldout`, `test_heldout_sources`, `test_entity_swap`, `test_entity_frequency`,
 `test_counterfactual_condition`, `test_biographies`, `test_prepare_injection`, `test_closed_book_rank`,
-`test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`. `TINY_LLM_CONFIG=path.yaml`
+`test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`. `TINY_LLM_CONFIG=path.yaml`
 swaps the config yaml for every script (the checkpoint still decides shape and mode on load, so a
 micro checkpoint under the default yaml fails the strict load, as it should).
 

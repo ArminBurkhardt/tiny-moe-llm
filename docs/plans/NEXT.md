@@ -10,12 +10,13 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-04)
+## Now (2026-10-05)
 
-**The from-scratch reader reads, once it is the model's own attention, and masking the fact spans
-stores nothing at the 3 sigma bar.** R0b ran from 2026-10-02 to 2026-10-04
-([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the micro shape (35M,
-`config_micro.yaml`), from one seed, on `data/prepared_inject`:
+**The key/value reader copies completely in distribution, and arm (c) fails R0b on a leak present
+before copying existed. With a copy-first warm-up the R0b rule holds through tier 100 and tier
+1000 still leaks: the gate verdict is the user's (open decision A).** R0b ran from
+2026-10-02 to 2026-10-05 ([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the
+micro shape (35M, `config_micro.yaml`), from one seed, on `data/prepared_inject`:
 
 - **Arm (a), full CE, 300M tokens: the instrument reads.** Closed-book entity `delta` in
   distribution 0.009 / 0.063 / 0.378 / 0.467 at tiers 1 / 10 / 100 / 1000 (tier 1000 rank 0,
@@ -39,16 +40,43 @@ stores nothing at the 3 sigma bar.** R0b ran from 2026-10-02 to 2026-10-04
 - **Arm (c) already leaks at 100M under either reader.** Closed-book `delta` in distribution at
   tier 100 / 1000: cross 0.037 (z 10.5) / 0.203 (z 20.3), key/value 0.026 (z 5.2) / 0.149 (z 12.3),
   arm (a) at the same tokens 0.099 / 0.332. The reader that copies leaks least but still fails the
-  pass rule at tier 100. These are mid-cosine readings; the full arm (c) decides.
+  pass rule at tier 100. These were mid-cosine readings; the full arm (c) confirmed them (below).
 - **Arm (b), masked fact spans, 300M tokens: nothing stored at 3 sigma** (2026-10-04). Closed-book
   entity `delta` in distribution 0.001 / 0.003 / 0.002 / 0.011 (z at most 1.7), held out -0.001 /
   0.001 / -0.000 / 0.013 (z at most 2.4); flat at matched 100M as well. The tier 1000 entity cell
   is the one to watch (0.012 at z 2.8 pooled over forms, up from 0.001 and 0.003 at 100M). The
   in-context input path does not leak, so the arm (c) leak most likely comes from the spans arm
   (c) supervises (81% of the fact tokens, real name in the prompt, unswapped target 85% of the
-  time). The masked arm copies from its prompt at 0.15 in distribution and 0.05 held out, flat over
-  tiers 1 to 100 and worse at 1000; better than arm (a) held out and at tiers 1 and 10. `compare`
-  at matched 100M: held-out form holds, in-distribution form fails on arm (c) at tier 100.
+  time); sharpened 2026-10-05 by the warm-up arm: the store is written by supervised real-value
+  spans, not by the input or the card path, and also after the reader copies. The
+  masked arm copies from its prompt at 0.15 in distribution and 0.05 held out, flat over tiers 1 to
+  100 and worse at 1000; better than arm (a) held out and at tiers 1 and 10. `compare` at matched
+  100M: held-out form holds, in-distribution form fails on arm (c) at tier 100 (corrected
+  2026-10-05: the held-out hold did not last, see arm (c) in full).
+- **Arm (c) in full, key/value reader, 300M tokens: it copies, and it fails the rule on both
+  forms** (2026-10-05). Resumed from the 100M save, 299.22M tokens, final filler validation CE
+  3.8842 (arm (a) 3.9037, arm (b) 3.8769). In distribution the gold card ranks the value at 0 with
+  top-1 1.000 at every tier in every class (0.999 for entities at tier 10), a swapped card is
+  followed on every item with `mr_ll` 0.000, and the prompt copy reads 0.0002 or better; held out
+  the gold card ranks entities at 0.010 to 0.024 (top-1 0.58 to 0.74) and a swapped card is
+  followed 0.61 to 0.64 of the time. Closed-book entity `delta` in distribution 0.002 (z 0.3) /
+  0.003 (0.5) / 0.027 (4.1) / 0.120 (8.8), held out 0.000 / -0.001 / 0.013 (z 3.6) / 0.071 (z 8.2).
+  `compare full masked retrieval_kv`: FAILS on both forms at tier 100, and tier 1000 is a leak on
+  both. The held-out tier 100 cell held at 100M (0.006, z 1.6) and sits 3.3 to 3.9 sigma off its
+  prior from 150M on.
+- **The arm (c) leak is present before copying and flat after 100M** (2026-10-05). Entity
+  `delta` in distribution at 100 / 150 / 200 / 250 / 300M: tier 100 0.026 / 0.029 / 0.023 / 0.024 /
+  0.027, tier 1000 0.149 / 0.140 / 0.115 / 0.112 / 0.120; paired from 100M to final +0.001 (z 0.2)
+  and -0.029 (z -2.0), where arm (a) gains +0.279 and +0.134 over the same tokens. Gold top-1 in
+  distribution is 0.91 at 100M and 1.00 from 150M. The 50M save does not copy yet (gold top-1 0.007
+  to 0.013 through tier 100) and already leaks: 0.010 (z 4.0) at tier 100 and 0.105 (z 14.4) at
+  tier 1000, equal to arm (a) at 50M at tier 100 (paired +0.000, z 0.1). Established: the leak is
+  there before copying and does not grow after 100M. The warm-up arm (next bullet) reads it as both
+  an offset written before copying and a level that training maintains. A dose prediction
+  (about 0.68 of the arm (c) spans carry the real value next to the real name, so less leak than
+  arm (a) at 50M) failed on `delta`. At the final save arm (c) holds 7% / 26% of arm (a)'s stored
+  signal at tier 100 / 1000 in distribution. Copying emerged between 50M and 100M for the key/value
+  reader.
 - **The loop reading on arm (a): a weakly stored fact is recalled better after two passes**
   (2026-10-04, `closed_book_rank.py bios --n-loops`). In distribution the entity `delta` at depth
   1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100: paired, depth 1 to 2 is +0.100 (z 19.7), depth 2
@@ -60,6 +88,41 @@ stores nothing at the 3 sigma bar.** R0b ran from 2026-10-02 to 2026-10-04
   block's weights are shared across passes, so this reads as recall of a weakly stored fact being a
   two-step computation, not as extra capacity in later passes. The axiom is reworded to say so
   (Decisions, loops), and every closed-book leak read is taken at full depth.
+- **The per-exit read: depth pays evenly on this corpus** (2026-10-05, `scripts/eval_exit.py`,
+  eval only, no evidence attached). On `inject_val` (1,104,743 tokens, 1,492 documents) arm (a)
+  final reads CE 4.0072 / 3.9132 / 3.9071 at exits 1 / 2 / 3: the second pass +0.0940, the third
+  +0.0061. The gain from exit 1 to 3 is +0.107 to +0.122 over the seven least confident deciles of
+  `p_max` at exit 1, +0.072 in the ninth and +0.024 in the most confident; a confidence exit rule
+  is no better than a mix of fixed depths at the same mean passes (3.9237 against 3.9106 at 2.43
+  passes for tau 0.5, equal within 0.0002 at tau 0.99); the entropy-regularized optimum at beta
+  0.1 is near uniform over exits (0.343 / 0.286 / 0.371), and that is a bound, since it chooses
+  with the label. Arm (c) final reads the same (3.9902 / 3.8919 / 3.8859). A learned exit gate has
+  little to learn here (ladder step 8, held).
+- **The copy-first warm-up arm, done 2026-10-05: the rule holds through tier 100, tier 1000
+  leaks** (`inject_retrieval_kv_cf`). Arm (c) with the key/value reader, first 100M on a split where
+  every fact span in a gold-present document carries a substitute the card also carries (swap rate
+  1.0), then on the arm (c) split to 299.19M tokens; final filler CE 3.9106 against 3.8842 for the
+  original arm (c), a 0.026 gap that opens after the switch and that the logs do not explain. At the
+  switch both criteria were met: gold top-1 in distribution 0.973 / 0.973 / 0.959 / 0.953, and
+  closed-book `delta` within 3 sigma in every cell at 50M and 100M (the original arm (c) at 50M read
+  0.010, z 4.0 and 0.105, z 14.4). After the switch, entity `delta` in distribution at 100 / 150 /
+  200 / 250 / 300M: tier 100 -0.006 / 0.011 / 0.013 / 0.013 / 0.015 (z 2.6 at the final save), tier
+  1000 -0.001 / 0.081 / 0.095 / 0.087 / 0.085 (z 6.4); held out at the final save 0.007 (z 2.0) / 0.047 (z 5.1); paired
+  200M to final +0.002 (z 0.5) and -0.011 (z -1.2). `compare full masked retrieval_kv_cf`: HOLDS on
+  both forms through tier 100; tier 1000 is a leak on both forms by the rule's own reading, and
+  dates leak at tier 1000 in distribution (0.106, z 3.6). The pre-registered expectation "tier 1000
+  at most about 0.03" failed, and the falsifier "a `delta` climbing after the switch, paired z above
+  3" triggered at tier 1000 (and, from 100M to final, at tier 100: +0.020, z 3.3). Against the
+  original arm at the final save, paired per form: tier 100 -0.012 (z -1.5) / -0.006 (z -1.4),
+  tier 1000 -0.035 (z -2.2) / -0.024 (z -2.2) in distribution / held out; lower everywhere, under 3
+  sigma per form. Copying at the final save: gold top-1 0.999 to 1.000 and a swapped card followed
+  on every item in distribution; held out followed 0.66 to 0.69, prompt copy 0.008 (top-1 0.84,
+  against 0.017 and 0.76 in the original arm). Established: nothing is stored without a real-value
+  target; real-value supervision after the reader copies still writes frequent facts (tier 1000 to
+  0.08 to 0.10 within 50M to 100M tokens, then flat); tier 100 is inside 3 sigma on both forms with
+  the warm-up. So the original arm's leak is in part written before copying and in part a level
+  that training maintains while real values are supervised next to the real name. Open: what sets
+  that level (the swap rate, the gold-drop documents, residual span loss after copying).
 
 Earlier, still binding: Phase 4's graft arms were killed at 10.08M tokens on the content gain
 (+0.058 / +0.081, [evidence_arm_a.md](../measurements/evidence_arm_a.md),
@@ -79,51 +142,139 @@ in graft arms.
    resumed to the same 100M. The key/value reader copies; the cross reader does not.
 4. **Done 2026-10-04: arm (b), `inject_masked`, in full.** Within 3 sigma of its prior at every
    tier on both forms; the in-context input path does not leak (above).
-5. **Next: arm (c) in full with the key/value reader.** Resume `inject_retrieval_kv` from its 100M save
-   with the same flags (`--reader-kv` included; the mode is in the checkpoint and a relaunch
-   without the flag fails the strict load). Every arm (c) save gets four reads, `--evidence gold`,
-   `swapped`, `none` and `prompt`, at `--batch-size 1024`, json to
-   `ckpts/inject/rank_<run><tokens>_<mode>.json`. Then `compare full masked retrieval_kv`, one
-   verdict per form, under the pass rule (R0b in the Phase 5 ladder: tier 1000 in distribution
-   read alongside tier 100). The cross reader is closed at micro scale; its 100M save stays as the
-   control. Staged: `ckpts/inject/launch_kv_resume.sh` (removes the `STOP`) and `reads_kv_full.sh`
-   (the four reads on every save past 100M). About 13.3 GB on the card, about 70 minutes plus the
-   reads.
-6. **If (c) still climbs at 300M**, the plan's lever for "only (c) climbs" applies: one sweep arm
-   at the higher swap rate (`--suffix s30a50`), key/value reader. The anonymization arm (`s15a90`)
-   is dropped: arm (b) did not climb, and anonymization only touches the 20% of biography documents
-   without the gold card, where it reaches at most about 0.7% of the supervised spans that see the
-   real name (value collisions with a distractor card; 10% of biography documents carry a
-   placeholder name). If the swap rate is not enough, the next lever acts on the supervised spans:
-   a placeholder name in documents that have the gold card, with the card carrying the same
-   placeholder.
+5. **Done 2026-10-05: arm (c) in full with the key/value reader. Fails.** `inject_retrieval_kv`
+   resumed from its 100M save with the same flags to 299.22M tokens; every save from 100M on read
+   with `gold`, `swapped`, `none` and `prompt` at `--batch-size 1024` (the 50M save with `none`
+   and `gold`), then `compare full masked retrieval_kv`. The reader copies (in distribution top-1
+   1.000, a swapped card followed on every item, from 150M on), and the verdict FAILS on both forms:
+   tier 100 off its prior (0.027, z 4.1 in distribution; 0.013, z 3.6 held out), tier 1000 a leak
+   on both (0.120, z 8.8; 0.071, z 8.2). The leak is there at 50M before copying and does not grow
+   after 100M (above). The cross reader is closed at micro scale; its 100M save stays as the
+   control.
+6. **Done 2026-10-05: the copy-first warm-up arm. The R0b rule holds through tier 100, tier 1000
+   leaks; the verdict is open (decision A below).**
+   The sweep arm at swap rate 0.30 (`s30a50`) was set aside on 2026-10-05, on the reading that the
+   swap rate acts only before copying exists (after it a real and a swapped span both cost about
+   zero) and that 0.30 in place of 0.15 cuts the real-value share of the spans from 0.68 to 0.56,
+   an expected 10 to 20% less leak. The warm-up arm's 150M read removes the support for that
+   reading, so `s30a50` is reopened as a candidate, not run. The anonymization arm (`s15a90`)
+   stays dropped (2026-10-04: it reaches at most about 0.7% of the supervised spans that see the
+   real name). The warm-up arm,
+   `inject_retrieval_kv_cf` (`ckpts/evidence_inject_retrieval_kv_cf/`), trains from
+   `seed_micro.pt` with `--reader-kv` on `inject_retrieval_s100a50_train`, built with
+   `prepare_injection_data.py ... --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --arms
+   retrieval --suffix s100a50` (same seed, documents, order and card selection). Every span in a
+   gold-present document carries a substitute that the card also carries, so there is no
+   consistent name-to-value target to store; the value collisions in gold-less documents, about
+   0.6% of spans, are the only real values left next to the real name. It trains until copying
+   holds, planned stop at the 100M save; then the same run is relaunched with every flag and
+   `--train-split inject_retrieval_train` to 300M (the data overrides are not stored in the
+   checkpoint, and the resume position indexes the same permutation). No code change. Staged:
+   `ckpts/inject/launch_kv_cf_warm.sh` (touches the `STOP` at the 100M save, then reads `gold`,
+   `none` and `swapped` on the 50M and 100M saves). Criteria, fixed before the read:
+   - At the switch: gold top-1 in distribution at least 0.9, and closed-book `delta` within 3 sigma
+     of its prior at every tier. Above 3 sigma there falsifies "nothing to store": the input or
+     encoder path stores before copying.
+   - At 300M: the R0b rule on both forms (tier 100 within 3 sigma), tier 1000 read alongside with
+     an expectation of at most about 0.03. A `delta` that climbs after the switch (paired z above
+     3) falsifies the copy-first reading.
+   - If it passes, the pilot inherits a requirement: fact spans are not supervised with real values
+     before the reader copies (a warm-up or a copy criterion). Whether it does is decision A.
+   - **First phase, read 2026-10-05.** Stopped at the 100M save (trainer exit 10,
+     `checkpoint_evidence_tok100M_loss7.7318.pt`; filler validation CE 4.4870 against 4.4807 for
+     the original arm at the same step). Both switch criteria are met: gold top-1 in distribution
+     0.953 to 0.973, closed-book `delta` within 3 sigma of its prior in every cell at 50M and 100M
+     (largest |z| 2.3). "Nothing to store" is not falsified: with no consistent real-value target
+     the input side and the card path store nothing detectable, so the arm (c) store is written
+     by supervised real-value spans. Copying is learned at least as well on fully swapped spans
+     (paired at 100M against the original arm, entity in distribution: gold top-1 +0.037 to +0.061
+     at tiers 1 to 100, z 5.0 to 8.0; swapped follow +0.057 to +0.113).
+   - **Second phase, done 2026-10-05**: relaunched from that save with every flag and
+     `--train-split inject_retrieval_train` (`ckpts/inject/inject_retrieval_kv_cf_main.log`,
+     `launch_kv_cf_main.sh`), 299.19M tokens, 62.6 minutes, final filler CE 3.9106 (original arm
+     (c) 3.8842: a 0.026 gap that opens after the switch and that the logs do not explain). The
+     150M read already triggered the falsifier at tier 1000 (0.081, z 6.0; paired from 100M
+     +0.082, z 5.9). Entity `delta` at the final save: in distribution 0.004 / 0.000 / 0.015
+     (z 2.6) / 0.085 (z 6.4), held out 0.001 / -0.001 / 0.007 (z 2.0) / 0.047 (z 5.1); no tier 100
+     cell in any class or form beyond 3 sigma; dates at tier 1000 in distribution 0.106 (z 3.6).
+     Tier 1000 in distribution went -0.001 / 0.081 / 0.095 / 0.087 / 0.085 at 100 / 150 / 200 /
+     250 / 300M
+     (paired 200M to final -0.011, z -1.2): up within 50M tokens, then flat. `compare full masked
+     retrieval_kv_cf`: HOLDS on both forms through tier 100 (margin in distribution z 2.6); tier
+     1000 is a leak on both forms by the rule's own reading. The 0.03 expectation failed; the
+     falsifier triggered at tier 1000 (and from 100M to final at tier 100, +0.020, z 3.3). Against
+     the original arm at the final save, paired per form: tier 100 -0.012 (z -1.5) / -0.006
+     (z -1.4), tier 1000 -0.035 (z -2.2) / -0.024 (z -2.2) in distribution / held out: lower in
+     every cell, under 3 sigma per form. The `gold`, `swapped`, `prompt` reads at 150M, 200M and
+     250M were still running when this was written (250M `none`: 0.013, z 2.3 and 0.087, z 6.0).
+   - **Reading.** Established: nothing is stored without a real-value target; real-value
+     supervision after the reader copies still writes frequent facts into the weights; with the
+     warm-up, tier 100 is inside 3 sigma on both forms. Both earlier readings hold in part: some of
+     the original arm's leak was written before copying (the warm-up arm ends lower in every
+     cell), the rest is a level that training maintains while real values are supervised next to
+     the real name. Open: what sets that level. Candidates: the swap rate (swapped exposures
+     penalize answering from memory at every point of training; untested), the gold-drop
+     documents, residual span loss after copying.
+   - **Open decision A (the user's)**: accept R0b on this basis and carry "no real-value fact
+     supervision before the reader copies" into the pilot as a requirement (a new element of the
+     pilot's schedule), or first act on tier 1000.
+   - **Recommended if tier 1000 is acted on, cheapest first**: (1) a second phase at swap rate 0.30
+     branched from the warm-up arm's 100M save: build `--suffix s30a50`, copy the 100M save and
+     `run_state.json` into a new run directory, relaunch with `--train-split
+     inject_retrieval_s30a50_train`; no code; about 60 minutes plus reads. Read as paired tier 1000
+     against the warm-up arm at the same saves; it tests whether the maintained level follows the
+     swap rate. (2) The placeholder name in gold-present documents with the card carrying the same
+     placeholder (about 25 lines in the builder and `biographies.render_store_chunk`). After them:
+     a span weight by a copy criterion in the trainer. The goldfish loss is expected to do no
+     better than a dose cut, since the renders are paraphrased.
 7. **Done 2026-10-04: the loop reading on arm (a).** `closed_book_rank.py bios --n-loops 1|2|3` on
    arm (a) final. At tier 100 the `delta` grows with depth beyond its paired sigma, almost all of it
    in the second pass; at tier 1000 the real name is saturated after one pass (above). The axiom
    was reworded on the same day (Decisions, loops).
-8. **Learned depth allocation on the loop axis**, after the reader works on the full arm (c):
-   an entropy-regularized exit distribution over depths, as in Ouro (arXiv 2510.25741), in place of
-   the fixed depth draw, as a micro arm against the fixed schedule.
+8. **Held 2026-10-05: learned depth allocation on the loop axis.** A design exists, after Ouro
+   (arXiv 2510.25741, checked against the paper): a per-token gate `lambda_t =
+   sigmoid(linear(h_t))`, an exit distribution `p_t = lambda_t * prod_{j<t} (1 - lambda_j)` with
+   the remainder on the last pass, and the objective `sum_t p_t L_t - beta H(p)` with beta 0.1.
+   The gate only reweights the per-pass losses and never touches the forward, which is how it
+   differs from the removed halt head. Not built. Three decisions are open, and they are the
+   user's:
+   - (i) The Parked rule "learned halting: only trainable if halting skips real compute" and the
+     rule in `docs/looped-transformers.md` 4.1 would need an explicit exemption, since this gate
+     skips nothing in training and claims no speedup.
+   - (ii) An equal-weight control arm (`loop_ce_weights` 1/3 each, subsample 1.0, no depth draw; a
+     yaml change, about 95 minutes) is needed to tell reweighting from gate learning, and it is the
+     same arm the Decisions row "loops (axiom)" lists as not planned.
+   - (iii) The pilot spec has a minimum depth of 3 and one CE on the last pass, so it has no
+     per-pass exits; the micro arm would test something the pilot does not use as written.
+   The per-exit read (above) says the gate has little to learn on this corpus: the second pass's
+   gain is spread evenly over tokens, the third adds 0.006 nats, and the gate's own optimum is near
+   uniform, which would cut the last pass's share of the CE weight from 0.67 to about 0.37 to
+   0.39, against the requirement that a weak later loop is fixed, not cut. Recommendation: do not
+   train the gate arm on the biography corpus; the depth question needs a corpus where depth pays
+   (the chain splits; only their eval splits are built).
 9. **The seed-side instruments still open**: the counterfactual eval and PopQA on the seed and both
    10M checkpoints. Both 10M arms abstain on 99.9% of answerable rows and the seed on 46.5%, so the
    counterfactual is read with `eval_abstention.py --counterfactual-likelihood-only` (mr_ll by
    stratum, no generation, no gold condition needed). The store build, the edit store and the
    chain splits are CPU work that can run beside any GPU arm.
-10. **Then the pilot** (Phase 5), with the key/value reader and its rotation, after R0b passes;
-    the ladder is cut to the budget before launch.
+10. **Then the pilot** (Phase 5), with the key/value reader and its rotation, after the R0b
+    verdict (decision A in step 6); the ladder is cut to the budget before launch.
 
 Batch caveat: `config_micro.yaml` moved from batch 16 x accumulate 2 to 32 x 1 for throughput.
 That changes nothing the induction-head result keys on: formation is set by tokens per update x
 updates (batch x context, arXiv 2511.16893), and both settings put 32 rows of 1024 tokens into
-every optimizer step. Copying emerged between 20M and 100M here, so nothing is blocking. If a later
+every optimizer step. Copying emerged between 50M and 100M for the key/value reader (gold top-1
+0.01 at 50M, 0.91 at 100M, 1.00 from 150M), so nothing is blocking. If a later
 arm copies late or weakly, the lever is fewer tokens per optimizer step (16 x 1, twice the updates
 per token, a larger batch giving weaker heads), not the accumulation split.
 
 Relaunching: a stopped arm is relaunched with the same `-c` and every flag (`--data-dir`,
 `--train-split`, `--val-split`, `--reader-kv`, `--run-name`). The STOP file stays in the run
 directory after a stop (`ckpts/evidence_inject_retrieval/STOP`, `.../evidence_inject_retrieval_kv/STOP`);
-delete it before a resume or the run exits at its first poll. Throughput at the micro shape: 55k to
-60k tok/s typical, 13.3 GB peak with the card buffer, under either reader.
+delete it before a resume or the run exits at its first poll. The warm-up arm's launcher leaves one
+in `ckpts/evidence_inject_retrieval_kv_cf/` at its 100M save; the relaunch on
+`inject_retrieval_train` deletes it first. Throughput at the micro shape: 55k to 60k tok/s typical,
+13.3 GB peak with the card buffer, under either reader.
 
 Seed baselines for the graft lineage (2026-09-30, unchanged): fixed-target gold gain -0.0020 nats,
 per-token chunk AUROC 0.515 / 0.484 / 0.490 by loop, mass/chunk AUROC 0.481 / 0.470 / 0.469,
@@ -223,7 +374,7 @@ cannot see the chains.
 | decision | choice |
 |---|---|
 | goal | The reworded goal above. Strong form is not a gate; A1 with A3, A4 and A7 is. |
-| roles | Selector = the IR path, chooses by embedding. Reader = the evidence tokens as leading keys and values of the shared self-attention in every loop, carries content. Measured 2026-10-03 at micro scale: at matched 100M tokens this read copies (gold card top-1 0.92, swapped card followed 92%) where the separate cross-attention reader does not (top-1 0.01, followed 2%). The cross reader stays loadable as the legacy mode. |
+| roles | Selector = the IR path, chooses by embedding. Reader = the evidence tokens as leading keys and values of the shared self-attention in every loop, carries content. Measured 2026-10-03 at micro scale: at matched 100M tokens this read copies (gold card top-1 0.92, swapped card followed 92%) where the separate cross-attention reader does not (top-1 0.01, followed 2%). In the full arm (c) (2026-10-05) it copies completely from 150M on in distribution (top-1 1.000, a swapped card followed on every item); held out it follows a swapped card 0.61 to 0.64 of the time. The cross reader stays loadable as the legacy mode. |
 | learned IR table | Dropped from the real run. Zeroing its read costs 0.0002 nats on every arm. |
 | selector in the real run | Always on, not routed; scores raw bge keys plus one learned null key; no value read, no key adapter. |
 | selector to reader coupling | The selector's own logit enters the reader's attention logit through a one-hot chunk channel, per token, causal. Replaces the document-mean sigmoid gate. Carries over to the key/value read as a head-dim extension: the channel on the evidence keys, zeros on the segment's own keys. |
@@ -239,10 +390,10 @@ cannot see the chains.
 | token tables | One table, tied to the LM head and the MTP head through small adapters; no weight decay on it. The per-layer and router tables become projections of it, gated on the per-layer table zero-ablation on the seed (Phase 4b). G9 gates the head tie only. |
 | shape | Shape L: width 1024, 16 heads x 64, 4 KV heads; 8 prelude layers; looped core of 3 sublayers per pass with 8 MLP experts each, top 2; 2 coda layers. About 470M total, 300M active per token. Sublayer count and expert count are pilot arms. |
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
-| real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. |
+| real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. Open since 2026-10-05: R0b arm (c) leaked before its reader copied (50M) and did not grow after (100M on); the copy-first warm-up arm stored nothing without real-value targets, held the R0b rule through tier 100 at 300M, and still stored tier 1000 facts after copying (0.085, z 6.4 at the final save). Whether the recipe adds a requirement that fact spans are not supervised with real values before the reader copies (a warm-up or a copy criterion), or first acts on tier 1000, is open decision A (ladder step 6). |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
-| loops (axiom) | "Passes add computation, not capacity; recalling a weakly stored fact can take more than one pass" (reworded 2026-10-04 from "loops buy computation, not storage") is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Decided 2026-10-04: the axiom is reworded as above and the storage-half falsifier is retired as read, since it measured recall depth, not capacity. The rule it leaves: every closed-book leak read is taken at full depth. Not planned, available if the axiom ever has to be quoted as measured: an arm with equal CE weight on every exit, which removes the weaker training of the early exits (a last-loop-only arm cannot be read by depth at all). Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
-| depth allocation | The planned loop fix, after the reader works on the full arm (c): learned depth allocation on the loop axis, an entropy-regularized exit distribution over depths (Ouro), tried as a micro arm against the fixed depth draw before it replaces the draw in the pilot. |
+| loops (axiom) | "Passes add computation, not capacity; recalling a weakly stored fact can take more than one pass" (reworded 2026-10-04 from "loops buy computation, not storage") is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Decided 2026-10-04: the axiom is reworded as above and the storage-half falsifier is retired as read, since it measured recall depth, not capacity. The rule it leaves: every closed-book leak read is taken at full depth. Not planned, available if the axiom ever has to be quoted as measured: an arm with equal CE weight on every exit, which removes the weaker training of the early exits (a last-loop-only arm cannot be read by depth at all). Since 2026-10-05 the same arm is also the control the depth allocation arm would need (depth allocation, open decision ii). Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
+| depth allocation | Held 2026-10-05, not decided. The planned loop fix was learned depth allocation on the loop axis, an entropy-regularized exit distribution over depths (Ouro), tried as a micro arm against the fixed depth draw before it replaces the draw in the pilot. A design exists (a per-token gate `sigmoid(linear(h_t))`, exit distribution with the remainder on the last pass, `sum_t p_t L_t - beta H(p)` at beta 0.1; the gate reweights the per-pass losses and never touches the forward) and is not built. Open, for the user: (i) whether the Parked rule on learned halting and `docs/looped-transformers.md` 4.1 ("a learned depth mechanism must skip computation") get an explicit exemption for a gate that skips nothing in training and claims no speedup; (ii) whether the equal-weight control arm (`loop_ce_weights` 1/3 each, subsample 1.0, no depth draw, about 95 minutes) runs, which is the arm "loops (axiom)" lists as not planned; (iii) the pilot spec has a minimum depth of 3 and one CE on the last pass, so it has no per-pass exits for a gate to weigh. The per-exit read on micro arms (a) and (c) (`eval_exit.py`, 2026-10-05) finds little for the gate to learn on the biography corpus: the second pass's gain (+0.094) is spread evenly over confidence deciles, the third pass adds 0.006 nats, and the entropy-regularized optimum is near uniform even as a bound (0.343 / 0.286 / 0.371 at beta 0.1), which would cut the last pass's share of the CE weight from 0.67 to about 0.37 to 0.39. Recommendation: no gate arm on this corpus; the depth question needs a corpus where depth pays (the chain splits). |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
 | POC role | Phase 4 is a mechanism check of the reader, read per loop. It decides nothing about externalization. |
 | matched compute | SMELT's definition: equal compute per token, equal non-embedding parameters and equal KV-cache size, or the comparison is not quoted as compute-matched. |
@@ -287,12 +438,17 @@ Done, with the full records linked:
   established that the corpus and the old real-run recipe both keep rewarding recall from weights.
   Its loop section found the objective and the migrated `loop_scale` working against depth, and
   merged three loop designs into the one in Decisions.
-- **R0b, first from-scratch runs** (2026-10-02 and 03,
+- **R0b, first from-scratch runs** (2026-10-02 to 05,
   [r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)): arm (a) reads the instrument; the
   key/value reader copies from the card at 100M where the cross reader does not; arm (c) leaks at
   tier 100 at 100M under both. Arm (b) in full (2026-10-04) stores nothing at 3 sigma, and the loop
   reading on arm (a) shows closed-book recall at tier 100 growing with depth, mostly in the second
-  pass. Arm (c) in full is open.
+  pass. Arm (c) in full (2026-10-05) copies completely in distribution and fails on both forms, on
+  a leak present at 50M before copying and flat after 100M. The copy-first warm-up arm stored
+  nothing without real-value targets, then stored tier 1000 facts again after the switch; at 300M
+  it holds the R0b rule through tier 100 and leaks at tier 1000, and the verdict is open. The
+  per-exit read finds the second pass's gain spread evenly over tokens, so the depth
+  allocation arm is held.
 
 ## Binding measurements
 
@@ -586,7 +742,12 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
   in every visible chunk that holds it, in the target, and in every later mention in the document.
 - **Tail anonymization.** In 50% of documents, unsupported entities below the head-frequency
   threshold get a typed placeholder in input and target, re-drawn per epoch. The 15% and 50% rates
-  are first guesses and get a sweep in the micro-pilot (R0b).
+  are first guesses. The micro-pilot (R0b) dropped the anonymization sweep (2026-10-04: it barely
+  reaches the supervised spans) and set the swap rate sweep aside on 2026-10-05, then reopened it
+  as a candidate the same day, after the copy-first warm-up arm stored tier 1000 facts again once
+  real values were supervised with copying already in place. At 300M the warm-up arm holds the
+  rule through tier 100 and leaks at tier 1000; a swap rate 0.30 second phase branched from its
+  100M save is the cheapest test of whether the remaining level follows the swap rate.
 - **QA.** Distractors half bge hard negatives, half random. Partial hop: a HotpotQA row with one
   supporting paragraph withheld, target abstains. Hop labels from MuSiQue and 2Wiki are for
   evaluation only. A wider abstention phrasing set.
@@ -603,7 +764,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 |---|---|---|---|---|---|
 | R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
 | R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop. **Read 2026-10-01**: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 by loop and the per-loop content gain 0.070 / 0.078 / 0.081 (arm B), so loop 1 reads best and later loops add little |
-| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; swap rate swept in (c), the anonymization sweep dropped 2026-10-04 | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
+| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; the anonymization sweep dropped 2026-10-04; the swap rate sweep set aside 2026-10-05 for a copy-first warm-up arm of (c), reopened as a candidate by the warm-up arm's 150M read | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms. **(c) read 2026-10-05: fails** on both forms. In distribution 0.027 (z 4.1) at tier 100 and 0.120 (z 8.8) at tier 1000, held out 0.013 (z 3.6) and 0.071 (z 8.2), while the reader copies (top-1 1.000, swapped card followed on every item); the leak is present at 50M before copying (0.010, z 4.0; 0.105, z 14.4) and flat after 100M (paired +0.001, z 0.2 at tier 100). **Copy-first warm-up arm, read 2026-10-05**: nothing stored at 50M and 100M without real-value targets (every cell within 3 sigma), copying at 100M (top-1 0.95 to 0.97); at 300M 0.015 (z 2.6) at tier 100 and 0.085 (z 6.4) at tier 1000 in distribution, held out 0.007 (z 2.0) and 0.047 (z 5.1): the rule holds through tier 100 on both forms, tier 1000 is a leak on both. Verdict open (decision A, ladder step 6) | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
 | R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable |
 | R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
 | R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
@@ -727,7 +888,14 @@ above are a different, live series).
   Without them A1 is expected to fail. The levers only work if they are complete: MTP targets carry
   the same span weight, a swap reaches every visible chunk and every later mention, the
   anonymization is re-drawn per epoch, and attribute nouns the tagger misses stay learnable. R0b's
-  arm (b) is the input-side leak test and sweeps the rates before any 1B-token spend.
+  arm (b) was the input-side leak test and stored nothing at 3 sigma (2026-10-04). Arm (c) leaked
+  anyway (2026-10-05): the leak is present at 50M, before its reader copied, and flat after 100M.
+  The copy-first warm-up arm showed that the input side and the card path store nothing
+  detectable without real-value targets, and that real-value supervision stores tier 1000 facts
+  again even with copying in place (0.085, z 6.4 at 300M). Copying first brings tier 100 inside 3
+  sigma on both forms; what sets the remaining tier 1000 level (the swap rate, the gold-drop
+  documents, residual span loss) is open, and decision A asks whether to act on it before any
+  1B-token spend.
 - **Small models ignore evidence.** Models of 7B and under have been measured ignoring oracle
   passages 85 to 100% of the time on questions they cannot answer alone. At 120M the pilot may
   come out flat. The matched control and A6 decide, and the 1-hop curve must saturate first.
@@ -778,12 +946,17 @@ above are a different, live series).
   read imitates inside the loop.
 - Memorization Sinks (arXiv 2507.09937) and the goldfish loss (Hans et al., NeurIPS 2024, arXiv
   2406.10209): alternative levers against memorization, held for the case where the swap and
-  anonymization rates do not stop arm (c) from leaking.
+  anonymization rates do not stop arm (c) from leaking. As of 2026-10-05 the goldfish loss is
+  expected to do no better than a dose cut on the biography corpus, since its renders are
+  paraphrased; it ranks after the placeholder name and the copy-criterion span weight.
 
 ## Parked
 
 - **Learned halting.** Only trainable if halting skips real compute; unparks after the exit and KV
-  cache exclusion is fixed and a halt decision breaks the loop during training.
+  cache exclusion is fixed and a halt decision breaks the loop during training. Open since
+  2026-10-05, not decided: whether the learned depth allocation gate, which reweights per-pass
+  losses, skips nothing in training and claims no speedup, gets an exemption from this rule
+  (Decisions, depth allocation, open decision i).
 - **RL and reasoning training.** Unparks when pass@8 on the target task exceeds about 15%. A
   looped model wants per-loop latent credit (LoopRPT, RLTT), not token-level GRPO.
 - **Per-pass re-query and the append-only buffer at serving.** Untrained; after the pilot.
@@ -812,6 +985,30 @@ above are a different, live series).
   plus a fact-injection probe, A3 a memorization ratio, A4 goes through the store, A7 is added,
   L1 and L2 are scored by read ablation at fixed depth, R0b is added, and the budget is recomputed
   at about 1.3 GFLOP per token.
+- 2026-10-05: R0b arm (c) ran in full with the key/value reader. It copies completely from 150M on
+  (top-1 1.000, a swapped card followed on every item in distribution) and fails the rule on both
+  forms (tier 100 0.027, z 4.1 in distribution; 0.013, z 3.6 held out; tier 1000 a leak on both).
+  The leak is present at 50M before copying, at arm (a)'s level at tier 100, and does not grow
+  after 100M: not a climb. The 0.30 sweep arm was set aside and a copy-first warm-up arm (swap
+  rate 1.0 until the reader copies, then the arm (c) split) launched with its criteria fixed
+  before the read. Its first phase met both switch criteria (copying at 0.95 to 0.97 top-1, nothing
+  stored at 50M or 100M), so the arm (c) store is written by supervised real-value spans, not by
+  the input or card path; its 150M read, 50M tokens after the switch, has tier 1000 back at 0.081
+  (z 6.0, paired +0.082, z 5.9), which triggers the pre-registered falsifier at tier 1000. Read in
+  full at 300M (299.19M tokens, filler CE 3.9106 against 3.8842, gap unexplained): `compare`
+  HOLDS through tier 100 on both forms (0.015, z 2.6 in distribution; 0.007, z 2.0 held out),
+  tier 1000 leaks on both (0.085, z 6.4; 0.047, z 5.1), the 0.03 expectation failed, and the
+  warm-up arm sits under the original arm in every per-form cell without reaching 3 sigma per
+  form. The arm (c) leak is read as both: in part written before copying, in part a level that
+  training maintains while real values are supervised next to the real name. The R0b verdict and
+  whether "no real-value fact supervision before the reader copies" enters the pilot are open
+  decision A; if tier 1000 is acted on first, the recommended arm is a swap rate 0.30 second phase
+  branched from the warm-up arm's 100M save, then the placeholder name. Corrections: the
+  held-out hold at matched 100M did not last; copying emerged between 50M and 100M. A per-exit
+  read (`eval_exit.py`) finds the second pass's gain spread evenly over tokens and the
+  entropy-regularized exit optimum near uniform, so the learned depth allocation arm is held, with
+  three decisions open (an exemption from the halting rule, the equal-weight control arm, the
+  pilot's lack of per-pass exits) and the recommendation to read depth on the chain corpus instead.
 - 2026-10-04: R0b arm (b) ran in full and stores nothing at 3 sigma, so the arm (c) leak is most
   likely on its supervised spans and the anonymization sweep arm is dropped (it reaches under 1% of
   the supervised spans that see the real name); the loop reading on arm (a) met the storage
