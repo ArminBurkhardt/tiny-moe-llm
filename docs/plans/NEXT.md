@@ -14,7 +14,9 @@ and the new references). The design itself, with blueprints of both runs, is
 
 **The key/value reader copies completely in distribution, and arm (c) fails R0b on a leak present
 before copying existed. With a copy-first warm-up the R0b rule holds through tier 100 and tier
-1000 still leaks: the gate verdict is the user's (open decision A).** R0b ran from
+1000 still leaks. Decided 2026-10-05: R0b is accepted on the warm-up arm with the tier 1000 leak
+known, and the warm-up enters the pilot as a requirement. The swap rate 0.30 branch (read
+2026-10-06) leaves the tier 1000 leak where it was.** R0b ran from
 2026-10-02 to 2026-10-05 ([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the
 micro shape (35M, `config_micro.yaml`), from one seed, on `data/prepared_inject`:
 
@@ -122,7 +124,23 @@ micro shape (35M, `config_micro.yaml`), from one seed, on `data/prepared_inject`
   0.08 to 0.10 within 50M to 100M tokens, then flat); tier 100 is inside 3 sigma on both forms with
   the warm-up. So the original arm's leak is in part written before copying and in part a level
   that training maintains while real values are supervised next to the real name. Open: what sets
-  that level (the swap rate, the gold-drop documents, residual span loss after copying).
+  that level (the swap rate, the gold-drop documents, residual span loss after copying). Decided
+  2026-10-05: R0b is accepted on this arm, the tier 1000 leak recorded as known, and "no real-value
+  fact supervision before the reader copies" enters the pilot as a requirement. The warm-up is the
+  better of two arms on one seed, not an optimum; its improvement over the original arm is a
+  direction, not established per form.
+- **The swap rate 0.30 branch, started 2026-10-05, read 2026-10-06**: the swap rate does not move the tier 1000 level in any large way. Final closed-book entity `delta` in distribution 0.005 / 0.004 / 0.010 (z 1.7) / 0.083 (z 6.2), held out -0.002 / -0.001 / 0.003 (z 0.9) / 0.039 (z 4.6), against the warm-up arm's 0.015 (z 2.6) / 0.085 (z 6.4) and 0.007 (z 2.0) / 0.047 (z 5.1) at tiers 100 / 1000. Paired branch minus warm-up arm (same items), entity: tier 1000 -0.002 (z -0.3) in distribution and -0.008 (z -1.4) held out, -0.005 (z -1.0) pooled over forms, so the pre-registered criterion (z at or beyond -3 per form or pooled) is not met; tier 100 -0.004 (z -1.0) and -0.004 (z -1.4), lower on both forms as a direction, and the rule holds with more margin (z 1.7 and 0.9). The raw-rank z -4.0 in `compare_cf_vs_cf30.log` (all classes, pooled over forms) is mostly the real name ranking worse in the branch (+0.014, z 3.8) with the prior also worse (+0.005, z 1.2), so the `delta` moves only -0.009 (z -2.1). Within the stated power this is no large effect, not no effect: a dose-sized effect (about 0.07) could not be separated from none. Copying holds: gold top-1 in distribution 0.999 to 1.000 in both arms, swapped card followed on every item in distribution, held out 0.654 to 0.673 against 0.663 to 0.690 (all classes), `mr_ll` the same within 0.005; prompt copy held out 0.0084 (top-1 0.834), the same as the warm-up arm. Filler CE 3.9131 against 3.9106 for the warm-up arm. The 150M `none` read was taken (0.003, z 0.6 / 0.072, z 5.3 in distribution); the 200M and 250M reads and the other 150M modes were not taken. Open decision (the user's): the pilot's swap rate, and whether the placeholder name arm runs before the pilot. Recommendation: choose the swap rate on copy quality and tier 100 margin, not on tier 1000; on those reads 0.30 costs nothing measurable in copying (in distribution identical, held out follow within 0.04) and gives tier 100 more margin, so 0.30 is the slightly better choice, by a direction only. The open lever against tier 1000 is the placeholder name in gold-present documents with the card carrying the same placeholder (about 25 lines in the builder and `biographies.render_store_chunk`); its design, cost and expected effect are in ladder step 6, the decision to run it is open.
+- **The seed-side instruments, done 2026-10-06** ([seed_instruments.md](../measurements/seed_instruments.md)).
+  PopQA (20 candidates, prior control, 14,233 items): seed entity `delta` 0.0287 (z 11.7) / 0.0263
+  (z 12.8) / 0.0356 (z 19.4) by tail / mid / head, concentrated in four cue relations (father,
+  mother, capital, capital of: 0.151, tail 0.261 against head 0.113); the other 9,430 entity items
+  read 0.0088 / 0.0075 / 0.0070. Paired arm minus seed at the entity tail the raw rank moved +0.0090
+  (z 7.4, arm A) but the prior moved +0.0102, so `delta` moved +0.0012 (z 1.0): 10M of evidence
+  finetuning shifted the answer prior and stored nothing. Counterfactual likelihood (1,409 SQuAD v2
+  items): seed `mr_ll` 0.295 to 0.766 across frequency strata, a frequency-ratio prior (the port is
+  neutral; correlation 0.636 with the log count ratio); the arms gain about 1.6 to 1.8 nats on both
+  answers under a buffer and follow the swapped card in no stratum (paired gap +0.01, z 0.1 pooled,
+  arm A). Method notes now in gates A1 and A3.
 
 Earlier, still binding: Phase 4's graft arms were killed at 10.08M tokens on the content gain
 (+0.058 / +0.081, [evidence_arm_a.md](../measurements/evidence_arm_a.md),
@@ -152,7 +170,7 @@ in graft arms.
    after 100M (above). The cross reader is closed at micro scale; its 100M save stays as the
    control.
 6. **Done 2026-10-05: the copy-first warm-up arm. The R0b rule holds through tier 100, tier 1000
-   leaks; the verdict is open (decision A below).**
+   leaks; R0b accepted on this arm 2026-10-05.**
    The sweep arm at swap rate 0.30 (`s30a50`) was set aside on 2026-10-05, on the reading that the
    swap rate acts only before copying exists (after it a real and a swapped span both cost about
    zero) and that 0.30 in place of 0.15 cuts the real-value share of the spans from 0.68 to 0.56,
@@ -179,7 +197,7 @@ in graft arms.
      an expectation of at most about 0.03. A `delta` that climbs after the switch (paired z above
      3) falsifies the copy-first reading.
    - If it passes, the pilot inherits a requirement: fact spans are not supervised with real values
-     before the reader copies (a warm-up or a copy criterion). Whether it does is decision A.
+     before the reader copies (a warm-up or a copy criterion). Decided 2026-10-05: it does.
    - **First phase, read 2026-10-05.** Stopped at the 100M save (trainer exit 10,
      `checkpoint_evidence_tok100M_loss7.7318.pt`; filler validation CE 4.4870 against 4.4807 for
      the original arm at the same step). Both switch criteria are met: gold top-1 in distribution
@@ -206,7 +224,7 @@ in graft arms.
      the original arm at the final save, paired per form: tier 100 -0.012 (z -1.5) / -0.006
      (z -1.4), tier 1000 -0.035 (z -2.2) / -0.024 (z -2.2) in distribution / held out: lower in
      every cell, under 3 sigma per form. The `gold`, `swapped`, `prompt` reads at 150M, 200M and
-     250M were still running when this was written (250M `none`: 0.013, z 2.3 and 0.087, z 6.0).
+     250M are on disk and not tabulated yet (250M `none`: 0.013, z 2.3 and 0.087, z 6.0).
    - **Reading.** Established: nothing is stored without a real-value target; real-value
      supervision after the reader copies still writes frequent facts into the weights; with the
      warm-up, tier 100 is inside 3 sigma on both forms. Both earlier readings hold in part: some of
@@ -215,18 +233,48 @@ in graft arms.
      the real name. Open: what sets that level. Candidates: the swap rate (swapped exposures
      penalize answering from memory at every point of training; untested), the gold-drop
      documents, residual span loss after copying.
-   - **Open decision A (the user's)**: accept R0b on this basis and carry "no real-value fact
-     supervision before the reader copies" into the pilot as a requirement (a new element of the
-     pilot's schedule), or first act on tier 1000.
-   - **Recommended if tier 1000 is acted on, cheapest first**: (1) a second phase at swap rate 0.30
-     branched from the warm-up arm's 100M save: build `--suffix s30a50`, copy the 100M save and
-     `run_state.json` into a new run directory, relaunch with `--train-split
-     inject_retrieval_s30a50_train`; no code; about 60 minutes plus reads. Read as paired tier 1000
-     against the warm-up arm at the same saves; it tests whether the maintained level follows the
-     swap rate. (2) The placeholder name in gold-present documents with the card carrying the same
-     placeholder (about 25 lines in the builder and `biographies.render_store_chunk`). After them:
-     a span weight by a copy criterion in the trainer. The goldfish loss is expected to do no
-     better than a dose cut, since the renders are paraphrased.
+   - **Decided by the user 2026-10-05 (decision A closed), both**: (1) the copy-first warm-up is
+     accepted as the basis for R0b (the rule holds through tier 100 on both forms with it,
+     marginally in distribution at z 2.6), the tier 1000 leak is recorded as known, and "no
+     real-value fact supervision before the reader copies" goes into the pilot as a requirement, a
+     new element of the pilot's schedule. The warm-up is the better of two arms on one seed, not an
+     optimum, and its improvement over the original arm is a direction, not established per form.
+     (2) The swap rate 0.30 branch runs before the pilot spec is frozen, because it sets a pilot
+     parameter either way.
+   - **The swap rate 0.30 branch, started 2026-10-05, read 2026-10-06.** Run name
+     `inject_retrieval_kv_cf30` (`ckpts/evidence_inject_retrieval_kv_cf30/`, log
+     `ckpts/inject/inject_retrieval_kv_cf30.log`, launcher `ckpts/inject/launch_kv_cf30.sh`). The
+     split `inject_retrieval_s30a50_train` is built with `--swap-rate 0.30 --anon-rate 0.5
+     --gold-drop-rate 0.2 --arms retrieval --suffix s30a50`; the warm-up arm's 100M save
+     (`checkpoint_evidence_tok100M_loss7.7318.pt`) and a `run_state.json` at 100,419,895 tokens are
+     copied into the new run directory, and the run goes to 300M with `--reader-kv` and
+     `--train-split inject_retrieval_s30a50_train`. No code change. Every save past 100M gets
+     `none`, `gold`, `swapped` and `prompt` reads into
+     `ckpts/inject/rank_retrieval_kv_cf30<tag>_<mode>`. Criteria, fixed before the read:
+     - The question: does the level that training maintains follow the swap rate. Read
+       closed-book entity `delta` at tiers 1000 and 100, paired against the warm-up arm at the
+       same saves (150M, 200M, 250M, final), per form. It follows the swap rate if tier 1000 is
+       lower than the warm-up arm's at paired z at or beyond -3 per form at the final save, or on
+       both forms pooled.
+     - Power: the paired sigma at tier 1000 is about 0.016 in distribution and 0.011 held out (from
+       the warm-up against original comparison), so only a drop of about 0.05 in distribution (the
+       0.085 falling to about 0.035 or below) reads at 3 sigma per form. A pure dose effect
+       (real-value share 0.68 to 0.56) predicts about 0.07, which this arm cannot separate from no
+       effect. A null therefore means "no large effect of the swap rate", not "no effect".
+     - Alongside: copying must not degrade (gold top-1 in distribution, swapped follow, held-out
+       follow against the warm-up arm), tier 100 must stay within 3 sigma, and the filler CE gap is
+       read again (the warm-up arm ended 0.026 above the original arm after its switch).
+     - After it: if the level follows the swap rate, the pilot's swap rate is set from it; if not,
+       the placeholder name in gold-present documents with the card carrying the same placeholder
+       (about 25 lines in the builder and `biographies.render_store_chunk`) is the next candidate
+       against tier 1000, and the pilot can start with the warm-up alone (the user's call then).
+     - **Read 2026-10-06**: the swap rate does not move the tier 1000 level in any large way. Final closed-book entity `delta` in distribution 0.005 / 0.004 / 0.010 (z 1.7) / 0.083 (z 6.2), held out -0.002 / -0.001 / 0.003 (z 0.9) / 0.039 (z 4.6), against the warm-up arm's 0.015 (z 2.6) / 0.085 (z 6.4) and 0.007 (z 2.0) / 0.047 (z 5.1) at tiers 100 / 1000. Paired branch minus warm-up arm (same items), entity: tier 1000 -0.002 (z -0.3) in distribution and -0.008 (z -1.4) held out, -0.005 (z -1.0) pooled over forms, so the pre-registered criterion (z at or beyond -3 per form or pooled) is not met; tier 100 -0.004 (z -1.0) and -0.004 (z -1.4), lower on both forms as a direction, and the rule holds with more margin (z 1.7 and 0.9). The raw-rank z -4.0 in `compare_cf_vs_cf30.log` (all classes, pooled over forms) is mostly the real name ranking worse in the branch (+0.014, z 3.8) with the prior also worse (+0.005, z 1.2), so the `delta` moves only -0.009 (z -2.1). Within the stated power this is no large effect, not no effect: a dose-sized effect (about 0.07) could not be separated from none. Copying holds: gold top-1 in distribution 0.999 to 1.000 in both arms, swapped card followed on every item in distribution, held out 0.654 to 0.673 against 0.663 to 0.690 (all classes), `mr_ll` the same within 0.005; prompt copy held out 0.0084 (top-1 0.834), the same as the warm-up arm. Filler CE 3.9131 against 3.9106 for the warm-up arm. The 150M `none` read was taken (0.003, z 0.6 / 0.072, z 5.3 in distribution); the 200M and 250M reads and the other 150M modes were not taken.
+     - Open decision (the user's): the pilot's swap rate, and whether the placeholder name arm runs before the pilot. Recommendation: choose the swap rate on copy quality and tier 100 margin, not on tier 1000; on those reads 0.30 costs nothing measurable in copying (in distribution identical, held out follow within 0.04) and gives tier 100 more margin, so 0.30 is the slightly better choice, by a direction only. The open lever against tier 1000 is the placeholder name in gold-present documents with the card carrying the same placeholder (about 25 lines in the builder and `biographies.render_store_chunk`).
+     - **The placeholder name arm, designed 2026-10-05/06, not built; open decision, the user's.** `--placeholder-rate 0.5` for gold-present documents: the subject's name is replaced by a placeholder in the document, the gold card is rendered with the same placeholder, each distractor card with its own placeholder; swaps on top; gold-absent anonymization unchanged; keys canonical; the eval renders its own cards with the real name, so `closed_book_rank.py` needs no change. About 40 lines in `prepare_injection_data.py` (`RetrievalBuilder.build`, argparse, metrics) and `biographies.render_store_chunk(name_override=)` plus about 30 lines of tests. Branched from the warm-up arm's 100M save (paired sigma about 0.006 against the warm-up arm, against 0.016 from the seed); build about 5 minutes and 1.8 GB, training about 64 minutes, reads 21 to 48 minutes. Supervision shares per exposure at p = 0.5 and swap 0.15: real value with real name 0.346 (0.686 at p = 0), real value with placeholder 0.346, substitute with real name 0.060, substitute with placeholder 0.060, unsupervised 0.189. Expected tier 1000 `delta` at the final save against the warm-up arm's 0.085: unchanged under the "written before copying" reading; 0.043 (z about -6) if the maintained level is linear in dose; 0.064 (z about -3) if it saturates. Criterion: the leak follows dose if paired z is at or beyond -3 per form or pooled; the lever is falsified if pooled z is above -2; p = 1.0 only on a null (it passes by construction and tests nothing). Rate 1.0 is not used because the real name would never be supervised with a value and the closed-book instrument would read zero by construction. The placeholder cannot carry to the pilot (nothing in the repo finds a subject name in real text; `entity_swap.py` is a heuristic gazetteer with no NER); what carries over is the result: if the leak follows dose, the trainer-side span weight by a copy criterion (an n-gram support match between document and evidence, the same test the builder uses) is worth building. Recommendation on record: run it before freezing the pilot's lever list and write the pilot spec in parallel.
+       After them: a span weight by a copy criterion in the trainer. The goldfish loss is expected
+       to do no better than a dose cut, since the renders are paraphrased.
+   - **Next: the pilot spec**, with the copy-first warm-up requirement and the swap rate the user
+     sets, frozen before steps 9 and 10.
 7. **Done 2026-10-04: the loop reading on arm (a).** `closed_book_rank.py bios --n-loops 1|2|3` on
    arm (a) final. At tier 100 the `delta` grows with depth beyond its paired sigma, almost all of it
    in the second pass; at tier 1000 the real name is saturated after one pass (above). The axiom
@@ -252,13 +300,16 @@ in graft arms.
    0.39, against the requirement that a weak later loop is fixed, not cut. Recommendation: do not
    train the gate arm on the biography corpus; the depth question needs a corpus where depth pays
    (the chain splits; only their eval splits are built).
-9. **The seed-side instruments still open**: the counterfactual eval and PopQA on the seed and both
-   10M checkpoints. Both 10M arms abstain on 99.9% of answerable rows and the seed on 46.5%, so the
-   counterfactual is read with `eval_abstention.py --counterfactual-likelihood-only` (mr_ll by
-   stratum, no generation, no gold condition needed). The store build, the edit store and the
-   chain splits are CPU work that can run beside any GPU arm.
-10. **Then the pilot** (Phase 5), with the key/value reader and its rotation, after the R0b
-    verdict (decision A in step 6); the ladder is cut to the budget before launch.
+9. **Done 2026-10-06: the seed-side instruments**
+   ([seed_instruments.md](../measurements/seed_instruments.md)). PopQA with its prior control
+   resolves the seed's weak stored knowledge (entity `delta` 0.029 / 0.026 / 0.036 by tail / mid /
+   head, most of it in four cue relations), and 10M tokens of evidence finetuning moved neither the
+   PopQA `delta` (arm A -0.0002, z -0.4 over all entity items) nor counterfactual following (paired
+   gap +0.01, z 0.1 pooled; the seed's `mr_ll` gradient is a frequency-ratio prior). The store
+   build, the edit store and the chain splits are CPU work that can run beside any GPU arm.
+10. **Then the pilot** (Phase 5), on the spec from step 6: the key/value reader and its rotation,
+    the copy-first warm-up as a requirement, and the swap rate the user sets; the ladder is
+    cut to the budget before launch.
 
 Batch caveat: `config_micro.yaml` moved from batch 16 x accumulate 2 to 32 x 1 for throughput.
 That changes nothing the induction-head result keys on: formation is set by tokens per update x
@@ -330,9 +381,9 @@ sigma is recorded before any CE gate is quoted.
 
 | gate | metric | bar | home |
 |---|---|---|---|
-| A1 closed-book externalization | (a) closed-book likelihood rank (or MC accuracy) of the gold answer among at least 20 same-type candidates, pathway off, neutral prompt, head and tail obscurity tiers, entity-valued relations; (b) fact injection: fictional biographies (bioS style, Allen-Zhu and Li, Physics of Language Models 3.1) inserted at 1 / 10 / 100 / 1000 exposures with their chunks in the store | (a) tail-tier rank worse than the matched no-retrieval control by at least 3 sigma (bootstrap); (b) closed-book rank at chance up to 100 exposures where the control memorizes | new closed-book rank scorer, PopQA and the tiers (Phase 4b build item); R0b |
+| A1 closed-book externalization | (a) closed-book likelihood rank (or MC accuracy) of the gold answer among at least 20 same-type candidates, pathway off, neutral prompt, head and tail obscurity tiers, entity-valued relations; (b) fact injection: fictional biographies (bioS style, Allen-Zhu and Li, Physics of Language Models 3.1) inserted at 1 / 10 / 100 / 1000 exposures with their chunks in the store | (a) tail-tier rank worse than the matched no-retrieval control by at least 3 sigma (bootstrap); (b) closed-book rank at chance up to 100 exposures where the control memorizes | new closed-book rank scorer, PopQA and the tiers (Phase 4b build item); R0b. Method (2026-10-06, [seed_instruments.md](../measurements/seed_instruments.md)): read `delta` against the subject-blind prior, never the raw rank; report the cue relations (father, mother, capital, capital of) separately; the no-retrieval control must sit above its prior at the tail before the pathway arm is read against it (the seed's non-cue tail `delta` is 0.0088, paired sigma about 0.0012) |
 | A2 evidence recovery | fixed-target answer-span CE on held-out rows, gain = CE(none) - CE(cond) | gold gain at least 1.6 nats (50% of the 3.23-nat in-context ceiling); distractors gain at least 0 | `sft.py` `[eval fixed]`; `eval_abstention.py --evidence-port` cross-check |
-| A3 counterfactual faithfulness | memorization ratio p_orig / (p_orig + p_swap) (Longpre et al. 2021) under an entity-swapped gold chunk, on items answered correctly with the unswapped chunk, stratified by entity frequency, injected high-exposure facts included so conflicts exist at pilot scale; n reported per stratum | memorization ratio at most 0.05 and follow rate at least 90% in every stratum | new condition in `eval_abstention.py` |
+| A3 counterfactual faithfulness | memorization ratio p_orig / (p_orig + p_swap) (Longpre et al. 2021) under an entity-swapped gold chunk, on items answered correctly with the unswapped chunk, stratified by entity frequency, injected high-exposure facts included so conflicts exist at pilot scale; n reported per stratum | memorization ratio at most 0.05 and follow rate at least 90% in every stratum | new condition in `eval_abstention.py`. Method (2026-10-06, [seed_instruments.md](../measurements/seed_instruments.md)): read the high-frequency strata paired against a neutral-port baseline or binned by the frequency ratio of original to substitute, never by the original's count alone (the seed's `mr_ll` runs 0.050 to 0.957 across ratio bins with a neutral port) |
 | A4 store edit | edit or delete the gold chunk and its near neighbours in the store, re-retrieve with the model's own query, answer; not the oracle buffer | flip rate at least 70% on items answered correctly before the edit | two-store swap through the model-query retrieval path |
 | A5 selector | chunk AUROC (per token, chance 0.5) per loop; mass/chunk AUROC gold-present vs distractors; grounded AUROC (evidence rows) | chunk AUROC at least 0.59 per loop (3 sigma of 0.030 over 0.5); mass/chunk and grounded AUROC at least 0.674 (0.584 + 3 x 0.030) | `sft.py` `[eval fixed]` (Phase 4 home); `eval_abstention.py` cross-check |
 | A6 reasoning retained | HotpotQA, BoolQ and SciQ through the port against in-prompt, counted only on tasks whose in-prompt score is at least 3 sigma above chance; language benchmarks within noise | port at least in-prompt minus 2 points, judged at the binomial sigma; control is the pilot's own in-prompt score | `eval_benchmarks.py` with an evidence path |
@@ -390,7 +441,7 @@ cannot see the chains.
 | token tables | One table, tied to the LM head and the MTP head through small adapters; no weight decay on it. The per-layer and router tables become projections of it, gated on the per-layer table zero-ablation on the seed (Phase 4b). G9 gates the head tie only. |
 | shape | Shape L: width 1024, 16 heads x 64, 4 KV heads; 8 prelude layers; looped core of 3 sublayers per pass with 8 MLP experts each, top 2; 2 coda layers. About 470M total, 300M active per token. Sublayer count and expert count are pilot arms. |
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
-| real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. Open since 2026-10-05: R0b arm (c) leaked before its reader copied (50M) and did not grow after (100M on); the copy-first warm-up arm stored nothing without real-value targets, held the R0b rule through tier 100 at 300M, and still stored tier 1000 facts after copying (0.085, z 6.4 at the final save). Whether the recipe adds a requirement that fact spans are not supervised with real values before the reader copies (a warm-up or a copy criterion), or first acts on tier 1000, is open decision A (ladder step 6). |
+| real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. Decided 2026-10-05: fact spans are not supervised with real values before the reader copies (a copy-first warm-up, a new element of the pilot's schedule). R0b arm (c) leaked before its reader copied (50M) and did not grow after (100M on); the copy-first warm-up arm stored nothing without real-value targets, held the R0b rule through tier 100 at 300M, and still stored tier 1000 facts after copying (0.085, z 6.4 at the final save), recorded as a known leak. The warm-up is the better of two arms on one seed, not an optimum. The swap rate 0.30 branch (read 2026-10-06) left tier 1000 where it was (paired -0.002, z -0.3 in distribution), so the pilot's swap rate is chosen on copy quality and tier 100 margin; the choice is open, the user's. |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
 | loops (axiom) | "Passes add computation, not capacity; recalling a weakly stored fact can take more than one pass" (reworded 2026-10-04 from "loops buy computation, not storage") is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Decided 2026-10-04: the axiom is reworded as above and the storage-half falsifier is retired as read, since it measured recall depth, not capacity. The rule it leaves: every closed-book leak read is taken at full depth. Not planned, available if the axiom ever has to be quoted as measured: an arm with equal CE weight on every exit, which removes the weaker training of the early exits (a last-loop-only arm cannot be read by depth at all). Since 2026-10-05 the same arm is also the control the depth allocation arm would need (depth allocation, open decision ii). Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. |
 | depth allocation | Held 2026-10-05, not decided. The planned loop fix was learned depth allocation on the loop axis, an entropy-regularized exit distribution over depths (Ouro), tried as a micro arm against the fixed depth draw before it replaces the draw in the pilot. A design exists (a per-token gate `sigmoid(linear(h_t))`, exit distribution with the remainder on the last pass, `sum_t p_t L_t - beta H(p)` at beta 0.1; the gate reweights the per-pass losses and never touches the forward) and is not built. Open, for the user: (i) whether the Parked rule on learned halting and `docs/looped-transformers.md` 4.1 ("a learned depth mechanism must skip computation") get an explicit exemption for a gate that skips nothing in training and claims no speedup; (ii) whether the equal-weight control arm (`loop_ce_weights` 1/3 each, subsample 1.0, no depth draw, about 95 minutes) runs, which is the arm "loops (axiom)" lists as not planned; (iii) the pilot spec has a minimum depth of 3 and one CE on the last pass, so it has no per-pass exits for a gate to weigh. The per-exit read on micro arms (a) and (c) (`eval_exit.py`, 2026-10-05) finds little for the gate to learn on the biography corpus: the second pass's gain (+0.094) is spread evenly over confidence deciles, the third pass adds 0.006 nats, and the entropy-regularized optimum is near uniform even as a bound (0.343 / 0.286 / 0.371 at beta 0.1), which would cut the last pass's share of the CE weight from 0.67 to about 0.37 to 0.39. Recommendation: no gate arm on this corpus; the depth question needs a corpus where depth pays (the chain splits). |
@@ -446,7 +497,8 @@ Done, with the full records linked:
   pass. Arm (c) in full (2026-10-05) copies completely in distribution and fails on both forms, on
   a leak present at 50M before copying and flat after 100M. The copy-first warm-up arm stored
   nothing without real-value targets, then stored tier 1000 facts again after the switch; at 300M
-  it holds the R0b rule through tier 100 and leaks at tier 1000, and the verdict is open. The
+  it holds the R0b rule through tier 100 and leaks at tier 1000; R0b was accepted on it on
+  2026-10-05; a swap rate 0.30 branch (read 2026-10-06) left tier 1000 where it was. The
   per-exit read finds the second pass's gain spread evenly over tokens, so the depth
   allocation arm is held.
 
@@ -747,7 +799,15 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
   as a candidate the same day, after the copy-first warm-up arm stored tier 1000 facts again once
   real values were supervised with copying already in place. At 300M the warm-up arm holds the
   rule through tier 100 and leaks at tier 1000; a swap rate 0.30 second phase branched from its
-  100M save is the cheapest test of whether the remaining level follows the swap rate.
+  100M save (read 2026-10-06) found no large effect of the swap rate on the remaining level
+  (tier 1000 0.083 against 0.085), so the pilot's swap rate is chosen on copy quality and tier 100
+  margin.
+- **Copy-first warm-up** (decided 2026-10-05, a requirement). Fact spans are not supervised with
+  real values before the reader copies: the pilot opens with a warm-up in which every supported
+  span carries a substitute that its visible chunk also carries, and switches to real values once
+  the reader copies (on R0b the switch was at 100M with gold top-1 0.95 to 0.97). This is a new
+  element of the pilot's schedule; how long the warm-up runs at pilot scale, and whether a copy
+  criterion replaces a fixed length, is part of the pilot spec.
 - **QA.** Distractors half bge hard negatives, half random. Partial hop: a HotpotQA row with one
   supporting paragraph withheld, target abstains. Hop labels from MuSiQue and 2Wiki are for
   evaluation only. A wider abstention phrasing set.
@@ -764,7 +824,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 |---|---|---|---|---|---|
 | R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
 | R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop. **Read 2026-10-01**: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 by loop and the per-loop content gain 0.070 / 0.078 / 0.081 (arm B), so loop 1 reads best and later loops add little |
-| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; the anonymization sweep dropped 2026-10-04; the swap rate sweep set aside 2026-10-05 for a copy-first warm-up arm of (c), reopened as a candidate by the warm-up arm's 150M read | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms. **(c) read 2026-10-05: fails** on both forms. In distribution 0.027 (z 4.1) at tier 100 and 0.120 (z 8.8) at tier 1000, held out 0.013 (z 3.6) and 0.071 (z 8.2), while the reader copies (top-1 1.000, swapped card followed on every item); the leak is present at 50M before copying (0.010, z 4.0; 0.105, z 14.4) and flat after 100M (paired +0.001, z 0.2 at tier 100). **Copy-first warm-up arm, read 2026-10-05**: nothing stored at 50M and 100M without real-value targets (every cell within 3 sigma), copying at 100M (top-1 0.95 to 0.97); at 300M 0.015 (z 2.6) at tier 100 and 0.085 (z 6.4) at tier 1000 in distribution, held out 0.007 (z 2.0) and 0.047 (z 5.1): the rule holds through tier 100 on both forms, tier 1000 is a leak on both. Verdict open (decision A, ladder step 6) | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
+| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; the anonymization sweep dropped 2026-10-04; the swap rate sweep set aside 2026-10-05 for a copy-first warm-up arm of (c), reopened as a candidate by the warm-up arm's 150M read | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms. **(c) read 2026-10-05: fails** on both forms. In distribution 0.027 (z 4.1) at tier 100 and 0.120 (z 8.8) at tier 1000, held out 0.013 (z 3.6) and 0.071 (z 8.2), while the reader copies (top-1 1.000, swapped card followed on every item); the leak is present at 50M before copying (0.010, z 4.0; 0.105, z 14.4) and flat after 100M (paired +0.001, z 0.2 at tier 100). **Copy-first warm-up arm, read 2026-10-05**: nothing stored at 50M and 100M without real-value targets (every cell within 3 sigma), copying at 100M (top-1 0.95 to 0.97); at 300M 0.015 (z 2.6) at tier 100 and 0.085 (z 6.4) at tier 1000 in distribution, held out 0.007 (z 2.0) and 0.047 (z 5.1): the rule holds through tier 100 on both forms, tier 1000 is a leak on both. **Accepted 2026-10-05 on the warm-up arm**, the tier 1000 leak recorded as known; the swap rate 0.30 branch (read 2026-10-06) leaves tier 1000 at 0.083 (z 6.2), paired -0.002 (z -0.3) against the warm-up arm, and holds the rule with more margin (tier 100 0.010, z 1.7; 0.003, z 0.9) | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
 | R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable |
 | R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
 | R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
@@ -894,8 +954,9 @@ above are a different, live series).
   detectable without real-value targets, and that real-value supervision stores tier 1000 facts
   again even with copying in place (0.085, z 6.4 at 300M). Copying first brings tier 100 inside 3
   sigma on both forms; what sets the remaining tier 1000 level (the swap rate, the gold-drop
-  documents, residual span loss) is open, and decision A asks whether to act on it before any
-  1B-token spend.
+  documents, residual span loss) is open. The tier 1000 leak is recorded as known (decided
+  2026-10-05); the swap rate 0.30 branch (read 2026-10-06) found no large effect of the swap rate on it; the
+  placeholder name is the open lever before any 1B-token spend.
 - **Small models ignore evidence.** Models of 7B and under have been measured ignoring oracle
   passages 85 to 100% of the time on questions they cannot answer alone. At 120M the pilot may
   come out flat. The matched control and A6 decide, and the 1-hop curve must saturate first.
@@ -985,6 +1046,22 @@ above are a different, live series).
   plus a fact-injection probe, A3 a memorization ratio, A4 goes through the store, A7 is added,
   L1 and L2 are scored by read ablation at fixed depth, R0b is added, and the budget is recomputed
   at about 1.3 GFLOP per token.
+- 2026-10-06: the swap rate 0.30 branch (`inject_retrieval_kv_cf30`, from the warm-up arm's 100M
+  save) read: tier 1000 entity `delta` 0.083 (z 6.2) against the warm-up arm's 0.085, paired
+  -0.002 (z -0.3) in distribution and -0.008 (z -1.4) held out, so the pre-registered criterion is
+  not met and the swap rate is not a strong dial for the level that training maintains (no large
+  effect; a dose-sized one is under the stated power). Tier 100 is lower on both forms as a
+  direction (paired z -1.0 and -1.4) and the rule holds with more margin; copying is unchanged in
+  distribution. Open, the user's: the pilot's swap rate (recommendation: choose on copy quality
+  and tier 100 margin) and whether the placeholder name arm runs before the pilot. The placeholder
+  name arm is designed, not built (ladder step 6: about 40 lines plus 30 of tests, about 64 minutes
+  of training from the warm-up arm's 100M save; expected tier 1000 0.043 if the maintained level is
+  linear in dose, 0.064 if it saturates, unchanged under the before-copying reading); the
+  recommendation is to run it before freezing the pilot's lever list. The seed-side instruments are
+  done ([seed_instruments.md](../measurements/seed_instruments.md)): PopQA needs its prior control
+  (a raw-rank 7 sigma effect of the 10M finetune is the prior moving), and the counterfactual
+  strata must be read by frequency ratio or against a neutral-port baseline; gates A1 and A3 carry
+  both notes.
 - 2026-10-05: R0b arm (c) ran in full with the key/value reader. It copies completely from 150M on
   (top-1 1.000, a swapped card followed on every item in distribution) and fails the rule on both
   forms (tier 100 0.027, z 4.1 in distribution; 0.013, z 3.6 held out; tier 1000 a leak on both).
@@ -1000,10 +1077,13 @@ above are a different, live series).
   tier 1000 leaks on both (0.085, z 6.4; 0.047, z 5.1), the 0.03 expectation failed, and the
   warm-up arm sits under the original arm in every per-form cell without reaching 3 sigma per
   form. The arm (c) leak is read as both: in part written before copying, in part a level that
-  training maintains while real values are supervised next to the real name. The R0b verdict and
-  whether "no real-value fact supervision before the reader copies" enters the pilot are open
-  decision A; if tier 1000 is acted on first, the recommended arm is a swap rate 0.30 second phase
-  branched from the warm-up arm's 100M save, then the placeholder name. Corrections: the
+  training maintains while real values are supervised next to the real name. Decided by the user
+  the same day: R0b is accepted on the warm-up arm with the tier 1000 leak known, "no real-value
+  fact supervision before the reader copies" enters the pilot as a requirement (the warm-up is
+  the better of two arms on one seed, not an optimum), and a swap rate 0.30 second phase branched
+  from the warm-up arm's 100M save (`inject_retrieval_kv_cf30`) runs before the pilot spec is
+  frozen, with its criteria and its power stated before the read; the placeholder name follows if
+  the level does not follow the swap rate. Corrections: the
   held-out hold at matched 100M did not last; copying emerged between 50M and 100M. A per-exit
   read (`eval_exit.py`) finds the second pass's gain spread evenly over tokens and the
   entropy-regularized exit optimum near uniform, so the learned depth allocation arm is held, with

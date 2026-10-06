@@ -11,8 +11,11 @@ is [docs/plans/NEXT.md](docs/plans/NEXT.md) (older notes call it `PLAN.md`).
 Mirror of the "Now" section of NEXT.md; update both when the next step changes. As of 2026-10-05
 R0b arms (a), (b) and (c) have run in full: the key/value reader copies completely in distribution
 and arm (c) fails, on a leak present before copying existed. With a copy-first warm-up the R0b
-rule holds through tier 100 and tier 1000 still leaks; the gate verdict is the user's (open
-decision A). The learned depth allocation arm is held on open decisions after the per-exit read.
+rule holds through tier 100 and tier 1000 still leaks. Decided 2026-10-05: R0b is accepted on the
+warm-up arm with the tier 1000 leak known, the warm-up enters the pilot as a requirement, and a
+swap rate 0.30 branch (read 2026-10-06) left the tier 1000 leak where it was, so the pilot's
+swap rate is an open choice on copy quality and tier 100 margin. The learned
+depth allocation arm is held on open decisions after the per-exit read.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -105,31 +108,60 @@ source and the artifact stays identical to it; the file goes into the same commi
   real-value target; real-value supervision after copying still writes frequent facts (tier 1000
   to 0.08 to 0.10, then flat); tier 100 inside 3 sigma on both forms. The original arm's leak is
   in part written before copying, in part a level training maintains. Open: what sets that level
-  (the swap rate, the gold-drop documents, residual span loss after copying).
+  (the swap rate, the gold-drop documents, residual span loss after copying). Decided 2026-10-05:
+  R0b accepted on this arm, tier 1000 leak known, "no real-value fact supervision before the
+  reader copies" a pilot requirement; the warm-up is the better of two arms on one seed, not an
+  optimum, and its gain over the original arm is a direction, not established per form.
+- **The swap rate 0.30 branch, started 2026-10-05, read 2026-10-06** (`inject_retrieval_kv_cf30`,
+  from the warm-up arm's 100M save, `--train-split inject_retrieval_s30a50_train`, 299.19M tokens,
+  filler CE 3.9131 against 3.9106): final entity `delta` in distribution 0.005 / 0.004 / 0.010
+  (z 1.7) / 0.083 (z 6.2), held out -0.002 / -0.001 / 0.003 (z 0.9) / 0.039 (z 4.6). Paired against
+  the warm-up arm: tier 1000 -0.002 (z -0.3) in distribution, -0.008 (z -1.4) held out, -0.005
+  (z -1.0) pooled: the pre-registered criterion (z at or beyond -3) is not met, so no large effect
+  of the swap rate on tier 1000 (a dose-sized one is under the stated power). Tier 100 -0.004
+  (z -1.0) and -0.004 (z -1.4), a direction; `compare` HOLDS on both forms. The raw-rank z -4.0 in
+  `compare_cf_vs_cf30.log` is mostly the real name ranking worse (+0.014, z 3.8, all classes
+  pooled), with the prior also worse, so `delta` moves -0.009 (z -2.1). Copying unchanged in
+  distribution; prompt copy held out 0.008 (top-1 0.83), the same as the warm-up arm. The 150M
+  `none` read was taken; 200M, 250M and the other
+  150M modes were not.
+- **Seed-side instruments, done 2026-10-06** ([seed_instruments.md](docs/measurements/seed_instruments.md)):
+  PopQA with its prior control, seed entity `delta` 0.0287 (z 11.7) / 0.0263 (z 12.8) / 0.0356
+  (z 19.4) by tail / mid / head, concentrated in four cue relations (father, mother, capital,
+  capital of: 0.151; tail 0.261 against head 0.113); the other 9,430 entity items 0.0088 / 0.0075 /
+  0.0070. At the entity tail the 10M arms move the raw rank +0.0090 (z 7.4, arm A) but the prior
+  +0.0102, so `delta` +0.0012 (z 1.0): the finetune moved the prior, stored nothing. Counterfactual
+  likelihood (1,409 items): seed `mr_ll` 0.295 to 0.766 by stratum is a frequency-ratio prior
+  (neutral port; correlation 0.636 with the log count ratio); the arms follow in no stratum (paired
+  gap +0.01, z 0.1, arm A). Gates A1 and A3 carry the method notes (prior control and cue relations;
+  ratio-binned or baseline-paired `mr_ll`). Raw `ckpts/instruments/popqa_*`, `cfll_*`.
 - Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
   in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
 - **Next, in order** (the full ladder with its done steps is in NEXT.md):
-  1. Open decision A (the user's): accept R0b on the warm-up arm's read (rule holds through tier
-     100, tier 1000 leaks) and carry "no real-value fact supervision before the reader copies" into
-     the pilot as a requirement (a new element of the pilot's schedule), or first act on tier 1000.
-     The `gold`, `swapped`, `prompt` reads at 150M, 200M and 250M were still landing.
-  2. If tier 1000 is acted on, cheapest first: (1) a second phase at swap rate 0.30 branched from
-     the warm-up arm's 100M save: build `--suffix s30a50`, copy the 100M save and `run_state.json`
-     into a new run directory, relaunch with `--train-split inject_retrieval_s30a50_train`; no
-     code; about 60 minutes plus reads; read as paired tier 1000 against the warm-up arm at the
-     same saves (does the maintained level follow the swap rate). (2) The placeholder name in
-     gold-present documents with the card carrying the same placeholder (about 25 lines in the
-     builder and `biographies.render_store_chunk`). Then a span weight by a copy criterion. The
+  1. Open decision (the user's): the pilot's swap rate, and whether the placeholder name arm (gold-
+     present documents with the card carrying the same placeholder; about 25 lines in the builder
+     and `biographies.render_store_chunk`) runs before the pilot. Recommendation: choose the swap
+     rate on copy quality and tier 100 margin, not tier 1000; 0.30 against 0.15 copies the same in
+     distribution, follows a swapped card 0.654 to 0.673 against 0.663 to 0.690 held out, and gives
+     tier 100 more margin (z 1.7 and 0.9 against 2.6 and 2.0), a direction only. The placeholder
+     name arm is designed, not built (NEXT.md step 6): `--placeholder-rate 0.5` for gold-present
+     documents (document and gold card share a placeholder, each distractor its own, swaps on top),
+     about 40 lines in `prepare_injection_data.py` and `render_store_chunk(name_override=)` plus 30
+     of tests, branched from the warm-up arm's 100M save (paired sigma about 0.006), about 64
+     minutes of training. Real value with real name drops to 0.346 of exposures (0.686 at p = 0).
+     Expected tier 1000 against 0.085: unchanged if written before copying, 0.043 (z about -6) if
+     linear in dose, 0.064 (z about -3) if it saturates; follows dose at paired z at or beyond -3,
+     falsified at pooled z above -2. It cannot carry to the pilot; its result decides whether a
+     trainer-side copy-criterion span weight is worth building. Recommendation: run it before
+     freezing the pilot's lever list, writing the spec in parallel.
+  2. The pilot spec, with the copy-first warm-up requirement and the swap rate the user sets. The
      goldfish loss is expected no better than a dose cut (renders are paraphrased).
   3. Held: learned depth allocation (Ouro gate, designed, not built). Open, the user's: an
      exemption from the Parked halting rule and `docs/looped-transformers.md` 4.1 (the gate skips
      nothing); the equal-weight control arm (the one "loops (axiom)" lists as not planned); the
      pilot spec has no per-pass exits. Recommendation: no gate arm on the biography corpus; read
      depth on the chain splits (only the eval splits are built).
-  4. Seed-side instruments still open: counterfactual (`--counterfactual-likelihood-only` for the
-     abstaining 10M arms) and PopQA on the seed and both 10M checkpoints.
-  5. The pilot (Phase 5) with the key/value reader, after the R0b verdict (decision A), ladder cut
-     to budget.
+  4. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
   emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same

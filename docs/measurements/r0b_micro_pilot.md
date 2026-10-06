@@ -410,7 +410,7 @@ after 100M not at all, and tier 1000 decays slowly. Weakened the same day by the
   (`s30a50`) was set aside on 2026-10-05. The warm-up arm's 150M read removes the support for
   "the swap acts only before copying": if the leak is a level that training maintains, swapped
   exposures act against memory at every point. `s30a50` is reopened as a candidate by the 150M
-  read, not run yet; it is the cheapest next arm if tier 1000 is acted on (below).
+  read; it runs since 2026-10-05 as a branch of the warm-up arm (below).
 - **The copy-first warm-up arm, run 2026-10-05**, run name
   `inject_retrieval_kv_cf` (`ckpts/evidence_inject_retrieval_kv_cf/`). It trains on a second
   retrieval split at swap rate 1.0, `inject_retrieval_s100a50_train`, built with
@@ -431,9 +431,9 @@ after 100M not at all, and tier 1000 decays slowly. Weakened the same day by the
   reading. If it passes, the pilot inherits a requirement: fact spans are not supervised with real
   values before the reader copies (a warm-up or a copy criterion). Read in full below: the rule
   holds through tier 100, tier 1000 leaks, the 0.03 expectation failed and the falsifier triggered
-  at tier 1000; whether the requirement enters the pilot is open decision A (NEXT.md).
-- **Remaining levers if tier 1000 is acted on**, cheapest first: a second phase at swap rate 0.30
-  branched from the warm-up arm's 100M save; a placeholder name in gold-present documents, with the
+  at tier 1000. Decided 2026-10-05: the requirement enters the pilot (below).
+- **Remaining levers against tier 1000**, cheapest first: a second phase at swap rate 0.30
+  branched from the warm-up arm's 100M save (read 2026-10-06: no large effect, below); a placeholder name in gold-present documents, with the
   card carrying the same placeholder; a span weight by a copy criterion in the trainer. The
   goldfish loss is expected to do no better than a dose cut, since the renders are paraphrased.
 
@@ -454,8 +454,9 @@ warm-up arm ends 0.007 above arm (a), which never had evidence. Saves in
 
 Reads in hand when these tables were built: `none` at 50M, 100M, 150M, 200M, 250M and final (250M
 landed last and was added to the trajectory only; the paired tests below do not use it); `gold`
-and `swapped` at 50M, 100M and final; `prompt` at final. Missing (still running): `gold`,
-`swapped` and `prompt` at 150M, 200M and 250M.
+and `swapped` at 50M, 100M and final; `prompt` at final. Not used here (they landed after the
+tables were built and are on disk, not tabulated): `gold`, `swapped` and `prompt` at 150M, 200M
+and 250M.
 
 Entity class, closed-book `delta` (z) from each save's own log, next to the original arm (c) on the
 same items; gold top-1 and the swapped follow rate (all classes) in distribution:
@@ -528,7 +529,7 @@ classes); prompt copy rank 0.0000 in distribution (top-1 0.997 to 1.000), held o
   through tier 100 while full climbs". The margin is small in distribution (tier 100 z 2.6). Tier
   1000 is a leak on both forms by the rule's own reading of tier 1000 (0.085, z 6.4; 0.047, z 5.1),
   and the date class leaks at tier 1000 in distribution (0.106, z 3.6). No tier 100 cell in any
-  class or form is beyond 3 sigma. The gate verdict on this basis is the user's to give.
+  class or form is beyond 3 sigma. The gate verdict was the user's; decided 2026-10-05 (below).
 - **Lower than the original arm, not at 3 sigma per form.** Paired against the original arm (c) at
   the final save (same items), entity: in distribution tier 100 -0.012 (z -1.5), tier 1000 -0.035
   (z -2.2); held out -0.006 (z -1.4) and -0.024 (z -2.2). At 150M the same comparison read -0.018
@@ -562,14 +563,92 @@ classes); prompt copy rank 0.0000 in distribution (top-1 0.997 to 1.000), held o
   answering from memory at every point of training; untested), the gold-drop documents (20% of
   biography documents carry no gold card; their spans are supervised only where a distractor card
   happens to carry the same value, 1.1% of all spans), and residual span loss after copying.
-- **Plan state** (decisions are the user's, recorded in NEXT.md). Open decision A: accept R0b on
-  this basis and carry "no real-value fact supervision before the reader copies" into the pilot as
-  a requirement (a new element of the pilot's schedule), or first act on tier 1000. If tier 1000 is
-  acted on, cheapest first: (1) a second phase at swap rate 0.30 branched from the warm-up arm's
-  100M save (build `--suffix s30a50`, copy the 100M save and `run_state.json` into a new run
-  directory, relaunch with `--train-split inject_retrieval_s30a50_train`; no code; about 60
-  minutes plus reads), read as paired tier 1000 against the warm-up arm at the same saves, which
-  tests whether the maintained level follows the swap rate; (2) the placeholder name in
+
+**Decided 2026-10-05 (by the user, both).** (1) The copy-first warm-up is accepted as the basis for
+R0b: the rule holds through tier 100 on both forms with it (marginally, in distribution z 2.6), the
+tier 1000 leak is recorded as known, and "no real-value fact supervision before the reader copies"
+goes into the pilot as a requirement, a new element of the pilot's schedule. The warm-up is the
+better of two arms on one seed, not an optimum; its improvement over the original arm is a
+direction, not established per form. (2) The swap rate 0.30 branch below ran before the pilot spec
+is frozen, because it sets a pilot parameter (the swap rate) either way.
+
+### The swap rate 0.30 branch (started 2026-10-05, read 2026-10-06)
+
+Run name `inject_retrieval_kv_cf30` (`ckpts/evidence_inject_retrieval_kv_cf30/`, log
+`ckpts/inject/inject_retrieval_kv_cf30.log`, launcher `ckpts/inject/launch_kv_cf30.sh`). The split
+`inject_retrieval_s30a50_train` is built with `--swap-rate 0.30 --anon-rate 0.5 --gold-drop-rate
+0.2 --arms retrieval --suffix s30a50`; the warm-up arm's 100M save
+(`checkpoint_evidence_tok100M_loss7.7318.pt`) and a `run_state.json` at 100,419,895 tokens are
+copied into the new run directory, and the run goes to 300M with `--reader-kv` and `--train-split
+inject_retrieval_s30a50_train`. No code change. Every save past 100M gets `none`, `gold`,
+`swapped` and `prompt` reads into `ckpts/inject/rank_retrieval_kv_cf30<tag>_<mode>`. The two arms
+share everything up to 100M, so later differences come from the swap rate (0.30 against 0.15) and
+the draw of which spans are swapped.
+
+Criteria, fixed before the read:
+
+- **The question**: does the level that training maintains follow the swap rate. Read closed-book
+  entity `delta` at tiers 1000 and 100, paired against the warm-up arm at the same saves (150M,
+  200M, 250M, final), per form. It follows the swap rate if tier 1000 is lower than the warm-up
+  arm's at paired z at or beyond -3 per form at the final save, or on both forms pooled.
+- **Power, stated before the read.** The paired sigma at tier 1000 is about 0.016 in distribution
+  and 0.011 held out (from the warm-up against original comparison at the final save: -0.035 at
+  z -2.2 and -0.024 at z -2.2). Only a drop of about 0.05 in distribution (the 0.085 falling to
+  about 0.035 or below) reads at 3 sigma per form. A pure dose effect (real-value share 0.68 to
+  0.56) predicts about 0.07, which this arm cannot separate from no effect. A null therefore means
+  "no large effect of the swap rate", not "no effect".
+- **Alongside**: copying must not degrade (gold top-1 in distribution, swapped follow, held-out
+  follow, against the warm-up arm), tier 100 must stay within 3 sigma, and the filler CE gap is
+  read again (the warm-up arm ended 0.026 above the original arm after its switch).
+- **After it**: if the level follows the swap rate, the pilot's swap rate is set from it; if not,
+  the placeholder name in gold-present documents with the card carrying the same placeholder
+  (about 25 lines in the builder and `biographies.render_store_chunk`) is the next candidate
+  against tier 1000, and the pilot can start with the warm-up alone (the user's call then).
+
+**Read 2026-10-06.** Finished at 299.19M tokens, the second phase in 63.8 minutes, filler
+validation CE 3.9131 (warm-up arm 3.9106, original arm (c) 3.8842). Reads taken: `none` at 150M
+and final, `gold` and `swapped` at final. Not taken: the 200M and 250M reads and `gold`, `swapped`,
+`prompt` at 150M. The final `prompt` read landed after the tables were built: in distribution rank
+0.0001 (top-1 0.993 to 0.997), held out 0.0084 (top-1 0.834), the same as the warm-up arm's 0.0081
+(0.839).
+
+Entity class, closed-book `delta` (z) from each save's own log:
+
+| save | arm | indist, tier 100 | indist, tier 1000 | heldout, tier 100 | heldout, tier 1000 |
+|---|---|---|---|---|---|
+| 150M | swap 0.30 branch | 0.003 (0.6) | 0.072 (5.3) | 0.006 (1.4) | 0.027 (3.0) |
+| 150M | warm-up arm (swap 0.15) | 0.011 (1.9) | 0.081 (6.0) | 0.002 (0.5) | 0.021 (2.3) |
+| final | swap 0.30 branch | 0.010 (1.7) | 0.083 (6.2) | 0.003 (0.9) | 0.039 (4.6) |
+| final | warm-up arm (swap 0.15) | 0.015 (2.6) | 0.085 (6.4) | 0.007 (2.0) | 0.047 (5.1) |
+
+Final branch, tiers 1 and 10: 0.005 (0.8) / 0.004 (0.7) in distribution, -0.002 (-0.5) / -0.001
+(-0.2) held out. No tier 100 cell in any class or form is beyond 3 sigma (largest noun in
+distribution 0.026, z 2.5); dates at tier 1000 in distribution 0.099 (z 3.0). `compare full masked
+retrieval_kv_cf30`: HOLDS on both forms.
+
+- **Paired branch minus warm-up arm at the final save** (same items, entity): tier 1000 -0.002
+  (z -0.3) in distribution, -0.008 (z -1.4) held out, -0.005 (z -1.0) pooled over forms; tier 100
+  -0.004 (z -1.0) and -0.004 (z -1.4). All classes pooled over forms: tier 1000 -0.009 (z -2.1),
+  with the real name ranking worse by +0.014 (z 3.8) and the prior worse by +0.005 (z 1.2). That
+  real-rank change is what `compare_cf_vs_cf30.log` shows as tier 1000 -0.014 at z -4.0 (raw rank,
+  warm-up minus branch); the `delta` change is smaller and under 3 sigma.
+- **Criterion: not met.** Tier 1000 is not lower at paired z at or beyond -3, per form or pooled.
+  The tier 1000 level does not follow the swap rate in any large way (0.083 against 0.085 in
+  distribution): doubling the swap rate after the switch leaves the frequent-fact leak where it
+  was, so the swap rate is not a strong dial for the level that training maintains. Within the
+  stated power this is "no large effect", not "no effect": a dose-sized effect (about 0.07) could
+  not be separated from none.
+- **Tier 100**: lower on both forms as a direction (paired z -1.0 and -1.4), and the rule holds
+  with more margin (z 1.7 and 0.9 against 2.6 and 2.0).
+- **Copying does not degrade.** Gold top-1 in distribution 0.999 to 1.000 in both arms, held out
+  entity 0.62 to 0.73 against 0.60 to 0.74; swapped card followed on every item in distribution,
+  held out 0.654 to 0.673 against 0.663 to 0.690 (all classes; tier 1000 -0.036, z -2.1); `mr_ll`
+  0.000 in distribution and within 0.005 held out. Prompt copy: not read.
+- **Plan state.** Open, the user's: the pilot's swap rate, and whether the placeholder name arm
+  runs before the pilot. Recommendation: choose the swap rate on copy quality and tier 100 margin,
+  not on tier 1000. On those reads 0.30 against 0.15 copies the same in distribution, follows a
+  swapped card about 0.01 to 0.04 less often held out (under 3 sigma), and gives tier 100 more
+  margin, a direction only. The open lever against tier 1000 is the placeholder name in
   gold-present documents with the card carrying the same placeholder (about 25 lines in the
   builder and `biographies.render_store_chunk`).
 
