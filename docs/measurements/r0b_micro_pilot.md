@@ -1,4 +1,4 @@
-# Fact injection micro-pilot: arms (a), (b) and (c), the arm (c) readers, the loop reading, the per-exit read (2026-10-02 to 10-05)
+# Fact injection micro-pilot: arms (a), (b) and (c), the arm (c) readers, the loop reading, the per-exit read, the lever branches (2026-10-02 to 10-08)
 
 The first from-scratch runs. Model: `config_micro.yaml`, 35.5M parameters (12.6M outside the
 embeddings), random init from `init_scratch_seed.py --seed 0`. Corpus: `data/prepared_inject`, 300M
@@ -434,8 +434,11 @@ after 100M not at all, and tier 1000 decays slowly. Weakened the same day by the
   at tier 1000. Decided 2026-10-05: the requirement enters the pilot (below).
 - **Remaining levers against tier 1000**, cheapest first: a second phase at swap rate 0.30
   branched from the warm-up arm's 100M save (read 2026-10-06: no large effect, below); a placeholder name in gold-present documents, with the
-  card carrying the same placeholder; a span weight by a copy criterion in the trainer. The
-  goldfish loss is expected to do no better than a dose cut, since the renders are paraphrased.
+  card carrying the same placeholder (read 2026-10-08: the dose lever is falsified, below); a span
+  weight by a copy criterion in the trainer (dropped 2026-10-08 on the placeholder arm's null). The
+  goldfish loss is expected to do no better than a dose cut, since the renders are paraphrased. No
+  lever against tier 1000 is left on the list; the pilot carries the copy-first warm-up at swap rate
+  0.15.
 
 ### The warm-up arm in full: the rule holds through tier 100, tier 1000 leaks
 
@@ -646,12 +649,12 @@ retrieval_kv_cf30`: HOLDS on both forms.
   0.000 in distribution and within 0.005 held out. Prompt copy held out 0.0084 (top-1 0.834),
   the same as the warm-up arm (read after the tables, above).
 - **Plan state.** Decided 2026-10-06 by the user: the pilot's swap rate stays at 0.15, and the
-  placeholder name arm is approved, not started (NEXT.md step 6). The recommendation on record was: choose the swap rate on copy quality and tier 100 margin,
+  placeholder name arm is approved (NEXT.md step 6; ran and read 2026-10-08, below). The recommendation on record was: choose the swap rate on copy quality and tier 100 margin,
   not on tier 1000. On those reads 0.30 against 0.15 copies the same in distribution, follows a
   swapped card about 0.01 to 0.04 less often held out (under 3 sigma), and gives tier 100 more
-  margin, a direction only. The open lever against tier 1000 is the placeholder name in
+  margin, a direction only. The open lever against tier 1000 was then the placeholder name in
   gold-present documents with the card carrying the same placeholder (about 25 lines in the
-  builder and `biographies.render_store_chunk`).
+  builder and `biographies.render_store_chunk`); it was falsified on 2026-10-08 (below).
 
 Raw output: `ckpts/inject/rank_retrieval_kv{50M,100M,150M,200M,250M,final}_{gold,swapped,none,prompt}`
 (`.json` and `.log`; 50M has `none` and `gold` only), `rank_full_50M`, `compare_full_masked_kv.log`;
@@ -660,6 +663,88 @@ training logs `inject_retrieval_kv.log`, `inject_retrieval_kv_resume.log`; warm-
 `rank_retrieval_kv_cf{50M,100M}_{gold,none,swapped}`, `rank_retrieval_kv_cf{150M,200M}_none`,
 `rank_retrieval_kv_cffinal_{none,gold,swapped,prompt}`, `compare_full_masked_kv_cf.log`,
 `compare_kv_vs_cf.log`.
+
+### The placeholder name arm (built and read 2026-10-08): the dose lever is falsified
+
+The question: does the level that training maintains at tier 1000 follow the number of supervised
+spans that pair the real name with the real value. Design, criteria and predictions were fixed on
+2026-10-05/06 (NEXT.md step 6): in half of the gold-present documents the subject's name is
+replaced by a placeholder, the gold card is rendered with the same placeholder and each distractor
+card with its own, swaps on top, gold-absent anonymization unchanged, keys canonical; the eval
+renders its own cards with the real name, so `closed_book_rank.py` is unchanged. At p = 0.5 and
+swap 0.15 the real value is supervised next to the real name in 0.346 of exposures (0.686 at
+p = 0). Predicted tier 1000 entity `delta` at the final save against the warm-up arm's 0.085:
+unchanged if the level was written before copying, 0.043 (z about -6) if it is linear in dose,
+0.064 (z about -3) if it saturates. Criterion: it follows dose at paired z at or beyond -3 per form
+or pooled; the lever is falsified at pooled z above -2.
+
+**Build.** `prepare_injection_data.py --placeholder-rate 0.5 --arms retrieval --suffix s15a50p50`
+(swap 0.15, anon 0.5, gold drop 0.2, seed 42), 4 minutes: split `inject_retrieval_s15a50p50_train`,
+558,657 documents, 298.26M tokens. `.evkey`, `.evgold`, `.cond`, `.evkeyidx` and `.ans` are byte
+identical to `inject_retrieval_train`; 64,664 of 129,438 gold-present documents renamed (0.4996);
+swaps 97,395, identical to the base split; anonymized gold-absent documents 16,294, unchanged. The
+builder change: `--placeholder-rate` (default 0; rate 0 is byte identical to the old code, verified
+side by side), `biographies.render_store_chunk(name_override=)`, and the placeholder draws on their
+own rng stream, so the gold flag, buffer and swap draws do not move; tests in section 8 of
+`tests/test_prepare_injection.py`.
+
+**Training.** Run `inject_retrieval_kv_cf_p50` (`ckpts/evidence_inject_retrieval_kv_cf_p50/`, log
+`ckpts/inject/inject_retrieval_kv_cf_p50.log`), branched from the warm-up arm's 100M save
+(`checkpoint_evidence_tok100M_loss7.7318.pt`, resume at document 187,658) with `--reader-kv` and
+`--train-split inject_retrieval_s15a50p50_train`, to 298.27M tokens in 68.5 minutes. Filler
+validation CE on `inject_val` tracks the warm-up arm within 0.003 at every matched step (4.0018
+against 4.0040 at step 9000, 3.9581 against 3.9561 at 10000, 3.9301 against 3.9323 at 11000); final
+3.9161, against 3.9106 for the warm-up arm and 3.9131 for the swap rate 0.30 branch.
+
+Final save, closed-book entity `delta` (z) from each save's own log:
+
+| arm, final | form | tier 1 | tier 10 | tier 100 | tier 1000 |
+|---|---|---|---|---|---|
+| placeholder, p = 0.5 | indist | 0.005 | 0.001 | 0.0185 (3.0) | 0.0986 (6.7) |
+| warm-up (p = 0) | indist | 0.004 | 0.000 | 0.0146 (2.6) | 0.0848 (6.4) |
+| placeholder, p = 0.5 | heldout | 0.000 | -0.003 | 0.0133 (3.7) | 0.0559 (6.4) |
+| warm-up (p = 0) | heldout | 0.001 | -0.001 | 0.0069 (2.0) | 0.0469 (5.1) |
+
+Other classes at tier 1000 in the placeholder arm: dates 0.090 (z 2.8) in distribution, 0.028
+(z 1.1) held out; nouns 0.035 (z 1.5) / 0.025 (z 1.7).
+
+- **Paired, placeholder arm minus warm-up arm** (same items, entity): tier 1000 +0.014 (z +1.3) in
+  distribution, +0.009 (z +1.3) held out, +0.011 (z +1.8) pooled over forms; tier 100 +0.004
+  (z +0.8), +0.006 (z +2.2), +0.005 (z +1.8) pooled. The real name's raw rank is better in the
+  placeholder arm (tier 1000 -0.025, z -4.6 pooled) and so is the prior (-0.014, z -2.5), so the
+  `delta` does not move.
+- **Criterion: falsified.** Pooled z at tier 1000 is +1.8, above -2. Halving the
+  real-name-with-real-value supervision (0.686 to 0.346 of exposures) left the tier 1000 level where
+  it was, if anything higher (a direction at z 1.3 to 1.8). Neither dose prediction (0.043, 0.064)
+  came true; the "unchanged" reading did.
+- **The rule at tier 100.** `compare full masked retrieval_kv_cf_p50`: HOLDS in distribution (the
+  tier 100 cell at the edge, z 3.0), FAILS on the held-out form at tier 100 (retrieval off its prior,
+  0.0133, z 3.7). The warm-up arm held on both forms, so the placeholder arm is worse on the rule at
+  tier 100 too, a direction (paired held out +0.006, z 2.2).
+- **Copying, paired against the warm-up arm at the final save.** In distribution unchanged: gold
+  top-1 1.000, a swapped card followed on every item, `mr_ll` 0.000. Held out it degrades: gold
+  top-1 (entity) 0.53 / 0.53 / 0.53 / 0.68 by tier against 0.60 / 0.63 / 0.61 / 0.74 (paired -0.06
+  to -0.10, z -2.5 to -8.0); swapped card followed 0.51 / 0.53 / 0.52 / 0.54 against 0.61 / 0.62 /
+  0.60 / 0.63 (z -3.4 to -8.1); `mr_ll` 0.034 to 0.066 against 0.027 to 0.049 (z about +2.5). The
+  prompt copy held out improves: top-1 0.84 to 0.87 (z +3 to +3.7); in distribution 0.996 to 1.000,
+  unchanged.
+- **Reading.** The maintained tier 1000 level is not proportional to the number of supervised spans
+  that pair the real name with the real value. A trainer-side span weight by a copy criterion would
+  cut exactly that count, so it is not worth building and is dropped from the pilot's lever list.
+  What writes the level stays open; candidates on record: the gold-absent documents, which carry the
+  real name with unsupervised values; the input path; the prior drifting under real-name exposure.
+  The masked arm's 0.012 at tier 1000 is the floor of that family. The held-out copy loss is a cost
+  of the placeholder and fits the reader binding on the name: with half the cards carrying a
+  placeholder, matching by name is trained less, and the held-out templates, which name the person
+  differently, suffer; in distribution the surface match carries it anyway. That is a reading, not
+  established.
+- **Consequence for the plan.** The copy-criterion span weight is dropped (decided 2026-10-08). The
+  placeholder was diagnostic only and does not carry to the pilot (on record since 2026-10-06). The
+  pilot's lever list against the leak is the copy-first warm-up alone, at swap rate 0.15.
+
+Raw output: `ckpts/inject/rank_retrieval_kv_cf_p50final_{none,gold,swapped,prompt}.{json,log}`,
+`compare_cf_vs_cf_p50.log`, `compare_full_masked_kv_cf_p50.log`, training log
+`inject_retrieval_kv_cf_p50.log`.
 
 ## The per-exit read: depth pays evenly on this corpus (2026-10-05)
 
@@ -699,8 +784,11 @@ tokens, the third pass adds 0.006 nats, and the gate's own optimum is near unifo
 the last pass's share of the CE weight from 0.67 (`loop_ce_weights` 0.2 / 0.3 / 1.0) to about 0.37
 to 0.39, against the requirement that a weak later loop is fixed, not cut. Recommendation recorded
 with it: do not train the gate arm on the biography corpus; the depth question needs a corpus where
-depth pays (the chain splits, of which only the eval splits are built). Three decisions on it are
-open (NEXT.md, ladder step 8).
+depth pays (the chain splits, of which only the eval splits are built). The gate arm was dropped on
+2026-10-06 and its three open questions closed as moot (NEXT.md, ladder step 8); the chain depth
+arm takes its place, specified in [chain_depth_micro.md](chain_depth_micro.md) (2026-10-08).
+`eval_exit.py` cannot read that arm (it refuses splits with evidence), so its full-site cells at
+depth 1, 2 and 3 stand in for the per-exit read there.
 
 Raw output: `ckpts/inject/exit_full.{json,log}` (arm (a) final), `exit_retrieval_kv.{json,log}`
 (arm (c) final).

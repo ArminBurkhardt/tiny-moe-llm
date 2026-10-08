@@ -15,7 +15,11 @@ rule holds through tier 100 and tier 1000 still leaks. Decided 2026-10-05: R0b i
 warm-up arm with the tier 1000 leak known, the warm-up enters the pilot as a requirement, and a
 swap rate 0.30 branch (read 2026-10-06) left the tier 1000 leak where it was. Decided 2026-10-06
 (the user): the pilot's swap rate stays at 0.15; the placeholder name arm and a chain depth arm
-are approved, not started; the learned exit gate arm is dropped on the per-exit read.
+are approved; the learned exit gate arm is dropped on the per-exit read. On 2026-10-08 the
+placeholder name arm falsified the dose lever, so the copy-criterion span weight is dropped and the
+pilot's lever list is the warm-up alone at swap rate 0.15. The same day the chain depth arm read
+inconclusive ([chain_depth_micro.md](docs/measurements/chain_depth_micro.md)): the micro model
+never learned 1-hop lookup, so L1 stays unmeasured at micro scale; the pilot spec is next.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -112,19 +116,46 @@ source and the artifact stays identical to it; the file goes into the same commi
   R0b accepted on this arm, tier 1000 leak known, "no real-value fact supervision before the
   reader copies" a pilot requirement; the warm-up is the better of two arms on one seed, not an
   optimum, and its gain over the original arm is a direction, not established per form.
-- **The swap rate 0.30 branch, started 2026-10-05, read 2026-10-06** (`inject_retrieval_kv_cf30`,
-  from the warm-up arm's 100M save, `--train-split inject_retrieval_s30a50_train`, 299.19M tokens,
-  filler CE 3.9131 against 3.9106): final entity `delta` in distribution 0.005 / 0.004 / 0.010
-  (z 1.7) / 0.083 (z 6.2), held out -0.002 / -0.001 / 0.003 (z 0.9) / 0.039 (z 4.6). Paired against
-  the warm-up arm: tier 1000 -0.002 (z -0.3) in distribution, -0.008 (z -1.4) held out, -0.005
-  (z -1.0) pooled: the pre-registered criterion (z at or beyond -3) is not met, so no large effect
-  of the swap rate on tier 1000 (a dose-sized one is under the stated power). Tier 100 -0.004
-  (z -1.0) and -0.004 (z -1.4), a direction; `compare` HOLDS on both forms. The raw-rank z -4.0 in
-  `compare_cf_vs_cf30.log` is mostly the real name ranking worse (+0.014, z 3.8, all classes
-  pooled), with the prior also worse, so `delta` moves -0.009 (z -2.1). Copying unchanged in
-  distribution; prompt copy held out 0.008 (top-1 0.83), the same as the warm-up arm. The 150M
-  `none` read was taken; 200M, 250M and the other
-  150M modes were not.
+- **Swap rate 0.30 branch, read 2026-10-06** (`inject_retrieval_kv_cf30`, from the warm-up arm's
+  100M save on `inject_retrieval_s30a50_train`, 299.19M tokens, filler CE 3.9131): final entity
+  `delta` in distribution 0.005 / 0.004 / 0.010 (z 1.7) / 0.083 (z 6.2), held out -0.002 / -0.001 /
+  0.003 (z 0.9) / 0.039 (z 4.6). Paired against the warm-up arm, tier 1000 -0.002 (z -0.3) /
+  -0.008 (z -1.4), -0.005 (z -1.0) pooled: criterion (z at or beyond -3) not met, no large effect (a
+  dose-sized one is under the power); tier 100 -0.004 (z -1.0 / -1.4); `compare` HOLDS on both
+  forms. The raw-rank z -4.0 in `compare_cf_vs_cf30.log` is the real name ranking worse (+0.014,
+  z 3.8, all classes pooled), the prior also worse, so `delta` moves -0.009 (z -2.1). Copying
+  unchanged; prompt copy held out 0.008 (top-1 0.83). Of the middle saves only 150M `none` was read.
+- **Placeholder name arm, read 2026-10-08: the dose lever is falsified** (`inject_retrieval_kv_cf_p50`,
+  `ckpts/evidence_inject_retrieval_kv_cf_p50/`). Split `inject_retrieval_s15a50p50_train`
+  (`--placeholder-rate 0.5`: 64,664 of 129,438 gold-present documents share a placeholder with their
+  gold card; keys, gold flags, swaps and the rest byte identical to `inject_retrieval_train`;
+  298.26M tokens), from the warm-up arm's 100M save to 298.27M in 68.5 minutes, filler CE 3.9161.
+  Final entity `delta` in distribution 0.005 / 0.001 / 0.0185 (z 3.0) / 0.0986 (z 6.7), held out
+  0.000 / -0.003 / 0.0133 (z 3.7) / 0.0559 (z 6.4). Paired against the warm-up arm: tier 1000
+  +0.014 / +0.009 (z +1.3 each), +0.011 (z +1.8) pooled; tier 100 +0.005 (z +1.8) pooled; the real
+  name and the prior both rank better (-0.025, z -4.6; -0.014, z -2.5). Real-name-with-real-value
+  supervision halved (0.686 to 0.346 of exposures), level unchanged: falsified (pooled z above -2).
+  `compare` HOLDS in distribution, FAILS held out at tier 100. Held-out copying pays (gold top-1
+  0.53 to 0.68 against 0.60 to 0.74, swapped followed 0.51 to 0.54 against 0.60 to 0.63, z down to
+  -8); prompt copy held out better (top-1 0.84 to 0.87). Decided 2026-10-08: the copy-criterion span
+  weight is dropped. Open: what writes the level (gold-absent documents with the real name, the
+  input path, the prior drifting). Reads `ckpts/inject/rank_retrieval_kv_cf_p50final_*`,
+  `compare_cf_vs_cf_p50.log`, `compare_full_masked_kv_cf_p50.log`.
+- **Chain depth arm, read 2026-10-08: inconclusive, not readable** ([chain_depth_micro.md](docs/measurements/chain_depth_micro.md)):
+  `chains_kv` (`ckpts/evidence_chains_kv/`), 2M questions (104.66M prompt tokens, 439M evidence,
+  ratio 4.20), `--evidence --reader-kv` from `seed_micro.pt`, 102.66M tokens in 51.5 minutes on
+  batch 16 x accum 2 (`ckpts/inject/config_micro_chains.yaml`; batch 32 spilled in minute one).
+  `[eval]` answer CE on `chains_val` 0.628 / 0.501 / 0.455 at 50 / 75 / 100M (top-1 per token
+  0.87); selector near uniform (`selection:` 0.495 to 0.440). Every accuracy cell at chance at 50M
+  and final: `chains_eval` depth 3 all sites 1-hop 0.104 (chance 0.115), 2-hop 0.187 (0.185),
+  3-hop 0.194 (0.206); held-out 2-hop kept 1 / 3 0.188 / 0.194 (0.191), Delta +0.006 at sigma
+  0.013. The read carries content (4-hop answer CE per token 3.82 with no site, 0.47 with them)
+  but not the choice: about 3.3 nats per answer against about 1.9 for a uniform pick among the
+  candidates, so it copies an answer-type entity and does not select which; no bug in
+  `eval_chains.py`. Readable precondition fails, so inconclusive; not a kill. `loop_scale` ended
+  [1.34, 0.48, 0.07], the third under 0.01 at 50M. No change to depth or the chain slice; the
+  pilot's L1 decides. Instrument gaps (no per-question JSON, answer CE for hop4 only, `*` glued to
+  the previous column) are in the record. Reads `ckpts/inject/chains_kv_{50M,final}_{d123,hop4}.*`.
 - **Seed-side instruments, done 2026-10-06** ([seed_instruments.md](docs/measurements/seed_instruments.md)):
   PopQA with its prior control, seed entity `delta` 0.0287 (z 11.7) / 0.0263 (z 12.8) / 0.0356
   (z 19.4) by tail / mid / head, concentrated in four cue relations (father, mother, capital,
@@ -138,29 +169,13 @@ source and the artifact stays identical to it; the file goes into the same commi
 - Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
   in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
 - **Next, in order** (the full ladder with its done steps is in NEXT.md):
-  1. The placeholder name arm, approved 2026-10-06, not started (spec as recorded in NEXT.md step
-     6): `--placeholder-rate 0.5` for gold-present documents (document and gold card share a
-     placeholder, each distractor its own, swaps on top), about 40 lines in
-     `prepare_injection_data.py` and `render_store_chunk(name_override=)` plus 30 of tests,
-     branched from the warm-up arm's 100M save (paired sigma about 0.006), about 64 minutes of
-     training. Real value with real name drops to 0.346 of exposures (0.686 at p = 0). Expected
-     tier 1000 against 0.085: unchanged if written before copying, 0.043 (z about -6) if linear in
-     dose, 0.064 (z about -3) if it saturates; follows dose at paired z at or beyond -3, falsified
-     at pooled z above -2. It cannot carry to the pilot; its result decides whether a trainer-side
-     copy-criterion span weight is worth building.
-  2. The chain depth arm, approved 2026-10-06, not started; its spec (token target, splits, pass and
-     kill criteria, cost) is written first. Build the chain `train,val` splits
-     (`prepare_chain_data.py` on cuda; only the eval splits exist), train one micro arm from
-     `seed_micro.pt` with `--evidence --reader-kv` on them, read it with `eval_chains.py` by depth
-     and by kept read sites (L1 at micro scale: sites past the first pass add at least 5 points on
-     held-out 2-hop at depth 3) plus the per-exit read. It replaces the learned exit gate arm,
-     dropped 2026-10-06 on the per-exit read; the gate's three open questions are moot.
-  3. The pilot spec, with the copy-first warm-up requirement and swap rate 0.15 (decided
-     2026-10-06 by the user: a leak this size matters little for the pilot, and RL planned later
-     can act on small leaks; caveat on record: RL is Parked and shapes behaviour at conflicts
-     rather than removing what is stored, so for small leaks the goal is read as behavioural at
-     conflicts). The goldfish loss is expected no better than a dose cut (renders are paraphrased).
-  4. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
+  1. The pilot spec, with the copy-first warm-up requirement, swap rate 0.15 and no further lever
+     against the leak (decided 2026-10-06 by the user: a leak this size matters little for the
+     pilot, and RL planned later can act on small leaks; caveat on record: RL is Parked and shapes
+     behaviour at conflicts rather than removing what is stored, so for small leaks the goal is read
+     as behavioural at conflicts). The chain slice stays 10% at hops 25 / 50 / 25 and the pilot's
+     L1 is the deciding read on the loop clause.
+  2. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
   emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same
@@ -341,11 +356,13 @@ TINY_LLM_CONFIG=config_micro.yaml python scripts/init_scratch_seed.py --out ckpt
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence -c ckpts/inject/seed_micro.pt --run-name inject_full --data-dir data/prepared_inject --train-split inject_full_train --val-split inject_val   # also inject_masked, inject_retrieval
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv --data-dir data/prepared_inject --train-split inject_retrieval_train --val-split inject_val   # the key/value reader arm (c)
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --arms retrieval --suffix s100a50 --device cuda   # the copy-first warm-up split
+python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 0.15 --anon-rate 0.5 --gold-drop-rate 0.2 --placeholder-rate 0.5 --distractors 3 --seed 42 --arms retrieval --suffix s15a50p50 --device cuda   # the placeholder name split
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv_cf --data-dir data/prepared_inject --train-split inject_retrieval_s100a50_train --val-split inject_val   # warm-up to 100M, then the same line with --train-split inject_retrieval_train
 TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped|prompt --batch-size 1024 [--n-loops N] --json-out ckpts/inject/rank_full.json
 python scripts/closed_book_rank.py compare rank_full.json rank_masked.json rank_retrieval.json
 TINY_LLM_CONFIG=config_micro.yaml python scripts/eval_exit.py -c CKPT --data-dir data/prepared_inject --split inject_val --max-batches 40 --json-out OUT.json
 python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits eval,heldout_tmpl,hop4 --eval-questions-per-hop 1000 --seed 42 --device cpu   # train,val on cuda
+python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits train,val --train-questions 2000000 --val-questions 2000 --seed 42 --device cuda
 python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --json-out OUT.json
 python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max-questions 3000 --chunk-tokens 128 --device cuda --seed 42
 python scripts/build_store.py --edit-from openqa --name openqa_edit --edit-fraction 0.5 --neighbour-cos 0.85 --device cpu --seed 42
@@ -584,6 +601,8 @@ prompt. `--target-tokens` counts prompt tokens.
 - Other evidence-format builders: `prepare_injection_data.py` (biographies plus filler from
   `data/prepared/{ir,phase1,phase2}.bin`; arms `full` and `masked` share `.bin` bytes and differ
   in `.mask` only; `retrieval` carries the store card buffer with swaps and name placeholders;
+  `--placeholder-rate` (default 0, byte identical at 0, its own rng stream) renames gold-present
+  documents: the document and its gold card share a placeholder, each distractor its own;
   `inject_val` is filler only and identical across arms) and `prepare_chain_data.py` (fictional
   k-hop chains, `.evhop` per chunk and `.chains.jsonl` per document, eval-only sidecars; held-out
   2-hop compositions are absent from every seen split including 3-hop). Stores
