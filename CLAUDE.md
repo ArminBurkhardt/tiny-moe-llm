@@ -13,9 +13,9 @@ R0b arms (a), (b) and (c) have run in full: the key/value reader copies complete
 and arm (c) fails, on a leak present before copying existed. With a copy-first warm-up the R0b
 rule holds through tier 100 and tier 1000 still leaks. Decided 2026-10-05: R0b is accepted on the
 warm-up arm with the tier 1000 leak known, the warm-up enters the pilot as a requirement, and a
-swap rate 0.30 branch (read 2026-10-06) left the tier 1000 leak where it was, so the pilot's
-swap rate is an open choice on copy quality and tier 100 margin. The learned
-depth allocation arm is held on open decisions after the per-exit read.
+swap rate 0.30 branch (read 2026-10-06) left the tier 1000 leak where it was. Decided 2026-10-06
+(the user): the pilot's swap rate stays at 0.15; the placeholder name arm and a chain depth arm
+are approved, not started; the learned exit gate arm is dropped on the per-exit read.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -138,29 +138,28 @@ source and the artifact stays identical to it; the file goes into the same commi
 - Graft lineage, binding: Phase 4 arms A and B killed at 10.08M on content gain (+0.058 / +0.081);
   in-context ceiling on `evidence_fixed` 3.18 nats pooled; R0 failed; the graft branch is closed.
 - **Next, in order** (the full ladder with its done steps is in NEXT.md):
-  1. Open decision (the user's): the pilot's swap rate, and whether the placeholder name arm (gold-
-     present documents with the card carrying the same placeholder; about 25 lines in the builder
-     and `biographies.render_store_chunk`) runs before the pilot. Recommendation: choose the swap
-     rate on copy quality and tier 100 margin, not tier 1000; 0.30 against 0.15 copies the same in
-     distribution, follows a swapped card 0.654 to 0.673 against 0.663 to 0.690 held out, and gives
-     tier 100 more margin (z 1.7 and 0.9 against 2.6 and 2.0), a direction only. The placeholder
-     name arm is designed, not built (NEXT.md step 6): `--placeholder-rate 0.5` for gold-present
-     documents (document and gold card share a placeholder, each distractor its own, swaps on top),
-     about 40 lines in `prepare_injection_data.py` and `render_store_chunk(name_override=)` plus 30
-     of tests, branched from the warm-up arm's 100M save (paired sigma about 0.006), about 64
-     minutes of training. Real value with real name drops to 0.346 of exposures (0.686 at p = 0).
-     Expected tier 1000 against 0.085: unchanged if written before copying, 0.043 (z about -6) if
-     linear in dose, 0.064 (z about -3) if it saturates; follows dose at paired z at or beyond -3,
-     falsified at pooled z above -2. It cannot carry to the pilot; its result decides whether a
-     trainer-side copy-criterion span weight is worth building. Recommendation: run it before
-     freezing the pilot's lever list, writing the spec in parallel.
-  2. The pilot spec, with the copy-first warm-up requirement and the swap rate the user sets. The
-     goldfish loss is expected no better than a dose cut (renders are paraphrased).
-  3. Held: learned depth allocation (Ouro gate, designed, not built). Open, the user's: an
-     exemption from the Parked halting rule and `docs/looped-transformers.md` 4.1 (the gate skips
-     nothing); the equal-weight control arm (the one "loops (axiom)" lists as not planned); the
-     pilot spec has no per-pass exits. Recommendation: no gate arm on the biography corpus; read
-     depth on the chain splits (only the eval splits are built).
+  1. The placeholder name arm, approved 2026-10-06, not started (spec as recorded in NEXT.md step
+     6): `--placeholder-rate 0.5` for gold-present documents (document and gold card share a
+     placeholder, each distractor its own, swaps on top), about 40 lines in
+     `prepare_injection_data.py` and `render_store_chunk(name_override=)` plus 30 of tests,
+     branched from the warm-up arm's 100M save (paired sigma about 0.006), about 64 minutes of
+     training. Real value with real name drops to 0.346 of exposures (0.686 at p = 0). Expected
+     tier 1000 against 0.085: unchanged if written before copying, 0.043 (z about -6) if linear in
+     dose, 0.064 (z about -3) if it saturates; follows dose at paired z at or beyond -3, falsified
+     at pooled z above -2. It cannot carry to the pilot; its result decides whether a trainer-side
+     copy-criterion span weight is worth building.
+  2. The chain depth arm, approved 2026-10-06, not started; its spec (token target, splits, pass and
+     kill criteria, cost) is written first. Build the chain `train,val` splits
+     (`prepare_chain_data.py` on cuda; only the eval splits exist), train one micro arm from
+     `seed_micro.pt` with `--evidence --reader-kv` on them, read it with `eval_chains.py` by depth
+     and by kept read sites (L1 at micro scale: sites past the first pass add at least 5 points on
+     held-out 2-hop at depth 3) plus the per-exit read. It replaces the learned exit gate arm,
+     dropped 2026-10-06 on the per-exit read; the gate's three open questions are moot.
+  3. The pilot spec, with the copy-first warm-up requirement and swap rate 0.15 (decided
+     2026-10-06 by the user: a leak this size matters little for the pilot, and RL planned later
+     can act on small leaks; caveat on record: RL is Parked and shapes behaviour at conflicts
+     rather than removing what is stored, so for small leaks the goal is read as behavioural at
+     conflicts). The goldfish loss is expected no better than a dose cut (renders are paraphrased).
   4. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever

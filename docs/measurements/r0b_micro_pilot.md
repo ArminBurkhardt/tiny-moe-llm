@@ -643,9 +643,10 @@ retrieval_kv_cf30`: HOLDS on both forms.
 - **Copying does not degrade.** Gold top-1 in distribution 0.999 to 1.000 in both arms, held out
   entity 0.62 to 0.73 against 0.60 to 0.74; swapped card followed on every item in distribution,
   held out 0.654 to 0.673 against 0.663 to 0.690 (all classes; tier 1000 -0.036, z -2.1); `mr_ll`
-  0.000 in distribution and within 0.005 held out. Prompt copy: not read.
-- **Plan state.** Open, the user's: the pilot's swap rate, and whether the placeholder name arm
-  runs before the pilot. Recommendation: choose the swap rate on copy quality and tier 100 margin,
+  0.000 in distribution and within 0.005 held out. Prompt copy held out 0.0084 (top-1 0.834),
+  the same as the warm-up arm (read after the tables, above).
+- **Plan state.** Decided 2026-10-06 by the user: the pilot's swap rate stays at 0.15, and the
+  placeholder name arm is approved, not started (NEXT.md step 6). The recommendation on record was: choose the swap rate on copy quality and tier 100 margin,
   not on tier 1000. On those reads 0.30 against 0.15 copies the same in distribution, follows a
   swapped card about 0.01 to 0.04 less often held out (under 3 sigma), and gives tier 100 more
   margin, a direction only. The open lever against tier 1000 is the placeholder name in
