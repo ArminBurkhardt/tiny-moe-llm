@@ -39,7 +39,13 @@ Per bio document in the ``retrieval`` arm, in this order:
 4. **Anonymization.** With the gold card absent, with probability ``anon_rate`` every mention of the
    name becomes a typed placeholder (``Person KTV``), ``.factspan`` 7. Values are head entities, so
    only the name is anonymized.
-5. **Mask.** 1 on language tokens and supported spans (swapped included), 0 on unsupported spans.
+5. **Placeholders with the gold card.** With the gold card present, with probability
+   ``placeholder_rate`` every mention of the name becomes a typed placeholder in the document and in
+   this document's copy of the gold card, and each distractor card is rendered with its own distinct
+   placeholder. The keys stay canonical and swaps apply on top; ``.factspan`` is 7 on those mentions.
+   The draws come from their own stream, so the buffer, the gold flag and the swaps equal those of a
+   build at rate 0.
+6. **Mask.** 1 on language tokens and supported spans (swapped included), 0 on unsupported spans.
 
 ``.factspan`` is one uint8 per ``.bin`` token: 0 none, 1 to 5 the attribute (index in ``ATTRIBUTES``
 plus one), 6 a name mention, 7 a placeholder. It is for evals and build metrics; no trainer reads it.
@@ -269,16 +275,18 @@ class RetrievalBuilder:
         swap_rate: chance a supported span is swapped.
         anon_rate: chance a gold-less document anonymizes the name.
         gold_drop_rate: chance a document's buffer has no gold card.
+        placeholder_rate: chance a document with the gold card renames every card and the document.
         distractors: distractor cards beside the gold (one more without it).
         neighbors: how many nearest same-tier people the near distractors are drawn from.
     """
 
     def __init__(self, people: List[bio.Person], pools: Dict[str, List[str]], keys: np.ndarray,
                  tokenizer, seed: int, swap_rate: float, anon_rate: float, gold_drop_rate: float,
-                 distractors: int, neighbors: int = 8):
+                 distractors: int, neighbors: int = 8, *, placeholder_rate: float = 0.0):
         self.people, self.pools, self.keys = people, pools, np.asarray(keys, dtype=np.float32)
         self.tokenizer, self.seed = tokenizer, seed
         self.swap_rate, self.anon_rate, self.gold_drop_rate = swap_rate, anon_rate, gold_drop_rate
+        self.placeholder_rate = placeholder_rate
         self.distractors = distractors
         self.card_ids = [np.asarray(x, dtype=np.uint16) for x in
                          tokenizer([p.store_chunk for p in people], add_special_tokens=False)["input_ids"]]
@@ -295,7 +303,7 @@ class RetrievalBuilder:
         self.stats = {
             "docs": 0, "gold_in_buffer": 0, "spans": 0, "spans_supported": 0, "span_tokens": 0,
             "span_tokens_supported": 0, "swapped_spans": 0, "anonymized_docs": 0,
-            "collision_spans": 0, "spans_in_goldless_docs": 0, "goldless_docs": 0,
+            "placeholder_docs": 0, "collision_spans": 0, "spans_in_goldless_docs": 0, "goldless_docs": 0,
             "ev_tokens_max": 0,
         }
 
@@ -347,21 +355,44 @@ class RetrievalBuilder:
             if not gold and rng.random() < self.anon_rate:
                 letters = "".join(rng.choice(string.ascii_uppercase) for _ in range(rng.choice((2, 3))))
                 placeholder = f"Person {letters}"
+            card_placeholders: Dict[int, str] = {}
+            if gold:
+                prng = _rng(self.seed, "p", pid, j)
+                if prng.random() < self.placeholder_rate:
+                    taken = set()
+                    for card in [pid] + [c for c in cards if c != pid]:
+                        while True:
+                            letters = "".join(prng.choice(string.ascii_uppercase)
+                                              for _ in range(prng.choice((2, 3))))
+                            if letters not in taken:
+                                break
+                        taken.add(letters)
+                        card_placeholders[card] = f"Person {letters}"
+                    placeholder = card_placeholders[pid]
             text, spans = bio.render_bio(person, _rng(self.seed, "r", pid, j),
                                          name_override=placeholder, value_overrides=overrides or None)
-            card_text = (bio.render_store_chunk(person, overrides) if overrides else None)
+            card_texts = {}
+            if card_placeholders:
+                for card, name in card_placeholders.items():
+                    card_texts[card] = bio.render_store_chunk(
+                        self.people[card], (overrides or None) if card == pid else None, name_override=name)
+            elif overrides:
+                card_texts[pid] = bio.render_store_chunk(person, overrides)
             specs.append({"pid": pid, "gold": gold, "cards": cards, "supported": supported,
                           "collided": collided, "overrides": overrides, "placeholder": placeholder,
-                          "text": text, "spans": spans, "card_text": card_text})
+                          "card_placeholders": card_placeholders, "text": text, "spans": spans,
+                          "card_texts": card_texts})
 
         tokenized = tokenize_with_codes(
             self.tokenizer, [s["text"] for s in specs], [s["spans"] for s in specs],
             [CODE_PLACEHOLDER if s["placeholder"] else CODE_NAME for s in specs])
-        swapped_cards = [s for s in specs if s["card_text"] is not None]
-        swapped_ids = (self.tokenizer([s["card_text"] for s in swapped_cards],
-                                      add_special_tokens=False)["input_ids"] if swapped_cards else [])
-        for spec, ids in zip(swapped_cards, swapped_ids):
-            spec["card_ids"] = np.asarray(ids, dtype=np.uint16)
+        rewritten = [(s, card, t) for s in specs for card, t in s["card_texts"].items()]
+        rewritten_ids = (self.tokenizer([t for _, _, t in rewritten],
+                                        add_special_tokens=False)["input_ids"] if rewritten else [])
+        for spec in specs:
+            spec["card_ids"] = {}
+        for (spec, card, _), ids in zip(rewritten, rewritten_ids):
+            spec["card_ids"][card] = np.asarray(ids, dtype=np.uint16)
 
         bos, eos = self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
         out = []
@@ -378,7 +409,7 @@ class RetrievalBuilder:
 
             ev_ids, ev_chunk = [], []
             for slot, card in enumerate(spec["cards"]):
-                piece = spec["card_ids"] if (card == spec["pid"] and "card_ids" in spec) else self.card_ids[card]
+                piece = spec["card_ids"].get(card, self.card_ids[card])
                 ev_ids.append(piece)
                 ev_chunk.append(np.full(len(piece), slot, dtype=np.uint16))
             ev_ids = np.concatenate(ev_ids)
@@ -398,7 +429,8 @@ class RetrievalBuilder:
             s["span_tokens"] += int(is_value.sum())
             s["span_tokens_supported"] += int((is_value & supported_by_code[codes]).sum())
             s["swapped_spans"] += len(spec["overrides"])
-            s["anonymized_docs"] += int(spec["placeholder"] is not None)
+            s["anonymized_docs"] += int(spec["placeholder"] is not None and not spec["gold"])
+            s["placeholder_docs"] += int(bool(spec["card_placeholders"]))
             s["collision_spans"] += sum(spec["collided"].values())
             s["goldless_docs"] += int(not spec["gold"])
             s["spans_in_goldless_docs"] += 0 if spec["gold"] else n_spans
@@ -417,8 +449,8 @@ def _write_json_atomic(path: str, payload: dict) -> None:
 
 def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict[int, int],
                     filler: Sequence[Tuple[str, str]], target_tokens: int, seq_length: int = 1024,
-                    swap_rate: float = 0.15, anon_rate: float = 0.5, gold_drop_rate: float = 0.2,
-                    distractors: int = 3, seed: int = 42, arms: Sequence[str] = ARMS,
+                    swap_rate: float = 0.15, anon_rate: float = 0.5, placeholder_rate: float = 0.0,
+                    gold_drop_rate: float = 0.2, distractors: int = 3, seed: int = 42, arms: Sequence[str] = ARMS,
                     suffix: str = "", val_fraction: float = 0.005, store_dir: Optional[str] = None,
                     overwrite: bool = False, block: int = 4096) -> dict:
     """Write the arm splits, the shared validation split, the facts, the pools and the store.
@@ -437,6 +469,7 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
             the multi-token prediction separators.
         swap_rate: see the module docstring.
         anon_rate: see the module docstring.
+        placeholder_rate: see the module docstring.
         gold_drop_rate: see the module docstring.
         distractors: distractor cards beside a gold card.
         seed: seeds everything.
@@ -534,7 +567,7 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
     builder = None
     if "retrieval" in arms:
         builder = RetrievalBuilder(people, pools, keys, tokenizer, seed, swap_rate, anon_rate,
-                                   gold_drop_rate, distractors)
+                                   gold_drop_rate, distractors, placeholder_rate=placeholder_rate)
 
     def window_doc(row) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         source, start, length = (int(v) for v in row)
@@ -616,13 +649,13 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         if arm == "retrieval":
             s = builder.stats
             entry.update({
-                "swap_rate": swap_rate, "anon_rate": anon_rate, "gold_drop_rate": gold_drop_rate,
-                "distractors": distractors,
+                "swap_rate": swap_rate, "anon_rate": anon_rate, "placeholder_rate": placeholder_rate,
+                "gold_drop_rate": gold_drop_rate, "distractors": distractors,
                 "gold_in_buffer_share": s["gold_in_buffer"] / max(1, s["docs"]),
                 "supported_span_share": s["spans_supported"] / max(1, s["spans"]),
                 "supported_fact_token_share": s["span_tokens_supported"] / max(1, s["span_tokens"]),
                 "swapped_spans": s["swapped_spans"], "anonymized_docs": s["anonymized_docs"],
-                "goldless_docs": s["goldless_docs"],
+                "placeholder_docs": s["placeholder_docs"], "goldless_docs": s["goldless_docs"],
                 "value_collision_share_of_spans": s["collision_spans"] / max(1, s["spans"]),
                 "value_collision_share_of_goldless_spans":
                     s["collision_spans"] / max(1, s["spans_in_goldless_docs"]),
@@ -660,6 +693,7 @@ def log_report(metrics: dict) -> None:
                 f"  gold in buffer {e['gold_in_buffer_share']:.1%}, supported spans "
                 f"{e['supported_span_share']:.1%} ({e['supported_fact_token_share']:.1%} of fact tokens), "
                 f"swapped {e['swapped_spans']:,}, anonymized docs {e['anonymized_docs']:,}, "
+                f"placeholder docs {e.get('placeholder_docs', 0):,}, "
                 f"collisions {e['value_collision_share_of_spans']:.2%} of spans "
                 f"({e['value_collision_share_of_goldless_spans']:.2%} of gold-less spans), "
                 f"evidence ratio {e['evidence_to_prompt_ratio']:.2f}"
@@ -687,6 +721,7 @@ def main():
     parser.add_argument("--seq-length", type=int, default=1024)
     parser.add_argument("--swap-rate", type=float, default=0.15)
     parser.add_argument("--anon-rate", type=float, default=0.5)
+    parser.add_argument("--placeholder-rate", type=float, default=0.0)
     parser.add_argument("--gold-drop-rate", type=float, default=0.2)
     parser.add_argument("--distractors", type=int, default=3)
     parser.add_argument("--persons-per-tier", default="1000:100,100:500,10:1000,1:2000",
@@ -714,7 +749,8 @@ def main():
     metrics = build_injection(
         args.out_dir, tokenizer, embedder, persons_per_tier=parse_tiers(args.persons_per_tier),
         filler=filler, target_tokens=args.target_tokens, seq_length=args.seq_length,
-        swap_rate=args.swap_rate, anon_rate=args.anon_rate, gold_drop_rate=args.gold_drop_rate,
+        swap_rate=args.swap_rate, anon_rate=args.anon_rate,
+        placeholder_rate=args.placeholder_rate, gold_drop_rate=args.gold_drop_rate,
         distractors=args.distractors, seed=args.seed, arms=arms, suffix=args.suffix,
         val_fraction=args.val_fraction, store_dir=args.store_dir, overwrite=args.overwrite,
     )

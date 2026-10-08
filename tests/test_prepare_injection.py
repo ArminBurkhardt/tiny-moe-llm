@@ -9,15 +9,18 @@ properties the experiment leans on:
    in every split;
 3. in ``retrieval`` the mask follows the evidence: a value token is supervised exactly when its
    value occurs in a visible card, a swap shows in the target and in the gold card's copy and nowhere
-   else, a placeholder name appears only where the gold card is absent, ``.evgold`` marks the
-   person's own card;
+   else, at placeholder rate 0 a placeholder name appears only where the gold card is absent,
+   ``.evgold`` marks the person's own card;
 4. ``SFTDataset`` reads ``full`` and ``masked`` (fewer supervised labels in ``masked``) and
    ``EvidenceDataset`` reads ``retrieval``;
 5. the validation split is filler only, identical for every arm, and disjoint from train;
 6. a build is deterministic, a second build with other rates next to the first leaves the shared
    files and the first arms untouched, the filler is cycled with a logged repeat factor when short;
 7. the biography store (when ``modules.data.store`` exists) holds one card per person with the
-   embedder's key.
+   embedder's key;
+8. with a placeholder rate, a build next to the first leaves buffers, gold flags, keys, swaps and
+   the mask on value tokens unchanged; renamed documents carry the same placeholder in the document,
+   the gold card and (distinct ones) the distractor cards.
 
 GPU free. Needs the pruned tokenizer (``utils.TOKENIZER_DIR``).
 """
@@ -304,6 +307,61 @@ def main():
         ((ids, codes),) = tokenize_with_codes(tokenizer, [text], [spans], [7])
         assert len(ids) == len(codes) and set(codes.tolist()) == {0, 1, 2, 3, 4, 5, 7}
         assert "Person ABC" in tokenizer.decode(ids[codes == 7])
+
+        # 8. placeholders with the gold card present, next to the base build
+        p50 = build_injection(out, tokenizer, FakeEmbedder(),
+                              **dict(common, arms=("retrieval",), suffix="p50", placeholder_rate=0.5))
+        p50_name = split_name("retrieval", "p50")
+        for suffix in ("evkey", "evgold", "cond", "evkeyidx", "ans"):
+            a = file_hash(os.path.join(out, f"inject_retrieval_train.{suffix}"))
+            b = file_hash(os.path.join(out, f"{p50_name}.{suffix}"))
+            assert a == b, suffix
+        # a placeholder changes token counts, so the mask is compared where it can differ: on the
+        # value tokens and in how many tokens it zeroes
+        p50_docs = read_evidence(out, p50_name)
+        assert len(p50_docs) == len(retrieval)
+        with_ph = without_ph = 0
+        for base, new in zip(retrieval, p50_docs):
+            assert base["gold"] == new["gold"] and base["cond"] == new["cond"]
+            assert (base["mask"] == 0).sum() == (new["mask"] == 0).sum()
+            base_runs, new_runs = value_runs(base), value_runs(new)
+            assert [c for c, _ in base_runs] == [c for c, _ in new_runs]
+            for (_, a), (_, b) in zip(base_runs, new_runs):
+                assert set(base["mask"][a].tolist()) == set(new["mask"][b].tolist())
+                assert tokenizer.decode(base["ids"][a]) == tokenizer.decode(new["ids"][b])
+            if not any(base["gold"]):
+                assert base["ids"].tolist() == new["ids"].tolist()
+                assert base["chunks"] == new["chunks"]
+                continue
+            base_texts = [tokenizer.decode(c) for c in base["chunks"]]
+            new_texts = [tokenizer.decode(c) for c in new["chunks"]]
+            slot = base["gold"].index(1)
+            if not (new["codes"] == 7).any():
+                without_ph += 1
+                assert new["chunks"] == base["chunks"] and new["ids"].tolist() == base["ids"].tolist()
+                continue
+            with_ph += 1
+            name = base_texts[slot].split(". Born")[0]
+            placeholder = new_texts[slot].split(". Born")[0]
+            doc_text = tokenizer.decode(new["ids"][1:-1])
+            assert placeholder.startswith("Person ") and placeholder in doc_text and name not in doc_text
+            assert name not in new_texts[slot]
+            assert base_texts[slot].replace(name, placeholder, 1) == new_texts[slot]
+            heads = []
+            for k, (b_text, n_text) in enumerate(zip(base_texts, new_texts)):
+                head = n_text.split(". Born")[0]
+                heads.append(head)
+                if k != slot:
+                    real = b_text.split(". Born")[0]
+                    assert head.startswith("Person ") and real not in n_text
+                    assert b_text.replace(real, head, 1) == n_text
+            assert len(set(heads)) == len(heads), heads
+        assert with_ph > 0 and without_ph > 0, (with_ph, without_ph)
+        assert p50["arms"]["retrieval"]["placeholder_docs"] == with_ph > 0
+        assert entry["placeholder_docs"] == 0
+        assert p50["arms"]["retrieval"]["anonymized_docs"] == entry["anonymized_docs"]
+        print(f"8. placeholders with the gold card: {with_ph} documents renamed, {without_ph} not, buffers "
+              f"and flags identical to the base build, cards renamed with distinct placeholders   PASS")
         print("all injection corpus checks passed")
     finally:
         shutil.rmtree(root, ignore_errors=True)

@@ -391,7 +391,8 @@ def render_bio(person: Person, rng: random.Random, *, name_override: Optional[st
     return " ".join(sentences), sorted(spans)
 
 
-def render_store_chunk(person: Person, value_overrides: Optional[Dict[str, str]] = None) -> str:
+def render_store_chunk(person: Person, value_overrides: Optional[Dict[str, str]] = None,
+                       name_override: Optional[str] = None) -> str:
     """The person's store card, in a form no biography template uses.
 
     Copying a value from the card into a sentence therefore takes reading, not recall of a string
@@ -400,9 +401,11 @@ def render_store_chunk(person: Person, value_overrides: Optional[Dict[str, str]]
     Args:
         person: whose card to write.
         value_overrides: ``{attribute: value}`` written in place of the person's value.
+        name_override: written in place of the person's name (a typed placeholder).
     """
     v = {**person.attributes, **(value_overrides or {})}
-    return (f"{person.name}. Born {v['birth_date']} in {v['birth_city']}. "
+    name = person.name if name_override is None else name_override
+    return (f"{name}. Born {v['birth_date']} in {v['birth_city']}. "
             f"Education: {v['major']}, {v['university']}. Employer: {v['employer']}.")
 
 
