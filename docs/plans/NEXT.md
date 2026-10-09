@@ -10,7 +10,26 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-08)
+## Now (2026-10-09)
+
+**The pilot spec is written ([PILOT.md](PILOT.md), 2026-10-09), and it cuts the pilot to what is
+built.** A code inventory found most of the Phase 5 blueprint unbuilt (no coda, no tied table, the
+selector is still the routed IR expert, one read site per loop, today's depth sampling and per-loop
+CE, no union selection loss, no InfoNCE; no per-window retrieval or fact tagger on natural text, no
+near-duplicate filter, no 0.4B-token store). The pilot therefore runs the R0b recipe on today's code
+at a larger shape (99.1M total, 84.9M active, width 512, 6 prelude layers, 8 experts, seq 4096,
+key/value reader) on a merged corpus from the existing builders (biographies plus filler 60%, QA
+plus web plus replay 25%, synthetic chains 10%; 1B tokens per arm), with the copy-first warm-up
+and swap rate 0.15, against a matched full-CE control. It reads A1(b), a new 1-hop gate before L1,
+L1, A2, A3, A4, A5, A7 and A6 as benchmarks within noise; it cannot read A1(a), A6 through the
+port or L2 at depth 4, and the ladder rungs R4, R4b and R6 are cut from the bottom. Measured
+2026-10-09 on the probe shape: 44k to 50k prompt tokens per second at batch 8 x 4096 (20.4 GB) on
+rows with little evidence, 2.7k to 3.9k on `evidence_train` (ratio 3.75) at the 4608 cap (fill 17
+to 30%); a fit through the two gives about 16k on the merged corpus (ratio about 0.73), 16 to 28
+hours per pathway arm, 35 to 45 GPU hours for the pilot, all estimates until the first hour prints
+its rate; the chain slice (ratio 4.2) is the heavy one. Before the launch: a split merge tool, the
+`eval_chains.py` instrument fixes, the pilot config and seed, three biography builds at 4096 and
+three merges. The user decides the launch.**
 
 **The key/value reader copies completely in distribution, and arm (c) fails R0b on a leak present
 before copying existed. With a copy-first warm-up the R0b rule holds through tier 100 and tier
@@ -24,7 +43,7 @@ weight is dropped and the pilot's lever list is the copy-first warm-up alone at 
 same day the chain depth arm ran and read inconclusive
 ([chain_depth_micro.md](../measurements/chain_depth_micro.md)): the micro model copies an
 answer-type entity from the buffer but never learned which one (1-hop accuracy at chance), so the
-readable precondition fails and L1 stays unmeasured at micro scale; the pilot spec is next.** R0b ran from
+readable precondition fails and L1 stays unmeasured at micro scale.** R0b ran from
 2026-10-02 to 2026-10-05 ([r0b_micro_pilot.md](../measurements/r0b_micro_pilot.md)), all at the
 micro shape (35M, `config_micro.yaml`), from one seed, on `data/prepared_inject`:
 
@@ -405,11 +424,18 @@ in graft arms.
    PopQA `delta` (arm A -0.0002, z -0.4 over all entity items) nor counterfactual following (paired
    gap +0.01, z 0.1 pooled; the seed's `mr_ll` gradient is a frequency-ratio prior). The store
    build, the edit store and the chain splits are CPU work that can run beside any GPU arm.
-10. **Next: the pilot spec, then the pilot** (Phase 5): the key/value reader and its rotation,
-    the copy-first warm-up as a requirement, and swap rate 0.15, with no further lever against the
-    leak (the copy-criterion span weight dropped 2026-10-08); the chain slice stays at 10% with
-    hops 25 / 50 / 25, and the pilot's L1 is the deciding read on the loop clause (the micro chain
-    read was inconclusive); the ladder is cut to the budget before launch.
+10. **Spec written 2026-10-09 ([PILOT.md](PILOT.md)); next: its build list, then the pilot**
+    (Phase 5): the key/value reader and its rotation, the copy-first warm-up as a requirement, and
+    swap rate 0.15, with no further lever against the leak (the copy-criterion span weight dropped
+    2026-10-08); the chain slice stays at 10% with hops 25 / 50 / 25, and the pilot's L1 is the
+    deciding read on the loop clause (the micro chain read was inconclusive), behind a 1-hop gate.
+    The spec cuts the ladder to today's code: the blueprint items (coda, tied table, always-on
+    selector, sublayer read sites, depth draw with a detached prefix, last-pass loss, union
+    selection loss, InfoNCE, the natural-text corpus builder) are deferred to arms after the pilot
+    reads or to the real-run spec, and R4, R4b and R6 are cut. Cost measured on the probe shape
+    (99.1M params): 44k to 50k tokens per second on low-evidence rows, 2.7k to 3.9k on
+    `evidence_train` at the 4608 cap; the pilot is about 35 to 45 GPU hours (estimate), two arms of
+    about 1B tokens.
 
 Batch caveat: `config_micro.yaml` moved from batch 16 x accumulate 2 to 32 x 1 for throughput.
 That changes nothing the induction-head result keys on: formation is set by tokens per update x
@@ -1134,6 +1160,19 @@ above are a different, live series).
 
 ## What changed from the previous plan
 
+- 2026-10-09: the pilot spec ([PILOT.md](PILOT.md)). The pilot is cut to what is built: the R0b
+  recipe on today's code at 99.1M parameters (width 512, 6 prelude layers, 8 experts, seq 4096,
+  key/value reader), a merged corpus from the existing builders (biographies plus filler 60%, QA
+  plus web plus replay 25%, synthetic chains 10%, 1B tokens per arm), the copy-first warm-up with
+  a switch criterion at every 50M save, swap rate 0.15, and a matched full-CE control. A new 1-hop
+  gate (1-hop accuracy at depth 3 at least 3 sigma over chance by the 500M save) is the
+  precondition for L1. Deferred: every Phase 5 blueprint item that is not built, and the rungs R4,
+  R4b, R6. Not readable in this pilot: A1(a), A6 through the port, L2 at depth 4. Cost measured on
+  the probe shape (2026-10-09): 44k to 50k tokens per second at batch 8 x 4096 (20.4 GB) on
+  low-evidence rows, 2.7k to 3.9k on `evidence_train` (ratio 3.75) at the 4608 cap (fill 17 to 30%,
+  15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
+  (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
+  lever if one is needed.
 - 2026-10-08, later: the chain depth arm (`chains_kv`, 102.66M tokens, 2M chain questions, key/value
   reader from `seed_micro.pt`) read **inconclusive** under its pre-registered criteria
   ([chain_depth_micro.md](../measurements/chain_depth_micro.md)). Every accuracy cell is at chance

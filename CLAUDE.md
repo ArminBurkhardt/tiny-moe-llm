@@ -19,7 +19,12 @@ are approved; the learned exit gate arm is dropped on the per-exit read. On 2026
 placeholder name arm falsified the dose lever, so the copy-criterion span weight is dropped and the
 pilot's lever list is the warm-up alone at swap rate 0.15. The same day the chain depth arm read
 inconclusive ([chain_depth_micro.md](docs/measurements/chain_depth_micro.md)): the micro model
-never learned 1-hop lookup, so L1 stays unmeasured at micro scale; the pilot spec is next.
+never learned 1-hop lookup, so L1 stays unmeasured at micro scale. On 2026-10-09 the pilot spec
+was written ([PILOT.md](docs/plans/PILOT.md)): the pilot runs the R0b recipe on today's code at
+99.1M parameters (width 512, 6 prelude layers, 8 experts, seq 4096, key/value reader) on a merged
+corpus from the existing builders, 1B tokens per arm against a matched full-CE control, with a
+1-hop gate before L1; the unbuilt blueprint items and the rungs R4, R4b and R6 are deferred. Its
+build list is next; the user decides the launch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -176,6 +181,18 @@ source and the artifact stays identical to it; the file goes into the same commi
      as behavioural at conflicts). The chain slice stays 10% at hops 25 / 50 / 25 and the pilot's
      L1 is the deciding read on the loop clause.
   2. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
+  Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)). Its build list, in order: the split
+  merge tool `scripts/merge_evidence_splits.py` with its test, the `eval_chains.py` instrument
+  fixes (per-question JSON, per-answer gold NLL against ln K, the `*` marker), `config_pilot.yaml`
+  and its seed, the three biography builds at seq 4096 (retrieval s15, retrieval s100, full) and
+  the three merges (warm-up, main, control), the launchers and per-save read scripts. No change to
+  `modules/`.
+- Pilot shape probe (2026-10-09, `ckpts/inject/config_pilot_probe*.yaml`, logs
+  `ckpts/inject/pilot_probe*.log`): 99.1M total, 84.9M active, 249M FLOP/token at seq 4096, 39.4M
+  per evidence token. Batch 8 x 4096 x 1 on `inject_retrieval_train`: 44k to 50k tok/s, 20.4 GB;
+  batch 4 x 2: 41k to 45k, 12.7 GB. On `evidence_train` (ratio 3.75, cap 4608) rows close on the
+  evidence budget at fill 17 to 30% and the rate is 2.7k to 3.9k, GPU at 99%: the evidence ratio
+  sets the rate, not the batch; the pilot's merged corpus (ratio about 0.73) fits to about 16k.
 - Micro runs: 55k to 60k tok/s, 13.3 GB peak with the card buffer, `--batch-size 1024` for
   `closed_book_rank.py`. The batch move to 32 x 1 changed no tokens per update; if copying ever
   emerges late, the lever is fewer tokens per update (16 x 1). Relaunch a stopped arm with the same
