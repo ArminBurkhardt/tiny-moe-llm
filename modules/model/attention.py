@@ -70,46 +70,68 @@ def varlen_attention(
     dropout_p: float = 0.0,
     softmax_scale: float | None = None,
     causal: bool = True,
+    cu_seqlens_k: torch.Tensor | None = None,
+    max_seqlen_k: int | None = None,
 ) -> torch.Tensor:
     """Document packed causal attention
 
     Args:
         q: queries, shape ``[B, Hq, S, D]``.
-        k, v: keys/values, shape ``[B, Hkv, S, D]`` (GQA: ``Hkv`` may divide ``Hq``, flash handles the head broadcast natively, so KV heads are not pre repeated)
+        k, v: keys/values, shape ``[B, Hkv, S_kv, D]`` (GQA: ``Hkv`` may divide ``Hq``, flash handles the head broadcast natively, so KV heads are not pre repeated). ``S_kv`` equals ``S`` unless ``cu_seqlens_k`` says otherwise
         cu_seqlens: int32 tensor ``[num_segments + 1]`` of cumulative segment lengths over the flattened ``B*S`` token axis (row major: all of sample 0s tokens, then sample 1, etc).
             ``None`` falls back to one segment per sample (plain causal attn)
         max_seqlen: longest segment length (int). Ignored when ``cu_seqlens`` is ``None``
         dropout_p: attention dropout probability
         softmax_scale: attention scale. Defaults to ``D ** -0.5``
         causal: apply causal masking within each segment
+        cu_seqlens_k: segment boundaries for the KEY side, when it is a different set of tokens than
+            the query side -- cross attention over retrieved evidence, where each query segment pairs
+            with an evidence segment of its own length. ``None`` (the default, and every call the
+            model made before the evidence port existed) reuses ``cu_seqlens`` for both sides, which
+            is what pins ``S_kv`` to ``S``. Must have the same number of segments as ``cu_seqlens``:
+            flash pairs them by position, so segment *i* of the queries attends to segment *i* of the
+            keys and nothing else
+        max_seqlen_k: longest key segment. Defaults to ``max_seqlen``
 
     Returns:
         Attention output, shape ``[B, S, Hq, D]``
 
-    Notes: 
-        - Hq: number of query heads 
+    Notes:
+        - Hq: number of query heads
         - Hkv: number of key/value heads
         - GQA: Hkv must divide Hq and Hq > Hkv
     """
     B, Hq, S, D = q.shape
-    Hkv = k.shape[1]
+    Hkv, S_kv = k.shape[1], k.shape[2]
     if softmax_scale is None:
         softmax_scale = D ** -0.5
 
     if cu_seqlens is None:
         cu_seqlens = _default_cu_seqlens(B, S, q.device)
         max_seqlen = S
+    if cu_seqlens_k is None:
+        # the self attention case: one set of tokens, so both sides index the same segmentation.
+        # asserted rather than broadcast -- a key set of a different length with no segmentation of
+        # its own would be silently mis-segmented by flash rather than rejected
+        assert S_kv == S, (
+            f"keys have {S_kv} positions against {S} queries -- pass cu_seqlens_k to attend over a "
+            f"different set of tokens"
+        )
+        cu_seqlens_k, max_seqlen_k = cu_seqlens, max_seqlen
+    if max_seqlen_k is None:
+        max_seqlen_k = max_seqlen
 
     if _HAS_FLASH:
         # flash wants [total_tokens, H, D], transpose+reshape forces contiguity
         qf = q.transpose(1, 2).reshape(B * S, Hq, D)
-        kf = k.transpose(1, 2).reshape(B * S, Hkv, D)
-        vf = v.transpose(1, 2).reshape(B * S, Hkv, D)
+        kf = k.transpose(1, 2).reshape(B * S_kv, Hkv, D)
+        vf = v.transpose(1, 2).reshape(B * S_kv, Hkv, D)
         cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
+        cu_k = cu_seqlens_k.to(device=q.device, dtype=torch.int32)
         out = flash_attn_varlen_func(
             qf, kf, vf,
-            cu, cu,
-            int(max_seqlen), int(max_seqlen),
+            cu, cu_k,
+            int(max_seqlen), int(max_seqlen_k),
             dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
@@ -117,27 +139,213 @@ def varlen_attention(
         return out.reshape(B, S, Hq, D)
 
     # fallback (no flash-attn): rebuild the block mask and use SDPA => slowwww
-    return _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal)
+    return _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal,
+                          cu_seqlens_k, S_kv)
 
 
-def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal):
-    # default scaled product attention with a block diagonal mask (one block per document segment)
+def prefix_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    max_seqlen: int | None,
+    cu_seqlens_prefix: torch.Tensor,
+    max_seqlen_prefix: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Document packed causal self attention with extra keys in front of every segment.
+
+    Segment *i* of the queries attends to segment *i* of the prefix in full and to its own tokens
+    causally, under one softmax: the prefix reads as text that came before the document. Built as
+    one flash call: the two key sets are interleaved into ``[prefix_0, own_0, prefix_1, own_1, ...]``
+    and flash's causal mask, which aligns the last query with the last key when a segment has more
+    keys than queries, lets query ``j`` of a segment with ``E`` prefix keys see keys ``0..E + j``.
+    A segment with an empty prefix is plain causal attention over its own tokens.
+
+    Args:
+        q: ``[B, Hq, S, D]``.
+        k, v: ``[B, Hkv, S, D]``, the queries' own keys and values.
+        k_prefix, v_prefix: ``[B, Hkv, S_p, D]``, laid out sorted by segment over the flattened
+            ``B * S_p`` axis.
+        cu_seqlens: ``[n + 1]`` over the query axis; ``None`` is one segment per row.
+        max_seqlen: longest query segment (an upper bound).
+        cu_seqlens_prefix: ``[n + 1]`` over the prefix axis, zero length segments allowed, the same
+            ``n`` as ``cu_seqlens``.
+        max_seqlen_prefix: longest prefix segment (an upper bound).
+        dropout_p: attention dropout probability.
+        softmax_scale: defaults to ``D ** -0.5``.
+
+    Returns:
+        ``[B, S, Hq, D]``.
+    """
+    B, Hq, S, D = q.shape
+    Hkv, S_p = k_prefix.shape[1], k_prefix.shape[2]
     device = q.device
-    # derive a per token segment id from the internal boundaries, then mask same segment pairs
-    seg_id = torch.zeros(B * S, dtype=torch.long, device=device)
-    internal = cu_seqlens[1:-1].long()
-    if internal.numel() > 0:
-        seg_id[internal] = 1
-    seg_id = torch.cumsum(seg_id, dim=0).view(B, S)             # [B, S]
-    same = seg_id[:, :, None] == seg_id[:, None, :]             # [B, S, S]
-    if causal:
-        same = same & torch.tril(torch.ones(S, S, dtype=torch.bool, device=device))
-    attn_mask = same[:, None, :, :]                             # [B, 1, S, S]
+    if softmax_scale is None:
+        softmax_scale = D ** -0.5
+    if cu_seqlens is None:
+        cu_seqlens = _default_cu_seqlens(B, S, device)
+        max_seqlen = S
+    assert cu_seqlens.shape == cu_seqlens_prefix.shape, (
+        "the prefix must carry one segment per query segment, paired by position"
+    )
+    cu_q = cu_seqlens.to(device=device, dtype=torch.long)
+    cu_p = cu_seqlens_prefix.to(device=device, dtype=torch.long)
+    seg_q = _segment_ids(cu_q, B, S, device).reshape(-1)
+    seg_p = _segment_ids(cu_p, B, S_p, device).reshape(-1)
+    n_q, n_p = B * S, B * S_p
+    # where each own key and each prefix key lands in the interleaved key axis
+    dest_q = torch.arange(n_q, device=device) + cu_p[seg_q + 1]
+    dest_p = torch.arange(n_p, device=device) + cu_q[seg_p]
+    source = torch.empty(n_q + n_p, dtype=torch.long, device=device)
+    source[dest_q] = torch.arange(n_q, device=device)
+    source[dest_p] = torch.arange(n_p, device=device) + n_q
+    cu_k = cu_q + cu_p
+
+    kf = torch.cat([k.transpose(1, 2).reshape(n_q, Hkv, D), k_prefix.transpose(1, 2).reshape(n_p, Hkv, D)])
+    vf = torch.cat([v.transpose(1, 2).reshape(n_q, Hkv, D), v_prefix.transpose(1, 2).reshape(n_p, Hkv, D)])
+    kf, vf = kf.index_select(0, source), vf.index_select(0, source)
+    qf = q.transpose(1, 2).reshape(n_q, Hq, D)
+
+    if _HAS_FLASH:
+        out = flash_attn_varlen_func(
+            qf, kf, vf,
+            cu_q.to(torch.int32), cu_k.to(torch.int32),
+            int(max_seqlen), int(max_seqlen) + int(max_seqlen_prefix),
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        return out.reshape(B, S, Hq, D)
+
+    # fallback: one dense mask over the flattened axes, written out from the same layout
+    seg_k = _segment_ids(cu_k, 1, n_q + n_p, device).reshape(-1)
+    is_prefix = torch.zeros(n_q + n_p, dtype=torch.bool, device=device)
+    is_prefix[dest_p] = True
+    own_offset_k = torch.arange(n_q + n_p, device=device) - cu_k[seg_k] - (cu_p[seg_k + 1] - cu_p[seg_k])
+    offset_q = torch.arange(n_q, device=device) - cu_q[seg_q]
+    mask = (seg_q[:, None] == seg_k[None, :]) & (is_prefix[None, :] | (own_offset_k[None, :] <= offset_q[:, None]))
+    if Hkv != Hq:
+        kf = kf.repeat_interleave(Hq // Hkv, dim=1)
+        vf = vf.repeat_interleave(Hq // Hkv, dim=1)
+    out = F.scaled_dot_product_attention(
+        qf.transpose(0, 1)[None], kf.transpose(0, 1)[None], vf.transpose(0, 1)[None],
+        attn_mask=mask[None, None], dropout_p=dropout_p, scale=softmax_scale,
+    )                                                            # [1, Hq, n_q, D]
+    return out[0].transpose(0, 1).reshape(B, S, Hq, D)
+
+
+def cached_attention(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    kv_cache,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Causal attention against a growable ``LayerKVCache``, for single-sequence (unpacked)
+    incremental decoding.
+
+    ``q`` and ``k_new``/``v_new`` cover only the newly-appended tokens for this call (``Lq``
+    positions); ``kv_cache`` already holds every earlier token at this depth (see
+    ``modules/model/kv_cache.py`` for why that is valid under this model's causal structure). The
+    new K/V are appended to the cache first, then every query attends causally over the FULL
+    (old + new) key/value set -- aligned so query row ``i`` (absolute position
+    ``cache_len_before + i``) may see key column ``j`` iff ``j <= cache_len_before + i``.
+
+    Args:
+        q: queries, shape ``[B, Hq, Lq, D]``.
+        k_new, v_new: this call's new keys/values, shape ``[B, Hkv, Lq, D]``.
+        kv_cache: a ``LayerKVCache`` to append to and read the full history from.
+        dropout_p: attention dropout probability.
+        softmax_scale: attention scale. Defaults to ``D ** -0.5``.
+
+    Returns:
+        Attention output, shape ``[B, Lq, Hq, D]`` (matches ``varlen_attention``'s layout).
+    """
+    B, Hq, Lq, D = q.shape
+    Hkv = k_new.shape[1]
+    if softmax_scale is None:
+        softmax_scale = D ** -0.5
+
+    cache_len_before = kv_cache.length
+    k, v = kv_cache.update(k_new, v_new)
+    total_len = k.shape[2]
 
     if Hkv != Hq:
         k = k.repeat_interleave(Hq // Hkv, dim=1)
         v = v.repeat_interleave(Hq // Hkv, dim=1)
+
+    if Lq == 1:
+        # the single new token is the last (and therefore latest) position in the cache -> every
+        # key is already causally visible, no mask needed
+        attn_mask, is_causal = None, False
+    elif cache_len_before == 0:
+        # plain prefill from an empty cache -> standard top-left-aligned causal mask
+        attn_mask, is_causal = None, True
+    else:
+        # continuing an already-primed cache with more than one new token (e.g. accepting several
+        # MTP-drafted tokens at once) -> explicit bottom-right-aligned causal mask
+        device = q.device
+        i = torch.arange(Lq, device=device).unsqueeze(1)
+        j = torch.arange(total_len, device=device).unsqueeze(0)
+        attn_mask = (j <= (cache_len_before + i))[None, None, :, :]
+        is_causal = False
+
     out = F.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=softmax_scale
+        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, scale=softmax_scale, is_causal=is_causal,
     )
+    return out.transpose(1, 2)  # [B, Lq, Hq, D]
+
+
+def _segment_ids(cu_seqlens, B, S, device):
+    # per token segment id, from the internal boundaries: mark each start and cumsum. The ids are
+    # global over the flattened B*S axis, so two tokens in different rows never compare equal
+    # sized past the token axis, and accumulated rather than assigned, because the EVIDENCE axis has
+    # zero length segments -- a document that retrieved nothing contributes one, and it shows up
+    # here as a repeated boundary (two segments starting at the same token) or as a boundary sitting
+    # at B*S itself (every trailing segment empty). Assignment would collapse a repeat into a single
+    # increment and mis-number every later token, and indexing at B*S is a device side assert. The
+    # overflow slots are dropped by the slice below; the query side has neither case, so its ids are
+    # bit-identical to what this returned before.
+    internal = cu_seqlens[1:-1].long()
+    seg_id = torch.zeros(B * S + internal.numel() + 1, dtype=torch.long, device=device)
+    if internal.numel() > 0:
+        seg_id.index_add_(0, internal, torch.ones_like(internal))
+    return torch.cumsum(seg_id, dim=0)[:B * S].view(B, S)
+
+
+def _sdpa_fallback(q, k, v, cu_seqlens, B, S, Hq, Hkv, dropout_p, softmax_scale, causal,
+                   cu_seqlens_k=None, S_kv=None):
+    # default scaled product attention with a block diagonal mask (one block per document segment)
+    device = q.device
+    S_kv = S if S_kv is None else S_kv
+    seg_q = _segment_ids(cu_seqlens, B, S, device)                        # [B, S]
+    # both sides number their segments from 0 in the same order, so equal ids mean segment i of the
+    # queries against segment i of the keys -- the pairing flash does by position
+    seg_k = seg_q if cu_seqlens_k is None else _segment_ids(cu_seqlens_k, B, S_kv, device)
+    same = seg_q[:, :, None] == seg_k[:, None, :]               # [B, S, S_kv]
+    if causal:
+        # only meaningful when the two sides are the same tokens; cross attention over evidence
+        # passes causal=False, because "before" has no meaning across two different token sets
+        assert S_kv == S, "causal masking needs the key and query sides to be the same tokens"
+        same = same & torch.tril(torch.ones(S, S, dtype=torch.bool, device=device))
+    attn_mask = same[:, None, :, :]                             # [B, 1, S, S_kv]
+
+    if Hkv != Hq:
+        k = k.repeat_interleave(Hq // Hkv, dim=1)
+        v = v.repeat_interleave(Hq // Hkv, dim=1)
+    # a query whose segment has NO keys at all -- a document that retrieved no evidence, packed
+    # beside one that did -- has an all-False mask row. flash returns exact zeros there; SDPA
+    # softmaxes over nothing and returns NaN, so the two paths would disagree on the one case the
+    # evidence corpus creates on purpose. Unmask the row and zero the output instead, which
+    # reproduces flash rather than approximating it.
+    empty = ~attn_mask.any(dim=-1, keepdim=True)                # [B, 1, S, 1]
+    out = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask | empty, dropout_p=dropout_p, scale=softmax_scale
+    )
+    out = out.masked_fill(empty, 0.0)                           # broadcasts over heads and dim
     return out.transpose(1, 2)  # [B, S, Hq, D]
