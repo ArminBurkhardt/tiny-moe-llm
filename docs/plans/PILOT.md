@@ -1,6 +1,7 @@
 # The from-scratch pilot (Phase 5): the spec, written 2026-10-09 before the build
 
-Status 2026-10-09: spec written, nothing built. The pilot runs on today's code: the R0b recipe (the
+Status 2026-10-10: spec written 2026-10-09, build list done 2026-10-10 (the "Build" section at the
+end), launch pending the user's decision. The pilot runs on today's code: the R0b recipe (the
 key/value reader, the copy-first warm-up, swap rate 0.15) at a larger shape and on a mixed corpus,
 two arms of 1B prompt tokens each, the pathway arm P against a matched-token control C without
 retrieval. Most of the Phase 5 blueprint in NEXT.md (coda, tied token table, always-on selector,
@@ -154,9 +155,12 @@ slice.
   4096) and a copy of `evidence_fixed.*` with its `.src`. The biography builds write there and to their
   own store dir, so the micro splits in `data/prepared_inject` and `data/index/inject_bios` stay as
   recorded.
-- **Checks.** Each form is built once. `md5sum` of the files that must be identical: the QA and chain
-  documents between the warm-up and main merges (same seed, same order), the `inject_val` and the
-  facts and pools files between the biography builds, `evidence_fixed.*` against `data/prepared`.
+- **Checks.** Each form is built once. What must be identical: the QA and chain documents between
+  the warm-up and main merges (same seed, same order; read off `md5_by_slice` in
+  `{split}.merge.json`, since the whole files differ in the biography documents), the `inject_val`
+  and the facts and pools files between the biography builds, `evidence_fixed.*` against
+  `data/prepared`. The three merges share one document order (`--order-from`), so a run resumed by
+  document position on the main split continues where it stopped on the warm-up split.
 
 ## Schedule
 
@@ -318,3 +322,59 @@ the query training).
 - The in-context ceiling for A2 comes from arm P itself, which never sees a QA passage in the prompt
   during training; NEXT.md's absolute bar (1.6 nats, half the 3.23-nat ceiling of the full model) is
   printed beside it.
+
+## Build (2026-10-10)
+
+The build list ran in order on 2026-10-10; nothing in the spec above changed, and no file under
+`modules/` was touched.
+
+1. `scripts/merge_evidence_splits.py` with `tests/test_merge_evidence_splits.py` (six checks, all
+   pass). Per slice a seeded permutation that depends only on the seed, the label and the document
+   count; the output order drawn by remaining tokens; `evidx`, `evkeyidx` rebuilt; `--no-evidence`
+   writes `bin idx mask` only; `--max-chunks-per-doc` keeps every gold chunk; `{split}.slice` (uint8
+   per document) and `{split}.merge.json` (stats and `md5_by_slice`) ride along. One addition over
+   the spec: `--order-from`, since the interleave weights are token counts and the two biography
+   forms differ in length, so the warm-up and main merges would not share an order and the switch
+   (a resume by document position on the main split) would repeat and skip documents.
+2. `eval_chains.py` with `tests/test_eval_chains.py`: `records` per question and cell in the JSON
+   (candidate scores, gold rank, margin, gold NLL, ln K, the divergent position and the NLL there),
+   gold NLL against ln K per split, depth, kept and hops, `readings.paired_delta` (kept max minus
+   kept 1, paired bootstrap, 2,000 resamples), the `*` marker in its own column.
+3. `config_pilot.yaml` at the repo root (the probe shape; lr 6e-4 for every group, batch 8 x 4096
+   x 1, checkpoint every 50M, eval every 25M, `[eval fixed]` on `evidence_fixed` with `kill_tokens`
+   0, `groundedness_weight` 0.1). One file for both arms: the groundedness and selection terms are
+   gated on evidence labels in the batch and the control split carries none, so both weights are
+   inert there and every other number is shared by construction. Seed
+   `ckpts/inject/seed_pilot.pt` (seed 0, 99.1M parameters) and `seed_pilot_grounded.pt` (the head
+   added, 1.0K parameters).
+4. Biography builds into `data/prepared_pilot` with the store in `data/index/pilot_bios`
+   (`ckpts/inject/build_pilot_bios.sh`, log `build_pilot_bios.log`, 10 minutes for both):
+   `--seq-length 4096 --target-tokens 600000000`, arms full and retrieval, then retrieval with
+   `--swap-rate 1.0 --suffix s100a50`. 974,525 documents per arm (812,525 filler, 162,000
+   biographies), filler repeat 2.18x over 373,317 train windows (the 270M-token filler supply is
+   the limit), bio token share 2.3%, gold in buffer 79.9%, supported spans 81.1%, swapped spans
+   97,395 (s15) and 647,555 (s100), evidence ratio 0.05. `inject_val`, `inject_facts.jsonl`,
+   `inject_pools.json`, the store's `keys.npy` and `chunks.jsonl` are md5 identical to the micro
+   build's, so the closed-book reads use the same people, pools and cards as every micro arm.
+   Merges (`merge_pilot.sh`, `merge_pilot2.sh`, log `merge_pilot.log`, about 10 minutes each):
+   `pilot_warm_train` (bios s100a50 at 0.60, QA `evidence_nomany_train` at 0.25 and 2 passes,
+   chains `chains_train` at 0.10, target 1B, seed 42), `pilot_main_train` (bios s15, the same
+   slices, `--order-from pilot_warm_train.slice`) and `pilot_control_train` (bios full at 0.6001 so
+   its 600,000,752 tokens are taken whole and the counts match the order, `--no-evidence`,
+   `--order-from` the same). Realized per merge: 3,488,744 documents, 910.2M prompt tokens (bios
+   599.6M, QA 210,607,046 at exactly 2 passes, chains 99,999,982 in 1,910,913 of 2M questions);
+   evidence 652.3M tokens at ratio 0.717 (bios 30.0M at 0.050, QA 202.7M at 0.962, chains 419.6M
+   at 4.196; 24.1M chunks), no document over the 4608 cap or the 256-chunk limit. The QA and chain
+   `md5_by_slice` are identical across the three merges, the `.slice` files are identical, and
+   `evidence_fixed.*` with its `.src` is md5 identical to `data/prepared`. **The budget is 910M
+   prompt tokens per arm**, not 1B: `sft.py` fits the cosine to the split, the QA slice at 2 passes
+   holds 210.6M, and the gap is recorded here rather than closed (a third QA pass or more chains
+   would change the shares). Disk: 25.6 GB per evidence merge, 2.8 GB for the control, 194 GB free.
+5. `ckpts/inject/launch_pilot_p.sh` (`SPLIT` defaults to `pilot_warm_train`; the switch relaunch is
+   the same script with `SPLIT=pilot_main_train`, resuming `ckpts/evidence_pilot_p/`) and
+   `launch_pilot_c.sh`, both teeing to `ckpts/inject/pilot_{p,c}.log`.
+6. `ckpts/inject/read_pilot_save.sh CKPT p|c TAG [CHAINS]`: the four card conditions of
+   `closed_book_rank.py bios` (arm C: `none` only) with `--facts`, `--pools` and `--store` from the
+   pilot build, then `eval_chains.py` at depths 1, 2, 3 on the three chain splits and at 3, 4 on
+   `chains_hop4`, each timed. Not dry-run: no probe save exists (the probe run directories were
+   removed on 2026-10-09), so the first 50M save of arm P is the dry run and the timing.

@@ -274,6 +274,12 @@ the pilot spec.
 
 ### Instrument gaps (worth fixing before the next chain arm)
 
+Closed 2026-10-10 in `eval_chains.py` (`tests/test_eval_chains.py`): per-question records under
+`records` in the JSON, gold NLL against ln K for every split and hop, the NLL at the first token
+where the candidates diverge, a paired bootstrap delta between the fewest and the most kept sites
+(`readings.paired_delta`), and the `*` marker in its own column. The list below is the record of
+what was missing when this arm was read.
+
 - The JSON holds per-cell accuracy only: no per-question record (candidate scores, gold rank,
   margin), so Delta cannot be paired and a diagnosis like the one above has to be argued from
   aggregates.

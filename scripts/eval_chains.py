@@ -14,9 +14,14 @@ sigma above chance; if it is not, the instrument is "not readable" and says so r
 A checkpoint that never trained on chains will usually give "not readable": the instrument is first
 readable on a chain trained one.
 
-Besides the grid the report carries the depth readings (answer cross entropy by kept sites on the
-4-hop split, and by depth 3 against 4 at full sites) and the held out composition 2-hop accuracy
-beside the seen 2-hop accuracy.
+Besides the grid the report carries, per split and depth, the gold answer's NLL against ln K (the
+cost of a uniform pick among the K candidates), the per-token answer CE and the NLL at the first
+token where the candidates diverge (the token that carries the choice); the depth readings (answer
+cross entropy by kept sites on the 4-hop split, and by depth 3 against 4 at full sites); the held
+out composition 2-hop accuracy beside the seen 2-hop accuracy; and a paired delta between the
+fewest and the most kept sites with a paired bootstrap sigma. The JSON holds one record per
+question and cell (candidate scores, gold rank, margin, NLLs) under ``records``, so any two cells
+can be paired by position.
 
 Usage:
 
@@ -27,9 +32,10 @@ Usage:
 import os
 import sys
 import json
+import math
 import argparse
 from collections import defaultdict
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -100,7 +106,8 @@ def encode_items(split: ChainSplit, indices: Sequence[int], tokenizer, template:
 
 @torch.no_grad()
 def score_items(model, items: List[dict], *, depth: int, kept: Optional[int], pad_id: int,
-                batch_size: int, device: str, max_seq_len: int) -> List[List[float]]:
+                batch_size: int, device: str, max_seq_len: int,
+                return_tokens: bool = False) -> Union[List[List[float]], Tuple[List[List[float]], List[List[List[float]]]]]:
     """Summed log-probability of every candidate of every item, at depth ``depth`` with ``kept`` sites.
 
     Rows are right padded with one extra pad column, which gives every row a second attention
@@ -113,12 +120,15 @@ def score_items(model, items: List[dict], *, depth: int, kept: Optional[int], pa
         kept: ``reader_sites_kept`` for the forward; None keeps every site.
         batch_size: rows (question, candidate pairs) per forward.
         max_seq_len: longest row allowed.
+        return_tokens: also return every candidate's per-token log-probabilities.
 
     Returns:
-        Per item, one summed log-probability per candidate.
+        Per item, one summed log-probability per candidate; with ``return_tokens`` a pair of that and
+        the per-token log-probabilities (item, candidate, token, EOS last).
     """
     rows = [(n, c) for n, item in enumerate(items) for c in range(len(item["candidates"]))]
     scores = [[0.0] * len(item["candidates"]) for item in items]
+    token_lps = [[[] for _ in item["candidates"]] for item in items]
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
         seqs = [items[n]["prompt"] + items[n]["cand_ids"][c] for n, c in chunk]
@@ -152,7 +162,12 @@ def score_items(model, items: List[dict], *, depth: int, kept: Optional[int], pa
         per_row = torch.zeros(len(chunk), device=device).index_add_(0, torch.tensor(owner, device=device), token_lp)
         for (n, c), value in zip(chunk, per_row.tolist()):
             scores[n][c] = value
-    return scores
+        flat, at = token_lp.tolist(), 0
+        for n, c in chunk:
+            k = len(items[n]["cand_ids"][c])
+            token_lps[n][c] = flat[at:at + k]
+            at += k
+    return (scores, token_lps) if return_tokens else scores
 
 
 def parse_sites(text: str, depth: int) -> List[int]:
@@ -197,6 +212,152 @@ def answer_ce(cell: dict) -> float:
     return -sum(cell["gold_lp"]) / max(sum(cell["gold_n"]), 1)
 
 
+def divergent_position(cand_ids: Sequence[Sequence[int]]) -> int:
+    """First token index where the candidates' id sequences are not all equal.
+
+    Args:
+        cand_ids: one id list per candidate (EOS included).
+
+    Returns:
+        The index, 0 when the first tokens differ or when no position within the shortest
+        candidate separates them.
+    """
+    for t in range(min(len(c) for c in cand_ids)):
+        if len({c[t] for c in cand_ids}) > 1:
+            return t
+    return 0
+
+
+def build_records(items: List[dict], scores: List[List[float]], token_lps: List[List[List[float]]]) -> List[dict]:
+    """One record per question: the candidate scores and what they say about the gold answer.
+
+    Rank 0 is best; ties go to the lower candidate index, as ``argmax`` does, so ``correct`` is
+    ``rank == 0``. The margin is the gold score minus the best other candidate (0 with one
+    candidate). NLL per answer sums the gold's tokens, EOS included.
+
+    Args:
+        items: from ``encode_items``.
+        scores: from ``score_items``.
+        token_lps: per-token log-probabilities from ``score_items(return_tokens=True)``.
+    """
+    records = []
+    for item, s, tl in zip(items, scores, token_lps):
+        g, k = item["gold"], len(s)
+        rank = sum(1 for c, v in enumerate(s) if v > s[g] or (v == s[g] and c < g))
+        others = [v for c, v in enumerate(s) if c != g]
+        pos = divergent_position(item["cand_ids"])
+        n_gold = len(item["cand_ids"][g])
+        records.append({
+            "question": item["index"], "hops": item["hops"], "gold": g, "n_candidates": k,
+            "scores": [round(v, 4) for v in s], "gold_rank": rank, "correct": rank == 0,
+            "margin": round(s[g] - max(others), 4) if others else 0.0,
+            "gold_tokens": n_gold, "gold_nll": round(-s[g], 4),
+            "gold_nll_per_token": round(-s[g] / max(n_gold, 1), 4), "ln_k": round(math.log(k), 4),
+            "divergent_pos": pos, "gold_nll_at_divergence": round(-tl[g][pos], 4),
+        })
+    return records
+
+
+def cell_extras(records: List[dict]) -> dict:
+    """Mean gold NLL per answer, mean ln K, CE per gold token and mean NLL at the divergent token.
+
+    Args:
+        records: ``build_records`` entries of one cell.
+    """
+    n = max(len(records), 1)
+    return {
+        "gold_nll_per_answer": sum(r["gold_nll"] for r in records) / n,
+        "ln_k": sum(r["ln_k"] for r in records) / n,
+        "ce_per_token": sum(r["gold_nll"] for r in records) / max(sum(r["gold_tokens"] for r in records), 1),
+        "nll_at_divergence": sum(r["gold_nll_at_divergence"] for r in records) / n,
+    }
+
+
+def paired_delta(lo: Sequence[bool], hi: Sequence[bool], n_boot: int = 2000, seed: int = 0) -> dict:
+    """Accuracy of ``hi`` minus accuracy of ``lo`` on the same questions, with a paired bootstrap sigma.
+
+    Args:
+        lo: per question correct flags of the first cell.
+        hi: per question correct flags of the second cell, same question order.
+        n_boot: bootstrap resamples of the questions.
+        seed: seed of the resampling generator.
+    """
+    assert len(lo) == len(hi), "paired cells must hold the same questions"
+    n = len(lo)
+    if n == 0:
+        return {"delta": float("nan"), "sigma": float("nan"), "n": 0}
+    d = np.asarray(hi, dtype=np.float64) - np.asarray(lo, dtype=np.float64)
+    idx = np.random.default_rng(seed).integers(0, n, size=(n_boot, n))
+    return {"delta": float(d.mean()), "sigma": float(d[idx].mean(axis=1).std(ddof=1)), "n": n}
+
+
+def paired_delta_by_hops(by_kept: Dict[int, List[dict]]) -> Dict[int, dict]:
+    """Per hop count, accuracy at the most kept sites minus accuracy at one kept site, paired by question.
+
+    Args:
+        by_kept: records of one split and depth, keyed by kept-site count, in the same question order.
+    """
+    if 1 not in by_kept or max(by_kept) <= 1:
+        return {}
+    hi_kept = max(by_kept)
+    out = {}
+    for hops in sorted({r["hops"] for r in by_kept[1]}):
+        lo = [r for r in by_kept[1] if r["hops"] == hops]
+        hi = [r for r in by_kept[hi_kept] if r["hops"] == hops]
+        assert [r["question"] for r in lo] == [r["question"] for r in hi], "cells are not paired"
+        out[hops] = dict(paired_delta([r["correct"] for r in lo], [r["correct"] for r in hi]),
+                         kept_lo=1, kept_hi=hi_kept)
+    return out
+
+
+ACC_WIDTH = 29
+NLL_WIDTH = 34
+
+
+def accuracy_table(by_kept: Dict[int, Dict[int, dict]]) -> List[str]:
+    """Header and one row per kept count; a two character marker column precedes each cell.
+
+    Args:
+        by_kept: grid cells of one split and depth, ``by_kept[kept][hops]``.
+    """
+    hops_seen = sorted({h for k in by_kept.values() for h in k})
+    lines = ["kept  " + "".join(f"{f'hops {h}':>{ACC_WIDTH + 2}}" for h in hops_seen)]
+    for kept, by_hops in by_kept.items():
+        line = f"{kept:>4}  "
+        for h in hops_seen:
+            s = by_hops.get(h)
+            if s is None:
+                line += " " * (ACC_WIDTH + 2)
+                continue
+            mark = "*" if kept < h else " "
+            body = f"{s['acc']:.3f}+-{s['sigma']:.3f} | {s['chance']:.3f} | {s['z_vs_chance']:+6.1f}"
+            line += f" {mark}{body:>{ACC_WIDTH}}"
+        lines.append(line)
+    return lines
+
+
+def nll_table(by_kept: Dict[int, Dict[int, dict]]) -> List[str]:
+    """Gold NLL per answer, mean ln K, CE per token and NLL at the divergent token, per kept count and hops.
+
+    Args:
+        by_kept: grid cells of one split and depth carrying the ``cell_extras`` keys.
+    """
+    hops_seen = sorted({h for k in by_kept.values() for h in k})
+    lines = ["kept  " + "".join(f"{f'hops {h}':>{NLL_WIDTH}}" for h in hops_seen)]
+    for kept, by_hops in by_kept.items():
+        line = f"{kept:>4}  "
+        for h in hops_seen:
+            s = by_hops.get(h)
+            if s is None or "gold_nll_per_answer" not in s:
+                line += " " * NLL_WIDTH
+                continue
+            body = (f"{s['gold_nll_per_answer']:6.3f} /{s['ln_k']:6.3f} | {s['ce_per_token']:5.3f}"
+                    f" | {s['nll_at_divergence']:6.3f}")
+            line += f"{body:>{NLL_WIDTH}}"
+        lines.append(line)
+    return lines
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-c", "--checkpoint", required=True)
@@ -223,11 +384,12 @@ def main():
     grid: Dict[str, dict] = {}
     cells: List[dict] = []
     ce_by_split: Dict[str, dict] = {}
+    records: Dict[str, dict] = {}
     for split_name in [s.strip() for s in args.splits.split(",") if s.strip()]:
         split = ChainSplit(args.data_dir, split_name)
         items = encode_items(split, split.select(args.max_questions), tokenizer, template)
         logger.info(f"{split_name}: {len(items)} questions")
-        grid[split_name], ce_by_split[split_name] = {}, {}
+        grid[split_name], ce_by_split[split_name], records[split_name] = {}, {}, {}
         for depth in depths:
             if split_name == args.splits.split(",")[0].strip() and depth == depths[0]:
                 head = items[:max(1, args.batch_size // 4)]
@@ -236,14 +398,18 @@ def main():
                 drift = max(abs(x - y) for ra, rb in zip(a, b) for x, y in zip(ra, rb))
                 assert drift < 1e-4, f"kept == depth differs from reader_sites_kept=None by {drift}"
             grid[split_name][depth], ce_by_split[split_name][depth] = {}, {}
+            records[split_name][depth] = {}
             for kept in parse_sites(args.sites, depth):
-                scores = score_items(model, items, depth=depth, kept=None if kept >= depth else kept, **common)
+                scores, token_lps = score_items(model, items, depth=depth, kept=None if kept >= depth else kept,
+                                                return_tokens=True, **common)
                 by_hops = tally(items, scores)
+                records[split_name][depth][kept] = build_records(items, scores, token_lps)
                 grid[split_name][depth][kept] = {}
                 ce_by_split[split_name][depth][kept] = {}
                 for hops, cell in sorted(by_hops.items()):
                     stats = chains.cell_stats(cell["correct"], cell["chance"])
-                    grid[split_name][depth][kept][hops] = stats
+                    extras = cell_extras([r for r in records[split_name][depth][kept] if r["hops"] == hops])
+                    grid[split_name][depth][kept][hops] = dict(stats, **extras)
                     ce_by_split[split_name][depth][kept][hops] = answer_ce(cell)
                     cells.append(dict(stats, split=split_name, depth=depth, hops=hops, kept=kept))
                     logger.info(f"{split_name} D={depth} kept={kept} hops={hops}: acc {stats['acc']:.3f} "
@@ -254,17 +420,7 @@ def main():
     for split_name, by_depth in grid.items():
         for depth, by_kept in by_depth.items():
             print(f"\n{split_name}  depth {depth}   (acc +- sigma | chance | z vs chance)")
-            hops_seen = sorted({h for k in by_kept.values() for h in k})
-            print("kept  " + "".join(f"{f'hops {h}':>30}" for h in hops_seen))
-            for kept, by_hops in by_kept.items():
-                line = f"{kept:>4}  "
-                for h in hops_seen:
-                    s = by_hops.get(h)
-                    if s is None:
-                        line += f"{'':>30}"
-                        continue
-                    mark = "*" if kept < h else " "
-                    line += f"{mark}{s['acc']:.3f}+-{s['sigma']:.3f} | {s['chance']:.3f} | {s['z_vs_chance']:+6.1f}".rjust(30)
+            for line in accuracy_table(by_kept):
                 print(line)
     print("\n(* marks a cell with fewer kept sites than hops: it must sit at chance)")
     print(f"sub-hop cells outside 3 sigma of chance: {len(verdict['failing'])}")
@@ -275,7 +431,17 @@ def main():
         print(f"1-hop curve not readable: {len(verdict['unreadable'])} cells under 3 sigma above chance")
     print(f"instrument valid: {'yes' if verdict['valid'] else 'no'}")
 
-    readings: dict = {}
+    print("\n=== gold NLL per answer / mean ln K | CE per token | NLL at the divergent token ===")
+    for split_name, by_depth in grid.items():
+        for depth, by_kept in by_depth.items():
+            print(f"\n{split_name}  depth {depth}")
+            for line in nll_table(by_kept):
+                print(line)
+
+    readings: dict = {"paired_delta": {}}
+    for split_name, by_depth in records.items():
+        readings["paired_delta"][split_name] = {
+            str(d): {str(h): v for h, v in paired_delta_by_hops(by_kept).items()} for d, by_kept in by_depth.items()}
     if "chains_hop4" in ce_by_split:
         print("\nanswer CE by kept sites on the 4-hop split")
         for depth, by_kept in ce_by_split["chains_hop4"].items():
@@ -296,6 +462,11 @@ def main():
             if h is not None and kept in (1, 3):
                 seen_text = f"{s['acc']:.3f} (chance {s['chance']:.3f})" if s else "n/a"
                 print(f"  kept {kept}: held out {h['acc']:.3f} (chance {h['chance']:.3f}) | seen {seen_text}")
+        for name, split_name in (("held out", "chains_heldout_tmpl"), ("seen", "chains_eval")):
+            pd = readings["paired_delta"].get(split_name, {}).get("3", {}).get("2")
+            if pd:
+                print(f"  paired Delta acc (kept {pd['kept_hi']} minus kept {pd['kept_lo']}), {name}: "
+                      f"{pd['delta']:+.3f} +- {pd['sigma']:.3f} (n {pd['n']})")
         readings["heldout_vs_seen_depth3"] = {
             str(k): {"held_out": held[k].get(2), "seen": seen.get(k, {}).get(2)} for k in sorted(held)}
 
@@ -306,6 +477,8 @@ def main():
                          for d, bk in bd.items()} for s, bd in grid.items()},
             "validity": {"valid": verdict["valid"], "readable": verdict["readable"],
                          "failing": verdict["failing"], "unreadable": verdict["unreadable"]},
+            "records": {s: {str(d): {str(k): recs for k, recs in bk.items()} for d, bk in bd.items()}
+                        for s, bd in records.items()},
             "readings": readings,
         }
         with open(args.json_out, "w", encoding="utf-8") as f:

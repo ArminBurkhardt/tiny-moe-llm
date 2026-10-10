@@ -23,8 +23,11 @@ never learned 1-hop lookup, so L1 stays unmeasured at micro scale. On 2026-10-09
 was written ([PILOT.md](docs/plans/PILOT.md)): the pilot runs the R0b recipe on today's code at
 99.1M parameters (width 512, 6 prelude layers, 8 experts, seq 4096, key/value reader) on a merged
 corpus from the existing builders, 1B tokens per arm against a matched full-CE control, with a
-1-hop gate before L1; the unbuilt blueprint items and the rungs R4, R4b and R6 are deferred. Its
-build list is next; the user decides the launch.
+1-hop gate before L1; the unbuilt blueprint items and the rungs R4, R4b and R6 are deferred. On
+2026-10-10 its build list was done: the merge tool, the chain instrument fixes, `config_pilot.yaml`
+and `ckpts/inject/seed_pilot_grounded.pt`, the biography builds and the three merges in
+`data/prepared_pilot` (910.2M prompt tokens per arm, the budget), the launchers and the per-save
+read script under `ckpts/inject/`. The user decides the launch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -181,12 +184,25 @@ source and the artifact stays identical to it; the file goes into the same commi
      as behavioural at conflicts). The chain slice stays 10% at hops 25 / 50 / 25 and the pilot's
      L1 is the deciding read on the loop clause.
   2. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
-  Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)). Its build list, in order: the split
-  merge tool `scripts/merge_evidence_splits.py` with its test, the `eval_chains.py` instrument
-  fixes (per-question JSON, per-answer gold NLL against ln K, the `*` marker), `config_pilot.yaml`
-  and its seed, the three biography builds at seq 4096 (retrieval s15, retrieval s100, full) and
-  the three merges (warm-up, main, control), the launchers and per-save read scripts. No change to
-  `modules/`.
+  Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)); build list done 2026-10-10 (its
+  "Build" section). Launch: `bash ckpts/inject/launch_pilot_p.sh` (warm-up split; after the switch
+  criterion holds, `SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_p.sh` resumes the same
+  run directory) and `bash ckpts/inject/launch_pilot_c.sh`, each in the background under a Monitor
+  watch; reads per save with `bash ckpts/inject/read_pilot_save.sh CKPT p|c TAG [0|1]`. The first
+  50M save of arm P times the read set (no probe save exists). No change to `modules/`.
+- Pilot corpus (2026-10-10, `data/prepared_pilot`, built by `ckpts/inject/build_pilot_bios.sh`,
+  `merge_pilot.sh`, `merge_pilot2.sh`, log `merge_pilot.log`): biographies at seq 4096 and 600M
+  tokens (974,525 documents, filler repeat 2.18x, bio share 2.3%; store `data/index/pilot_bios`,
+  facts, pools and `inject_val` byte identical to the micro build); merges `pilot_warm_train`
+  (bios s100a50), `pilot_main_train` (bios s15), `pilot_control_train` (bios full, no evidence
+  files): 3,488,744 documents, 910.2M prompt tokens each (bios 599.6M, QA 210.6M at 2 passes,
+  chains 100.0M), evidence 652M tokens at ratio 0.717 (chains 419.6M at 4.20, QA 202.7M at 0.96,
+  bios 30M at 0.05), one shared document order (`--order-from`), QA and chain subsequences md5
+  identical across the three (`md5_by_slice` in `{split}.merge.json`); `evidence_fixed.*` copied
+  with its `.src`. `sft.py` fits the cosine to the split, so 910M is the per-arm budget, not the
+  yaml's 1B. The merge tool: `python scripts/merge_evidence_splits.py --out-dir D --split S
+  --target-tokens N --seed 42 --slice label=dir/split:share[:passes] ... [--no-evidence]
+  [--max-chunks-per-doc label=K] [--order-from other.slice]`.
 - Pilot shape probe (2026-10-09, `ckpts/inject/config_pilot_probe*.yaml`, logs
   `ckpts/inject/pilot_probe*.log`): 99.1M total, 84.9M active, 249M FLOP/token at seq 4096, 39.4M
   per evidence token. Batch 8 x 4096 x 1 on `inject_retrieval_train`: 44k to 50k tok/s, 20.4 GB;
@@ -219,6 +235,10 @@ source and the artifact stays identical to it; the file goes into the same commi
   ```
 - `tests/run_tests.sh` wraps this; `TINY_LLM_ROOT` / `TINY_LLM_ENV_INIT` override it on the
   rented box (`TINY_LLM_ENV_INIT=/dev/null`).
+- **One command per tool call.** Do not chain commands with `&&`, `;` or pipes into `tail`,
+  `grep` and the like beyond the `cd ... && source env_init && python ...` wrapper above. Chained
+  lines cannot be auto-approved and hide which step failed; independent commands go in separate
+  calls (user request 2026-10-10).
 - **Every training launch (`sft.py`, `pretrain.py`, `run_training.py`) runs in the background
   under a Monitor watch**, however short. The filter matches failures and progress:
   `Traceback|Error|Killed|OOM|assert|device not ready` plus `Step` / `Tokens/sec`, and for

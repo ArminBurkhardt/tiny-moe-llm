@@ -10,7 +10,29 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-09)
+## Now (2026-10-10)
+
+**The pilot's build list is done (2026-10-10); the launch is the user's decision.** Built: the
+split merge tool `scripts/merge_evidence_splits.py` with its test (seeded per-slice permutations,
+an interleave drawn by remaining tokens, re-indexed chunk tables, a per-document chunk cap, an
+evidence-free form, a per-slice md5 and a `.slice` sidecar; `--order-from` reuses another merge's
+document order so a run resumed by position on the main split continues where the warm-up split
+stopped); the `eval_chains.py` instrument fixes (per-question records, gold NLL against ln K for
+every split and hop, the NLL at the first divergent token, a paired bootstrap delta between kept
+site counts, the `*` marker in its own column); `config_pilot.yaml` (one file for both arms: the
+groundedness and selection terms are never computed on the control's evidence-free split) and the
+seed `ckpts/inject/seed_pilot_grounded.pt` (99.1M parameters, the head added); the biography
+builds at seq 4096 and 600M tokens in `data/prepared_pilot` (974,525 documents per arm, filler
+repeat 2.18x over 270M filler tokens, bio share 2.3%; the store `data/index/pilot_bios`, the facts,
+pools and `inject_val` are byte identical to the micro build, so the closed-book reads are
+comparable); the three merges `pilot_warm_train`, `pilot_main_train`, `pilot_control_train`
+(3,488,744 documents, 910.2M prompt tokens each, so the per-arm budget is 910M, not 1B: the QA
+slice at 2 passes holds 210.6M; evidence 652M tokens at ratio 0.717, 419.6M of it in the chain
+slice; QA and chain subsequences md5 identical across the three) and `evidence_fixed` copied with
+its `.src`; the launchers `ckpts/inject/launch_pilot_{p,c}.sh` and the per-save read script
+`ckpts/inject/read_pilot_save.sh`. Not done: the dry run of the read scripts on a pilot save (no
+probe save exists; the first 50M save of arm P serves, and times the read set). The spec stands as
+written on 2026-10-09; the paragraph below is its summary.**
 
 **The pilot spec is written ([PILOT.md](PILOT.md), 2026-10-09), and it cuts the pilot to what is
 built.** A code inventory found most of the Phase 5 blueprint unbuilt (no coda, no tied table, the
@@ -424,7 +446,8 @@ in graft arms.
    PopQA `delta` (arm A -0.0002, z -0.4 over all entity items) nor counterfactual following (paired
    gap +0.01, z 0.1 pooled; the seed's `mr_ll` gradient is a frequency-ratio prior). The store
    build, the edit store and the chain splits are CPU work that can run beside any GPU arm.
-10. **Spec written 2026-10-09 ([PILOT.md](PILOT.md)); next: its build list, then the pilot**
+10. **Spec written 2026-10-09 ([PILOT.md](PILOT.md)), build list done 2026-10-10; next: the pilot,
+    on the user's go**
     (Phase 5): the key/value reader and its rotation, the copy-first warm-up as a requirement, and
     swap rate 0.15, with no further lever against the leak (the copy-criterion span weight dropped
     2026-10-08); the chain slice stays at 10% with hops 25 / 50 / 25, and the pilot's L1 is the
@@ -1173,6 +1196,12 @@ above are a different, live series).
   15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
   (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
   lever if one is needed.
+- 2026-10-10: the pilot's build list is done (the "Build" section of [PILOT.md](PILOT.md)): the
+  split merge tool and its test, the `eval_chains.py` instrument fixes, `config_pilot.yaml` and
+  the seed, the biography builds at 4096 and the three merges (910.2M prompt tokens per arm, the
+  budget; evidence ratio 0.717), the launchers and the per-save read script. The merged splits
+  share one document order (`--order-from`), so the switch from the warm-up to the main split
+  resumes by position without a repeat or a gap. Nothing in the spec changed.
 - 2026-10-08, later: the chain depth arm (`chains_kv`, 102.66M tokens, 2M chain questions, key/value
   reader from `seed_micro.pt`) read **inconclusive** under its pre-registered criteria
   ([chain_depth_micro.md](../measurements/chain_depth_micro.md)). Every accuracy cell is at chance
