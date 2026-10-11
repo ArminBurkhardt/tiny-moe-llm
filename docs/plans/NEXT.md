@@ -12,7 +12,35 @@ and the new references). The design itself, with blueprints of both runs, is
 
 ## Now (2026-10-10)
 
-**The pilot's build list is done (2026-10-10); the launch is the user's decision.** Built: the
+**Arm P is running on the main split (2026-10-10, evening).** Launched at 19:03 on the warm-up
+split, it ran at 42k to 48k tokens per second (50M per 21 minutes, 27.1 GB peak), three times the
+fitted rate, so the whole pilot is one night. Stopped right after the 300M save and read: gold card
+top-1 1.000 in every tier in distribution (0.95 to 1.00 held out), swapped card followed on every
+item, and closed book at chance in every cell on both forms (largest |z| 2.3), so both halves of
+the switch criterion hold with margin and no counterpart of the micro arm's 50M leak. The 1-hop
+gate passed at the same save: `chains_eval` 1-hop 0.32 against chance 0.115 (z +21) with one site
+kept, which the micro model never reached; 2-hop, 3-hop and the held-out composition sit at chance
+and the paired kept 3 minus kept 1 delta is +0.000, so L1 is readable and reads flat at 300M of
+warm-up. The trainer's own reads: gold gain on `evidence_fixed` +3.73 nats at 275M (above the
+3.23 ceiling measured on other rows), grounded AUROC 0.95, selector still weak (chunk AUROC 0.61).
+Relaunched on `pilot_main_train` from the 301M save at 21:50 (document 1,221,989, the same
+document on both splits by the shared order). A full read set takes 26 minutes against 21 minutes
+per 50M, and the trainer keeps the GPU, so each read is a stop, read, relaunch; rank reads at
+350M and 400M (the micro leak appeared within 50M of the switch), then every 100M with the chains.
+The 351M read: copying intact (gold top-1 1.000 / 0.985, swapped followed 1.000 / 0.97) and the
+tier 1000 leak written within 50M of the switch as at micro (entity `delta` 0.043, z 3.9 in
+distribution; 0.012, z 1.3 held out; tier 100 flat). At 426M the leak grows on both forms (0.050,
+z 5.0 / 0.029, z 3.3 at tier 1000; tier 100 still flat) and held-out copying slips (gold top-1
+0.92, swapped followed 0.93, from 0.985 / 0.97). The 530M full read (2026-10-11, after a user
+pause at 429M): the 1-hop gate holds at its 500M bar and is rising (1-hop 0.52 to 0.53 against
+chance 0.115, z +40, from 0.32 at 300M); L1 flat (2-hop, 3-hop, the held-out composition and 4-hop
+at chance at every depth, paired kept 3 minus kept 1 -0.004 +- 0.005); the tier 1000 leak level in
+distribution (0.040, z 4.5) and caught up held out (0.043, z 5.9), tier 100 flat on both forms;
+held-out copying back to 0.97 (gold top-1 0.973, swapped followed 0.97), so the 426M slip was a
+dip. Record: the "Run" section of [PILOT.md](PILOT.md). Next: reads at about 630M, 730M, 830M and
+the final save, then arm C, then the reads of the ladder.
+
+**The pilot's build list was done earlier on 2026-10-10.** Built: the
 split merge tool `scripts/merge_evidence_splits.py` with its test (seeded per-slice permutations,
 an interleave drawn by remaining tokens, re-indexed chunk tables, a per-document chunk cap, an
 evidence-free form, a per-slice md5 and a `.slice` sidecar; `--order-from` reuses another merge's
@@ -446,8 +474,9 @@ in graft arms.
    PopQA `delta` (arm A -0.0002, z -0.4 over all entity items) nor counterfactual following (paired
    gap +0.01, z 0.1 pooled; the seed's `mr_ll` gradient is a frequency-ratio prior). The store
    build, the edit store and the chain splits are CPU work that can run beside any GPU arm.
-10. **Spec written 2026-10-09 ([PILOT.md](PILOT.md)), build list done 2026-10-10; next: the pilot,
-    on the user's go**
+10. **Spec written 2026-10-09 ([PILOT.md](PILOT.md)), build list done 2026-10-10, arm P launched
+    the same evening and switched to the main split at 300M with the criterion met and the 1-hop
+    gate passed; running**
     (Phase 5): the key/value reader and its rotation, the copy-first warm-up as a requirement, and
     swap rate 0.15, with no further lever against the leak (the copy-criterion span weight dropped
     2026-10-08); the chain slice stays at 10% with hops 25 / 50 / 25, and the pilot's L1 is the
@@ -1196,6 +1225,16 @@ above are a different, live series).
   15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
   (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
   lever if one is needed.
+- 2026-10-11: arm P read at 530M after a pause at 429M: the 1-hop gate holds at its 500M bar
+  (1-hop 0.53, rising from 0.32), L1 flat (every composition cell at chance, paired delta -0.004),
+  the tier 1000 leak 0.040 / 0.043 on the two forms with tier 100 flat, held-out copying back to
+  0.97 (the "Run" section of [PILOT.md](PILOT.md)). Nothing in the spec changed.
+- 2026-10-10, evening: arm P launched at 19:03, ran at 42k to 48k tokens per second (three times
+  the fit), was stopped after the 300M save and read: copying complete (gold top-1 1.000 in
+  distribution, swapped followed 1.000), closed book at chance in every cell on both forms, the
+  1-hop gate passed (0.32 against chance 0.115, z +21) with 2-hop and held-out composition at
+  chance. Relaunched on the main split from the 301M save (the "Run" section of
+  [PILOT.md](PILOT.md)). Nothing in the spec changed.
 - 2026-10-10: the pilot's build list is done (the "Build" section of [PILOT.md](PILOT.md)): the
   split merge tool and its test, the `eval_chains.py` instrument fixes, `config_pilot.yaml` and
   the seed, the biography builds at 4096 and the three merges (910.2M prompt tokens per arm, the

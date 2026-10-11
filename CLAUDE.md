@@ -27,7 +27,19 @@ corpus from the existing builders, 1B tokens per arm against a matched full-CE c
 2026-10-10 its build list was done: the merge tool, the chain instrument fixes, `config_pilot.yaml`
 and `ckpts/inject/seed_pilot_grounded.pt`, the biography builds and the three merges in
 `data/prepared_pilot` (910.2M prompt tokens per arm, the budget), the launchers and the per-save
-read script under `ckpts/inject/`. The user decides the launch.
+read script under `ckpts/inject/`. The same evening arm P launched, ran at 42k to 48k tokens per
+second (50M per 21 minutes), was stopped after the 300M save and read: copying complete (gold
+top-1 1.000 in distribution, swapped followed 1.000), closed book at chance in every cell on both
+forms, the 1-hop gate passed (`chains_eval` 1-hop 0.32 against chance 0.115) with composition at
+chance; relaunched on `pilot_main_train` from the 301M save (the "Run" section of PILOT.md). At
+351M copying holds and the tier 1000 leak is written as at micro (entity `delta` 0.043, z 3.9 in
+distribution; tier 100 flat). At 530M (2026-10-11): the 1-hop gate holds at its 500M bar (1-hop
+0.53 against chance 0.115, from 0.32), L1 flat (every composition cell at chance, paired kept 3
+minus kept 1 -0.004 +- 0.005), tier 1000 leak 0.040 (z 4.5) / 0.043 (z 5.9) on the two forms with
+tier 100 flat, held-out copying 0.97 after a dip to 0.92 at 426M. Reads are a stop, read, relaunch
+(26 minutes per set; `ckpts/inject/stop_after_save.sh ARM PATTERN` drops STOP after a matching
+save; a stop leaves `STOP` to remove before relaunch); next reads about 630M, 730M, 830M and the
+final save, then arm C.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b

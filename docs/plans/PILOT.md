@@ -1,7 +1,10 @@
 # The from-scratch pilot (Phase 5): the spec, written 2026-10-09 before the build
 
-Status 2026-10-10: spec written 2026-10-09, build list done 2026-10-10 (the "Build" section at the
-end), launch pending the user's decision. The pilot runs on today's code: the R0b recipe (the
+Status 2026-10-11: spec written 2026-10-09, build list done 2026-10-10 (the "Build"
+section), arm P launched 2026-10-10 19:03, switched to the main split at the 300M save the same
+evening with both halves of the switch criterion met and the 1-hop gate passed; at 530M the gate
+holds at its 500M bar (1-hop 0.53), L1 reads flat, the tier 1000 leak sits at 0.04 on both forms
+and tier 100 is flat (the "Run" section at the end). The pilot runs on today's code: the R0b recipe (the
 key/value reader, the copy-first warm-up, swap rate 0.15) at a larger shape and on a mixed corpus,
 two arms of 1B prompt tokens each, the pathway arm P against a matched-token control C without
 retrieval. Most of the Phase 5 blueprint in NEXT.md (coda, tied token table, always-on selector,
@@ -378,3 +381,98 @@ The build list ran in order on 2026-10-10; nothing in the spec above changed, an
    pilot build, then `eval_chains.py` at depths 1, 2, 3 on the three chain splits and at 3, 4 on
    `chains_hop4`, each timed. Not dry-run: no probe save exists (the probe run directories were
    removed on 2026-10-09), so the first 50M save of arm P is the dry run and the timing.
+
+## Run (2026-10-10, arm P warm-up and switch)
+
+Arm P launched 2026-10-10 19:03 on `pilot_warm_train` (`launch_pilot_p.sh`, log
+`ckpts/inject/pilot_p.log`), stopped by STOP right after the 300M save at 21:17 (saves at 300M and
+301M, exit 10), read, and relaunched on `pilot_main_train` from the 301M save at 21:50 (resumed at
+document 1,221,989 of 3,488,744; the shared order makes that position the same document on both
+splits). Nothing in the spec changed.
+
+- **Rate.** 42k to 48k prompt tokens per second steady (bursts to 80k), peak 27.1 GB at batch 8 x
+  4096 x 1 with 2.5 GB already held by other processes; packing over 256 rows at fill 87 to 89%,
+  evidence 57 to 60% of its cap, 26 to 40 rows of 256 closed by the evidence budget. 50M per 21
+  minutes, so arm P is about 6.5 hours of training in all, not the 16 to 28 the fit gave: the
+  ratio-0.72 corpus runs at the low-evidence rate, and the 3.75-ratio probe rows did not transfer.
+- **Trainer reads through 300M.** Val CE on `inject_val` 5.75 / 5.04 / 4.46 / 4.21 / 4.07 / 3.96 /
+  3.89 / 3.82 / 3.77 / 3.68 at 25M steps from 25M to 275M. `[eval fixed]` gold gain +0.30 at 25M,
+  +2.02 at 75M, +3.08 at 125M, +3.25 at 150M (the 3.23-nat ceiling, measured on different rows),
+  +3.73 at 275M; content gain +3.39 at 275M; grounded AUROC 0.84 at 25M, 0.95 at 275M. The
+  selector stays weak: chunk AUROC per token 0.61 at 125M, gold mass per chunk 0.011 against
+  0.009 for distractors. `loop_scale` [1.19, 0.40, 0.13] at 300M (init 0.577 each), the third
+  pass faint as on the chain arm.
+- **Switch read on the 300M save** (`read_pilot_save.sh ... p 300M 1`, 26 minutes for the six
+  reads: rank 346 / 307 / 296 / 275 s for none / gold / swapped / prompt, chains 216 + 123 s;
+  outputs `ckpts/inject/pilot_p_300M_*`). Copying: gold card top-1 1.000 in every tier and class
+  in distribution, held out 0.953 to 1.000 (entities 0.98 / 0.98 / 0.98 / 0.95 by tier); swapped
+  card followed 1.000 in distribution, 0.979 to 0.986 held out, `mr_ll` 0.000 to 0.001; prompt
+  copy 1.000 in distribution, 0.967 to 1.000 held out. Closed book (`none`): every entity, date
+  and noun cell at chance on both forms, `delta` within 3 sigma everywhere (largest |z| 2.3, at
+  tier 10 dates in distribution; entity tier 1000 -0.013, z -1.3 / -0.016, z -1.9). Both halves
+  of the switch criterion met; the micro arm's 50M leak (0.010, z 4.0 at tier 100) has no
+  counterpart here.
+- **1-hop gate at 300M: passed, three saves ahead of the 500M bar.** `chains_eval` 1-hop with one
+  site kept 0.324 +- 0.015 against chance 0.115 (z +20.7) at depth 1, 0.319 to 0.325 at depths 2
+  and 3; kept 0 at 0.117 (chance). 2-hop 0.181 to 0.193 (chance 0.185, z at most 0.7), 3-hop 0.225
+  to 0.232 (chance 0.206, z 1.5 to 2.1), `chains_heldout_tmpl` 2-hop 0.198 to 0.201 (chance 0.191),
+  `chains_hop4` at chance; paired Delta kept 3 minus kept 1 on the held-out 2-hop +0.000 +- 0.003,
+  seen -0.004 +- 0.006; "sub-hop cells outside 3 sigma of chance: 0, instrument valid". Gold NLL
+  per answer 4.0 to 4.2 against ln K 1.6 to 2.2 with any site kept (46 to 48 with none): the read
+  carries the answer type and the candidates compete, as on the chain arm, but now 1-hop lookup
+  picks the right one a third of the time. Nothing composes yet; L1 is readable from here and
+  reads flat at 300M of warm-up.
+- **Read cadence.** 26 minutes per full read set (20 without the chain reads) against 21 minutes
+  per 50M of training, and the trainer keeps the GPU during reads, so each read set is a STOP,
+  read, relaunch (a pause costs the dataloader prefetch, under 4 documents, plus a 2-minute
+  restart). The micro arms wrote their leak within 50M of the switch, so the rank reads run at
+  350M and 400M; from 500M every 100M with the chain reads, and at the final save. Saves count
+  50M from the last resume point, so after each stop the grid shifts by about 1M (301M, 351M,
+  376M, ...); `stop_after_save.sh ARM PATTERN` takes a regex on the token tag.
+- **351M read, 50M after the switch** (rank reads only, 19.5 minutes; the stop landed late at
+  376M because the save notice reached the watcher buffered, so the run resumed from the 376M
+  save and nothing was lost). Copying intact: gold top-1 1.000 in every tier in distribution,
+  0.983 to 0.988 held out; swapped followed 1.000 / 0.967 to 0.972, `mr_ll` under 0.003; prompt
+  copy as at 300M. **The tier 1000 leak is written within 50M of the switch, as on the micro
+  warm-up arm**: closed-book entity `delta` in distribution 0.008 / 0.003 / 0.001 / 0.043 by tier
+  (tier 1000 z 3.9, raw rank 0.407 at z 5.8 from chance), held out 0.005 / 0.006 / 0.007 / 0.012
+  (z at most 1.9); pooled over tiers 0.0065 (z 2.9) / 0.0062 (z 3.1), carried by tier 1000 in
+  distribution and by small same-sign cells held out. Tier 100 is flat on both forms. The micro
+  arm had tier 1000 at 0.081 fifty million tokens after its switch at a third of the parameters
+  and a third of the tokens per exposure; here 0.043 at the same point on the run.
+- **426M read, 125M after the switch** (rank reads, 20 minutes; stopped by the watcher right after
+  the save, resumed from the 426M stop save). The tier 1000 leak grows and reaches the held-out
+  form: entity `delta` in distribution 0.009 / -0.003 / 0.006 / 0.050 by tier (tier 1000 z 5.0),
+  held out 0.004 / 0.007 / 0.004 / 0.029 (z 3.3); tier 100 flat on both (z 1.4 / 1.1). Copying in
+  distribution unchanged (gold top-1 1.000, swapped followed 1.000); held out it slips: gold top-1
+  0.919 pooled, 0.890 at tier 1000 (0.985 at 351M), swapped followed 0.928 to 0.934, 0.906 at tier
+  1000 (0.967 to 0.972 at 351M), `mr_ll` up to 0.006. The micro warm-up arm ended with held-out
+  copying at 0.66 to 0.69 followed; the pilot is on the same slope. Watch item from the read
+  table ("copying regressed, read with A3"): the final A3 read pairs this against the prompt copy.
+- **530M read, 229M after the switch** (2026-10-11; the full set, 24 minutes: rank 300 / 276 /
+  272 / 265 s, chains 199 + 101 s; the run was paused by the user at the 429M stop save overnight
+  and resumed from it; the watcher stopped it right after the regular 530M save, so the read and
+  the resume are on the 530M stop save, `loss5.8884`). **The 1-hop gate holds at its 500M bar and
+  is rising**: `chains_eval` 1-hop with any site kept 0.520 to 0.533 against chance 0.115 (z +40
+  to +41) at depths 1 to 3, from 0.32 at 300M; gold NLL per answer 2.7 against ln K 2.2 (4.0 at
+  300M). **L1 reads flat**: 2-hop 0.18 to 0.19 (chance 0.185), 3-hop 0.19 to 0.21 (0.206),
+  `chains_heldout_tmpl` 2-hop 0.18 to 0.20 (0.191), `chains_hop4` 0.18 to 0.21 (0.210) in every
+  cell at every depth, depth 4 included; paired Delta kept 3 minus kept 1 on the held-out 2-hop
+  -0.004 +- 0.005, seen -0.008 +- 0.008; "sub-hop cells outside 3 sigma of chance: 0". Composed
+  answers cost 3.7 to 3.8 nats against ln K 1.6 to 1.7 with every site kept: the read carries the
+  answer type and the one-hop pick, nothing composes yet. **The tier 1000 leak is level in
+  distribution and has caught up held out**: entity `delta` in distribution 0.007 / 0.001 / 0.002 /
+  0.040 by tier (tier 1000 z 4.5; 0.050 at 426M), held out 0.007 / -0.001 / 0.003 / 0.043 (z 5.9;
+  0.029 at 426M); tier 100 flat on both forms (z 0.4 / 0.9); pooled over tiers 0.0055 (z 2.6) /
+  0.0054 (z 2.8). By attribute at tier 1000 the birth city carries it (0.048, z 3.5 / 0.062,
+  z 4.7), then the university (0.039 / 0.040), the employer under 2.2 sigma; dates at tier 1000
+  0.022 / 0.025 (z under 1.2), nouns 0.034 (z 1.8 / 2.6). The micro warm-up arm ended at 0.085 /
+  0.047. **Held-out copying recovered**: gold top-1 0.973 for entities (0.969 / 0.968 / 0.981 /
+  0.977 by tier), 0.993 dates, 0.952 nouns (0.919 pooled at 426M); swapped followed 0.966 to 0.974
+  held out (0.928 to 0.934 at 426M), `mr_ll` under 0.005; in distribution gold top-1 1.000 and
+  followed 1.000 in every cell; prompt copy 1.000 / 0.981. So the 426M slip was a dip, not the
+  micro arm's slope, on one read each; the final A3 read decides. Trainer reads over the stretch:
+  gold gain on `evidence_fixed` +3.83 at 455M and +3.74 at 480M (content gain +3.79 / +3.69,
+  grounded AUROC 0.973 / 0.971), `[eval]` CE 3.453 at 480M, `loop_scale` [1.17, 0.45, 0.19] at
+  483M (the third pass up from 0.13 at 300M), 42k to 44k tokens per second. Outputs
+  `ckpts/inject/pilot_p_530M_*`. Next reads at about 630M, 730M, 830M and the final save.
