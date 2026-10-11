@@ -27,19 +27,24 @@ corpus from the existing builders, 1B tokens per arm against a matched full-CE c
 2026-10-10 its build list was done: the merge tool, the chain instrument fixes, `config_pilot.yaml`
 and `ckpts/inject/seed_pilot_grounded.pt`, the biography builds and the three merges in
 `data/prepared_pilot` (910.2M prompt tokens per arm, the budget), the launchers and the per-save
-read script under `ckpts/inject/`. The same evening arm P launched, ran at 42k to 48k tokens per
-second (50M per 21 minutes), was stopped after the 300M save and read: copying complete (gold
-top-1 1.000 in distribution, swapped followed 1.000), closed book at chance in every cell on both
-forms, the 1-hop gate passed (`chains_eval` 1-hop 0.32 against chance 0.115) with composition at
-chance; relaunched on `pilot_main_train` from the 301M save (the "Run" section of PILOT.md). At
-351M copying holds and the tier 1000 leak is written as at micro (entity `delta` 0.043, z 3.9 in
-distribution; tier 100 flat). At 530M (2026-10-11): the 1-hop gate holds at its 500M bar (1-hop
-0.53 against chance 0.115, from 0.32), L1 flat (every composition cell at chance, paired kept 3
-minus kept 1 -0.004 +- 0.005), tier 1000 leak 0.040 (z 4.5) / 0.043 (z 5.9) on the two forms with
-tier 100 flat, held-out copying 0.97 after a dip to 0.92 at 426M. Reads are a stop, read, relaunch
-(26 minutes per set; `ckpts/inject/stop_after_save.sh ARM PATTERN` drops STOP after a matching
-save; a stop leaves `STOP` to remove before relaunch); next reads about 630M, 730M, 830M and the
-final save, then arm C.
+read script under `ckpts/inject/`. **Arm P ran 2026-10-10 to 2026-10-11 and is complete at
+860.61M tokens, one epoch** (the trainer stops at the epoch's end, so the cosine fitted to the
+merge's 910M stopped at LR about 6e-5; 42k to 48k tokens per second; the warm-up to the 300M save,
+then `pilot_main_train`; reads at 300, 351, 426, 530, 631, 731, 832M and final, each a stop, read,
+relaunch of 26 minutes, `ckpts/inject/pilot_p_{TAG}_*`; the "Run" section of PILOT.md). Final
+read: the 1-hop gate holds (0.85 against chance 0.115, gold answer 0.82 nats against ln K 2.20,
+from 0.32 at 300M); **L1 in the spec's "falsified" cell** (held-out 2-hop Delta kept 3 minus kept
+1 +0.002 +- 0.005, every composition cell at chance at depths 3 and 4 at every read); **the arm P
+half of A1(b) not met on one form** (tier 100 entity `delta` 0.0125, z 3.2 held out; 0.010, z 2.2
+in distribution; tier 1000 0.064, z 7.2 / 0.046, z 5.5, written within 50M of the switch as at
+micro and grown through the cosine's tail; the tier 100 forms swapped sides over the last three
+reads, pooled z 4 to 5); copying intact (gold top-1 1.000 in distribution, 0.95 held out, swapped
+followed 1.000 / 0.94 to 0.97); A2 and A5 clear on the trainer's numbers (gold gain +4.00, content
++3.97, chunk AUROC 0.78, grounded 0.994). Verdicts pending arm C (launched 2026-10-11,
+`launch_pilot_c.sh`, `ckpts/evidence_pilot_c/`, `pilot_c.log`; reads `read_pilot_save.sh CKPT c
+TAG`, then `closed_book_rank.py compare`) and the user's decision on the PILOT.md decision table
+(first matching row: A1(b) fails on either form). `stop_after_save.sh ARM PATTERN` drops STOP
+after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -47,10 +52,10 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
 
 **The design page moves with the architecture and the plan.** Any change to the architecture (a
 tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
-gate, a measured verdict) is also made in `docs/evidence_path_design.html` in the same turn, and
-the page is republished to its artifact, https://claude.ai/artifact/GS2S79cV2ACydtXaaHzemW (the
-Artifact tool with that `url`; a new session reads the artifact first). The repo file is the
-source and the artifact stays identical to it; the file goes into the same commit line.
+gate, a measured verdict) is also made in `docs/evidence_path_design.html` in the same turn; the
+file goes into the same commit line. The repo file is the source. Its online copy,
+https://claude.ai/artifact/GS2S79cV2ACydtXaaHzemW, is republished only when the user asks (decided
+2026-10-11; it lives in another organization and lags the file); a new session reads the file.
 
 - **Arm (a), full CE, 300M tokens, reads the instrument**: closed-book entity `delta` in
   distribution 0.009 / 0.063 / 0.378 / 0.467 by tier 1 / 10 / 100 / 1000 (tier 1000 rank 0),

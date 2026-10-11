@@ -2,9 +2,11 @@
 
 Status 2026-10-11: spec written 2026-10-09, build list done 2026-10-10 (the "Build"
 section), arm P launched 2026-10-10 19:03, switched to the main split at the 300M save the same
-evening with both halves of the switch criterion met and the 1-hop gate passed; at 530M the gate
-holds at its 500M bar (1-hop 0.53), L1 reads flat, the tier 1000 leak sits at 0.04 on both forms
-and tier 100 is flat (the "Run" section at the end). The pilot runs on today's code: the R0b recipe (the
+evening, complete at 860.61M (one epoch) on 2026-10-11 and read; arm C launched the same day.
+Arm P's final read: 1-hop 0.85 (the gate holds), L1 Delta +0.002 +- 0.005 (the spec's
+"falsified" cell), tier 1000 leak 0.064 / 0.046, tier 100 at z 3.2 held out and z 2.2 in
+distribution (the arm P half of A1(b) not met on one form), copying intact; A2 and A5 clear on
+the trainer's numbers. The verdicts wait for arm C and the user (the "Run" section at the end). The pilot runs on today's code: the R0b recipe (the
 key/value reader, the copy-first warm-up, swap rate 0.15) at a larger shape and on a mixed corpus,
 two arms of 1B prompt tokens each, the pathway arm P against a matched-token control C without
 retrieval. Most of the Phase 5 blueprint in NEXT.md (coda, tied token table, always-on selector,
@@ -476,3 +478,122 @@ splits). Nothing in the spec changed.
   grounded AUROC 0.973 / 0.971), `[eval]` CE 3.453 at 480M, `loop_scale` [1.17, 0.45, 0.19] at
   483M (the third pass up from 0.13 at 300M), 42k to 44k tokens per second. Outputs
   `ckpts/inject/pilot_p_530M_*`. Next reads at about 630M, 730M, 830M and the final save.
+- **631M read, 330M after the switch** (the full set, 25 minutes; the watcher stopped the run right
+  after the regular 631M save, the read and the resume are on the 631M stop save, `loss6.3982`).
+  **1-hop keeps rising**: `chains_eval` 1-hop 0.585 to 0.594 with a site kept (chance 0.115,
+  z +47; 0.53 at 530M), gold NLL per answer 2.25 against ln K 2.20, so the 1-hop pick now costs
+  what a uniform pick among the type-matched candidates costs. **L1 still flat**: 2-hop 0.18 to
+  0.19 (chance 0.185), 3-hop 0.18 to 0.19 (0.206, z down to -2.1), held-out 2-hop 0.175 to 0.182
+  (0.191), 4-hop 0.20 to 0.21 (0.210) at depths 3 and 4; paired Delta kept 3 minus kept 1 held out
+  -0.006 +- 0.005, seen +0.004 +- 0.007; "instrument valid: yes". Composed answers 3.44 to 3.60
+  nats against ln K 1.6 to 1.7. **The leak: tier 1000 level, the lower tiers creeping in
+  distribution.** Entity `delta` in distribution 0.011 / 0.002 / 0.009 / 0.041 by tier (tier 1000
+  z 4.3; tier 1 z 2.8, tier 100 z 2.0, from 0.007 / 0.001 / 0.002 at 530M), pooled over tiers
+  0.0095 (z 4.3, from 0.0055 at z 2.6); held out 0.007 / 0.000 / 0.006 / 0.028 (tier 1000 z 3.5,
+  down from 0.043; tier 100 z 1.6), pooled 0.0057 (z 2.8). No single lower-tier cell is at 3 sigma
+  on either form, but the in-distribution pool is, with the same sign in three of four tiers: the
+  A1(b) tier 100 criterion is not breached, and it is the cell to watch at 731M. At tier 1000 the
+  employer leads now (0.050, z 3.1 / 0.036, z 2.3), the birth city 0.029 (z 2.6) / 0.023; dates
+  0.034 / 0.007 (z under 1.3), nouns 0.042 (z 2.4) / 0.020. **Held-out copying slipped again**:
+  gold top-1 0.921 for entities (0.930 at tier 1000), 0.986 dates, 0.971 nouns; swapped followed
+  0.932 to 0.952 (`mr_ll` under 0.008); prompt copy 0.950 held out; in distribution gold top-1
+  1.000 and followed 1.000 in every cell. Over the four reads held-out entity gold top-1 ran 0.985,
+  0.919, 0.973, 0.921: an oscillation of about 0.05 between reads taken on alternating saves,
+  not a monotone slope, around 0.95; the final A3 read is the one that counts. Trainer reads over
+  the stretch: gold gain on `evidence_fixed` +3.71 / +3.92 / +4.09 at 555 / 580 / 605M (content
+  gain +3.67 / +3.88 / +3.88; the 605M gold gain rides a higher `none` CE), grounded AUROC 0.971
+  to 0.979, `[eval]` CE 3.351 at 605M, `loop_scale` [1.22, 0.50, 0.23] at 625M, 40k to 47k
+  tokens per second (69k on one light stretch). Outputs `ckpts/inject/pilot_p_631M_*`.
+- **731M read, 430M after the switch** (the full set, 24 minutes; read and resumed on the 731M
+  stop save, `loss5.9930`). **1-hop lookup now selects**: `chains_eval` 1-hop 0.802 to 0.803
+  with a site kept (chance 0.115, z +68; 0.59 at 631M), gold NLL per answer 1.09 against ln K
+  2.20, half the uniform-pick cost, the first read where the one-hop answer is chosen rather than
+  type-matched. **L1 still flat**: 2-hop 0.19 to 0.20 (chance 0.185, z at most 1.2), 3-hop 0.18
+  (0.206, z -1.8 to -2.3), held-out 2-hop 0.197 to 0.200 (0.191, z at most 1.0), 4-hop 0.20
+  (0.210) at depths 3 and 4; paired Delta kept 3 minus kept 1 held out +0.002 +- 0.005, seen
+  +0.008 +- 0.007; composed answers 2.97 to 3.07 nats against ln K 1.6 to 1.7 (3.4 to 3.6 at
+  631M), so the composed answer is getting cheaper without the pick getting right. **The leak
+  grows again and the A1(b) tier 100 cell crosses 3 sigma in distribution**: entity `delta` in
+  distribution 0.008 / 0.006 / 0.013 / 0.064 by tier (tier 100 z 3.2, tier 1000 z 7.0, from
+  0.009 / 0.041 at 631M), pooled 0.0123 (z 5.5); held out 0.008 / -0.003 / 0.008 / 0.045 (tier 100
+  z 2.4, tier 1000 z 5.7), pooled 0.0069 (z 3.4). Nouns in distribution 0.024 (z 3.0) at tier 100
+  and 0.057 (z 3.2) at tier 1000; dates inside 2 sigma everywhere. At tier 1000 the employer
+  0.081 (z 4.6) / 0.051 (z 3.2), the university 0.064 (z 3.7) / 0.039, the birth city 0.048
+  (z 3.8) / 0.046 (z 4.0). The A1(b) criterion ("arm P within 3 sigma through tier 100 on both
+  forms") is breached on this read on the in-distribution form, at z 3.2 against a bar of 3.0,
+  and the held-out form sits at 2.4; the verdict is taken at the final save with arm C alongside,
+  and the direction since 530M (0.002, 0.009, 0.013 at tier 100; 0.040, 0.041, 0.064 at tier
+  1000, in distribution) is up through the cosine's tail (LR 1.3e-4 at 710M, floor 3e-5). The
+  micro warm-up arm's final was 0.015 (z 2.6) at tier 100 and 0.085 at tier 1000. **Held-out
+  copying at its low**: gold top-1 0.935 for entities, 0.974 dates, 0.833 nouns (0.971 at 631M);
+  swapped followed 0.916 to 0.952 (`mr_ll` under 0.008); prompt copy 0.961; in distribution gold
+  top-1 1.000 and followed 1.000 in every cell. Trainer reads over the stretch: gold gain on
+  `evidence_fixed` +3.99 / +3.98 / +3.96 / +4.06 at 655 / 680 / 705 / 730M (content gain +3.94 /
+  +3.90 / +3.86 / +4.01), grounded AUROC 0.975 to 0.989, `[eval]` CE 3.277 at 730M, `loop_scale`
+  [1.25, 0.53, 0.24] at 710M, 41k to 47k tokens per second. Outputs `ckpts/inject/pilot_p_731M_*`.
+- **832M read, 531M after the switch** (the full set, 24 minutes; read and resumed on the 832M
+  stop save, `loss5.4559`; the relaunch runs to the final save without another stop). **The tier
+  100 breach moves to the other form**: entity `delta` in distribution 0.006 / 0.006 / 0.008 /
+  0.068 by tier (tier 100 z 1.8, back inside; tier 1000 z 7.2), pooled 0.0106 (z 4.7); held out
+  0.004 / 0.000 / 0.013 / 0.046 (tier 100 z 3.4, the breach now on this form; tier 1000 z 5.6),
+  pooled 0.0081 (z 3.8). Over 731M and 832M the tier 100 cell reads 0.013 (z 3.2) then 0.008
+  (z 1.8) in distribution and 0.008 (z 2.4) then 0.013 (z 3.4) held out: one form at 3 sigma on
+  each read, neither on both, and the two forms pooled 0.011 then 0.011 at z 4 on each (the cells
+  are independent, 1,500 items a form). Tier 1000 keeps rising in distribution (0.064 to 0.068;
+  birth city 0.060, z 5.1, employer 0.071, z 4.1, university 0.074, z 4.0) and holds held out
+  (0.045 to 0.046; employer 0.060, z 3.9); nouns 0.063 (z 3.6) / 0.043 (z 2.8) at tier 1000,
+  0.016 (z 2.2) at tier 100 in distribution; dates inside 2 sigma everywhere. **1-hop 0.85**
+  (z +73) with the gold answer at 0.86 nats against ln K 2.20; **L1 flat**: 2-hop 0.18 to 0.19,
+  3-hop 0.19 to 0.20, held-out 2-hop 0.196 to 0.201 (chance 0.191, z at most 1.1), 4-hop 0.19 to
+  0.21 at depths 3 and 4, paired Delta kept 3 minus kept 1 held out +0.004 +- 0.005, seen +0.005
+  +- 0.007; composed answers 2.81 to 2.90 nats against ln K 1.6 to 1.7, down from 3.0 at 731M.
+  **Held-out copying back up**: gold top-1 0.956 entities (0.963 at tier 1000), 0.989 dates, 0.940
+  nouns; swapped followed 0.956 to 0.970 (`mr_ll` under 0.003); prompt copy 0.967; in
+  distribution 1.000 everywhere. Trainer reads: gold gain on `evidence_fixed` +4.04 / +4.02 /
+  +4.15 at 755 / 805 / 830M (content gain +3.97 / +3.95 / +4.05), grounded AUROC 0.982 to 0.991,
+  `[eval]` CE 3.237 at 830M, `loop_scale` [1.28, 0.56, 0.25] at 824M, 43k to 48k tokens per
+  second. Outputs `ckpts/inject/pilot_p_832M_*`. The final save decides A1(b): the cell has read
+  at 3 sigma on one form at each of the last two reads, so the final read is paired against arm C
+  before any verdict is written.
+- **Arm P complete: 860.61M tokens, one epoch, 2026-10-11** (`checkpoint_evidence_final.pt`,
+  exit 0; the trainer stops at the epoch's end, not the token target, so the cosine fitted to
+  910M ended at LR about 6e-5 against its 3e-5 floor; one epoch is 860M on the trainer's counter
+  because the packer skips over-length conversations and loses fill against the merge's 910M
+  prompt count). Final filler CE 3.2321 on `inject_val`. Trainer's final fixed eval: gold gain
+  +4.00 nats (124% of the 3.23 ceiling measured on other rows), mixed +3.74, distractors +0.03,
+  content gain +3.97; per source SQuAD gold +3.80 with distractors -0.28, HotpotQA gold +4.19 with
+  distractors +0.33; chunk AUROC per token 0.78 at loop 3 (0.66 / 0.68 / 0.78 by loop), gold
+  share 0.51; grounded AUROC 0.994 all rows, 0.988 evidence rows. **A2 and A5 clear on the
+  trainer's numbers** (bars: half the ceiling, distractors at least 0 pooled, chunk AUROC 0.59,
+  grounded 0.674); the formal A5 still wants `--ceiling-json` on this checkpoint.
+- **Final read set (`ckpts/inject/pilot_p_final_*`, 25 minutes).** Closed book, entity `delta` by
+  tier 1 / 10 / 100 / 1000: in distribution 0.008 / 0.005 / 0.010 (z 2.2) / 0.064 (z 7.2), pooled
+  0.0111 (z 4.9); held out 0.007 / -0.002 / 0.0125 (z 3.2) / 0.046 (z 5.5), pooled 0.0082
+  (z 3.8). Nouns at tier 1000 0.066 (z 3.8) / 0.056 (z 3.4), at tier 100 0.018 (z 2.4) / -0.005;
+  dates inside 2 sigma everywhere. By attribute at tier 1000 the employer 0.072 (z 4.6) / 0.059
+  (z 3.5), the university 0.069 (z 3.9) / 0.040 (z 2.9), the birth city 0.051 (z 4.2) / 0.040
+  (z 3.6); at tier 100 every attribute under 2.5 sigma on both forms. **The arm P half of A1(b)
+  ("within 3 sigma through tier 100 on both forms") is not met at the final save: tier 100 reads
+  z 3.2 on the held-out form** (z 2.2 in distribution; the forms swapped sides at 731M and 832M,
+  and the pooled-over-forms cell has sat at z 4 to 5 since 731M). The verdict waits for arm C's
+  final `none` read and the paired `compare`, as the A1(b) detail requires (arm C above its prior
+  first). The micro warm-up arm's final was 0.015 (z 2.6) / 0.007 (z 2.0) at tier 100 and 0.085 /
+  0.047 at tier 1000; the pilot's tier 1000 is lower held out and level in distribution, its
+  tier 100 the same size at a smaller sigma. Copying: in distribution gold top-1 1.000 and
+  swapped followed 1.000 in every cell, `mr_ll` 0.000; held out gold top-1 0.953 entities (0.942
+  / 0.951 / 0.962 / 0.967 by tier), 0.996 dates, 0.899 nouns, swapped followed 0.943 to 0.968
+  (`mr_ll` under 0.005), prompt copy 0.970 entities. Held-out entity gold top-1 across the reads:
+  0.985, 0.919, 0.973, 0.921, 0.935, 0.956, 0.953. **Chains: 1-hop 0.844 to 0.849 with a site
+  kept (chance 0.115, z +72), gold NLL per answer 0.82 against ln K 2.20; the 1-hop gate holds.
+  L1: `chains_heldout_tmpl` 2-hop at depth 3 0.193 / 0.194 / 0.195 at kept 1 / 2 / 3 (chance
+  0.191), paired Delta kept 3 minus kept 1 +0.002 +- 0.005 held out, +0.001 +- 0.008 seen;
+  Delta + 2 sigma = 0.012, under the 0.05 bar with the gate passed: the spec's "falsified" cell.**
+  2-hop seen 0.19 (chance 0.185), 3-hop 0.18 (0.206, z -2.1), 4-hop 0.18 to 0.19 (0.210, z down
+  to -2.1 at depths 3 and 4); every composition cell at chance or slightly under; composed
+  answers 2.81 to 2.90 nats against ln K 1.6 to 1.7 with every site kept, 45 without one; "sub-hop
+  cells outside 3 sigma of chance: 0, instrument valid". Pending the user's decision: the decision
+  table's first matching row is "A1(b) fails on either form" (the recipe fails at shape, no
+  blueprint work until the leak is understood), with the caveat that the failing cell is at
+  z 3.2 on one form and z 2.2 on the other and arm C is not read yet; the L1 row ("falsified at
+  this shape; looping stays a requirement; the goal's reasoning clause is reworded before the
+  real-run spec") applies on its own terms once the gate row is settled.

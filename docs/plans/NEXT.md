@@ -10,9 +10,32 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-10)
+## Now (2026-10-11)
 
-**Arm P is running on the main split (2026-10-10, evening).** Launched at 19:03 on the warm-up
+**Arm P is complete and read; arm C is running (2026-10-11).** Arm P ended at 860.61M tokens,
+one epoch (the trainer stops at the epoch's end, so the cosine fitted to 910M stopped at LR about
+6e-5), final filler CE 3.2321. Its final read: the 1-hop gate holds (0.85 against chance 0.115,
+gold answer 0.82 nats against ln K 2.20); **L1 reads in the spec's "falsified" cell** (held-out
+2-hop Delta kept 3 minus kept 1 +0.002 +- 0.005, every composition cell at chance at depths 3 and
+4, Delta + 2 sigma 0.012 against the 0.05 bar); **the arm P half of A1(b) is not met on one
+form** (tier 100 entity `delta` 0.0125 at z 3.2 held out, 0.010 at z 2.2 in distribution; tier
+1000 0.064, z 7.2 / 0.046, z 5.5; the forms have swapped sides across the last three reads and
+pooled over forms the tier 100 cell has sat at z 4 to 5 since 731M); copying intact (gold top-1
+1.000 in distribution, 0.95 held out, swapped followed 1.000 / 0.94 to 0.97); A2 and A5 clear on
+the trainer's numbers (gold gain +4.00 nats, content gain +3.97, chunk AUROC 0.78, grounded AUROC
+0.994). Verdicts are pending arm C's final `none` read (the paired `compare`, arm C above its own
+prior first) and the user's decision on the decision table: the first matching row is "A1(b)
+fails on either form" (the recipe fails at shape; no blueprint work until the leak is
+understood), with the failing cell at z 3.2 on one form only; the L1 row (falsified at this shape,
+looping stays a requirement, the reasoning clause is reworded before the real-run spec) applies on
+its own terms. Arm C (`launch_pilot_c.sh`, `ckpts/evidence_pilot_c/`, log
+`ckpts/inject/pilot_c.log`) runs the control split from the same seed to its epoch's end; reads
+`read_pilot_save.sh CKPT c TAG` (`none` only) at its saves and final, then `closed_book_rank.py
+compare` arm C against arm P, then the ladder's final reads on arm P (A3 `eval_abstention.py`,
+A4, A7 `eval_store.py`, A6 `eval_benchmarks.py` on both arms, A5 `--ceiling-json`). Record: the
+"Run" section of [PILOT.md](PILOT.md).
+
+**The warm-up and the main split, as they ran (2026-10-10, evening).** Launched at 19:03 on the warm-up
 split, it ran at 42k to 48k tokens per second (50M per 21 minutes, 27.1 GB peak), three times the
 fitted rate, so the whole pilot is one night. Stopped right after the 300M save and read: gold card
 top-1 1.000 in every tier in distribution (0.95 to 1.00 held out), swapped card followed on every
@@ -36,9 +59,23 @@ pause at 429M): the 1-hop gate holds at its 500M bar and is rising (1-hop 0.52 t
 chance 0.115, z +40, from 0.32 at 300M); L1 flat (2-hop, 3-hop, the held-out composition and 4-hop
 at chance at every depth, paired kept 3 minus kept 1 -0.004 +- 0.005); the tier 1000 leak level in
 distribution (0.040, z 4.5) and caught up held out (0.043, z 5.9), tier 100 flat on both forms;
-held-out copying back to 0.97 (gold top-1 0.973, swapped followed 0.97), so the 426M slip was a
-dip. Record: the "Run" section of [PILOT.md](PILOT.md). Next: reads at about 630M, 730M, 830M and
-the final save, then arm C, then the reads of the ladder.
+held-out copying back to 0.97 (gold top-1 0.973, swapped followed 0.97). The 631M full read: 1-hop
+0.59 (z +47, the gold answer now at ln K); L1 still flat (every composition cell at chance, paired
+delta -0.006 +- 0.005); tier 1000 leak 0.041 (z 4.3) / 0.028 (z 3.5), the lower tiers creeping in
+distribution (tier 1 z 2.8, tier 100 z 2.0, the pool over tiers z 4.3) but no lower-tier cell at
+3 sigma on either form; held-out copying 0.92 again, so it oscillates between 0.92 and 0.98 across
+reads rather than sliding. The 731M full read: 1-hop 0.80 (z +68) with the gold answer at half
+the uniform-pick cost, so lookup selects now; L1 still flat (every composition cell at chance,
+paired delta +0.002 +- 0.005); the leak grows again through the cosine's tail, tier 1000 0.064
+(z 7.0) / 0.045 (z 5.7), and **the A1(b) tier 100 cell crosses 3 sigma in distribution (0.013,
+z 3.2; held out 0.008, z 2.4)**, the first breach of the pilot's externalization criterion on one
+form at one read; the verdict is the final save's, read against arm C; held-out copying at its
+low (gold top-1 0.935 entities, 0.833 nouns). The 832M full read: the tier 100 breach moves to
+the other form (in distribution 0.008, z 1.8; held out 0.013, z 3.4), so over the last two reads
+one form is at 3 sigma each time and neither on both; tier 1000 0.068 (z 7.2) / 0.046 (z 5.6);
+1-hop 0.85; L1 flat (paired delta +0.004 +- 0.005); held-out copying back to 0.96. Record: the
+"Run" section of [PILOT.md](PILOT.md). Next: the final save (910M) read, then arm C, then the
+reads of the ladder with A1(b) decided on the paired `compare`.
 
 **The pilot's build list was done earlier on 2026-10-10.** Built: the
 split merge tool `scripts/merge_evidence_splits.py` with its test (seeded per-slice permutations,
@@ -1225,10 +1262,21 @@ above are a different, live series).
   15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
   (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
   lever if one is needed.
+- 2026-10-11, evening: arm P complete at 860.61M (one epoch) and read at the final save: 1-hop
+  0.85 (gate holds), L1 Delta +0.002 +- 0.005 (the "falsified" cell), tier 1000 0.064 / 0.046,
+  tier 100 z 3.2 held out and z 2.2 in distribution (the arm P half of A1(b) not met on one
+  form), copying intact, A2 and A5 clear on the trainer's numbers. Arm C launched. Verdicts
+  pending arm C and the user (the "Run" section of [PILOT.md](PILOT.md)).
 - 2026-10-11: arm P read at 530M after a pause at 429M: the 1-hop gate holds at its 500M bar
   (1-hop 0.53, rising from 0.32), L1 flat (every composition cell at chance, paired delta -0.004),
   the tier 1000 leak 0.040 / 0.043 on the two forms with tier 100 flat, held-out copying back to
-  0.97 (the "Run" section of [PILOT.md](PILOT.md)). Nothing in the spec changed.
+  0.97. At 631M: 1-hop 0.59, L1 flat, tier 1000 0.041 / 0.028, the lower tiers creeping in
+  distribution inside 3 sigma per cell, held-out copying 0.92. At 731M: 1-hop 0.80 with the
+  answer under ln K, L1 flat, tier 1000 0.064 / 0.045, and the A1(b) tier 100 cell at z 3.2 in
+  distribution (z 2.4 held out), a breach on one form at one read. At 832M: the breach on the
+  other form (tier 100 held out z 3.4, in distribution z 1.8), tier 1000 0.068 / 0.046, 1-hop
+  0.85, L1 flat; decided at the final save against arm C (the "Run" section of
+  [PILOT.md](PILOT.md)). Nothing in the spec changed.
 - 2026-10-10, evening: arm P launched at 19:03, ran at 42k to 48k tokens per second (three times
   the fit), was stopped after the 300M save and read: copying complete (gold top-1 1.000 in
   distribution, swapped followed 1.000), closed book at chance in every cell on both forms, the
