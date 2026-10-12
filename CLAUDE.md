@@ -201,6 +201,11 @@ https://claude.ai/artifact/GS2S79cV2ACydtXaaHzemW, is republished only when the 
      as behavioural at conflicts). The chain slice stays 10% at hops 25 / 50 / 25 and the pilot's
      L1 is the deciding read on the loop clause.
   2. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
+  3. Rung R7 (proposed 2026-10-12, NEXT.md Decisions "optimizer"): Muon on the hidden matrices
+     for the real run, AdamW for `E`, the head adapters, the router and every norm, scalar and
+     vector; build in `pretrain.py` / `sft.py`, then two micro arms against their AdamW twins on
+     the R0b recipe, then one pilot-shape arm against arm P. Decided on the leak, not the loss.
+     The pilot arms stay AdamW.
   Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)); build list done 2026-10-10 (its
   "Build" section). Launch: `bash ckpts/inject/launch_pilot_p.sh` (warm-up split; after the switch
   criterion holds, `SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_p.sh` resumes the same

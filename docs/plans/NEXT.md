@@ -77,6 +77,15 @@ one form is at 3 sigma each time and neither on both; tier 1000 0.068 (z 7.2) / 
 "Run" section of [PILOT.md](PILOT.md). Next: the final save (910M) read, then arm C, then the
 reads of the ladder with A1(b) decided on the paired `compare`.
 
+**Muon for the real run, proposed 2026-10-12 (the user), pending rung R7.** The hidden matrices
+step with Muon and everything else stays on AdamW (Decisions, optimizer). It changes nothing in the
+pilot: arms P and C share AdamW, as a matched pair must. R7 runs once arm C frees the GPU and the
+pilot verdicts are read: first a build (one optimizer over the fp32 masters in `pretrain.py` and
+`sft.py`, which share `train_step`), then two micro arms against their AdamW twins on the R0b
+recipe, then one pilot-shape arm against arm P if the micro arms pass. The read that decides is the
+leak, not the loss: Muon learns rare associations better than Adam (arXiv 2509.26030), and the
+tier 100 cell is a rare association.
+
 **The pilot's build list was done earlier on 2026-10-10.** Built: the
 split merge tool `scripts/merge_evidence_splits.py` with its test (seeded per-slice permutations,
 an interleave drawn by remaining tokens, re-indexed chunk tables, a per-document chunk cap, an
@@ -658,6 +667,7 @@ cannot see the chains.
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
 | real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. Decided 2026-10-05: fact spans are not supervised with real values before the reader copies (a copy-first warm-up, a new element of the pilot's schedule). R0b arm (c) leaked before its reader copied (50M) and did not grow after (100M on); the copy-first warm-up arm stored nothing without real-value targets, held the R0b rule through tier 100 at 300M, and still stored tier 1000 facts after copying (0.085, z 6.4 at the final save), recorded as a known leak. The warm-up is the better of two arms on one seed, not an optimum. The swap rate 0.30 branch (read 2026-10-06) left tier 1000 where it was (paired -0.002, z -0.3 in distribution), and the pilot's swap rate stays at 0.15 (decided 2026-10-06 by the user: a leak this size matters little for the pilot, and RL planned later can act on small leaks; caveat on record: RL is Parked and shapes behaviour at conflicts rather than removing what is stored, so for small leaks the goal is read as behavioural at conflicts). The placeholder name arm (read 2026-10-08) halved the supervision that pairs the real name with the real value (0.686 to 0.346 of exposures) and left tier 1000 where it was (paired +0.011, z +1.8 pooled; falsified at pooled z above -2). 2026-10-08: the copy-criterion span weight is dropped on the placeholder arm's null; the pilot's lever list against the leak is the copy-first warm-up alone, at swap rate 0.15. |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
+| optimizer | Proposed 2026-10-12 (the user), pending R7; AdamW until R7 passes. The real run steps the hidden matrices with Muon: Nesterov momentum 0.95, 5 Newton-Schulz steps in bf16, the update scaled by 0.2 sqrt(max(m, n)) to AdamW's RMS so the lr and weight decay carry over, decoupled weight decay kept (Moonlight, arXiv 2502.16982: both are what made Muon scale). On Muon: q, k, v and o of every attention (prelude, shared, coda), the shared and routed MLPs one expert matrix at a time, the selector's `down_proj`, `loop_inject`; gate and up are orthogonalized as two matrices, since both are fused into one `gate_up` weight today. On AdamW: the tied table `E`, the head and MTP adapters, the router and `loop_router_bias`, every norm, scalar and vector (`loop_scale`, `evidence_loop_scale`, the gate scales, `layer_scalar`, the null key, `loop_query_bias`). Where it does not apply: the pilot arms (a matched pair shares its optimizer), any graft or finetune of an AdamW-pretrained checkpoint (Moonlight reports its finetuning gain for matched pretrain and finetune optimizers), and so 6e's consolidation SFT runs on whatever trained the trunk. The budget in 6b keeps AdamW's numbers: Moonlight's about 2x compute efficiency is measured at compute optimal, and shape L at about 280B tokens is about 600 tokens per parameter, a regime it does not cover. |
 | loops (axiom) | "Passes add computation, not capacity; recalling a weakly stored fact can take more than one pass" (reworded 2026-10-04 from "loops buy computation, not storage") is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Decided 2026-10-04: the axiom is reworded as above and the storage-half falsifier is retired as read, since it measured recall depth, not capacity. The rule it leaves: every closed-book leak read is taken at full depth. Not planned, available if the axiom ever has to be quoted as measured: an arm with equal CE weight on every exit, which removes the weaker training of the early exits (a last-loop-only arm cannot be read by depth at all). It was also the control the learned exit gate arm would have needed; that arm was dropped on 2026-10-06 (Decisions, depth allocation), so the question is moot. Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. **Micro read 2026-10-08 ([chain_depth_micro.md](../measurements/chain_depth_micro.md)): inconclusive, the precondition "readable" fails.** The 35M arm at 105M tokens copies an answer-type entity from the buffer but does not select the right one, so 1-hop accuracy is at chance and so is every L1 cell (held-out Delta +0.006 at sigma 0.013). That the Delta also sits under the falsified bound (Delta + 2 sigma 0.032 against 0.05) does not count: a model that cannot look up one hop cannot show whether later sites compose. The read neither supports nor falsifies the computation half; the axiom stays an axiom, and the pilot's L1 (sublayer sites against passes, at the pilot's shape and dose) is the deciding read. The third pass's `loop_scale` falling under 0.01 by 50M (0.07 at the end) is the weak-later-loop case the rule says to fix, read on a task where no pass composed. |
 | depth allocation | Dropped 2026-10-06 (the user): the learned exit gate arm (an Ouro-style exit distribution that only reweights the per-pass losses, never built) is dropped on the per-exit read on micro arms (a) and (c) (`eval_exit.py`, 2026-10-05): the second pass's gain (+0.094) is spread evenly over confidence deciles, the third pass adds 0.006 nats, and the entropy-regularized optimum is near uniform even as a bound (0.343 / 0.286 / 0.371 at beta 0.1). Its three open questions (the skip-compute exemption, the equal-weight control arm, the pilot spec without exits) are closed as moot. The depth reading moves to the chain corpus: one micro arm with `--evidence --reader-kv` on chain training splits, read with `eval_chains.py` by depth and by kept read sites (L1 at micro scale); approved 2026-10-06, spec written 2026-10-08 ([chain_depth_micro.md](../measurements/chain_depth_micro.md), ladder step 8). `eval_exit.py` cannot read that arm (it refuses evidence splits); the full-site cells at depth 1, 2 and 3 replace the per-exit read. **Read 2026-10-08: inconclusive, not readable.** The arm never learned 1-hop lookup (every accuracy cell at chance at 50M and final), so the full-site cells by depth (answer CE 0.485 / 0.468 / 0.468 at depth 1 / 2 / 3 on the 4-hop split) say nothing about how depth should be allocated on a task that composes. The fixed draw {3: 0.7, 4: 0.2, 5: 0.1} stands; depth allocation is not reopened. |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
@@ -1050,6 +1060,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 | R4b | 2 x 1B | sublayers per pass 2 against 3 at matched compute; experts 4 against 8 | L1 plus closed-book rank plus language benchmarks | see gates | shape L's core |
 | R5 | 0 | the winner, eval only | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | L2 and the A gates | whether the design enters the real run |
 | R6 | 1 to 2B | hop 1 seen only in pretraining text (about 100 exposures), hop-1 documents excluded from the store, hop 2 retrieved | closed-book hop-1 accuracy and 2-hop accuracy | at chance on both (the A1 leak probe: above chance means pretraining-text facts reached the weights) | whether the recipe keeps pretraining-text facts out of the weights |
+| R7 | 2 x 0.3B, then 0.9B | Muon on the hidden matrices (Decisions, optimizer) against AdamW, at the AdamW arm's lr and weight decay through the RMS-matched update, no sweep. Micro first, from `seed_micro.pt` on the R0b splits: Muon arm (a) full CE against arm (a), and the Muon copy-first warm-up arm of (c) against the warm-up arm, same seed, data and switch at 100M; about 1.5 5090 hours each. Then, only if both micro reads pass, one Muon arm P from `seed_pilot_grounded.pt` on the pilot splits against arm P, about one night | filler CE on `inject_val` at 50M steps (`eval_exit.py`, paired against the twin); gold top-1 at 50M and 100M (when copying emerges); closed-book entity `delta` by tier on both forms, `compare` against the twin; arm (a) by tier as the storage read (descriptive: whether Muon stores the tail more, arXiv 2509.26030); max attention logit per layer (no QK norm in the trunk); on the pilot shape also the 1-hop gate, L1 and A2 | Muon filler CE below its twin's at matched tokens beyond the paired sigma; copying no later (the warm-up's switch criterion met by 100M at micro, by 300M at pilot shape); the (c) and P `delta` not above the twin's by 3 sigma paired at tier 100 or tier 1000 on either form; the logit not growing without bound | the real run's optimizer. A loss gain with a worse leak fails: the goal outranks the speed |
 
 A 1-hop curve must saturate before any null is read. R4 replaces the previous plan's per-loop CE
 test, which changed loss placement, depth sampling and the coda in one arm. Pilot arms that do not
@@ -1105,7 +1116,11 @@ prep is its own interruption-safe job with its own budget line in the run spec.
 
 Written before anything is rented. It names, per component, the pilot rung that admitted it and
 its margin. Shape L from the pilot's R4b reading. A token target, with the hours derived from it.
-An LR transfer sweep at reduced width, or muP if it can be adopted cheaply. The gate table A1 to
+The optimizer from R7 (Muon on the hidden matrices if it passed, AdamW otherwise); the LR
+transfer sweep at reduced width runs on that optimizer, or muP if it can be adopted cheaply. Under
+Muon, DDP repeats the Newton-Schulz steps on every rank (cheap at 470M); a sharded optimizer needs
+the distributed form (Moonlight); a growing attention logit gets QK-clip (MuonClip, Kimi K2, arXiv
+2507.20534), since the trunk has no QK norm. The gate table A1 to
 A7 and L1, L2, with the seed noise measured. The
 two-phase curriculum with a reasoning-weighted tail. The per-loop and per-pass readouts in the log
 from step 0. The early signals for a run whose kill rules no longer have zero-init tensors to
@@ -1201,6 +1216,12 @@ above are a different, live series).
 - **Benchmark contamination.** Standard val and test splits only; a single suspiciously strong
   benchmark is suspect, not a win; the A1 probe answers are held out of the pretraining text.
 - **FP8 divergence.** Validated on the 2B-token A/B before the real run trusts it.
+- **Muon stores the tail.** Muon learns rare associations in the feed-forward and value/output
+  weights better than Adam (arXiv 2509.26030), which is where a leak is written and what the tier
+  100 cell measures. A faster optimizer can raise A1's leak; R7 reads it on the R0b instrument
+  before the real run trusts it. Under Muon a matrix with any gradient moves at full rate, so a
+  zero-init tensor that stays flat no longer means what the kill rules assumed; the real run has
+  no such rules, the micro arms read those lines as descriptive.
 - **Data prep at 100B tokens is a real job**, budgeted in the run spec.
 - **Stale numbers.** Every FLOP, parameter and ratio figure in this plan is an estimate until the
   constructor and the builder print it. Budget math keyed to an estimate goes stale silently.
@@ -1231,6 +1252,13 @@ above are a different, live series).
   paraphrased; it ranked after the placeholder name and the copy-criterion span weight, and since
   the placeholder arm's null (2026-10-08) a dose cut is not expected to move the tier 1000 level
   at all.
+- Added 2026-10-12, for R7. Liu et al., "Muon is Scalable for LLM Training" (Moonlight, arXiv
+  2502.16982): weight decay and an update scaled to AdamW's RMS make Muon scale without retuning,
+  about 2x compute efficiency at compute optimal, on a 16B MoE. Wang et al., "Muon Outperforms Adam
+  in Tail-End Associative Memory Learning" (arXiv 2509.26030, ICLR 2026): the gain sits in the
+  value/output and feed-forward weights and comes from learning rare classes better, the reason
+  R7 decides on the leak. Kimi K2 (arXiv 2507.20534): attention logits grow under Muon at scale,
+  fixed by QK-clip.
 
 ## Parked
 
@@ -1249,6 +1277,11 @@ above are a different, live series).
 
 ## What changed from the previous plan
 
+- 2026-10-12: Muon proposed for the real run (the user). A Decisions row (Muon on the hidden
+  matrices, AdamW for the tied table, the head adapters, the router and every norm, scalar and
+  vector), rung R7 (two micro arms against their AdamW twins, then one pilot-shape arm against arm
+  P), a Risks entry (Muon learns the tail better, so the leak is the deciding read), and 6d takes
+  the optimizer from R7. The pilot arms stay on AdamW.
 - 2026-10-09: the pilot spec ([PILOT.md](PILOT.md)). The pilot is cut to what is built: the R0b
   recipe on today's code at 99.1M parameters (width 512, 6 prelude layers, 8 experts, seq 4096,
   key/value reader), a merged corpus from the existing builders (biographies plus filler 60%, QA
