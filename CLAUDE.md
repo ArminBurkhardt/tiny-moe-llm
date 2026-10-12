@@ -40,10 +40,13 @@ in distribution; tier 1000 0.064, z 7.2 / 0.046, z 5.5, written within 50M of th
 micro and grown through the cosine's tail; the tier 100 forms swapped sides over the last three
 reads, pooled z 4 to 5); copying intact (gold top-1 1.000 in distribution, 0.95 held out, swapped
 followed 1.000 / 0.94 to 0.97); A2 and A5 clear on the trainer's numbers (gold gain +4.00, content
-+3.97, chunk AUROC 0.78, grounded 0.994). Verdicts pending arm C (launched 2026-10-11,
-`launch_pilot_c.sh`, `ckpts/evidence_pilot_c/`, `pilot_c.log`; reads `read_pilot_save.sh CKPT c
-TAG`, then `closed_book_rank.py compare`) and the user's decision on the PILOT.md decision table
-(first matching row: A1(b) fails on either form). `stop_after_save.sh ARM PATTERN` drops STOP
++3.97, chunk AUROC 0.78, grounded 0.994). Arm C (launched 2026-10-11, `launch_pilot_c.sh`,
+`ckpts/evidence_pilot_c/`, `pilot_c.log`, 51k to 59k tokens per second; reads `read_pilot_save.sh
+CKPT c TAG`) at 325M stores the biographies as the micro arm (a) did: entity `delta` 0.299 (z 43)
+at tier 100 and 0.390 (z 25) at tier 1000 in distribution, 0.029 / 0.105 held out, about 300x and
+9x arm P at the same tokens, so A1(b) is readable. Verdicts pending arm C's final read, the paired
+`closed_book_rank.py compare`, and the user's decision on the PILOT.md decision table (first
+matching row: A1(b) fails on either form, on a cell 30x under the control). `stop_after_save.sh ARM PATTERN` drops STOP
 after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
@@ -206,6 +209,11 @@ https://claude.ai/artifact/GS2S79cV2ACydtXaaHzemW, is republished only when the 
      vector; build in `pretrain.py` / `sft.py`, then two micro arms against their AdamW twins on
      the R0b recipe, then one pilot-shape arm against arm P. Decided on the leak, not the loss.
      The pilot arms stay AdamW.
+  4. Proposed 2026-10-12: rung R8 (loss-free MoE balancing against the aux loss, micro), rung R9
+     (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
+     did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
+     distillation, RL past the pass@8 gate with credit over passes, depth record and routing
+     replay; prerequisite: decode with evidence through a KV cache).
   Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)); build list done 2026-10-10 (its
   "Build" section). Launch: `bash ckpts/inject/launch_pilot_p.sh` (warm-up split; after the switch
   criterion holds, `SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_p.sh` resumes the same

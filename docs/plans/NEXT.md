@@ -32,8 +32,12 @@ its own terms. Arm C (`launch_pilot_c.sh`, `ckpts/evidence_pilot_c/`, log
 `ckpts/inject/pilot_c.log`) runs the control split from the same seed to its epoch's end; reads
 `read_pilot_save.sh CKPT c TAG` (`none` only) at its saves and final, then `closed_book_rank.py
 compare` arm C against arm P, then the ladder's final reads on arm P (A3 `eval_abstention.py`,
-A4, A7 `eval_store.py`, A6 `eval_benchmarks.py` on both arms, A5 `--ceiling-json`). Record: the
-"Run" section of [PILOT.md](PILOT.md).
+A4, A7 `eval_store.py`, A6 `eval_benchmarks.py` on both arms, A5 `--ceiling-json`). Arm C at
+325M (2026-10-12, after a pause at 74M): the control stores the biographies as the micro arm (a)
+did, entity `delta` in distribution 0.299 (z 43) at tier 100 and 0.390 (z 25, top-1 1.000) at
+tier 1000, held out 0.029 (z 7.7) / 0.105 (z 10.3), so A1(b) is readable; against arm P at the
+same tokens (0.001 / 0.043) the control stores about 300x more at tier 100 and 9x more at tier
+1000. Record: the "Run" section of [PILOT.md](PILOT.md).
 
 **The warm-up and the main split, as they ran (2026-10-10, evening).** Launched at 19:03 on the warm-up
 split, it ran at 42k to 48k tokens per second (50M per 21 minutes, 27.1 GB peak), three times the
@@ -667,7 +671,9 @@ cannot see the chains.
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
 | real run ordering | Retrieval-augmented pretraining from token 0 with fact spans kept out of the loss. No plain pretraining plus a graft. Decided 2026-10-05: fact spans are not supervised with real values before the reader copies (a copy-first warm-up, a new element of the pilot's schedule). R0b arm (c) leaked before its reader copied (50M) and did not grow after (100M on); the copy-first warm-up arm stored nothing without real-value targets, held the R0b rule through tier 100 at 300M, and still stored tier 1000 facts after copying (0.085, z 6.4 at the final save), recorded as a known leak. The warm-up is the better of two arms on one seed, not an optimum. The swap rate 0.30 branch (read 2026-10-06) left tier 1000 where it was (paired -0.002, z -0.3 in distribution), and the pilot's swap rate stays at 0.15 (decided 2026-10-06 by the user: a leak this size matters little for the pilot, and RL planned later can act on small leaks; caveat on record: RL is Parked and shapes behaviour at conflicts rather than removing what is stored, so for small leaks the goal is read as behavioural at conflicts). The placeholder name arm (read 2026-10-08) halved the supervision that pairs the real name with the real value (0.686 to 0.346 of exposures) and left tier 1000 where it was (paired +0.011, z +1.8 pooled; falsified at pooled z above -2). 2026-10-08: the copy-criterion span weight is dropped on the placeholder arm's null; the pilot's lever list against the leak is the copy-first warm-up alone, at swap rate 0.15. |
 | real run budget | A token target is fixed and the hours derived from it (6b). About 2.5k H100 hours planned for shape L, which buys about 270 to 290B tokens with evidence at today's MFU; the 5k-hour ceiling stands. Estimates until the constructor prints them; recomputed after Phase 6a's throughput work. |
-| optimizer | Proposed 2026-10-12 (the user), pending R7; AdamW until R7 passes. The real run steps the hidden matrices with Muon: Nesterov momentum 0.95, 5 Newton-Schulz steps in bf16, the update scaled by 0.2 sqrt(max(m, n)) to AdamW's RMS so the lr and weight decay carry over, decoupled weight decay kept (Moonlight, arXiv 2502.16982: both are what made Muon scale). On Muon: q, k, v and o of every attention (prelude, shared, coda), the shared and routed MLPs one expert matrix at a time, the selector's `down_proj`, `loop_inject`; gate and up are orthogonalized as two matrices, since both are fused into one `gate_up` weight today. On AdamW: the tied table `E`, the head and MTP adapters, the router and `loop_router_bias`, every norm, scalar and vector (`loop_scale`, `evidence_loop_scale`, the gate scales, `layer_scalar`, the null key, `loop_query_bias`). Where it does not apply: the pilot arms (a matched pair shares its optimizer), any graft or finetune of an AdamW-pretrained checkpoint (Moonlight reports its finetuning gain for matched pretrain and finetune optimizers), and so 6e's consolidation SFT runs on whatever trained the trunk. The budget in 6b keeps AdamW's numbers: Moonlight's about 2x compute efficiency is measured at compute optimal, and shape L at about 280B tokens is about 600 tokens per parameter, a regime it does not cover. |
+| MoE balancing | Proposed 2026-10-12, pending R8: loss-free balancing (a per-expert bias on the routing score for selection only, moved by the sign of the load error) replaces the aux loss in the real run if R8 passes. Not RL: balance has an exact dense signal. |
+| reasoning post-training | Proposed 2026-10-12 (the user): 6f, in written tokens with the loop as computation per token unless R9 says otherwise. SFT on short and mixed chains, on-policy distillation, then RL past the pass@8 gate with RLTT credit, a depth record and routing replay; rewards on outcomes with visible evidence, abstention (three-way) and evidence conflicts. RL only for decisions without a gradient. |
+| optimizer | Proposed 2026-10-12 (the user), pending R7; AdamW until R7 passes. The real run steps the hidden matrices with Muon: Nesterov momentum 0.95, 5 Newton-Schulz steps in bf16, the update scaled by 0.2 sqrt(max(m, n)) to AdamW's RMS so the lr and weight decay carry over, decoupled weight decay kept (Moonlight, arXiv 2502.16982: both are what made Muon scale). The partition is a rule, not a list. On Muon: the hidden 2D projection matrices of attention, MLP, expert and adapter modules (q, k, v, o of every attention; the dense and shared MLPs; the routed experts one matrix at a time, since TE `GroupedLinear` keeps one 2D `weight{i}` per expert; the selector's `down_proj`; the PLE projections). Where gate and up are fused into one `gate_up` weight (the routed experts and the shared MLP; the prelude MLP is already split), rows `[:I]` and `[I:]` are orthogonalized as two matrices. On AdamW: every table (the embedding or tied `E`, the per-layer and router tables, the IR `z_keys` and `y_values`, whose Adam moments `apply_ir_refresh` zeroes by row), every head (the LM head and its sub-heads, the MTP head, the groundedness head, the head adapters), the router, `noise_proj` and `loop_router_bias`, every tensor of ndim 1 or less, and the zero-init neutrality matrices (`loop_inject`, `direct_gate`, IR `g_proj`), which a normalized update would move to full RMS on the first step. Where it does not apply: the pilot arms (a matched pair shares its optimizer) and any graft or finetune of an AdamW-pretrained checkpoint (Moonlight reports its finetuning gain for matched pretrain and finetune optimizers). A Muon trunk is finetuned on Muon, so 6e and 6f then run on Muon. R7 tests today's parameter set; the coda and the tied `E` (absent from the micro and pilot shapes) inherit the rule unverified. The budget in 6b keeps AdamW's numbers: Moonlight's about 2x compute efficiency is measured at compute optimal, and shape L at about 280B tokens is about 600 tokens per parameter, a regime it does not cover. |
 | loops (axiom) | "Passes add computation, not capacity; recalling a weakly stored fact can take more than one pass" (reworded 2026-10-04 from "loops buy computation, not storage") is an axiom, not a measurement: the record is 0.008 to 0.012 nats from loop 2 to 3, confounded by the halt gate. Ouro (arXiv 2510.25741) measures looped and non-looped models at the same ~2 bits per parameter, with the loop gain in knowledge manipulation. Two falsifiers. Storage half: closed-book rank by loop count on arm (a) (depth 1, 2, 3; every exit was trained through `loop_count_sampling`); if the tier 100 and 1000 `delta` grows with depth beyond its paired sigma, later loops carry stored facts and the axiom is wrong for this design. **Read 2026-10-04: the condition is met at tier 100.** In distribution the entity `delta` at depth 1 / 2 / 3 is 0.269 / 0.369 / 0.378 at tier 100 (depth 1 to 2 +0.100, z 19.7; 2 to 3 +0.008, z 6.5; prior unmoved); the gain is on the real name (1.21 nats against 0.14 for the fresh-name prior), and held out nothing grows. At tier 1000 the real name is saturated after one pass (rank 0.0008), and the `delta` growth there (0.393 / 0.453 / 0.467) is the prior drifting toward chance, not recall. Since the block's weights are shared, a second pass adds a step of computation over the same weights, not capacity: recall of a weakly stored fact is a two-step computation here. Decided 2026-10-04: the axiom is reworded as above and the storage-half falsifier is retired as read, since it measured recall depth, not capacity. The rule it leaves: every closed-book leak read is taken at full depth. Not planned, available if the axiom ever has to be quoted as measured: an arm with equal CE weight on every exit, which removes the weaker training of the early exits (a last-loop-only arm cannot be read by depth at all). It was also the control the learned exit gate arm would have needed; that arm was dropped on 2026-10-06 (Decisions, depth allocation), so the question is moot. Computation half (L1): if read sites past the first pass add under 5 points on held-out 2-hop at D = 3, the loop clause of the goal is wrong. Looping stays a requirement either way. **Micro read 2026-10-08 ([chain_depth_micro.md](../measurements/chain_depth_micro.md)): inconclusive, the precondition "readable" fails.** The 35M arm at 105M tokens copies an answer-type entity from the buffer but does not select the right one, so 1-hop accuracy is at chance and so is every L1 cell (held-out Delta +0.006 at sigma 0.013). That the Delta also sits under the falsified bound (Delta + 2 sigma 0.032 against 0.05) does not count: a model that cannot look up one hop cannot show whether later sites compose. The read neither supports nor falsifies the computation half; the axiom stays an axiom, and the pilot's L1 (sublayer sites against passes, at the pilot's shape and dose) is the deciding read. The third pass's `loop_scale` falling under 0.01 by 50M (0.07 at the end) is the weak-later-loop case the rule says to fix, read on a task where no pass composed. |
 | depth allocation | Dropped 2026-10-06 (the user): the learned exit gate arm (an Ouro-style exit distribution that only reweights the per-pass losses, never built) is dropped on the per-exit read on micro arms (a) and (c) (`eval_exit.py`, 2026-10-05): the second pass's gain (+0.094) is spread evenly over confidence deciles, the third pass adds 0.006 nats, and the entropy-regularized optimum is near uniform even as a bound (0.343 / 0.286 / 0.371 at beta 0.1). Its three open questions (the skip-compute exemption, the equal-weight control arm, the pilot spec without exits) are closed as moot. The depth reading moves to the chain corpus: one micro arm with `--evidence --reader-kv` on chain training splits, read with `eval_chains.py` by depth and by kept read sites (L1 at micro scale); approved 2026-10-06, spec written 2026-10-08 ([chain_depth_micro.md](../measurements/chain_depth_micro.md), ladder step 8). `eval_exit.py` cannot read that arm (it refuses evidence splits); the full-site cells at depth 1, 2 and 3 replace the per-exit read. **Read 2026-10-08: inconclusive, not readable.** The arm never learned 1-hop lookup (every accuracy cell at chance at 50M and final), so the full-site cells by depth (answer CE 0.485 / 0.468 / 0.468 at depth 1 / 2 / 3 on the 4-hop split) say nothing about how depth should be allocated on a task that composes. The fixed draw {3: 0.7, 4: 0.2, 5: 0.1} stands; depth allocation is not reopened. |
 | abstention | The groundedness head reads the reader output and the null mass; the preference pass stays deferred until an A-gate has a pilot reading. |
@@ -984,7 +990,7 @@ separate module (its own `o_proj`, its own output gate).
 **Encoder.** The first 4 prelude layers, chunk-causal, TE checkpoint, encoded once per forward.
 
 **Objective.** `L = CE x span_weight + 0.1 MTP + 0.01 aux + 0.1 L_sel + 0.1 contrastive + 0.1
-groundedness`, with the MTP targets span-weighted like the main CE. The control arm swaps the first
+groundedness` (the aux term leaves if R8 passes), with the MTP targets span-weighted like the main CE. The control arm swaps the first
 term for per-loop CE.
 
 **Optimizer (pilot).** Its own spec, in tokens: warmup 2 to 5% of the pilot's tokens (the design's
@@ -1060,11 +1066,15 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 | R4b | 2 x 1B | sublayers per pass 2 against 3 at matched compute; experts 4 against 8 | L1 plus closed-book rank plus language benchmarks | see gates | shape L's core |
 | R5 | 0 | the winner, eval only | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | L2 and the A gates | whether the design enters the real run |
 | R6 | 1 to 2B | hop 1 seen only in pretraining text (about 100 exposures), hop-1 documents excluded from the store, hop 2 retrieved | closed-book hop-1 accuracy and 2-hop accuracy | at chance on both (the A1 leak probe: above chance means pretraining-text facts reached the weights) | whether the recipe keeps pretraining-text facts out of the weights |
-| R7 | 2 x 0.3B, then 0.9B | Muon on the hidden matrices (Decisions, optimizer) against AdamW, at the AdamW arm's lr and weight decay through the RMS-matched update, no sweep. Micro first, from `seed_micro.pt` on the R0b splits: Muon arm (a) full CE against arm (a), and the Muon copy-first warm-up arm of (c) against the warm-up arm, same seed, data and switch at 100M; about 1.5 5090 hours each. Then, only if both micro reads pass, one Muon arm P from `seed_pilot_grounded.pt` on the pilot splits against arm P, about one night | filler CE on `inject_val` at 50M steps (`eval_exit.py`, paired against the twin); gold top-1 at 50M and 100M (when copying emerges); closed-book entity `delta` by tier on both forms, `compare` against the twin; arm (a) by tier as the storage read (descriptive: whether Muon stores the tail more, arXiv 2509.26030); max attention logit per layer (no QK norm in the trunk); on the pilot shape also the 1-hop gate, L1 and A2 | Muon filler CE below its twin's at matched tokens beyond the paired sigma; copying no later (the warm-up's switch criterion met by 100M at micro, by 300M at pilot shape); the (c) and P `delta` not above the twin's by 3 sigma paired at tier 100 or tier 1000 on either form; the logit not growing without bound | the real run's optimizer. A loss gain with a worse leak fails: the goal outranks the speed |
+| R7 | 3 x 0.3B, then 0.9B | Muon on the hidden matrices (Decisions, optimizer) against AdamW, at the AdamW arm's lr and weight decay through the RMS-matched update, no sweep. Build first: one combined Muon plus AdamW optimizer class over the fp32 masters (`train_step` takes one optimizer and one `LambdaLR`); `eval_exit.py --pair OTHER.json` (paired per-token CE against a twin; today it keeps aggregates only); a sampled max of q·k per layer (flash varlen exposes no logits). Micro, from `seed_micro.pt` on the R0b splits: Muon arm (a) full CE against arm (a), the Muon copy-first warm-up arm of (c) against the warm-up arm (same seed, data and switch at 100M), and one AdamW reseed of arm (a) for the run-to-run spread (the paired sigma is per item, not per run); about 1.5 5090 hours each. Then, only if both micro reads pass, one Muon arm P from `seed_pilot_grounded.pt` on the pilot splits against arm P, about one night | filler CE on `inject_val` at 50M steps (`eval_exit.py`, paired against the twin); gold top-1 at 50M and 100M (when copying emerges); closed-book entity `delta` by tier on both forms, `compare` against the twin; arm (a) by tier as the storage read (descriptive: whether Muon stores the tail more, arXiv 2509.26030); max attention logit per layer (no QK norm in the trunk); on the pilot shape also the 1-hop gate, L1 and A2 | Muon filler CE below its twin's at matched tokens beyond the paired sigma and beyond the AdamW reseed spread; copying no later (the warm-up's switch criterion met by 100M at micro, by 300M at pilot shape); the (c) and P `delta` not above the twin's by 3 sigma paired at tier 100 or tier 1000 on either form; the logit not growing without bound | the real run's optimizer. A loss gain with a worse leak fails: the goal outranks the speed |
+| R8 | 0.3B | loss-free balancing (arXiv 2408.15664: a bias added to the routing score for top-k selection only, moved after each optimizer step by u times the sign of the load error, u 0.001) against the aux loss; micro arm (a) recipe from `seed_micro.pt`, paired against arm (a). Build: the bias per pass, `[n_loops, E]`, since routing is loop-conditioned; over the MLP slots only (the attention and IR experts run densely anyway, and shape L routes MLP experts only); updated on device from the router's hard counts once per sync step; the buffer on `load_model_state`'s allow-list; expert load logged per pass (today the tracker pools passes into one EMA) | filler CE on `inject_val`, paired; expert load per pass (max over mean); closed-book entity `delta` by tier | CE not worse beyond the paired sigma; load at least as even | the real run's balancing |
+| R9 | about 200k questions | from arm P's final save (`ckpts/evidence_pilot_p/checkpoint_evidence_final.pt`): SFT on a written-bridge form of the chain splits (the first hop's answer written before the final answer; `.chains.jsonl` already holds start, bridge and answer, so the build is a template flag in `prepare_chain_data.py`). Budgeted in questions, not tokens: at the chain slice's evidence ratio 4.20 the rate is about 3k tok/s, so 0.1B tokens would take 7 to 10 hours. Read with a generate-then-score mode added to `eval_chains.py`, which today scores candidates right after the prompt and cannot read a written bridge. A short RL run on the chain answer only after 6f's rollout prerequisites exist | held-out 2-hop and 3-hop accuracy with the written bridge against arm P's latent read (at chance); the 1-hop gate kept | held-out 2-hop 3 sigma above chance | whether 6f reasons in written tokens or in the loop |
 
 A 1-hop curve must saturate before any null is read. R4 replaces the previous plan's per-loop CE
 test, which changed loss placement, depth sampling and the coda in one arm. Pilot arms that do not
 fit the budget are dropped from the bottom of this table, not the top; R0b runs before all of them.
+R7 to R9 (added 2026-10-12) sit outside that rule: they decide the run spec and 6f, not the
+pilot's claims, and cost hours, not 1B-token arms. They queue behind arm C and its reads.
 
 ### Later, after the pilot passes
 
@@ -1116,7 +1126,8 @@ prep is its own interruption-safe job with its own budget line in the run spec.
 
 Written before anything is rented. It names, per component, the pilot rung that admitted it and
 its margin. Shape L from the pilot's R4b reading. A token target, with the hours derived from it.
-The optimizer from R7 (Muon on the hidden matrices if it passed, AdamW otherwise); the LR
+The optimizer from R7 (Muon on the hidden matrices if it passed, AdamW otherwise) and the
+balancing from R8 (loss-free in place of the 0.01 aux term if it passed); the LR
 transfer sweep at reduced width runs on that optimizer, or muP if it can be adopted cheaply. Under
 Muon, DDP repeats the Newton-Schulz steps on every rank (cheap at 470M); a sharded optimizer needs
 the distributed form (Moonlight); a growing attention logit gets QK-clip (MuonClip, Kimi K2, arXiv
@@ -1137,7 +1148,87 @@ loss, and A3 at every checkpoint.
   preference pass on abstention pairs mined from the model's own samples, if the groundedness
   signal did not bend the abstention curve on its own. Gate G7 as before: benchmarks within noise,
   false abstention under 10% with recall at least 0.5 and precision at least 0.65, A-gates
-  re-confirmed on the shipped checkpoint.
+  re-confirmed on the shipped checkpoint. If 6f's RL stage runs, its three-way abstention reward
+  replaces the preference pass; the pass stays the fallback.
+
+### 6f. Reasoning post-training
+
+Proposed 2026-10-12 (the user): a reasoning model on the real trunk after 6e. The rule for what
+gets RL: only decisions without a gradient (discrete choices, outcomes over a whole sequence, real
+compute savings). Anything with a dense differentiable loss keeps that loss, because a reward is a
+noisier estimate of the same signal. Reasoning is planned in written tokens with the loop as
+computation per token, unless R9 says otherwise; L1 read falsified at pilot shape, so a
+latent-only reasoning model is not planned.
+
+1. **Reasoning SFT.** Short and mixed-length chains of thought, not long R1-style traces (models
+   of 3B and under learn short and mixed chains better, arXiv 2502.12143), plus retrieval-grounded
+   multi-hop chains with the evidence in the port (HotpotQA, MuSiQue, 2Wiki, the synthetic
+   chains). Built by the evidence builders, so every item carries `.ans` and `.evgold`; off-the-shelf
+   QA sets without those labels are not used for any stage below. MuSiQue and 2Wiki are new builder
+   sources (none exists today). "Supporting chunk visible" is `.evgold` for QA and every chunk with
+   `.evhop` above 0 for chains; `merge_evidence_splits.py` carries only `.evgold`, `.cond` and
+   `.ans` today, so it is extended to `.evhop` and `.factspan` before any merged RL split. Folded
+   into 6e's consolidation SFT where the template allows.
+2. **On-policy distillation.** The student samples, a teacher scores every sampled token, the loss
+   is the per-token reverse KL (Thinking Machines, October 2025: about a tenth of RL's compute for
+   the same score in their report). The signal is dense, so it works where the pass rate is near
+   zero, which RL cannot. The teacher must score the student's tokens, and that is the open item
+   of this stage. A same-tokenizer teacher is DeepSeek V3 or V4 class: `id_remap.json` (written by
+   `prune_vocab.py`) maps its ids onto the pruned 65,536, but the model cannot run locally, an API
+   would have to return logprobs on given tokens, and a pruned tokenization is not the canonical
+   one in the full vocabulary. The default is therefore a cross-tokenizer variant with a smaller
+   self-hosted reasoning teacher, at extra cost; the teacher is chosen in the run spec, and without
+   one this stage is skipped and RL starts from SFT. Exit gate: pass@8 at about 15% or more on the target tasks (the
+   Parked gate).
+3. **RL**, only past that gate. GRPO family with DAPO's fixes (decoupled clip bounds with a higher
+   upper one, dynamic sampling that drops prompts solved always or never, a token-level loss) and
+   Dr. GRPO's removal of the length and standard-deviation normalization; a KL term with periodic
+   reference resets for a long run (ProRL). Three requirements of the looped MoE:
+   - RLTT trajectory credit over the passes (arXiv 2602.10520), not credit to the final state only;
+     Ouro reports RL after its reasoning SFT brought no significant gain, and RLTT names
+     final-state credit as the cause. RLTT needs a trained readout at every pass. The blueprint's
+     objective (one CE on the last pass through the coda, the first D minus 3 passes under
+     `no_grad`) leaves the per-pass readouts untrained, so RLTT depends on R4's loss placement: if
+     the real run trains one CE on the last pass, step 1 adds a per-pass readout term; under
+     per-loop CE (today's code) it is there already.
+   - Fixed depth: rollouts run at a fixed depth (the convergence exit is exclusive with the cache)
+     and RL turns `loop_count_sampling` off, so the training forward runs the rollout's depth.
+   - Routing replay (R3, arXiv 2510.11370): the expert choice of every pass at rollout is recorded
+     and reused in the training forward; routing mismatch between the two forwards is the known
+     cause of MoE RL collapse, and the loop repeats it once per pass. Build: a forced-index
+     argument to the router that also fills the dense gate slots.
+
+   Rewards:
+   - Outcome on retrieval QA and chains, paid only when the supporting chunk is visible.
+   - The three-way abstention reward (TruthRL, arXiv 2509.25760): correct +1, abstain 0, wrong -1;
+     an item without its evidence pays for abstaining.
+   - Evidence conflicts: counterfactual cards, paid for following the visible evidence (the
+     behavioural reading of the leak, decided 2026-10-06).
+   - A per-query cost once step 4 exists.
+4. **Retrieval as an action**, after the append-only buffer and per-pass re-query are built (Parked
+   today). The store lookup is a top-k search with no gradient, and whether to re-query is a
+   decision: RL learns both from the answer reward (Search-R1, arXiv 2503.09516), with retrieved
+   tokens masked from the loss and the per-query cost against query spam (its follow-ups report
+   many loosely relevant queries under an outcome reward alone). The selector's ranking inside the
+   buffer keeps its selection loss and InfoNCE.
+
+Not RL: MoE balance (a pretraining choice, R8), the selector, the null key, the gates, MTP.
+Halting stays Parked: a reward of correctness minus a cost per pass only once a halt skips real
+compute. A reward for depth itself is never used; it buys passes that do nothing.
+
+**Prerequisites**, built before any rollout budget (no serving engine runs this architecture):
+- Evidence prefill into the cache. The evidence states are fixed per forward and the chunk gate is
+  exactly 1 while `freeze_evidence_gate` holds (every config sets it), so each pass's prefix keys
+  and values can be written once into `shared_attn`'s cache slot; the asserts against a cache with
+  evidence (`gemma4.py`, `moe.py`, `inference.py`) come out. Valid only while the gate is frozen.
+- A batched KV cache; today it is single-sequence. `eval_abstention.py` already decodes batched
+  without a cache, but it re-encodes the evidence every step, returns no logprobs and is not
+  bit-exact through the MoE.
+- Rollout outputs: the sampled tokens' logprobs and the per-pass routing record. **Reads** after every stage: A1 closed-book rank (a reward on
+answers can pay for recall from the weights, which is the leak with a reward behind it), A3,
+pass@k curves up to k 64 (whether RL sharpens or expands, arXiv 2504.13837 against ProRL), the
+benchmark suite within noise. **Budget**: unmeasured; the rollout rate sets it, and its line in
+the run spec is written after the cache build.
 
 ---
 
@@ -1222,6 +1313,12 @@ above are a different, live series).
   before the real run trusts it. Under Muon a matrix with any gradient moves at full rate, so a
   zero-init tensor that stays flat no longer means what the kill rules assumed; the real run has
   no such rules, the micro arms read those lines as descriptive.
+- **RL pays for recall from the weights.** A reward on a correct answer given without its evidence
+  trains closed-book recall, the leak with a reward behind it. 6f pays outcomes only with the
+  supporting chunk visible, pays abstention without it, and reads A1 after every stage.
+- **Rollouts are the cost of 6f.** Decode with evidence is uncached today and no serving engine
+  runs this architecture, so the rollout rate is unknown and can make 6f's RL stage unaffordable;
+  on-policy distillation needs fewer samples per prompt and comes first.
 - **Data prep at 100B tokens is a real job**, budgeted in the run spec.
 - **Stale numbers.** Every FLOP, parameter and ratio figure in this plan is an estimate until the
   constructor and the builder print it. Budget math keyed to an estimate goes stale silently.
@@ -1259,14 +1356,25 @@ above are a different, live series).
   value/output and feed-forward weights and comes from learning rare classes better, the reason
   R7 decides on the leak. Kimi K2 (arXiv 2507.20534): attention logits grow under Muon at scale,
   fixed by QK-clip.
+- Added 2026-10-12, for 6f, R8 and R9. MobileLLM-R1 (arXiv 2509.24945): a 950M reasoner from
+  4.2T pretraining tokens and SFT alone, so at this size the reasoning ceiling is set in
+  pretraining. Li et al. (arXiv 2502.12143): small models learn short and mixed chains better than
+  long ones. Thinking Machines, "On-Policy Distillation" (October 2025). Yue et al. (arXiv
+  2504.13837) and ProRL (arXiv 2505.24864): RL sharpens within the base model's reach, or extends
+  it under long stabilized training. DAPO (arXiv 2503.14476) and Dr. GRPO (arXiv 2503.20783).
+  RLTT (arXiv 2602.10520) and LoopRPT (arXiv 2603.19714): RL for looped models. Rollout Routing
+  Replay (arXiv 2510.11370): MoE RL stability. TruthRL (arXiv 2509.25760), Search-R1 (arXiv
+  2503.09516). Loss-free balancing (arXiv 2408.15664).
 
 ## Parked
 
 - **Learned halting.** Only trainable if halting skips real compute; unparks after the exit and KV
   cache exclusion is fixed and a halt decision breaks the loop during training. The learned exit
   gate that raised an exemption question was dropped on the per-exit read (2026-10-06).
-- **RL and reasoning training.** Unparks when pass@8 on the target task exceeds about 15%. A
-  looped model wants per-loop latent credit (LoopRPT, RLTT), not token-level GRPO.
+- **RL and reasoning training.** Planned as 6f since 2026-10-12; its RL stage still unparks only
+  when pass@8 on the target task exceeds about 15%. A looped model wants per-loop latent credit
+  (RLTT), not final-state GRPO. LoopRPT (reinforcement during pretraining of a looped model, arXiv
+  2603.19714) stays a research arm only.
 - **Per-pass re-query and the append-only buffer at serving.** Untrained; after the pilot.
 - **Explicit reader-to-query feedback.** Query drift was measured without evidence; revisit only
   if it stays flat with evidence attached.
@@ -1282,6 +1390,17 @@ above are a different, live series).
   vector), rung R7 (two micro arms against their AdamW twins, then one pilot-shape arm against arm
   P), a Risks entry (Muon learns the tail better, so the leak is the deciding read), and 6d takes
   the optimizer from R7. The pilot arms stay on AdamW.
+- 2026-10-12: reasoning post-training (6f) and MoE balancing (the user). 6f: reasoning SFT,
+  on-policy distillation, RL past the pass@8 gate with trajectory credit, depth records and
+  routing replay, rewards on outcomes with visible evidence, abstention and evidence conflicts,
+  retrieval as an action after the re-query build. Rungs R8 (loss-free balancing against the aux
+  loss) and R9 (a written bridge on arm P's chains). Two Decisions rows and two Risks entries; the
+  RL Parked entry points to 6f. A feasibility review against the code the same day changed: the
+  Muon partition became a rule (tables, heads, router and zero-init matrices on AdamW, R7 tests
+  today's set only); R7 gained its build items and an AdamW reseed twin; RLTT depends on R4's
+  loss placement; the depth record became fixed-depth rollouts; the cache prerequisite became an
+  evidence prefill plus a batched cache; the distillation teacher is the open item; R9 is budgeted
+  in questions and needs a generate-then-score read.
 - 2026-10-09: the pilot spec ([PILOT.md](PILOT.md)). The pilot is cut to what is built: the R0b
   recipe on today's code at 99.1M parameters (width 512, 6 prelude layers, 8 experts, seq 4096,
   key/value reader), a merged corpus from the existing builders (biographies plus filler 60%, QA
