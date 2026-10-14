@@ -1,0 +1,82 @@
+# the ~30M shape for the fact injection runs. select it with TINY_LLM_CONFIG=config_micro.yaml,
+# relative to the repo root. every model: and training: key config.py reads is present here
+model:
+  vocab_size: 65536          # same tokenizer and uint16 corpus as the full shape
+  max_seq_length: 1024
+  hidden_size: 256
+  intermediate_size: 768
+  moe_intermediate_size: 768
+  num_layers: 4
+  num_attention_heads: 4     # 1 kv head (num_heads // 4)
+  head_dim: 64
+  dropout: 0.0
+  per_layer_embeddings_size: 8
+  num_mlp_experts: 8
+  num_attn_experts: 1
+  top_k: 2
+  n_loops: 3
+  num_ir_experts: 1
+  num_ir_entries: 256
+  ir_dim: 384                # bge width, the external keys arrive at it
+  ir_num_clusters: 0         # exact read, no centroids
+  ir_probe_clusters: 4
+  ir_read_top_k: 32
+  ir_direct_read: true
+  evidence_encoder: true
+  mtp_num_extra_tokens: 2
+  lm_head_factor: 4
+
+training:                    # loss weights, read by train_step for every profile
+  batch_size: 16
+  seq_length: 1024
+  lr: 1.0e-3
+  weight_decay: 0.1
+  grad_clip: 1.0
+  num_epochs: 1
+  lambda_mtp: 0.1
+  aux_loss_weight: 0.01
+  evidence_selection_weight: 0.1
+  groundedness_weight: 0.0
+  target_tokens: 300000000
+  warmup_steps: 0
+  noise_anneal_tokens: 0
+  loop_ce_weights: [0.2, 0.3, 1.0]
+  loop_ce_subsample: 0.25
+  loop_count_sampling: 0.3
+  grad_accumulation_steps: 1
+  seed: 42
+  data_dir: "data/prepared_inject"
+  phase: "phase1"
+  hf_upload_repo: ""
+
+sft:
+  data_dir: "data/prepared_inject"
+  seq_length: 1024
+  dropout: 0.0
+  hf_upload_repo: ""
+
+evidence:
+  train_split: "inject_full_train"     # every launch overrides it with --train-split
+  val_split: "inject_val"
+  fixed_split: ""                      # no fixed-target pass, no kill
+  kill_tokens: 0
+  freeze_evidence_gate: true
+  lr: 1.0e-3
+  fresh_lr: 1.0e-3                     # from scratch: one rate for everything
+  num_epochs: 1                        # the corpus is the token budget; exposures are explicit
+  weight_decay: 0.1
+  dropout: 0.0
+  batch_size: 32                       # at 35M the step is host bound: batch 16 x accum 2 ran 45k tok/s
+  grad_accumulation_steps: 1           # ~32k tokens per optimizer step at full rows
+  warmup_fraction: 0.02
+  lr_min_factor: 0.1
+  seed: 1234
+  checkpoint_every_tokens: 50000000
+  keep_local_checkpoints: 2
+  eval_every_tokens: 25000000
+  eval_max_batches: 40
+  conversation_loss_weighting: false   # plain per-token CE: this is pretraining, not policy
+  loss_weight_floor_tokens: 64
+  max_evidence_tokens: 3072
+  cluster_refresh_tokens: 0
+  dead_quantile: 0.0

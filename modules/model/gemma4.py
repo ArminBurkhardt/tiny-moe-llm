@@ -4,9 +4,13 @@ import torch.nn.functional as F
 import math
 import transformer_engine.pytorch as te
 
-from modules.model.embeddings import RotaryPositionEmbeddingsFrequency, apply_rotary_pos_emb
+from modules.model.embeddings import (
+    RotaryPositionEmbeddingsFrequency,
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_single,
+)
 from modules.model.utils import EncoderOutput
-from modules.model.attention import varlen_attention
+from modules.model.attention import varlen_attention, cached_attention, prefix_varlen_attention
 
 # adapted from https://github.com/huggingface/transformers/tree/main/src/transformers/models/gemma4
 # https://github.com/huggingface/blog/blob/main/gemma4.md#overview-of-capabilities-and-architecture 
@@ -60,40 +64,115 @@ class Gemma4TextAttention(nn.Module):
         max_seqlen: int | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         other_states: torch.Tensor | None = None,
+        kv_cache=None,
+        cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int | None = None,
+        other_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        causal: bool = True,
+        prefix_states: torch.Tensor | None = None,
+        prefix_cu_seqlens: torch.Tensor | None = None,
+        prefix_max_seqlen: int | None = None,
+        prefix_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prefix_value_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``prefix_*`` turn self attention into self attention over extra leading keys.
+
+        ``prefix_states`` ``[B, S_p, H]`` are projected by this attention's own ``k_proj`` and
+        ``v_proj``, rotated by ``prefix_position_embeddings`` and read by every query of the paired
+        segment in front of its own causal keys (``prefix_varlen_attention``).
+        ``prefix_value_scale`` multiplies the prefix values. None (the default) is the forward
+        this module always ran.
+        """
+        if prefix_states is not None:
+            return self._forward_with_prefix(
+                hidden_states, cu_seqlens, max_seqlen, position_embeddings, prefix_states,
+                prefix_cu_seqlens, prefix_max_seqlen, prefix_position_embeddings, prefix_value_scale,
+                kv_cache,
+            )
         bsz, q_len, _ = hidden_states.size()
 
         if other_states is None:
             other_states = hidden_states
+        o_len = other_states.shape[1]
 
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(other_states)
         value_states = self.v_proj(other_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, o_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, o_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if position_embeddings is not None:
             cos, sin = position_embeddings
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if other_position_embeddings is None:
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            else:
+                # the key side sits on its own position basis (per chunk, restarting at 0), so the
+                # two sides cannot share one rotation -- see the evidence read in moe.py
+                other_cos, other_sin = other_position_embeddings
+                query_states = apply_rotary_pos_emb_single(query_states, cos, sin)
+                key_states = apply_rotary_pos_emb_single(key_states, other_cos, other_sin)
 
-        # block-diagonal causal attention over the packed documents (flash varlen handles GQA,
-        # so KV heads are not pre-repeated). Returns [B, S, Hq, D].
-        attn_output = varlen_attention(
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens,
-            max_seqlen,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            softmax_scale=self.scaling,
-            causal=True,
-        )
+        if kv_cache is not None:
+            # KV-cached incremental decoding (modules/model/kv_cache.py): hidden_states/other_states
+            # cover only the newly-appended tokens, cu_seqlens/max_seqlen are unused (single
+            # unpacked sequence). Returns [B, S, Hq, D], same layout as varlen_attention.
+            attn_output = cached_attention(
+                query_states,
+                key_states,
+                value_states,
+                kv_cache,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=self.scaling,
+            )
+        else:
+            # block-diagonal causal attention over the packed documents (flash varlen handles GQA,
+            # so KV heads are not pre-repeated). Returns [B, S, Hq, D].
+            attn_output = varlen_attention(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens,
+                max_seqlen,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                softmax_scale=self.scaling,
+                causal=causal,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seqlen_k,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
 
         return self.o_proj(attn_output)
+
+    def _forward_with_prefix(self, hidden_states, cu_seqlens, max_seqlen, position_embeddings,
+                             prefix_states, prefix_cu_seqlens, prefix_max_seqlen,
+                             prefix_position_embeddings, prefix_value_scale, kv_cache):
+        assert kv_cache is None, "a prefix read has no KV cache slot; decode it uncached"
+        assert position_embeddings is not None and prefix_position_embeddings is not None, (
+            "the prefix keys are placed by rotation, so both sides need position embeddings"
+        )
+        bsz, q_len, _ = hidden_states.size()
+        p_len = prefix_states.shape[1]
+        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        prefix_keys = self.k_proj(prefix_states).view(bsz, p_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        prefix_values = self.v_proj(prefix_states).view(bsz, p_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        prefix_cos, prefix_sin = prefix_position_embeddings
+        prefix_keys = apply_rotary_pos_emb_single(prefix_keys, prefix_cos, prefix_sin)
+        if prefix_value_scale is not None:
+            prefix_values = prefix_values * prefix_value_scale.to(prefix_values.dtype)
+        attn_output = prefix_varlen_attention(
+            query_states, key_states, value_states, prefix_keys, prefix_values,
+            cu_seqlens, max_seqlen, prefix_cu_seqlens, prefix_max_seqlen,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            softmax_scale=self.scaling,
+        )
+        return self.o_proj(attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim))
 
 class Gemma4TextDecoderLayer(nn.Module):
     def __init__(
@@ -142,12 +221,13 @@ class Gemma4TextDecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         max_seqlen: int | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        per_layer_embeddings: torch.Tensor | None = None
+        per_layer_embeddings: torch.Tensor | None = None,
+        kv_cache=None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
+        hidden_states = self.self_attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings, kv_cache=kv_cache)
         hidden_states = self.dropout(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -216,15 +296,27 @@ class Gemma4TextModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.hidden_size = hidden_size
 
-    def forward(self, input_ids: torch.Tensor, cu_seqlens: torch.Tensor | None = None, max_seqlen: int | None = None):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
+        kv_cache: list | None = None,
+        position_offset: int = 0,
+    ):
         hidden_states = self.embed_tokens(input_ids)
 
         # scale embeddings by sqrt(hidden_size)
         hidden_states = hidden_states * (self.hidden_size**0.5)
         hidden_states = self.dropout(hidden_states)
-        
-        position_embeddings = self.rotary_emb(hidden_states, seq_len=input_ids.shape[1])
-        
+
+        if kv_cache is not None:
+            # KV-cached decoding: input_ids covers only the newly-appended tokens, which sit at
+            # absolute positions [position_offset, position_offset + seq_len) -- not [0, seq_len).
+            position_embeddings = self.rotary_emb.slice(position_offset, input_ids.shape[1], hidden_states.dtype)
+        else:
+            position_embeddings = self.rotary_emb(hidden_states, seq_len=input_ids.shape[1])
+
         if self.ple is not None:
             ple_emb = self.ple(input_ids)
             ple_emb = ple_emb.view(
@@ -243,7 +335,8 @@ class Gemma4TextModel(nn.Module):
                 cu_seqlens,
                 max_seqlen,
                 position_embeddings,
-                per_layer_embeddings=ple_emb[:, i] if ple_emb is not None else None
+                per_layer_embeddings=ple_emb[:, i] if ple_emb is not None else None,
+                kv_cache=kv_cache[i] if kv_cache is not None else None,
             )
             layers_outputs.append(hidden_states)
 
