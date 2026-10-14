@@ -2,11 +2,18 @@
 
 Status 2026-10-11: spec written 2026-10-09, build list done 2026-10-10 (the "Build"
 section), arm P launched 2026-10-10 19:03, switched to the main split at the 300M save the same
-evening, complete at 860.61M (one epoch) on 2026-10-11 and read; arm C launched the same day.
-Arm P's final read: 1-hop 0.85 (the gate holds), L1 Delta +0.002 +- 0.005 (the spec's
-"falsified" cell), tier 1000 leak 0.064 / 0.046, tier 100 at z 3.2 held out and z 2.2 in
-distribution (the arm P half of A1(b) not met on one form), copying intact; A2 and A5 clear on
-the trainer's numbers. The verdicts wait for arm C and the user (the "Run" section at the end). The pilot runs on today's code: the R0b recipe (the
+evening, complete at 860.61M (one epoch) on 2026-10-11 and read; arm C launched the same day,
+complete at 909.72M on 2026-10-14 and read. Arm P's final read: 1-hop 0.85 (the gate holds), L1
+Delta +0.002 +- 0.005 (the spec's "falsified" cell), tier 1000 leak 0.064 / 0.046, tier 100 at
+z 3.2 held out and z 2.2 in distribution (the arm P half of A1(b) not met on one form), copying
+intact; A2 and A5 clear on the trainer's numbers. Arm C's final read: the control stores tier 100
+at 0.467 in distribution and 0.049 held out, 47x and 4x arm P; the paired compare is at z -81 and
+-6.4 there. The ladder's remaining reads (2026-10-14): A5 holds (port gain 1.56x the in-context
+ceiling), A6 holds (within noise of the control), A3 holds in likelihood (+3.75 nats gold against
+none, the swapped answer wins) and is unreadable in generation (96% abstention under gold), A4
+fails (the model's query at recall@5 0.004 against bge 0.829), A7 unreadable (oracle EM 2.6%);
+the exit and depth reads repeat the micro shape on both arms. The verdict rows wait for the user
+(the "Run" section at the end). The pilot runs on today's code: the R0b recipe (the
 key/value reader, the copy-first warm-up, swap rate 0.15) at a larger shape and on a mixed corpus,
 two arms of 1B prompt tokens each, the pathway arm P against a matched-token control C without
 retrieval. Most of the Phase 5 blueprint in NEXT.md (coda, tied token table, always-on selector,
@@ -597,3 +604,105 @@ splits). Nothing in the spec changed.
   z 3.2 on one form and z 2.2 on the other and arm C is not read yet; the L1 row ("falsified at
   this shape; looping stays a requirement; the goal's reasoning clause is reworded before the
   real-run spec") applies on its own terms once the gate row is settled.
+- **Arm C (the control) launched 2026-10-11 21:04** (`launch_pilot_c.sh`, `ckpts/evidence_pilot_c/`,
+  log `ckpts/inject/pilot_c.log`; the control split through `SFTDataset`, no evidence, the port's
+  cross-reader tensors at their init; 51k to 59k tokens per second, 18.1 GB). Paused by the user at
+  the 74M save on the night of 2026-10-11 and resumed on 2026-10-12, so its save grid sits at
+  124M, 174M, ... (24M off arm P's). Its port stays neutral on the fixed eval (gain 0.000, grounded
+  AUROC 0.500 at every read). `[eval]` CE on `inject_val` 5.08 / 4.25 / 3.98 / 3.84 / 3.73 / 3.65
+  at 50 / 100 / 150 / 200 / 250 / 300M (arm P 3.47 at 455M, 3.23 at the end).
+- **Arm C 325M closed-book read** (`ckpts/inject/pilot_c_325M_rank_none.*`, the stop save
+  `loss6.5000`; the chain reads ran too and sit at chance in every cell, as a model that never read
+  evidence must). **The control stores the biographies as the micro arm (a) did**: entity `delta`
+  in distribution 0.006 / 0.044 (z 6.2) / 0.299 (z 43) / 0.390 (z 25; raw rank 0.000, top-1
+  1.000) by tier, pooled 0.130 (z 28); held out 0.001 / 0.008 / 0.029 (z 7.7) / 0.105 (z 10.3),
+  pooled 0.019 (z 9.0). Dates 0.232 / 0.217 at tiers 100 / 1000 in distribution, 0.052 / 0.175
+  held out; nouns 0.405 / 0.457 in distribution, held out flat but 0.044 (z 4.0) at tier 1000.
+  Every tier 100 and tier 1000 attribute is above 14 sigma in distribution and above 3.9 held out.
+  The micro arm (a) at 300M read 0.378 / 0.467 in distribution and 0.023 / 0.104 held out. **So
+  arm C is far above its prior at tier 100 and 1000 on both forms, and A1(b) is readable at the
+  final.** Against arm P at 351M (0.001 / 0.043 at tiers 100 / 1000 in distribution) the control
+  stores about 300x more at tier 100 and 9x more at tier 1000, on the same tokens of the same
+  document order; the paired `compare` at the final saves is the read that carries the verdict.
+- **Arm C complete: 909.72M tokens, one epoch, 2026-10-14** (`checkpoint_evidence_final.pt`,
+  exit 0; paused by the user at 854M on 2026-10-12 and resumed 2026-10-14; the control's epoch
+  runs 49M longer than arm P's because the control split has no evidence and so no over-length
+  skips). Final `inject_val` CE 3.2195 (arm P 3.2321, a 0.013 gap, the micro gap was 0.026).
+  Trainer's final fixed eval on `evidence_fixed`: answer CE 4.35 under every condition, gain
+  0.000, chunk AUROC 0.52, grounded AUROC 0.50: the port is neutral, as a run without evidence
+  must leave it. Note the `none` answer CE: 4.35 on the control against 5.86 on arm P, so arm P
+  answers worse than the control when no evidence is attached and 2.5 nats better with gold
+  (1.85).
+- **Arm C final closed-book read** (`ckpts/inject/pilot_c_final_rank_none.*`): entity `delta` in
+  distribution 0.016 / 0.201 (z 21) / 0.467 (z 62; top-1 0.959) / 0.468 (z 28; top-1 1.000) by
+  tier, pooled 0.243 (z 43); held out -0.006 / 0.005 / 0.049 (z 12.3) / 0.118 (z 10.8), pooled
+  0.022 (z 10.7). Dates 0.339 / 0.295 in distribution and 0.057 / 0.105 held out at tiers 100 /
+  1000; nouns 0.482 / 0.471 and 0.016 / 0.040. The micro arm (a) final was 0.378 / 0.467 and
+  0.023 / 0.104: the control at pilot scale stores tier 100 to the same level as tier 1000, and
+  now stores tier 10 (0.20) as well. **The paired `compare`** (`compare_pilot_c_vs_p.log`, arm C
+  minus arm P on the raw rank of the real name, all classes, negative means the control ranks it
+  better): in distribution tier 10 -0.226 (z -30), tier 100 -0.480 (z -81), tier 1000 -0.372
+  (z -29); held out tier 100 -0.033 (z -6.4), tier 1000 -0.050 (z -3.7); tier 1 flat on both forms.
+  **A1(b) as the read table states it: arm C is far above its prior at tiers 100 and 1000 on both
+  forms (the first half holds), and arm P is within 3 sigma through tier 100 in distribution but
+  not held out (0.0125, z 3.2), so the second half fails on one form.** In ratio the pathway
+  stores 47x less than the control at tier 100 in distribution (0.010 against 0.467), 4x less
+  held out (0.0125 against 0.049), 7x less at tier 1000 in distribution (0.064 against 0.468),
+  2.6x less held out (0.046 against 0.118). The decision table's first matching row is "A1(b)
+  fails on either form"; the cell that fails is 4x under the control on the same form and 47x
+  under it on the other. The user decides the row.
+- **The ladder's remaining reads, 2026-10-14** (`ckpts/inject/ladder_pilot.sh`, log
+  `ladder_pilot.log`, outputs `ckpts/inject/pilot_{p,c}_ladder_*.{json,log}`; 45 minutes for the
+  twelve reads).
+  - **A5, holds with margin.** `evidence_ceiling_probe.py --fixed-split evidence_fixed` on arm
+    P's final: the in-context ceiling (the passage in the prompt, no port) is 2.56 nats pooled
+    (HotpotQA 2.56, SQuAD 2.56; in-context gold CE 3.49 against `none` 6.05), and the trainer's
+    port read on the same rows was +4.00 (gold CE 1.85), so the port gain is 1.56x its own
+    in-context ceiling, against a bar of half. The model never trained with a passage in the
+    prompt, so the in-context number is a floor for this model rather than a ceiling.
+  - **Exit reads, both arms** (`eval_exit.py` on `inject_val`, 40 batches): arm P CE 3.490 /
+    3.417 / 3.409 at exits 1 / 2 / 3 (+0.073 then +0.0075), arm C 3.470 / 3.389 / 3.384 (+0.080
+    then +0.0050); the gain 1 to 3 is +0.08 to +0.11 in every confidence decile but the top one
+    (+0.05); a confidence exit rule is no better than a fixed-depth mix at the same passes on
+    either arm (tau 0.5: 3.428 against 3.415 on arm P); the beta 0.1 optimum is near uniform. The
+    micro read's shape, on both arms: depth pays evenly, the third pass is faint.
+  - **Depth reads** (`closed_book_rank.py --n-loops 1 | 2`, with the depth 3 final read): arm C
+    entity `delta` at tier 100 in distribution 0.348 / 0.464 / 0.467 by depth (the real name
+    first on 27% / 94% / 96% of items), tier 1000 saturated at every depth, held out 0.042 /
+    0.048 / 0.049 at tier 100: the control recalls weakly stored facts in pass 2, as the micro
+    arm (a) did (0.269 / 0.369 / 0.378). Arm P tier 100 0.005 / 0.010 / 0.010 and tier 1000
+    0.050 / 0.059 / 0.064 in distribution, held out 0.0125 / 0.012 / 0.0125 and 0.040 / 0.044 /
+    0.046: a small growth with depth at tier 1000 in distribution, under the unpaired noise.
+  - **A4, fails.** `eval_store.py recall` on `data/index/openqa` (8,715 questions, 274,212
+    chunks): the model's query at loop 1 recall@5 0.004 against bge 0.829 (z -203), loops 2 and 3
+    0.008 / 0.007, every source alike. The IR expert's query was trained by the selection loss
+    over the handful of chunks visible to a document (chunk AUROC 0.78 there) and has never
+    competed against a store; as a retriever it is at chance.
+  - **A7, unreadable.** `pathway`: generated EM 0.000 with the model's query (abstains on 97%),
+    0.026 with the oracle buffer (abstains on 88%), 0.022 with bge's buffer; the gate fails
+    (z -12.5) against an oracle ceiling of 2.6% exact match, so the read is about a 99M model
+    generating open-domain answers, not the pathway. `edit`: 0 of 2,000 answered correctly
+    before the edit, so the flip rate has no denominator.
+  - **A3, likelihood holds, behaviour unreadable.** `eval_abstention.py --evidence-port` on
+    SQuAD v2 dev (2,000 questions): answer-span CE with the real target 2.13 under gold, 6.11
+    under distractors, 5.87 with nothing attached (gold against none +3.75 nats). Generated:
+    the model abstains on 95.6% of answerable questions under gold (EM 0.010), 99.5% under
+    distractors and 100% under none; abstention precision 0.51 under gold. Counterfactual: 218
+    eligible items, follow 0.018, stuck 0.000, "other" 0.982 (it abstains), so the follow gate
+    fails for want of answers, not for memory; in likelihood the swapped answer wins (`mr_ll`
+    0.114 pooled, 0.016 to 0.040 in the 0 to 99 strata, 0.208 / 0.217 in the 100+ strata).
+    External memory mass AUROC for answerability 0.46 (chance). The SFT pattern on record:
+    calibration passes, generated behaviour is all abstention.
+  - **A6, within noise, holds.** `eval_benchmarks.py` on both arms (13 tasks, 6.7 minutes
+    each): arm P / arm C hellaswag 0.265 / 0.263, arc_easy 0.370 / 0.359, arc_challenge 0.213 /
+    0.216, piqa 0.575 / 0.565, winogrande 0.505 / 0.508, openbookqa 0.240 / 0.264, sciq 0.599 /
+    0.566, boolq 0.410 / 0.488 (acc_norm 0.619 / 0.622), lambada 0.115 / 0.110, mmlu 0.244 /
+    0.230, triviaqa and nq_open 0.000 / 0.000, gsm8k 0.014 / 0.017. Both arms sit at chance on
+    most tasks (99M parameters, 0.9B tokens, mostly synthetic); arm P is within two sigma of
+    arm C everywhere but boolq's raw accuracy (both under chance, the normalized score equal)
+    and mmlu (+0.014, z 2.7), so the pathway costs no language at this shape.
+  - **The ladder at the final saves, in one line each**: copy holds; A1(b) control half holds,
+    arm P half fails on the held-out form at tier 100 by z 3.2 at a 4x to 47x reduction; 1-hop
+    gate holds (0.85); L1 "falsified" (Delta +0.002 +- 0.005, nothing composes); A2 and A5
+    hold; A3 holds in likelihood and is unreadable in generation; A4 fails; A7 unreadable; A6
+    holds. The decision table's rows are the user's.

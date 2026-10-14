@@ -10,9 +10,37 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-11)
+## Now (2026-10-14)
 
-**Arm P is complete and read; arm C is running (2026-10-11).** Arm P ended at 860.61M tokens,
+**Both pilot arms are complete and read; the ladder's remaining reads are running (2026-10-14).**
+Arm C ended at 909.72M (one epoch; final `inject_val` CE 3.2195 against arm P's 3.2321). Its
+final closed-book read: entity `delta` in distribution 0.016 / 0.201 / 0.467 / 0.468 by tier
+(tier 100 z 62, top-1 0.96), held out -0.006 / 0.005 / 0.049 (z 12.3) / 0.118 (z 10.8). The
+paired `compare` against arm P (`ckpts/inject/compare_pilot_c_vs_p.log`): the control ranks the
+real name better by 0.480 (z -81) at tier 100 and 0.372 (z -29) at tier 1000 in distribution,
+0.033 (z -6.4) and 0.050 (z -3.7) held out. **A1(b) as written: the control half holds with
+margin; the arm P half fails on the held-out form at tier 100 (0.0125, z 3.2), a cell 4x under the
+control on that form and 47x under it in distribution.** The decision table's first matching row
+is "A1(b) fails on either form"; the user decides whether a per-form 3-sigma miss at a 4x to 47x
+reduction is that row. The ladder's remaining reads are done (`ckpts/inject/ladder_pilot.sh`,
+outputs `pilot_{p,c}_ladder_*`): **A5 holds** (the port's +4.00 nats is 1.56x the in-context
+ceiling of 2.56 measured on arm P's own final save); **A6 holds** (13 tasks, arm P within two
+sigma of arm C on all but boolq's raw accuracy and mmlu, both arms at chance on most tasks);
+**A3 holds in likelihood** (answer CE 2.13 under gold, 5.87 with nothing attached, 6.11 under
+distractors; the swapped answer wins in likelihood, `mr_ll` 0.11) **and is unreadable in
+generation** (the model abstains on 96% of answerable SQuAD questions with the gold passage
+attached, EM 0.01; the SFT pattern on record); **A4 fails** (the model's query at recall@5 0.004
+against bge 0.829 over 274k chunks: the selector was trained over a document's few visible chunks
+and never against a store); **A7 unreadable** (oracle-buffer EM 2.6%, model query EM 0.000 with
+97% abstention, zero correct answers to flip). The exit reads repeat the micro shape on both arms
+(pass 2 +0.07 to +0.08, pass 3 under +0.01, even across deciles, no confidence rule beats fixed
+depth) and the depth reads show the control recalling tier 100 in pass 2 (0.348 / 0.464 / 0.467)
+with arm P flat. In one line each: copy holds; A1(b) control half holds, arm P half fails on
+one form by z 3.2 at a 4x to 47x reduction; the 1-hop gate holds; L1 "falsified"; A2, A5, A6
+hold; A3 split; A4 fails; A7 unreadable. Next: the user's decision on the decision table and on
+the proposed rungs (R7 to R9, 6f).
+
+**Arm P was complete and read on 2026-10-11.** Arm P ended at 860.61M tokens,
 one epoch (the trainer stops at the epoch's end, so the cosine fitted to 910M stopped at LR about
 6e-5), final filler CE 3.2321. Its final read: the 1-hop gate holds (0.85 against chance 0.115,
 gold answer 0.82 nats against ln K 2.20); **L1 reads in the spec's "falsified" cell** (held-out
@@ -1414,6 +1442,14 @@ above are a different, live series).
   15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
   (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
   lever if one is needed.
+- 2026-10-14: arm C complete at 909.72M (one epoch) and read: the control stores tier 100 at
+  0.467 in distribution (z 62) and 0.049 held out (z 12), tier 10 at 0.20; the paired compare
+  against arm P reads z -81 / -6.4 at tier 100. A1(b)'s control half holds; its arm P half fails
+  on the held-out form by z 3.2 at a 4x reduction. The ladder's remaining reads done the same
+  day: A5 and A6 hold, A3 holds in likelihood and is unreadable in generation (96% abstention),
+  A4 fails (the query at recall@5 0.004 against bge 0.829), A7 unreadable; exits and depth reads
+  repeat the micro shape. The verdict rows wait for the user (the "Run" section of
+  [PILOT.md](PILOT.md)).
 - 2026-10-11, evening: arm P complete at 860.61M (one epoch) and read at the final save: 1-hop
   0.85 (gate holds), L1 Delta +0.002 +- 0.005 (the "falsified" cell), tier 1000 0.064 / 0.046,
   tier 100 z 3.2 held out and z 2.2 in distribution (the arm P half of A1(b) not met on one

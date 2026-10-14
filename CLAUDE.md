@@ -44,9 +44,20 @@ followed 1.000 / 0.94 to 0.97); A2 and A5 clear on the trainer's numbers (gold g
 `ckpts/evidence_pilot_c/`, `pilot_c.log`, 51k to 59k tokens per second; reads `read_pilot_save.sh
 CKPT c TAG`) at 325M stores the biographies as the micro arm (a) did: entity `delta` 0.299 (z 43)
 at tier 100 and 0.390 (z 25) at tier 1000 in distribution, 0.029 / 0.105 held out, about 300x and
-9x arm P at the same tokens, so A1(b) is readable. Verdicts pending arm C's final read, the paired
-`closed_book_rank.py compare`, and the user's decision on the PILOT.md decision table (first
-matching row: A1(b) fails on either form, on a cell 30x under the control). `stop_after_save.sh ARM PATTERN` drops STOP
+9x arm P at the same tokens. **Arm C complete at 909.72M on 2026-10-14** (final `inject_val` CE
+3.2195 against arm P's 3.2321): the control's final closed-book read is 0.016 / 0.201 / 0.467 /
+0.468 by tier in distribution and -0.006 / 0.005 / 0.049 / 0.118 held out; the paired `compare`
+(`ckpts/inject/compare_pilot_c_vs_p.log`) reads z -81 at tier 100 in distribution and z -6.4 held
+out. A1(b)'s control half holds with margin; its arm P half fails on the held-out form at tier
+100 (z 3.2) at a 4x reduction (47x in distribution). The ladder's remaining reads
+(`ckpts/inject/ladder_pilot.sh`, outputs `pilot_{p,c}_ladder_*`, 2026-10-14): A5 holds (port
+gain +4.00 against an in-context ceiling of 2.56 on the same save), A6 holds (13 tasks, within
+noise of the control, both at chance on most), A3 holds in likelihood (gold 2.13 against none
+5.87, `mr_ll` 0.11) and is unreadable in generation (96% abstention under gold, EM 0.01), A4
+fails (model query recall@5 0.004 against bge 0.829), A7 unreadable (oracle EM 2.6%, nothing to
+flip); exit reads on both arms repeat the micro shape (pass 2 +0.07 to +0.08, pass 3 under
++0.01); depth reads: the control recalls tier 100 in pass 2 (0.348 / 0.464 / 0.467), arm P flat.
+The verdict rows of the PILOT.md decision table wait for the user. `stop_after_save.sh ARM PATTERN` drops STOP
 after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
