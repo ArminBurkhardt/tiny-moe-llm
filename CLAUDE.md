@@ -67,9 +67,19 @@ leak known and its criterion amended to the paired reading (PILOT.md read table)
 this shape unless the chain continuation of arm P shows composition; the retriever fix is built
 (`evidence_contrastive_loss`, weight 0 by default, the port bullet below); A3's behaviour goes to
 6f's RL, marked the RL step that must not fail; queue: chain arm, InfoNCE micro arm, R7, R8, R9.**
-Running: the chain continuation (`ckpts/inject/launch_pilot_chains.sh`, run directory
-`ckpts/evidence_pilot_chains/`, log `pilot_chains.log`, batch 4 x 2 after batch 8 spilled, saves
-every 10M, about 9 GPU hours, every save read afterwards). Intermediate pilot saves deleted
+**The chain continuation ran and was read 2026-10-17
+([chain_continuation_pilot.md](docs/measurements/chain_continuation_pilot.md)): L1 is failed at
+this shape.** Arm P's final for one epoch of `chains_train` alone (`ckpts/evidence_pilot_chains/`,
+102.66M tokens in 5.1 hours, batch 4 x 2 after batch 8 spilled, saves every 10M, reads
+`ckpts/inject/pilot_ch_{TAG}_chains_*`): held-out answer CE 0.315 to 0.201 in a smooth decay,
+1-hop 0.99 at the final, every composition cell at chance at depths 1 to 4 (held-out 2-hop paired
+Delta +0.004 +- 0.008, composed answers 1.93 nats against ln K 1.72), loop scales healthy. **The
+InfoNCE micro arm against its twin, one epoch of the QA slice
+([infonce_micro.md](docs/measurements/infonce_micro.md), `ckpts/inject/launch_infonce.sh`,
+35M tokens each): store recall@5 0.012 against 0.000, recall@20 0.035 against 0.001 (bge
+0.829), language and selection equal; the term moves recall from zero to small.** Running: the
+same pair at three epochs (`w25e3`, `w0e3`), whose recall read decides whether the term enters
+the pilot-shape recipe; the model-keyed retriever variant stays held. Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval

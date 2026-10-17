@@ -20,7 +20,12 @@ chain split from the final save, saves every 10M, read for the abrupt 2-hop tran
 composition, in which case it is under-dosed; the retriever fix (in-batch InfoNCE on the model's
 own query, Co-LMLM's recipe) is built and goes to a micro arm; A3's behaviour is left to 6f's RL
 and marked the one RL step that must not fail; the queue is the chain arm, the InfoNCE arm, then
-R7, R8, R9. The pilot runs on today's code: the R0b recipe (the
+R7, R8, R9. **The chain continuation ran and was read the same day
+([chain_continuation_pilot.md](../measurements/chain_continuation_pilot.md)): one epoch of the
+chain split (102.66M tokens, 5.1 hours) takes 1-hop lookup to 0.99 and leaves every composition
+cell at chance (held-out 2-hop paired Delta +0.004 +- 0.008, composed answers at a uniform pick
+among candidates), so L1 is failed at this shape and the decision table's "falsified" row
+applies.** The pilot runs on today's code: the R0b recipe (the
 key/value reader, the copy-first warm-up, swap rate 0.15) at a larger shape and on a mixed corpus,
 two arms of 1B prompt tokens each, the pathway arm P against a matched-token control C without
 retrieval. Most of the Phase 5 blueprint in NEXT.md (coda, tied token table, always-on selector,
@@ -713,3 +718,14 @@ splits). Nothing in the spec changed.
     gate holds (0.85); L1 "falsified" (Delta +0.002 +- 0.005, nothing composes); A2 and A5
     hold; A3 holds in likelihood and is unreadable in generation; A4 fails; A7 unreadable; A6
     holds. The decision table's rows are the user's.
+  - **The chain continuation, 2026-10-17** ([chain_continuation_pilot.md](../measurements/chain_continuation_pilot.md),
+    `ckpts/evidence_pilot_chains/`, reads `ckpts/inject/pilot_ch_{TAG}_chains_*`): arm P's
+    final save for one epoch of `chains_train` alone (102.66M tokens, lr 3e-4, batch 4 x 2 after
+    batch 8 spilled, 307.9 minutes). Held-out answer CE 0.315 to 0.201 in a smooth decay, top-1
+    per token 0.906 to 0.913; loop scales end [1.23, 0.49, 0.27] (no collapse). The final
+    save's chain read: 1-hop 0.99 (z +87, the gold answer 0.04 nats), 2-hop 0.185 to 0.198
+    (chance 0.185), 3-hop 0.17 to 0.21 (0.206), 4-hop 0.20 to 0.22 at depths 1 to 4 (0.210),
+    held-out 2-hop 0.19 to 0.21 (0.191), paired kept 3 minus kept 1 +0.004 +- 0.008 (Delta + 2
+    sigma 0.020 against 0.05), composed answers 1.93 nats against ln K 1.72. **L1 failed at
+    this shape; the "falsified" row applies** (the user's rule of 2026-10-17). Still to read
+    for the record: the 10M to 90M saves by the chain instrument.
