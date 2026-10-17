@@ -45,8 +45,23 @@ composing only under looping and only after grokking-scale training, and the A4 
 in-batch InfoNCE on the model's own query; its seven proposed directions (a chain-overtraining
 arm with Poisson loop counts read every 10 to 20M, zero-hop identity questions, InfoNCE store
 negatives, a mask-rate leak lever, the deletion audit as the A7 read, a loop stability term, the
-anonymization lever read on grounded tasks) are proposals. Next: the user's decision on the
-decision table, on the proposed rungs (R7 to R9, 6f) and on those directions.
+anonymization lever read on grounded tasks) are proposals. **Decided 2026-10-17 (the user):**
+A1(b) passes with the leak recorded as known and its criterion amended to the paired reading
+(the read table in PILOT.md); L1 is recorded as failed at this shape unless the chain
+continuation shows composition, in which case it was under-dosed; the retriever fix is built; A3's
+behaviour is left to 6f's RL and that reward is marked the one RL step that must not fail; the
+queue is the chain arm, the InfoNCE micro arm, then R7, R8, R9. **Running: the chain continuation
+of arm P** (`ckpts/inject/launch_pilot_chains.sh`, `ckpts/evidence_pilot_chains/`, log
+`pilot_chains.log`, config `ckpts/inject/config_pilot_chains.yaml`: arm P's final save on
+`chains_train` alone, lr 3e-4, batch 4 x accumulation 2 after batch 8 spilled into shared memory
+at 1.1k tokens per second, saves and evals every 10M, about 9 GPU hours for the one pass; every
+save is read afterwards with `read_pilot_save.sh CKPT p TAG 1` for the 2-hop transition). **Built
+2026-10-17: the retriever's contrastive term** (`evidence_contrastive_loss`, in-batch InfoNCE on
+the selector's query at the answer-start positions against every chunk in the batch, both
+directions, temperature 0.07; `evidence_contrastive_weight`, 0 by default; the CLAUDE.md port
+bullet and `tests/test_evidence_contrastive.py`); still to build: the model-keyed variant (keys
+from the model's own encoder, Co-LMLM) and `eval_store.py` reading such keys, then the micro arm on
+the QA slice against a twin without the term, read by `eval_store.py recall`.
 
 **Arm P was complete and read on 2026-10-11.** Arm P ended at 860.61M tokens,
 one epoch (the trainer stops at the epoch's end, so the cosine fitted to 910M stopped at LR about
@@ -1237,7 +1252,11 @@ latent-only reasoning model is not planned.
    Rewards:
    - Outcome on retrieval QA and chains, paid only when the supporting chunk is visible.
    - The three-way abstention reward (TruthRL, arXiv 2509.25760): correct +1, abstain 0, wrong -1;
-     an item without its evidence pays for abstaining.
+     an item without its evidence pays for abstaining. **The one RL step that must not fail**
+     (decided 2026-10-17, the user): the pilot's arm P abstains on 96% of answerable SQuAD
+     questions with the gold passage attached while its likelihoods and its groundedness head are
+     right, and the data lever was left untouched on purpose; this reward is where that behaviour
+     is fixed, and the generated-answers block is read on every arm until it is.
    - Evidence conflicts: counterfactual cards, paid for following the visible evidence (the
      behavioural reading of the leak, decided 2026-10-06).
    - A per-query cost once step 4 exists.
@@ -1466,6 +1485,12 @@ above are a different, live series).
   15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
   (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
   lever if one is needed.
+- 2026-10-17: the pilot's verdicts decided (the user): A1(b) passes with the leak known and the
+  criterion amended to the paired reading; L1 failed at this shape pending the chain continuation
+  of arm P (launched, one pass over the chain split, about 9 GPU hours); the retriever's in-batch
+  InfoNCE built (`evidence_contrastive_loss`, weight 0 by default); A3's behaviour to 6f's RL,
+  marked the RL step that must not fail; queue: chain arm, InfoNCE arm, R7, R8, R9. Intermediate
+  pilot saves deleted (34 GB), the design page republished in this organization.
 - 2026-10-16: research round after the pilot read ([review_2026-10-16.md](../review_2026-10-16.md)):
   LMLM and Co-LMLM as the nearest relatives with the same residual, the chain read as the slow
   phase before an in-context two-hop transition, looping as the condition for from-scratch

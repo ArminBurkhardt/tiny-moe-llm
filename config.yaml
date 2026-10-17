@@ -91,6 +91,14 @@ training:
                                  # enough to rank the chunks, small enough that it cannot outrun the
                                  # language objective the port is supposed to be serving. 0.0
                                  # disables it, which is the run without a trained selector.
+  evidence_contrastive_weight: 0.0 # coefficient on the retriever's in-batch InfoNCE (the selector's
+                                   # query at each answer-start position against every chunk in
+                                   # the batch, the other documents' chunks as negatives; see
+                                   # information_retrieval.evidence_contrastive_loss). The
+                                   # selection loss above ranks a document's own chunks only, so a
+                                   # selector trained on it alone retrieves nothing from a store.
+                                   # 0.0 is the objective of every run before 2026-10-17.
+  evidence_contrastive_temperature: 0.07 # the fixed softmax temperature on the cosine for that term
   groundedness_weight: 0.1 # coefficient on the groundedness readout's BCE (evidence.py's
                            # GroundednessHead, label "a gold chunk is present AND the row is
                            # answerable", read at the last prompt token of each answer span).

@@ -183,6 +183,60 @@ def evidence_selection_loss(
     return (per_token * row_mask).sum() / total
 
 
+def evidence_contrastive_loss(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    positive: torch.Tensor,
+    temperature: float = 0.07,
+    symmetric: bool = True,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """InfoNCE between unit queries and unit chunk keys with every chunk in the batch as a candidate.
+
+    The selection loss above asks, of the chunks a token's own document retrieved, which one is the
+    gold one. It never asks the query to beat a chunk from another document, so the query it trains
+    cannot retrieve from a store (the pilot's A4 read: recall@5 at chance against a whole store).
+    This term is the retriever's signal: the other documents' chunks in the same batch are the
+    negatives, the way a dual encoder is trained (DPR's in-batch negatives; Co-LMLM trains the
+    model's own lookup query this way next to the language loss).
+
+    Args:
+        query: ``[P, D]`` unit rows, one per query position (the answer-start positions, where the
+            whole question and all of the evidence have been read and none of the answer).
+        keys: ``[M, D]`` unit rows, every chunk in the batch in the flat chunk axis order.
+        positive: ``[P, M]`` bool, which chunks are gold for each query (its own document's gold
+            chunks). A row with no positive (a distractor-only or empty condition) is excluded; a
+            row with several positives (a multi-hop row) treats their joint mass as the target.
+        temperature: the softmax temperature on the cosine, fixed and separate from the selector's
+            learned read temperature so this term cannot be satisfied by sharpening the read.
+        symmetric: also score every gold chunk against the batch's queries (the key-to-query
+            direction), averaged with the query-to-key one.
+        eps: floor for the row counts.
+
+    Returns:
+        Scalar loss with a live graph back to both inputs, exactly zero (and still connected) when
+        no row has a positive.
+    """
+    logits = torch.matmul(query.float(), keys.float().t()) / float(temperature)   # [P, M]
+    positive = positive.to(torch.bool)
+    neg_fill = torch.full_like(logits, -1e4)
+
+    # query -> key: the gold chunks' joint share of the row's softmax over every chunk
+    row_has = positive.any(dim=-1)
+    row_loss = torch.logsumexp(logits, dim=-1) - torch.logsumexp(torch.where(positive, logits, neg_fill), dim=-1)
+    row_mask = row_has.to(row_loss.dtype)
+    loss = (row_loss * row_mask).sum() / row_mask.sum().clamp_min(eps)
+    if not symmetric:
+        return loss
+
+    # key -> query: for each gold chunk, its owners' joint share of the column softmax over queries
+    col_has = positive.any(dim=0)
+    col_loss = torch.logsumexp(logits, dim=0) - torch.logsumexp(torch.where(positive, logits, neg_fill), dim=0)
+    col_mask = col_has.to(col_loss.dtype)
+    loss_k = (col_loss * col_mask).sum() / col_mask.sum().clamp_min(eps)
+    return 0.5 * (loss + loss_k)
+
+
 def _group_starts(group_ids: torch.Tensor, num_groups: int) -> torch.Tensor:
     """exclusive prefix sum of the per group counts of an already sorted ``group_ids``.
 
@@ -517,6 +571,14 @@ class InformationRetrievalModule(nn.Module):
         # stale, on a batch with no evidence" rule as last_memory_mass -- see forward().
         self.last_memory_weights = None
         self.memory_weights_by_loop = {}
+        # the unit query rows and the adapted unit chunk keys the external scores were taken from,
+        # [tokens, latent] and [M, latent], live, per loop: the contrastive retriever term rescores
+        # them against every chunk in the batch rather than the token's own document (see
+        # evidence_contrastive_loss). Same lifetime rule as last_memory_weights.
+        self.last_memory_query = None
+        self.last_adapted_keys = None
+        self.memory_query_by_loop = {}
+        self.adapted_keys_by_loop = {}
 
         if self.num_clusters > 0:
             assert num_entries % self.num_clusters == 0, (
@@ -649,6 +711,8 @@ class InformationRetrievalModule(nn.Module):
         """
         self.memory_mass_by_loop = {}
         self.memory_weights_by_loop = {}
+        self.memory_query_by_loop = {}
+        self.adapted_keys_by_loop = {}
 
     def _loop_query_bias(self, loop_idx: int, dtype: torch.dtype) -> torch.Tensor:
         """per-loop additive bias on the query, shape ``[latent_dim]``. See ``__init__``."""
@@ -692,6 +756,8 @@ class InformationRetrievalModule(nn.Module):
             # last evidence-bearing batch's value on a batch that carried no evidence
             self.last_memory_mass = None
             self.last_memory_weights = None
+            self.last_memory_query = None
+            self.last_adapted_keys = None
         if self.num_clusters > 0:
             retrieved_y, weights = self._two_stage_read(x_norm, memory)
         else:
@@ -708,6 +774,8 @@ class InformationRetrievalModule(nn.Module):
         if self.last_memory_mass is not None:
             self.memory_mass_by_loop[int(loop_idx)] = self.last_memory_mass
             self.memory_weights_by_loop[int(loop_idx)] = self.last_memory_weights
+            self.memory_query_by_loop[int(loop_idx)] = self.last_memory_query
+            self.adapted_keys_by_loop[int(loop_idx)] = self.last_adapted_keys
 
         # restore original shape (batch, seq_len, output_dim)
         if len(original_shape) == 3:
@@ -759,6 +827,10 @@ class InformationRetrievalModule(nn.Module):
         # unit rows on the adapted keys, so this is a cosine in the same units as the table's score
         # and the ONLY thing standing between the two distributions is the learned scale
         adapted = F.normalize(self.key_adapter(keys.to(x_norm.dtype)), p=2, dim=-1)  # [M, latent]
+        # kept live for the contrastive retriever term, which rescores the same query against the
+        # same keys with the mask off (see evidence_contrastive_loss)
+        self.last_memory_query = x_norm
+        self.last_adapted_keys = adapted
         scores = torch.matmul(x_norm, adapted.t()).float()
         scores = scores * self.log_memory_scale.exp().float() / self.temperature.float()
         # finite, not -inf: a token whose document retrieved nothing has every external entry masked,

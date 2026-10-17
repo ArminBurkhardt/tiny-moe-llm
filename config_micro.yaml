@@ -37,6 +37,8 @@ training:                    # loss weights, read by train_step for every profil
   aux_loss_weight: 0.01
   evidence_selection_weight: 0.1
   groundedness_weight: 0.0
+  evidence_contrastive_weight: 0.0   # the retriever's in-batch InfoNCE; 0 is the objective before 2026-10-17
+  evidence_contrastive_temperature: 0.07
   target_tokens: 300000000
   warmup_steps: 0
   noise_anneal_tokens: 0

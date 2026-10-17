@@ -11,7 +11,9 @@ from transformer_engine.pytorch import checkpoint
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
 from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
-from modules.model.information_retrieval import RetrievalEntropyTracking, evidence_selection_loss
+from modules.model.information_retrieval import (
+    RetrievalEntropyTracking, evidence_contrastive_loss, evidence_selection_loss,
+)
 from modules.model.embeddings import RotaryPositionEmbeddingsFrequency
 from modules.model.evidence import (
     EvidenceBatch, evidence_memory, chunk_mean_mass, apply_chunk_gate, prefix_position_ids,
@@ -989,6 +991,47 @@ class LoopMixtureOfExperts(nn.Module):
             for module in self.ir_modules
             for weights in module.memory_weights_by_loop.values()
             if weights is not None
+        ]
+        if not terms:
+            return None
+        return torch.stack(terms).mean()
+
+    def evidence_contrastive_term(self, chunk_gold: torch.Tensor, positions: torch.Tensor,
+                                  temperature: float = 0.07, symmetric: bool = True):
+        """The retriever's contrastive loss over the read the forward pass just did. Scalar, or None.
+
+        ``evidence_contrastive_loss`` (information_retrieval.py) on the selector's unit query at the
+        given positions against every chunk in the batch, the other documents' chunks included as
+        negatives; the positives are the position's own document's gold chunks. Averaged over every
+        (loop, IR expert) read, like the selection term, and under the same no-checkpointing rule.
+
+        Args:
+            chunk_gold: ``[M]`` bool/float on the flat chunk axis.
+            positions: ``[B * S]`` bool, the query positions (``answer_start_positions``).
+            temperature: the fixed softmax temperature on the cosine.
+            symmetric: also train the key-to-query direction.
+
+        Returns:
+            Scalar loss, or None when the forward carried no external store or no position was
+            selected.
+        """
+        visible = self.last_memory_visible
+        if visible is None or chunk_gold is None:
+            return None
+        index = positions.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if index.numel() == 0:
+            return None
+        positive = visible.index_select(0, index) & chunk_gold.to(torch.bool).unsqueeze(0)
+        terms = [
+            evidence_contrastive_loss(
+                module.memory_query_by_loop[loop].index_select(0, index),
+                module.adapted_keys_by_loop[loop],
+                positive, temperature=temperature, symmetric=symmetric,
+            )
+            for module in self.ir_modules
+            for loop in module.memory_query_by_loop
+            if module.memory_query_by_loop[loop] is not None
+            and module.adapted_keys_by_loop.get(loop) is not None
         ]
         if not terms:
             return None

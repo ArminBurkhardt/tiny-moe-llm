@@ -71,6 +71,20 @@ class TrainingConfig:
     assert groundedness_weight >= 0.0, (
         f"groundedness_weight ({groundedness_weight}) must be >= 0"
     )
+    # the retriever's contrastive term (information_retrieval.evidence_contrastive_loss): the
+    # selector's query at the answer-start positions against every chunk in the batch. 0 is the
+    # objective every run before 2026-10-17 trained under. The temperature is the fixed softmax
+    # temperature on the cosine, kept apart from the selector's learned read temperature.
+    evidence_contrastive_weight = float(Config["training"].get("evidence_contrastive_weight", 0.0))
+    assert evidence_contrastive_weight >= 0.0, (
+        f"evidence_contrastive_weight ({evidence_contrastive_weight}) must be >= 0"
+    )
+    evidence_contrastive_temperature = float(
+        Config["training"].get("evidence_contrastive_temperature", 0.07)
+    )
+    assert evidence_contrastive_temperature > 0.0, (
+        f"evidence_contrastive_temperature ({evidence_contrastive_temperature}) must be > 0"
+    )
     num_epochs = int(Config["training"]["num_epochs"])
     learning_rate = float(Config["training"]["lr"])
     lr = float(Config["training"]["lr"])

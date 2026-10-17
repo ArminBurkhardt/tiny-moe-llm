@@ -273,6 +273,28 @@ def train_step(
                 if selection_loss is not None:
                     loss = loss + TrainingConfig.evidence_selection_weight * selection_loss
 
+            # the retriever's term, on the same stashed forward: the selector's query at each
+            # answer-start position against every chunk in the batch, the other documents' chunks
+            # as negatives. The selection term above only ranks a document's own chunks, which is
+            # why a selector trained on it alone retrieves nothing from a store.
+            contrastive = None
+            if (
+                TrainingConfig.evidence_contrastive_weight > 0.0
+                and evidence is not None
+                and evidence.chunk_gold is not None
+            ):
+                assert not (unwrapped.use_checkpointing or unwrapped.use_sub_checkpointing), (
+                    "the evidence contrastive loss reads tensors the forward stashed, which gradient "
+                    "checkpointing recomputes under no_grad -- it would train nothing."
+                )
+                contrastive = unwrapped.moe.evidence_contrastive_term(
+                    evidence.chunk_gold,
+                    answer_start_positions(labels).reshape(-1),
+                    temperature=TrainingConfig.evidence_contrastive_temperature,
+                )
+                if contrastive is not None:
+                    loss = loss + TrainingConfig.evidence_contrastive_weight * contrastive
+
             # the groundedness readout, on the same stashed forward. Separate from the selection
             # term because it answers a different question -- "does what was retrieved ground an
             # answer at all", which the mass split alone cannot express: an adversarial SQuAD v2
@@ -301,6 +323,10 @@ def train_step(
                 )
                 metrics["groundedness_loss"] = (
                     groundedness.detach() if groundedness is not None
+                    else torch.full((), float("nan"), device=loss.device)
+                )
+                metrics["contrastive_loss"] = (
+                    contrastive.detach() if contrastive is not None
                     else torch.full((), float("nan"), device=loss.device)
                 )
 

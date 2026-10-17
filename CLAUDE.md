@@ -62,8 +62,16 @@ The verdict rows of the PILOT.md decision table wait for the user. A research ro
 reading the same residual against a standard model, the chain read matching the slow phase before
 an abrupt in-context two-hop transition, from-scratch two-hop composing only under looping after
 grokking-scale training, and Co-LMLM's in-batch InfoNCE on the model's own query as the A4 fix;
-seven directions are proposed there, none decided. `stop_after_save.sh ARM PATTERN` drops STOP
-after a matching save; a stop leaves `STOP` to remove before relaunch.
+seven directions were proposed there. **Decided 2026-10-17 (the user): A1(b) passes with the
+leak known and its criterion amended to the paired reading (PILOT.md read table); L1 is failed at
+this shape unless the chain continuation of arm P shows composition; the retriever fix is built
+(`evidence_contrastive_loss`, weight 0 by default, the port bullet below); A3's behaviour goes to
+6f's RL, marked the RL step that must not fail; queue: chain arm, InfoNCE micro arm, R7, R8, R9.**
+Running: the chain continuation (`ckpts/inject/launch_pilot_chains.sh`, run directory
+`ckpts/evidence_pilot_chains/`, log `pilot_chains.log`, batch 4 x 2 after batch 8 spilled, saves
+every 10M, about 9 GPU hours, every save read afterwards). Intermediate pilot saves deleted
+2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
+PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
@@ -73,8 +81,9 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
 tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
 gate, a measured verdict) is also made in `docs/evidence_path_design.html` in the same turn; the
 file goes into the same commit line. The repo file is the source. Its online copy,
-https://claude.ai/artifact/GS2S79cV2ACydtXaaHzemW, is republished only when the user asks (decided
-2026-10-11; it lives in another organization and lags the file); a new session reads the file.
+https://claude.ai/artifact/GaXssrGoBoikpGMy7s8rsf (private, this organization, published
+2026-10-17; the older copy in another organization is stale), is republished only when the user
+asks (decided 2026-10-11); a new session reads the file.
 
 - **Arm (a), full CE, 300M tokens, reads the instrument**: closed-book entity `delta` in
   distribution 0.009 / 0.063 / 0.378 / 0.467 by tier 1 / 10 / 100 / 1000 (tier 1000 rank 0),
@@ -460,7 +469,8 @@ GPU-free tests: the `modules/runtime/` ones (`test_checkpoint_lifecycle`, `test_
 plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_token_tracker`,
 `test_prepare_evidence_heldout`, `test_heldout_sources`, `test_entity_swap`, `test_entity_frequency`,
 `test_counterfactual_condition`, `test_biographies`, `test_prepare_injection`, `test_closed_book_rank`,
-`test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`. `TINY_LLM_CONFIG=path.yaml`
+`test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`,
+`test_evidence_contrastive`. `TINY_LLM_CONFIG=path.yaml`
 swaps the config yaml for every script (the checkpoint still decides shape and mode on load, so a
 micro checkpoint under the default yaml fails the strict load, as it should).
 
@@ -469,7 +479,8 @@ micro checkpoint under the default yaml fails the strict load, as it should).
 Tables in [configuration.md](docs/configuration.md).
 - `ModelConfig.Params` is splatted into `TinyMoETransformer(**...)`.
 - `TrainingConfig` holds **every loss weight** (`lambda_mtp`, `aux_loss_weight`,
-  `evidence_selection_weight`, `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
+  `evidence_selection_weight`, `evidence_contrastive_weight` + `evidence_contrastive_temperature`,
+  `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
   `loop_count_sampling`). `total_steps = target_tokens // (batch * seq * grad_accum)`.
   `loop_ce_weights` length is asserted against `n_loops` at import.
 - `RepairConfig` / `IRConfig` / `EvidenceConfig` subclass `SFTConfig` and read only the keys their
@@ -622,6 +633,16 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   produce a supervised token (`labels[:, 1:] != -100` shifted to `:-1`), the positions
   `answer_start_positions` and the readouts use. **Asserts gradient checkpointing off**
   (it reads stashed tensors a recompute would produce under `no_grad`). Logged `selection:`.
+- `evidence_contrastive_loss` (added 2026-10-17, the pilot's A4 fix): in-batch InfoNCE on the
+  selector's unit query at the answer-start positions against every chunk in the batch, the other
+  documents' chunks as negatives, positives = the position's own document's gold chunks (joint
+  mass when several, rows without one excluded), fixed temperature
+  `evidence_contrastive_temperature` 0.07, both directions averaged (Co-LMLM's recipe). The IR
+  module stashes `last_memory_query` / `last_adapted_keys` per loop next to the weights;
+  `moe.evidence_contrastive_term(chunk_gold, positions, temperature)` averages over (loop, expert).
+  Weight `evidence_contrastive_weight`, 0 by default and in every run before 2026-10-17; logged
+  `contrastive:` in the step line and the held-out eval when on. Same no-checkpointing rule as the
+  selection term. `tests/test_evidence_contrastive.py`.
 - `GroundednessHead` + `groundedness_loss`: label "gold present AND answerable" from the corpus
   (`.ans`, not the condition; never the model's argmax). Reads `moe.last_reader_output` at
   `pretrain.answer_start_positions` (last prompt token of each supervised span), weight 0.1. **Its

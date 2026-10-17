@@ -733,6 +733,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     # evidence-bearing positions, and weighting it by supervised TOKENS would weight it by answer
     # length, which has nothing to do with how many chunks were ranked
     selection_sum, selection_batches = 0.0, 0
+    contrastive_sum, contrastive_batches = 0.0, 0
     grounded_sum, grounded_batches = 0.0, 0
     grounded_scores, grounded_labels, grounded_has_evidence = [], [], []
     selector_sink = {}
@@ -769,6 +770,15 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                 if selection is not None:
                     selection_sum += selection.item()
                     selection_batches += 1
+                # the retriever's term, held out, read whenever the objective carries it
+                if TrainingConfig.evidence_contrastive_weight > 0.0:
+                    contrastive = model.moe.evidence_contrastive_term(
+                        evidence.chunk_gold, answer_start_positions(labels).reshape(-1),
+                        temperature=TrainingConfig.evidence_contrastive_temperature,
+                    )
+                    if contrastive is not None:
+                        contrastive_sum += contrastive.item()
+                        contrastive_batches += 1
                 if selector_by_loop and batch.get("condition_ids") is not None:
                     _selector_readings_by_loop(
                         model, evidence.chunk_gold, answer_start_positions(labels),
@@ -937,6 +947,8 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
         result["per_source_tokens"] = dict(source_token_sum)
     if selection_batches:
         result["selection"] = selection_sum / selection_batches
+    if contrastive_batches:
+        result["contrastive"] = contrastive_sum / contrastive_batches
     if grounded_batches:
         result["grounded"] = grounded_sum / grounded_batches
         scores = torch.cat(grounded_scores).numpy()
@@ -1403,6 +1415,8 @@ def sft(args):
         sel_str = (
             f" | selection: {stats['selection']:.4f}" if "selection" in stats else ""
         )
+        if "contrastive" in stats:
+            sel_str += f" | contrastive: {stats['contrastive']:.4f}"
         if "grounded" in stats:
             sel_str += f" | grounded: {stats['grounded']:.4f}"
             if grounded_str(stats):
@@ -1640,6 +1654,10 @@ def sft(args):
                     sel = metrics.get("selection_loss")
                     if sel is not None:
                         ir_entropy_str += f"selection: {sel.item():.4f} | "
+                    # the retriever's term; NaN on a run that does not carry it
+                    con = metrics.get("contrastive_loss")
+                    if con is not None and TrainingConfig.evidence_contrastive_weight > 0.0:
+                        ir_entropy_str += f"contrastive: {con.item():.4f} | "
                     # the other supervised head on the port. NaN whenever the checkpoint carries no
                     # head or the corpus no .ans, which is a missing label rather than a zero loss
                     grounded = metrics.get("groundedness_loss")

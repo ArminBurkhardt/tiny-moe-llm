@@ -12,8 +12,15 @@ at 0.467 in distribution and 0.049 held out, 47x and 4x arm P; the paired compar
 ceiling), A6 holds (within noise of the control), A3 holds in likelihood (+3.75 nats gold against
 none, the swapped answer wins) and is unreadable in generation (96% abstention under gold), A4
 fails (the model's query at recall@5 0.004 against bge 0.829), A7 unreadable (oracle EM 2.6%);
-the exit and depth reads repeat the micro shape on both arms. The verdict rows wait for the user
-(the "Run" section at the end). The pilot runs on today's code: the R0b recipe (the
+the exit and depth reads repeat the micro shape on both arms. Decided 2026-10-17 (the user, after
+the research round in [review_2026-10-16.md](../review_2026-10-16.md)): A1(b) passes with the
+leak recorded as known and the criterion amended to the paired reading (the read table above); L1
+is recorded as failed at this shape unless the chain continuation of arm P (one pass over the
+chain split from the final save, saves every 10M, read for the abrupt 2-hop transition) shows
+composition, in which case it is under-dosed; the retriever fix (in-batch InfoNCE on the model's
+own query, Co-LMLM's recipe) is built and goes to a micro arm; A3's behaviour is left to 6f's RL
+and marked the one RL step that must not fail; the queue is the chain arm, the InfoNCE arm, then
+R7, R8, R9. The pilot runs on today's code: the R0b recipe (the
 key/value reader, the copy-first warm-up, swap rate 0.15) at a larger shape and on a mixed corpus,
 two arms of 1B prompt tokens each, the pathway arm P against a matched-token control C without
 retrieval. Most of the Phase 5 blueprint in NEXT.md (coda, tied token table, always-on selector,
@@ -212,7 +219,7 @@ Gate names as NEXT.md. Every closed-book read at full depth. `closed_book_rank.p
 | gate | script, split | bar | cadence | a fail means |
 |---|---|---|---|---|
 | copy (arm P) | `closed_book_rank.py bios --evidence gold\|swapped\|prompt` | switch criterion; afterwards descriptive | every save | before 300M: Stop; after: copying regressed, read with A3 |
-| A1(b) | `closed_book_rank.py bios --evidence none --form both`, both arms; `compare` arm C against arm P | arm C at least 3 sigma above its prior at tier 100 or 1000 while arm P is within 3 sigma through tier 100 on both forms | every save | tier 100 on either form: the externalization claim fails |
+| A1(b) | `closed_book_rank.py bios --evidence none --form both`, both arms; `compare` arm C against arm P | arm C at least 3 sigma above its prior at tier 100 or 1000, and the paired `compare` puts arm P under arm C at tier 100 and 1000 on both forms by at least 3 sigma; arm P's own residual at tier 100 is recorded as a known leak when it is under a quarter of the control's (amended 2026-10-17 by the user after the pilot read: the original "arm P within 3 sigma of its prior per form" was written for micro power and flips on noise at pilot power; the published relatives, LMLM and Co-LMLM, judge the same residual against the standard model) | every save | the paired compare fails at tier 100 on either form, or arm P's tier 100 residual is above a quarter of the control's: the externalization claim fails |
 | 1-hop gate | `eval_chains.py`, `chains_eval` 1-hop, D 3, all sites | at least 3 sigma above chance (1 over type-matched candidates; 0.146 against 0.115 at n 1,000) and rising, by the 500M save | every save | at the final save: L1 inconclusive at this shape too |
 | L1 | `eval_chains.py`, `chains_heldout_tmpl` 2-hop, D 3, kept 1, 2, 3 | Delta = kept 3 minus kept 1 at least 0.05 and at least 3 sigma | once the 1-hop gate holds, and final | falsified: Delta + 2 sigma under 0.05 with the 1-hop gate passed; inconclusive: the gate failed, or Delta between the two |
 | A2, A5 | `[eval fixed]` on `evidence_fixed`; `--ceiling-json` from `evidence_ceiling_probe.py --fixed-split evidence_fixed` on arm P's final checkpoint | gold gain at least half that ceiling, distractors gain at least 0; chunk AUROC per loop at least 0.59; grounded AUROC at least 0.674 | every 25M in the trainer; final verdict | the port does not recover evidence on held-out QA |
