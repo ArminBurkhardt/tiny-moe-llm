@@ -57,7 +57,12 @@ noise of the control, both at chance on most), A3 holds in likelihood (gold 2.13
 fails (model query recall@5 0.004 against bge 0.829), A7 unreadable (oracle EM 2.6%, nothing to
 flip); exit reads on both arms repeat the micro shape (pass 2 +0.07 to +0.08, pass 3 under
 +0.01); depth reads: the control recalls tier 100 in pass 2 (0.348 / 0.464 / 0.467), arm P flat.
-The verdict rows of the PILOT.md decision table wait for the user. `stop_after_save.sh ARM PATTERN` drops STOP
+The verdict rows of the PILOT.md decision table wait for the user. A research round on 2026-10-16
+([review_2026-10-16.md](docs/review_2026-10-16.md)) found the nearest relatives (LMLM, Co-LMLM)
+reading the same residual against a standard model, the chain read matching the slow phase before
+an abrupt in-context two-hop transition, from-scratch two-hop composing only under looping after
+grokking-scale training, and Co-LMLM's in-batch InfoNCE on the model's own query as the A4 fix;
+seven directions are proposed there, none decided. `stop_after_save.sh ARM PATTERN` drops STOP
 after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
 pathway, reasoning in the looped trunk"; the

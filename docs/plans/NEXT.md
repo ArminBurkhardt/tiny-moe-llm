@@ -37,8 +37,16 @@ and never against a store); **A7 unreadable** (oracle-buffer EM 2.6%, model quer
 depth) and the depth reads show the control recalling tier 100 in pass 2 (0.348 / 0.464 / 0.467)
 with arm P flat. In one line each: copy holds; A1(b) control half holds, arm P half fails on
 one form by z 3.2 at a 4x to 47x reduction; the 1-hop gate holds; L1 "falsified"; A2, A5, A6
-hold; A3 split; A4 fails; A7 unreadable. Next: the user's decision on the decision table and on
-the proposed rungs (R7 to R9, 6f).
+hold; A3 split; A4 fails; A7 unreadable. A research round on 2026-10-16
+([review_2026-10-16.md](../review_2026-10-16.md)) found the nearest published relatives (LMLM,
+Co-LMLM) measuring the same kind of residual against a standard model, the pilot's chain read
+matching the slow phase before an abrupt in-context two-hop transition, from-scratch two-hop
+composing only under looping and only after grokking-scale training, and the A4 fix in Co-LMLM's
+in-batch InfoNCE on the model's own query; its seven proposed directions (a chain-overtraining
+arm with Poisson loop counts read every 10 to 20M, zero-hop identity questions, InfoNCE store
+negatives, a mask-rate leak lever, the deletion audit as the A7 read, a loop stability term, the
+anonymization lever read on grounded tasks) are proposals. Next: the user's decision on the
+decision table, on the proposed rungs (R7 to R9, 6f) and on those directions.
 
 **Arm P was complete and read on 2026-10-11.** Arm P ended at 860.61M tokens,
 one epoch (the trainer stops at the epoch's end, so the cosine fitted to 910M stopped at LR about
@@ -1393,6 +1401,22 @@ above are a different, live series).
   RLTT (arXiv 2602.10520) and LoopRPT (arXiv 2603.19714): RL for looped models. Rollout Routing
   Replay (arXiv 2510.11370): MoE RL stability. TruthRL (arXiv 2509.25760), Search-R1 (arXiv
   2503.09516). Loss-free balancing (arXiv 2408.15664).
+- Added 2026-10-16, after the pilot read ([review_2026-10-16.md](../review_2026-10-16.md)).
+  Limited Memory Language Models (arXiv 2505.15962, ICLR 2026) and Co-LMLM (arXiv 2607.07707):
+  the nearest relatives of the pathway, fact values masked from the loss and a lookup from the
+  model's own hidden state trained with in-batch InfoNCE; both still measure a residual in the
+  weights against the standard model, so the paired reading of A1(b) is the field's own. The
+  deletion audit of LMLM (arXiv 2607.00605): FULL / DEL-ON / DEL-OFF. Goldfish loss (arXiv
+  2406.10209): a mask-rate lever against memorization. Knowledgeless LMs (arXiv 2607.12831):
+  anonymized pretraining pays on grounded tasks and calibration. In-context two-hop phase
+  transition (arXiv 2502.13913): the slow phase of random guessing among distractor chains is the
+  pilot's chain read. From-scratch two-hop under looping (arXiv 2608.07261, 2604.07822): vanilla
+  depth never composes out of distribution, a looped block does after grokking-scale training;
+  identity bridge (arXiv 2509.24653): one zero-hop example per bridge entity unlocks it. Ouro
+  (arXiv 2510.25741): capacity about 2 bits per parameter looped or not, loops buy manipulation.
+  STARS (arXiv 2605.26733): loop performance peaks then collapses without a stability term.
+  Over-refusal with sufficient context (arXiv 2603.06198, 2608.27661) and its RL fixes (RSRR,
+  GRACE 2601.04525).
 
 ## Parked
 
@@ -1442,6 +1466,10 @@ above are a different, live series).
   15.0 GB); about 16k on the merged corpus by a two-point fit, 35 to 45 GPU hours for both arms
   (estimate); the chain slice (ratio 4.2) is the heavy one, and its per-document chunk count is the
   lever if one is needed.
+- 2026-10-16: research round after the pilot read ([review_2026-10-16.md](../review_2026-10-16.md)):
+  LMLM and Co-LMLM as the nearest relatives with the same residual, the chain read as the slow
+  phase before an in-context two-hop transition, looping as the condition for from-scratch
+  composition, in-batch InfoNCE as the A4 fix; seven directions proposed, none decided.
 - 2026-10-14: arm C complete at 909.72M (one epoch) and read: the control stores tier 100 at
   0.467 in distribution (z 62) and 0.049 held out (z 12), tier 10 at 0.20; the paired compare
   against arm P reads z -81 / -6.4 at tier 100. A1(b)'s control half holds; its arm P half fails
