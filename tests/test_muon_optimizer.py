@@ -14,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from modules.model.optim import (  # noqa: E402
-    MuonAdamW, build_optimizer, muon_kind, muon_update, newton_schulz, partition_summary, tag_param_groups,
+    MuonAdamW, build_optimizer, check_resume_kind, muon_kind, muon_update, newton_schulz, optimizer_kind,
+    partition_summary, saved_optimizer_kind, tag_param_groups,
 )
 
 
@@ -52,8 +53,10 @@ def main():
         "moe.router.noise_proj.weight": "adamw",
         "moe.loop_router_bias.weight": "adamw",
         "moe.evidence_query_bias.weight": "adamw",
-        "moe.loop_inject.weight": "adamw",
+        "moe.inject.weight": "adamw",
         "moe.shared_evidence.attn.q_proj.weight": "muon",
+        "moe.shared_evidence.attn.o_proj.weight": "adamw",
+        "groundedness_head.out_proj.weight": "adamw",
         "lm_head.projection.weight": "adamw",
         "lm_head.lm_heads.3.weight": "adamw",
         "mtp_head.gate.weight": "adamw",
@@ -136,6 +139,30 @@ def main():
     assert isinstance(build_optimizer("adamw", [{"params": [torch.randn(2, 2, requires_grad=True)]}], lr=1e-3),
                       torch.optim.AdamW)
     print("6. decoupled decay on Muon, the state round trip, tagging and building          PASS")
+
+    # 7. a bf16 parameter's momentum buffer stays fp32 across a resume; a resume across kinds is
+    #    refused by name before load_state_dict
+    wb = torch.randn(16, 8).to(torch.bfloat16).requires_grad_(True)
+    opt_b = MuonAdamW([{"params": [wb], "weight_decay": 0.0, "muon": "muon"}], lr=0.01)
+    wb.grad = torch.randn_like(wb)
+    opt_b.step()
+    assert opt_b.state[wb]["momentum_buffer"].dtype == torch.float32
+    resumed = MuonAdamW([{"params": [wb], "weight_decay": 0.0, "muon": "muon"}], lr=0.01)
+    resumed.load_state_dict(opt_b.state_dict())
+    assert resumed.state[wb]["momentum_buffer"].dtype == torch.bfloat16, "load_state_dict casts to the parameter's dtype"
+    wb.grad = torch.randn_like(wb)
+    resumed.step()
+    assert resumed.state[wb]["momentum_buffer"].dtype == torch.float32
+    assert optimizer_kind(opt_b) == "muon" and saved_optimizer_kind(opt_b.state_dict()) == "muon"
+    plain = torch.optim.AdamW([torch.randn(2, 2, requires_grad=True)], lr=1e-3)
+    assert optimizer_kind(plain) == "adamw" and saved_optimizer_kind(plain.state_dict()) == "adamw"
+    try:
+        check_resume_kind(plain, opt_b.state_dict(), "x.pt")
+        raise AssertionError("a resume across optimizer kinds must be refused")
+    except ValueError as exc:
+        assert "'muon'" in str(exc) and "'adamw'" in str(exc)
+    check_resume_kind(opt_b, opt_b.state_dict())
+    print("7. the momentum buffer is fp32 after a bf16 resume; a cross kind resume is refused  PASS")
     print("all muon optimizer checks passed")
 
 

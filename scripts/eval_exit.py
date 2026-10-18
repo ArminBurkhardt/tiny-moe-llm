@@ -575,7 +575,8 @@ def main():
         twin = load_model(pair_path, args.device)
         ce_b, p_max_b, correct_b, clusters_b = collect_exits(twin, dataset, args.device,
                                                              tokenizer.pad_token_id, args.max_batches)
-        assert clusters_b is None or torch.equal(clusters, clusters_b), "the twin read other documents"
+        assert (clusters is None) == (clusters_b is None) and (
+            clusters is None or torch.equal(clusters, clusters_b)), "the twin read other documents"
         pair = pair_stats(ce, ce_b, clusters)
         print(f"=== paired against {os.path.basename(args.pair)}: twin CE minus this CE per token, "
               f"per exit (mean, se, z; positive means the twin is worse) ===")

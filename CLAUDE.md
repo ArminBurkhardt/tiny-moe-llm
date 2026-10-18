@@ -370,6 +370,13 @@ asks (decided 2026-10-11); a new session reads the file.
   agent may still use them.
 - Each task is self-contained and finishes fast. Bundle work that shares a file into one agent and
   name its owned files; split genuinely independent work across parallel agents in one message.
+- **Every substantial or architectural change gets a Sonnet subagent review before the commit
+  line is handed over** (user request 2026-10-18): a new module, a loss term, an optimizer, a
+  tensor or checkpoint format change, a trainer path change. Give the reviewer the diff scope and
+  the invariants that bite; fold its findings in; say in the reply that it ran and what it found.
+  Small edits, docs and config values are exempt. The reviewer is fully detached: a
+  self-contained brief, no conversation history, and told not to read the memory directory, any
+  transcript or task output, or anything outside the repo.
 
 ## What this is
 
@@ -506,7 +513,10 @@ Tables in [configuration.md](docs/configuration.md).
   `lr` and `weight_decay` carry over; tables, heads, the router, scalars, vectors and the
   zero-init matrices stay on AdamW with `torch.optim.AdamW`'s arithmetic and state keys, so
   `apply_ir_refresh` still finds `exp_avg`; fused `gate_up` weights are orthogonalized as two
-  halves; a checkpoint resumes only under its own optimizer, the group layout differs).
+  halves; the momentum buffer stays fp32 across a bf16 resume; a checkpoint resumes only under
+  its own optimizer, `check_resume_kind` names both kinds before `load_state_dict`; the step
+  loops per tensor with no foreach batching, so time a Muon step at the pilot shape before
+  relying on it there, reviewed 2026-10-18).
   `total_steps = target_tokens // (batch * seq * grad_accum)`.
   `loop_ce_weights` length is asserted against `n_loops` at import.
 - `RepairConfig` / `IRConfig` / `EvidenceConfig` subclass `SFTConfig` and read only the keys their

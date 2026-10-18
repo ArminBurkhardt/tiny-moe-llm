@@ -33,9 +33,12 @@ _ADAMW_PATTERNS = (
     r"embed_tokens\.weight$", r"\.ple\.weight$", r"moe_embeddings\.weight$",
     r"\.z_keys$", r"\.y_values$",
     r"loop_query_bias\.weight$", r"loop_router_bias\.weight$", r"evidence_query_bias\.weight$",
-    r"^lm_head\.", r"^mtp_head\.", r"^coda_head\.",
+    r"^lm_head\.", r"^mtp_head\.", r"^coda_head\.", r"^groundedness_head\.",
     r"\.router\.", r"noise_proj\.weight$",
-    r"loop_inject", r"direct_gate\.weight$", r"\.g_proj\.weight$",
+    # the zero-init neutrality matrices: moe.inject (loop_inject), the IR expert's direct_gate and
+    # g_proj, and the cross reader's o_proj
+    r"(^|\.)inject\.weight$", r"direct_gate\.weight$", r"\.g_proj\.weight$",
+    r"shared_evidence\.attn\.o_proj\.weight$",
 )
 _FUSED_PATTERN = re.compile(r"gate_up\.weight\d*$")
 
@@ -116,23 +119,27 @@ class MuonAdamW(torch.optim.Optimizer):
 
     A param group with ``"muon": "muon"`` or ``"muon": "muon_halves"`` steps every parameter in
     it with Muon (Nesterov momentum ``momentum``, the orthogonalized update scaled to AdamW's RMS,
-    decoupled weight decay ``weight_decay`` at the group's ``lr``). Every other group steps with
-    AdamW (``betas``, ``eps``, decoupled ``weight_decay``), bit for bit the arithmetic of
-    ``torch.optim.AdamW`` without ``amsgrad`` or ``maximize``.
+    decoupled weight decay ``weight_decay`` at the group's ``lr``; the momentum buffer is kept in
+    fp32 whatever the parameter's dtype, also after a resume). Every other group steps with AdamW
+    (``betas``, ``eps``, decoupled ``weight_decay``): the arithmetic of ``torch.optim.AdamW``'s
+    single-tensor path without ``amsgrad`` or ``maximize``, with the same state keys
+    (``exp_avg``, ``exp_avg_sq``, ``step``); its foreach path sums in another order, so the two
+    agree to rounding, not bit for bit.
 
     Args:
         params: param groups (dicts) or an iterable of parameters.
         lr: learning rate (the group's own ``lr`` wins).
         betas: AdamW moments.
         eps: AdamW epsilon.
-        weight_decay: decoupled weight decay (the group's own wins).
+        weight_decay: decoupled weight decay (the group's own wins); ``torch.optim.AdamW``'s
+            default, so a group without the key decays as it would there.
         momentum: Muon's momentum.
         nesterov: blend the gradient into the momentum before orthogonalizing.
         ns_steps: Newton-Schulz iterations.
     """
 
     def __init__(self, params, lr: float = 1e-3, betas=(0.9, 0.999), eps: float = 1e-8,
-                 weight_decay: float = 0.0, momentum: float = MUON_MOMENTUM, nesterov: bool = True,
+                 weight_decay: float = 1e-2, momentum: float = MUON_MOMENTUM, nesterov: bool = True,
                  ns_steps: int = MUON_NS_STEPS):
         assert 0.0 <= momentum < 1.0, momentum
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, momentum=momentum,
@@ -172,6 +179,11 @@ class MuonAdamW(torch.optim.Optimizer):
                 state["momentum_buffer"] = torch.zeros_like(grad)
                 state["step"] = torch.zeros((), dtype=torch.float32)
             buf = state["momentum_buffer"]
+            if buf.dtype != torch.float32:
+                # load_state_dict casts the buffer to the parameter's dtype; pretraining steps bf16
+                # parameters directly, so a resumed buffer comes back bf16 and the momentum would
+                # run in bf16 from then on
+                buf = state["momentum_buffer"] = buf.float()
             state["step"] += 1
             buf.lerp_(grad, 1.0 - momentum)
             blended = grad.lerp(buf, momentum) if nesterov else buf
@@ -249,6 +261,43 @@ def build_optimizer(kind: str, groups, names_by_param: dict = None, **kwargs):
     assert kind == "muon", kind
     assert names_by_param is not None, "the Muon partition is a rule over parameter names"
     return MuonAdamW(tag_param_groups(groups, names_by_param), **kwargs)
+
+
+def optimizer_kind(optimizer) -> str:
+    """``"muon"`` when any param group steps with Muon, else ``"adamw"``."""
+    return "muon" if any(g.get("muon") in ("muon", "muon_halves") for g in optimizer.param_groups) else "adamw"
+
+
+def saved_optimizer_kind(optimizer_state_dict: dict) -> str:
+    """The kind a saved optimizer state was written under, read off its param groups.
+
+    A ``MuonAdamW`` state carries the ``muon`` tag on every group; a ``torch.optim.AdamW`` state
+    carries none. The two lay their groups out differently, so a resume across kinds fails in
+    ``load_state_dict`` with a group-count or size error that names neither; the trainers check
+    this first and name both kinds.
+
+    Args:
+        optimizer_state_dict: the ``optimizer_state_dict`` of a checkpoint.
+    """
+    groups = optimizer_state_dict.get("param_groups", [])
+    return "muon" if any(g.get("muon") in ("muon", "muon_halves") for g in groups) else "adamw"
+
+
+def check_resume_kind(optimizer, optimizer_state_dict: dict, path: str = "") -> None:
+    """Raise before ``load_state_dict`` when the checkpoint and the live optimizer differ in kind.
+
+    Args:
+        optimizer: the live optimizer.
+        optimizer_state_dict: the checkpoint's.
+        path: the checkpoint's path, for the message.
+    """
+    saved, live = saved_optimizer_kind(optimizer_state_dict), optimizer_kind(optimizer)
+    if saved != live:
+        raise ValueError(
+            f"{path or 'the checkpoint'} was saved under optimizer {saved!r} and this run is "
+            f"configured for {live!r} (training.optimizer): the group layouts differ, so it cannot "
+            f"resume; relaunch under {saved!r}, or pass it with -c to initialize from its weights"
+        )
 
 
 def partition_summary(optimizer) -> str:

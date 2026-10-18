@@ -72,7 +72,7 @@ from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.information_retrieval import is_rebuilt_ir_param
 from modules.model.moe import is_fresh_loop_param
 from modules.model.mtp import compute_mtp_loss
-from modules.model.optim import build_optimizer, partition_summary
+from modules.model.optim import build_optimizer, check_resume_kind, partition_summary
 from modules.model.transformer import TinyMoETransformer
 from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
@@ -511,6 +511,7 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
             f"Pass it with -c to initialize FROM it instead of resuming it, and keep "
             f"{checkpoint_dir} for {expected_phase} checkpoints only."
         )
+    check_resume_kind(optimizer, checkpoint["optimizer_state_dict"], os.path.basename(path))
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])

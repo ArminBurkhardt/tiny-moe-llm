@@ -214,6 +214,10 @@ def load_checkpoint(model, optimizer, scheduler, path):
                "point. Pass it with -c to initialize from it."
                if "phase0_migration" in checkpoint else "")
         )
+    # imported here: the optimizer module is pure torch, but utils is imported by every script and
+    # keeps modules.model out of its own import time
+    from modules.model.optim import check_resume_kind
+    check_resume_kind(optimizer, checkpoint["optimizer_state_dict"], os.path.basename(path))
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
