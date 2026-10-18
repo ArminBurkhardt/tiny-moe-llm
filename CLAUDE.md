@@ -77,9 +77,23 @@ Delta +0.004 +- 0.008, composed answers 1.93 nats against ln K 1.72), loop scale
 InfoNCE micro arm against its twin, one epoch of the QA slice
 ([infonce_micro.md](docs/measurements/infonce_micro.md), `ckpts/inject/launch_infonce.sh`,
 35M tokens each): store recall@5 0.012 against 0.000, recall@20 0.035 against 0.001 (bge
-0.829), language and selection equal; the term moves recall from zero to small.** Running: the
-same pair at three epochs (`w25e3`, `w0e3`), whose recall read decides whether the term enters
-the pilot-shape recipe; the model-keyed retriever variant stays held. Intermediate pilot saves deleted
+0.829), language and selection equal; the term moves recall from zero to small.** **The same
+pair at three epochs (`w25e3`, `w0e3`, 104M tokens each, read 2026-10-18): recall@5 0.059
+against 0.000, recall@20 0.133 against 0.002 (one sixth of bge), at a cost of 0.07 nats of
+held-out language on the arm (4.45 against 4.38, the gap widening with dose), selection 0.01
+better, the port read on neither.** Decision pending (the user): the term enters the pilot-shape
+recipe at 0.25 (recommended in the record), at a lower weight, or stays held; the model-keyed
+retriever variant stays held. **The Muon rung's three micro arms ran and were read 2026-10-18
+([muon_micro.md](docs/measurements/muon_micro.md)): the loss bar passes (Muon 0.07 to 0.15
+nats below its AdamW twin on both recipes, z 16 to 25 paired per token, 2 to 4x the one seed
+pair's spread of 0.03), copying is no later (both warm-up arms switch between 50M and 100M,
+Muon copies held out at 0.90 against 0.67), and the leak passes by the letter (largest cell
+z 2.6, tier 1000 in distribution) while worse by the sign (1.6x at tier 1000 and 2.4x at tier
+100 in distribution, held out equal); on arm (a) Muon stores the biographies about twice as
+early and more at every tier above 1, far outside the seed spread, the wrong direction for the
+goal. Decision pending (the user): the pilot-shape Muon arm P (the row's next step, one
+night, the instrument with the power the micro leak read lacks) or Muon out of the real-run
+spec.** Next on the GPU: the eight unread chain saves (`read_chain_saves.sh`). Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
@@ -251,8 +265,11 @@ asks (decided 2026-10-11); a new session reads the file.
      ckpts/inject/launch_muon.sh [full|cf|reseed]` (`config_micro_muon.yaml`,
      `config_micro_seed4321.yaml`; run directories `ckpts/evidence_muon_full`,
      `evidence_muon_kv_cf`, `evidence_adamw_full_s4321`; reads `ckpts/inject/muon_{ARM}_{TAG}_*`,
-     the exit read paired against the twin's save at the same tokens), queued after the
-     three-epoch InfoNCE pair. A checkpoint resumes only under its own optimizer.
+     the exit read paired against the twin's save at the same tokens), **run and read
+     2026-10-18** ([muon_micro.md](docs/measurements/muon_micro.md)): loss and copying bars
+     pass, the leak bar passes by the letter and is worse by the sign, storage twice as early
+     on arm (a); the pilot-shape arm is the user's call. A checkpoint resumes only under its
+     own optimizer.
   4. Proposed 2026-10-12: rung R8 (loss-free MoE balancing against the aux loss, micro), rung R9
      (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy

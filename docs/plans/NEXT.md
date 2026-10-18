@@ -76,16 +76,49 @@ equal on both arms (0.712 / 0.714), answer CE within 0.025 nats, the port unread
 dose. `eval_store.py recall` on `data/index/openqa` (274k chunks), loop 1: the arm 0.002 / 0.012 /
 0.035 at k 1 / 5 / 20 against the twin's 0.000 / 0.000 / 0.001 (arm P's final read 0.004 at k
 5; bge 0.829). The in-batch separation over about 250 chunks transfers weakly to the store at
-35M tokens on a 35M model. **Running: the same pair at three epochs** (`w25e3`, `w0e3`,
-`config_micro_infonce{,0}_e3.yaml`, about 50 minutes each), the dose at which the micro arms
-start reading the port; its recall read decides whether the term goes into the pilot-shape
-recipe at 0.25. The model-keyed variant (keys from the model's own encoder, Co-LMLM's) stays
+35M tokens on a 35M model. **The same pair at three epochs, read 2026-10-18** (`w25e3`, `w0e3`,
+`config_micro_infonce{,0}_e3.yaml`, 104.46M tokens in 40 minutes each; the twin relaunched
+clean from the seed after a stop at 85M): recall 0.016 / 0.059 / 0.133 at k 1 / 5 / 20 on the
+arm against 0.000 / 0.000 / 0.002 on the twin (bge 0.662 / 0.829 / 0.897), HotpotQA 0.237 at
+k 20 against NQ 0.019; the arm's held-out answer CE 4.45 against the twin's 4.38, a 0.07 nat
+cost that widens through the run (0.05 at 20M, 0.08 at 100M); `selection` 0.695 against 0.706;
+gold costs more than none on both (the port unread at this dose on either arm); the training
+rows' external mass under gold 0.123 against 0.076. The term is the whole of the model's store
+recall at this dose, one sixth of bge and growing; whether the retrieved mass becomes answer
+gain is unread at micro scale. **Decision pending (the user): the term enters the pilot-shape
+recipe at 0.25 (the record recommends it: the only lever that has moved A4, and the language
+cost at the pilot shape reads against the control like every other term's), at a lower weight
+(no micro sweep ran), or stays held.** The model-keyed variant (keys from the model's own encoder, Co-LMLM's) stays
 held: A4 is the model's query against a bge-keyed store, which is exactly the pairing the term
 trains, and model keys would change the store format and the gate's meaning. **Built
 2026-10-18 while that pair ran: the optimizer rung's code** (R7 in the ladder: `MuonAdamW` in
 `modules/model/optim.py`, the `optimizer` key, `eval_exit.py --pair`, the test); its three micro
-arms (`ckpts/inject/launch_muon.sh`) run after the InfoNCE pair, then the remaining chain saves
-are read.
+arms (`ckpts/inject/launch_muon.sh`) ran after the InfoNCE pair (the partition at micro: 60
+tensors, 25.7M on AdamW, 78 tensors, 9.8M on Muon, the embedding table being most of the
+model). **Read 2026-10-18 ([muon_micro.md](../measurements/muon_micro.md)).** Loss: Muon's
+held-out CE below its AdamW twin's at every read on both recipes, 0.07 to 0.15 nats, z 16 to
+25 paired per token, against a one-pair seed spread of 0.03 at the end (0.04 to 0.06 mid-run,
+itself z 6 paired); passes. Copying: both warm-up arms switch between 50M and 100M, gold top-1
+at 100M 0.98 to 0.99 against 0.95 to 0.97, held-out copying at the final 0.90 against 0.60 to
+0.74, swapped held-out card followed 0.90 against 0.67; passes. The leak (the warm-up arm's
+closed-book entity `delta` at the final, Muon against AdamW): in distribution 0.023 / 0.035 /
+0.136 against 0.000 / 0.015 / 0.085 at tiers 10 / 100 / 1000, held out 0.004 / 0.012 / 0.037
+against -0.001 / 0.007 / 0.047; paired on the rank the largest cell is z 2.6 (tier 1000 in
+distribution), so the bar as written holds, while in distribution Muon leaks more at every
+tier above 1 (each cell z 2.4 to 2.6 on `delta`) and the storage read on arm (a) says why:
+Muon stores the biographies about twice as early (its 50M read sits where AdamW's 100M does;
+tier 100 in distribution 0.072 against 0.010 at 50M, 0.451 against 0.378 at the final, z 22
+paired) and more at every tier above 1, far outside the seed spread at tiers 10 and 100 in
+distribution (z 0.6 and 0.7 between two AdamW seeds), while the seed spread at tier 1000 held
+out is z 3.6, as large as the leak difference. Nothing is stored before copying on either arm
+(50M and 100M within 2.1 sigma), so the extra leak is written after the switch by real-value
+supervision, as the AdamW leak is. The attention-logit bound is unread. **Decision pending
+(the user): run the row's next step, one Muon arm P at the pilot shape against arm P (about
+one night; the paired read against the control has the power to tell a 1.6x leak from the
+seed, and it times the per-tensor Newton-Schulz at that shape), or keep Muon out of the
+real-run spec on the storage direction. The record's reading: the micro step passes as
+written; the leak decides at the pilot shape, not the loss.** Next on the GPU: the
+remaining chain saves.
 
 **Arm P was complete and read on 2026-10-11.** Arm P ended at 860.61M tokens,
 one epoch (the trainer stops at the epoch's end, so the cosine fitted to 910M stopped at LR about
@@ -1141,7 +1174,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 | R4b | 2 x 1B | sublayers per pass 2 against 3 at matched compute; experts 4 against 8 | L1 plus closed-book rank plus language benchmarks | see gates | shape L's core |
 | R5 | 0 | the winner, eval only | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | L2 and the A gates | whether the design enters the real run |
 | R6 | 1 to 2B | hop 1 seen only in pretraining text (about 100 exposures), hop-1 documents excluded from the store, hop 2 retrieved | closed-book hop-1 accuracy and 2-hop accuracy | at chance on both (the A1 leak probe: above chance means pretraining-text facts reached the weights) | whether the recipe keeps pretraining-text facts out of the weights |
-| R7 | 3 x 0.3B, then 0.9B | Muon on the hidden matrices (Decisions, optimizer) against AdamW, at the AdamW arm's lr and weight decay through the RMS-matched update, no sweep. Build first: one combined Muon plus AdamW optimizer class over the fp32 masters (`train_step` takes one optimizer and one `LambdaLR`); `eval_exit.py --pair OTHER.json` (paired per-token CE against a twin; today it keeps aggregates only); a sampled max of q·k per layer (flash varlen exposes no logits). **Built 2026-10-18**: `modules/model/optim.py` (`MuonAdamW`, the name rule `muon_kind`, `build_optimizer`; `tests/test_muon_optimizer.py`), `training: optimizer: adamw | muon` read by both trainers, `eval_exit.py --pair TWIN_CKPT` (the twin read on the same tokens in one process, `pair_stats`); the sampled q·k max is not built. A detached Sonnet review the same day found two bugs, fixed: the momentum buffer came back bf16 on a pretraining resume (now kept fp32), and three zero-init tensors were misrouted to Muon (`moe.inject`, the groundedness head, the cross reader's `o_proj`); a resume across optimizer kinds is now refused by name (`check_resume_kind`). Open risk from the review: no foreach batching, one Newton-Schulz per expert matrix, so the step time at the pilot shape is measured before the pilot-shape arm. Arms: `ckpts/inject/launch_muon.sh` (`full`, `cf`, `reseed`; `config_micro_muon.yaml`, `config_micro_seed4321.yaml`), each read by `closed_book_rank` at 50M, 100M and the final and by the paired exit read at every save against the twin's save at the same tokens. Micro, from `seed_micro.pt` on the R0b splits: Muon arm (a) full CE against arm (a), the Muon copy-first warm-up arm of (c) against the warm-up arm (same seed, data and switch at 100M), and one AdamW reseed of arm (a) for the run-to-run spread (the paired sigma is per item, not per run); about 1.5 5090 hours each. Then, only if both micro reads pass, one Muon arm P from `seed_pilot_grounded.pt` on the pilot splits against arm P, about one night | filler CE on `inject_val` at 50M steps (`eval_exit.py`, paired against the twin); gold top-1 at 50M and 100M (when copying emerges); closed-book entity `delta` by tier on both forms, `compare` against the twin; arm (a) by tier as the storage read (descriptive: whether Muon stores the tail more, arXiv 2509.26030); max attention logit per layer (no QK norm in the trunk); on the pilot shape also the 1-hop gate, L1 and A2 | Muon filler CE below its twin's at matched tokens beyond the paired sigma and beyond the AdamW reseed spread; copying no later (the warm-up's switch criterion met by 100M at micro, by 300M at pilot shape); the (c) and P `delta` not above the twin's by 3 sigma paired at tier 100 or tier 1000 on either form; the logit not growing without bound | the real run's optimizer. A loss gain with a worse leak fails: the goal outranks the speed |
+| R7 | 3 x 0.3B, then 0.9B | Muon on the hidden matrices (Decisions, optimizer) against AdamW, at the AdamW arm's lr and weight decay through the RMS-matched update, no sweep. Build first: one combined Muon plus AdamW optimizer class over the fp32 masters (`train_step` takes one optimizer and one `LambdaLR`); `eval_exit.py --pair OTHER.json` (paired per-token CE against a twin; today it keeps aggregates only); a sampled max of q·k per layer (flash varlen exposes no logits). **Built 2026-10-18**: `modules/model/optim.py` (`MuonAdamW`, the name rule `muon_kind`, `build_optimizer`; `tests/test_muon_optimizer.py`), `training: optimizer: adamw | muon` read by both trainers, `eval_exit.py --pair TWIN_CKPT` (the twin read on the same tokens in one process, `pair_stats`); the sampled q·k max is not built. A detached Sonnet review the same day found two bugs, fixed: the momentum buffer came back bf16 on a pretraining resume (now kept fp32), and three zero-init tensors were misrouted to Muon (`moe.inject`, the groundedness head, the cross reader's `o_proj`); a resume across optimizer kinds is now refused by name (`check_resume_kind`). Open risk from the review: no foreach batching, one Newton-Schulz per expert matrix, so the step time at the pilot shape is measured before the pilot-shape arm. Arms: `ckpts/inject/launch_muon.sh` (`full`, `cf`, `reseed`; `config_micro_muon.yaml`, `config_micro_seed4321.yaml`), each read by `closed_book_rank` at 50M, 100M and the final and by the paired exit read at every save against the twin's save at the same tokens. Micro, from `seed_micro.pt` on the R0b splits: Muon arm (a) full CE against arm (a), the Muon copy-first warm-up arm of (c) against the warm-up arm (same seed, data and switch at 100M), and one AdamW reseed of arm (a) for the run-to-run spread (the paired sigma is per item, not per run); about 1.5 5090 hours each. **Run and read 2026-10-18** ([muon_micro.md](../measurements/muon_micro.md)): loss bar passes (0.07 to 0.15 nats below the twin, z 16 to 25 paired, 2 to 4x the seed spread), copying no later (both warm-up arms switch between 50M and 100M; held-out copying 0.90 against 0.67), the leak passes by the letter (largest cell z 2.6, tier 1000 in distribution) and is worse by the sign in distribution at every tier above 1 (1.6x at tier 1000, 2.4x at tier 100; held out equal); arm (a) stores about twice as early under Muon, far outside the seed spread; the logit bound unread. The pilot-shape arm is the user's decision. Then, only if both micro reads pass, one Muon arm P from `seed_pilot_grounded.pt` on the pilot splits against arm P, about one night | filler CE on `inject_val` at 50M steps (`eval_exit.py`, paired against the twin); gold top-1 at 50M and 100M (when copying emerges); closed-book entity `delta` by tier on both forms, `compare` against the twin; arm (a) by tier as the storage read (descriptive: whether Muon stores the tail more, arXiv 2509.26030); max attention logit per layer (no QK norm in the trunk); on the pilot shape also the 1-hop gate, L1 and A2 | Muon filler CE below its twin's at matched tokens beyond the paired sigma and beyond the AdamW reseed spread; copying no later (the warm-up's switch criterion met by 100M at micro, by 300M at pilot shape); the (c) and P `delta` not above the twin's by 3 sigma paired at tier 100 or tier 1000 on either form; the logit not growing without bound | the real run's optimizer. A loss gain with a worse leak fails: the goal outranks the speed |
 | R8 | 0.3B | loss-free balancing (arXiv 2408.15664: a bias added to the routing score for top-k selection only, moved after each optimizer step by u times the sign of the load error, u 0.001) against the aux loss; micro arm (a) recipe from `seed_micro.pt`, paired against arm (a). Build: the bias per pass, `[n_loops, E]`, since routing is loop-conditioned; over the MLP slots only (the attention and IR experts run densely anyway, and shape L routes MLP experts only); updated on device from the router's hard counts once per sync step; the buffer on `load_model_state`'s allow-list; expert load logged per pass (today the tracker pools passes into one EMA) | filler CE on `inject_val`, paired; expert load per pass (max over mean); closed-book entity `delta` by tier | CE not worse beyond the paired sigma; load at least as even | the real run's balancing |
 | R9 | about 200k questions | from arm P's final save (`ckpts/evidence_pilot_p/checkpoint_evidence_final.pt`): SFT on a written-bridge form of the chain splits (the first hop's answer written before the final answer; `.chains.jsonl` already holds start, bridge and answer, so the build is a template flag in `prepare_chain_data.py`). Budgeted in questions, not tokens: at the chain slice's evidence ratio 4.20 the rate is about 3k tok/s, so 0.1B tokens would take 7 to 10 hours. Read with a generate-then-score mode added to `eval_chains.py`, which today scores candidates right after the prompt and cannot read a written bridge. A short RL run on the chain answer only after 6f's rollout prerequisites exist | held-out 2-hop and 3-hop accuracy with the written bridge against arm P's latent read (at chance); the 1-hop gate kept | held-out 2-hop 3 sigma above chance | whether 6f reasons in written tokens or in the loop |
 
@@ -1513,6 +1546,13 @@ above are a different, live series).
   matrices by a name rule, AdamW's arithmetic on the rest, one class), `training: optimizer`,
   `eval_exit.py --pair`, `tests/test_muon_optimizer.py`; the three micro arms queued behind the
   three-epoch InfoNCE pair, which was relaunched clean from the seed after the evening's stop.
+  The three-epoch pair read the same afternoon (the twin relaunched once more after a stop at
+  85M): store recall@5 0.059 against 0.000, recall@20 0.133 against 0.002, at 0.07 nats of
+  held-out language; the term's entry into the pilot-shape recipe is the user's decision
+  (recommended at 0.25). The Muon arms ran behind it and were read the same night
+  ([muon_micro.md](../measurements/muon_micro.md)): loss and copying bars pass, the leak bar
+  passes by the letter (largest cell z 2.6) and is worse by the sign in distribution, Muon
+  stores about twice as early on arm (a); the pilot-shape arm is the user's decision.
 - 2026-10-17 (evening): the chain continuation of arm P complete and read
   ([chain_continuation_pilot.md](../measurements/chain_continuation_pilot.md)): one epoch of the
   chain split takes 1-hop to 0.99 and leaves every composition cell at chance (held-out paired
