@@ -90,6 +90,13 @@ class TrainingConfig:
     lr = float(Config["training"]["lr"])
     weight_decay = float(Config["training"]["weight_decay"])
     grad_clip = float(Config["training"]["grad_clip"])
+    # which optimizer steps the model (modules.model.optim): "adamw" is every run before
+    # 2026-10-18; "muon" steps the hidden matrices with Muon at the same lr and weight decay
+    # through the RMS-matched update and leaves tables, heads, the router, scalars and the
+    # zero-init matrices on AdamW. Read by both trainers, so it lives with the other training
+    # keys rather than per profile.
+    optimizer = str(Config["training"].get("optimizer", "adamw")).lower()
+    assert optimizer in ("adamw", "muon"), f"optimizer ({optimizer}) must be adamw or muon"
     target_tokens = int(Config["training"]["target_tokens"])
     grad_accumulation_steps = int(Config["training"].get("grad_accumulation_steps", 1))
     total_steps = int((Config["training"]["target_tokens"] // (Config["training"]["batch_size"] * Config["training"]["seq_length"] * grad_accumulation_steps)))

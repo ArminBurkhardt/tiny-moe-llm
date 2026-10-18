@@ -72,6 +72,7 @@ from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.information_retrieval import is_rebuilt_ir_param
 from modules.model.moe import is_fresh_loop_param
 from modules.model.mtp import compute_mtp_loss
+from modules.model.optim import build_optimizer, partition_summary
 from modules.model.transformer import TinyMoETransformer
 from modules.runtime import checkpoints as ckpt_lib
 from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
@@ -1114,7 +1115,12 @@ def sft(args):
         model, cfg.weight_decay, fresh_lr=getattr(cfg, "fresh_lr", None),
         is_fresh_param=fresh_predicate,
     )
-    optimizer = optim.AdamW(param_groups, lr=cfg.lr)
+    # the masters are what the optimizer steps, so the partition rule sees them under the model
+    # parameter's name
+    names = {id(p): n for n, p in model.named_parameters()}
+    names_by_master = {id(master): names[id(param)] for param, master in master_pairs}
+    optimizer = build_optimizer(TrainingConfig.optimizer, param_groups, names_by_master, lr=cfg.lr)
+    logger.info(f"optimizer {TrainingConfig.optimizer}: {partition_summary(optimizer)}")
     scheduler = build_sft_scheduler(optimizer, total_steps, cfg)
 
     os.makedirs(checkpoint_dir, exist_ok=True)

@@ -28,6 +28,7 @@ print(json.dumps({
     "groundedness_weight": TrainingConfig.groundedness_weight,
     "evidence_contrastive_weight": TrainingConfig.evidence_contrastive_weight,
     "evidence_contrastive_temperature": TrainingConfig.evidence_contrastive_temperature,
+    "optimizer": TrainingConfig.optimizer,
     "target_tokens": TrainingConfig.target_tokens,
     "sft_seq_length": SFTConfig.Seq_length,
     "sft_data_dir": SFTConfig.data_dir,
@@ -71,6 +72,7 @@ def main():
     assert micro["groundedness_weight"] == 0.0 and micro["target_tokens"] == 300_000_000
     assert micro["evidence_contrastive_weight"] == 0.0
     assert micro["evidence_contrastive_temperature"] == 0.07
+    assert micro["optimizer"] == "adamw"
     assert micro["sft_seq_length"] == 1024 and micro["sft_data_dir"] == "data/prepared_inject"
     ev = micro["evidence"]
     assert ev["train_split"] == "inject_full_train" and ev["val_split"] == "inject_val"
@@ -104,6 +106,7 @@ def main():
     assert default["evidence"]["batch"] == raw["evidence"]["batch_size"]
     assert default["evidence_contrastive_weight"] == raw["training"]["evidence_contrastive_weight"]
     assert default["evidence_contrastive_temperature"] == raw["training"]["evidence_contrastive_temperature"]
+    assert default["optimizer"] == raw["training"]["optimizer"] == "adamw"
     assert default != micro and not default["model_imported"]
     print("2. unset: every value is config.yaml's                                     PASS")
 

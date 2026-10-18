@@ -17,6 +17,7 @@ from modules.model.transformer import TinyMoETransformer
 from modules.data.dataset import Dataset
 from modules.model.attention import cu_seqlens_from_doc_ids
 from modules.model.mtp import compute_mtp_loss
+from modules.model.optim import build_optimizer, partition_summary
 from config import ModelConfig, TrainingConfig
 from utils import save_checkpoint, load_checkpoint, BASE_DIR, logger, BF16, TOKENIZER_DIR, get_hf_token, HF_UPLOAD_REPO
 from modules.runtime import checkpoints as ckpt_lib
@@ -627,9 +628,10 @@ def pretrain(phase=None):
     # from bitsandbytes.optim import AdamW8bit
     
     param_groups, no_decay_master_pairs = build_param_groups(model, TrainingConfig.weight_decay)
-    optimizer = optim.AdamW(
-        param_groups, lr=TrainingConfig.lr,
-    )
+    names = {id(p): n for n, p in model.named_parameters()}
+    names.update({id(master): names[id(param)] for param, master in no_decay_master_pairs})
+    optimizer = build_optimizer(TrainingConfig.optimizer, param_groups, names, lr=TrainingConfig.lr)
+    logger.info(f"optimizer {TrainingConfig.optimizer}: {partition_summary(optimizer)}")
     scheduler = build_scheduler(optimizer)
 
     logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")

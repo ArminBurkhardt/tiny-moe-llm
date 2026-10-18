@@ -78,6 +78,7 @@ training:
   lr: 4e-4
   weight_decay: 0.02
   grad_clip: 1.0
+  optimizer: adamw           # adamw | muon (modules/model/optim.py); adamw is every run before 2026-10-18
   num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient

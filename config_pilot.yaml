@@ -36,6 +36,7 @@ training:                    # loss weights, read by train_step for every profil
   lr: 6.0e-4
   weight_decay: 0.1
   grad_clip: 1.0
+  optimizer: adamw           # adamw | muon (modules/model/optim.py); adamw is every run before 2026-10-18
   num_epochs: 1
   lambda_mtp: 0.1
   aux_loss_weight: 0.01

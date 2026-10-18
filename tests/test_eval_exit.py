@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from scripts.eval_exit import (
     analyze, beta_optimum, confidence_rule, decile_table, exit_readouts, hull_ce, interpolated_ce,
-    oracle_stats, paired_gains, per_exit_stats,
+    oracle_stats, pair_stats, paired_gains, per_exit_stats,
 )
 
 
@@ -315,4 +315,28 @@ check_confidence()
 check_deciles()
 check_other_depths()
 check_exit_readouts()
+
+
+def check_pair():
+    """The twin read: per token differences per exit, the twin's CE minus this one's."""
+    torch.manual_seed(0)
+    ce_a = torch.rand(3, 200) + 1.0
+    ce_b = ce_a + 0.1
+    clusters = torch.arange(200) // 10
+    pair = pair_stats(ce_a, ce_b, clusters)
+    assert [row["exit"] for row in pair["per_exit"]] == [1, 2, 3]
+    for row in pair["per_exit"]:
+        close(row["mean"], 0.1, 1e-6)
+        close(row["ce_b"] - row["ce_a"], 0.1, 1e-6)
+        assert row["se_cluster"] is not None and row["z"] is not None and row["z"] > 100
+    same = pair_stats(ce_a, ce_a, None)
+    assert all(row["mean"] == 0.0 and row["z"] == 0.0 for row in same["per_exit"])
+    try:
+        pair_stats(ce_a, ce_a[:, :100], None)
+        raise AssertionError("a token count mismatch must be refused")
+    except AssertionError as exc:
+        assert "different tokens" in str(exc)
+
+
+check_pair()
 print("all eval exit checks passed")

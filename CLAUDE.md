@@ -241,9 +241,18 @@ asks (decided 2026-10-11); a new session reads the file.
   2. The pilot (Phase 5) on that spec with the key/value reader, ladder cut to budget.
   3. Rung R7 (proposed 2026-10-12, NEXT.md Decisions "optimizer"): Muon on the hidden matrices
      for the real run, AdamW for `E`, the head adapters, the router and every norm, scalar and
-     vector; build in `pretrain.py` / `sft.py`, then two micro arms against their AdamW twins on
-     the R0b recipe, then one pilot-shape arm against arm P. Decided on the leak, not the loss.
-     The pilot arms stay AdamW.
+     vector; then two micro arms against their AdamW twins on the R0b recipe, then one
+     pilot-shape arm against arm P. Decided on the leak, not the loss. The pilot arms stay AdamW.
+     **Built 2026-10-18**: `modules/model/optim.py` (`MuonAdamW`, the partition rule
+     `muon_kind`, `build_optimizer`), the `training: optimizer: adamw | muon` key read by both
+     trainers, `eval_exit.py --pair TWIN` (paired per-token CE per exit on the same tokens),
+     `tests/test_muon_optimizer.py`; the sampled max q·k logit per layer is not built (flash
+     varlen exposes no logits; it needs a sampled recompute). Arms: `bash
+     ckpts/inject/launch_muon.sh [full|cf|reseed]` (`config_micro_muon.yaml`,
+     `config_micro_seed4321.yaml`; run directories `ckpts/evidence_muon_full`,
+     `evidence_muon_kv_cf`, `evidence_adamw_full_s4321`; reads `ckpts/inject/muon_{ARM}_{TAG}_*`,
+     the exit read paired against the twin's save at the same tokens), queued after the
+     three-epoch InfoNCE pair. A checkpoint resumes only under its own optimizer.
   4. Proposed 2026-10-12: rung R8 (loss-free MoE balancing against the aux loss, micro), rung R9
      (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
@@ -421,7 +430,7 @@ scripts/
   entity_frequency.py exact token-sequence counts in a .bin (the counterfactual strata)
   eval_calibration.py eval_probe.py eval_stage0.py evidence_ceiling_probe.py (--fixed-split: ceiling on evidence_fixed)
   inference.py gradio_app.py prune_vocab.py fetch_tokenizer.py setup.sh onstart.sh run_sft_after_pretrain.sh
-modules/model/        transformer gemma4 moe router experts information_retrieval evidence mtp attention kv_cache
+modules/model/        transformer gemma4 moe router experts information_retrieval evidence mtp attention kv_cache optim
 modules/data/         dataset (pretrain) sft_dataset evidence_dataset chat abstention biographies chains entity_swap store
 modules/runtime/      run lifecycle; MUST NOT import torch.nn / TE / modules.model (its tests are GPU-free)
 tests/                tracked plain assert scripts
@@ -480,7 +489,7 @@ plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_toke
 `test_prepare_evidence_heldout`, `test_heldout_sources`, `test_entity_swap`, `test_entity_frequency`,
 `test_counterfactual_condition`, `test_biographies`, `test_prepare_injection`, `test_closed_book_rank`,
 `test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`,
-`test_evidence_contrastive`. `TINY_LLM_CONFIG=path.yaml`
+`test_evidence_contrastive`, `test_muon_optimizer`. `TINY_LLM_CONFIG=path.yaml`
 swaps the config yaml for every script (the checkpoint still decides shape and mode on load, so a
 micro checkpoint under the default yaml fails the strict load, as it should).
 
@@ -491,7 +500,14 @@ Tables in [configuration.md](docs/configuration.md).
 - `TrainingConfig` holds **every loss weight** (`lambda_mtp`, `aux_loss_weight`,
   `evidence_selection_weight`, `evidence_contrastive_weight` + `evidence_contrastive_temperature`,
   `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
-  `loop_count_sampling`). `total_steps = target_tokens // (batch * seq * grad_accum)`.
+  `loop_count_sampling`) and the `optimizer` choice (`adamw`, every run before 2026-10-18, or
+  `muon`: `modules/model/optim.py`, Muon on the hidden 2D matrices by the name rule `muon_kind`
+  with Nesterov 0.95, five Newton-Schulz steps in bf16 and the update scaled to AdamW's RMS so
+  `lr` and `weight_decay` carry over; tables, heads, the router, scalars, vectors and the
+  zero-init matrices stay on AdamW with `torch.optim.AdamW`'s arithmetic and state keys, so
+  `apply_ir_refresh` still finds `exp_avg`; fused `gate_up` weights are orthogonalized as two
+  halves; a checkpoint resumes only under its own optimizer, the group layout differs).
+  `total_steps = target_tokens // (batch * seq * grad_accum)`.
   `loop_ce_weights` length is asserted against `n_loops` at import.
 - `RepairConfig` / `IRConfig` / `EvidenceConfig` subclass `SFTConfig` and read only the keys their
   block names; the rest inherits. Never duplicate a shared number. No loss weights here.

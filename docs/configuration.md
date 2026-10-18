@@ -62,6 +62,7 @@ scale differently.
 | `lr` | 4e-4 | Peak learning rate (cosine floor = `0.1x`) |
 | `weight_decay` | 0.02 | AdamW weight decay. Applied only to tensors with `ndim >= 2` — norms/biases/gates are excluded because their zero is a degenerate state, not a regularization preference |
 | `grad_clip` | 1.0 | Gradient-norm clip (applied on real update steps only) |
+| `optimizer` | `adamw` | `adamw` or `muon` (`modules/model/optim.py`). `muon` steps the hidden 2D matrices (attention, MLPs, experts, the selector's projections, the store adapters, the PLE projections) with Muon: Nesterov momentum 0.95, five Newton-Schulz steps in bf16, the update scaled by `0.2 sqrt(max(m, n))` to AdamW's RMS so `lr` and `weight_decay` carry over; tables, heads, the router, scalars, vectors and the zero-init matrices stay on AdamW. Read by both trainers. A checkpoint resumes only under the optimizer it was saved with (the group layout differs) |
 | `num_epochs` | 1 | Safety net on the outer loop only. The real stop condition is the phase's token target |
 | `lambda_mtp` | 0.1 | Weight on each auxiliary MTP loss |
 | `aux_loss_weight` | 0.01 | Weight on the MoE load-balancing loss |

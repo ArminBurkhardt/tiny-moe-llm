@@ -17,10 +17,14 @@ operational side of a real run — starting, stopping, monitoring, recovering �
 
 1. Load the tokenizer from `utils.TOKENIZER_DIR` and build the mmap `Dataset` for the selected phase
 2. Build `TinyMoETransformer` from `ModelConfig.Params`, cast to BF16, `.train()`
-3. Optimizer `AdamW` over **two param groups**: weight decay applies only to tensors with
+3. Optimizer over **two param groups**: weight decay applies only to tensors with
    `ndim >= 2` — norms, biases and gates are excluded because their zero is a degenerate state
    (`loop_scale` decayed to 0 is the loop switched off). The undecayed group is stepped through
-   fp32 masters. LR schedule = **linear warmup → cosine decay** to `0.1 * lr`
+   fp32 masters. `training.optimizer` picks `adamw` (`torch.optim.AdamW`, every run before
+   2026-10-18) or `muon` (`modules/model/optim.MuonAdamW`: the hidden 2D matrices take Muon's
+   orthogonalized, RMS-matched update at the same lr and weight decay; tables, heads, the router,
+   the zero-init matrices and everything of ndim 1 or less keep AdamW's arithmetic). LR schedule =
+   **linear warmup → cosine decay** to `0.1 * lr`
 4. Clean up stale files, then resume from the newest checkpoint that actually **loads**
 5. Verify the resume against `run_state.json`, aborting with exit 30 if this process came back
    materially behind where the last one got to

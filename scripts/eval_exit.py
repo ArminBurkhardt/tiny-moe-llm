@@ -148,6 +148,33 @@ def paired_gains(ce: torch.Tensor, clusters: Optional[torch.Tensor] = None) -> d
     return {"consecutive": consecutive, "first_to_last": first_to_last}
 
 
+def pair_stats(ce_a: torch.Tensor, ce_b: torch.Tensor, clusters: Optional[torch.Tensor] = None) -> dict:
+    """Paired per token CE of one checkpoint against a twin, exit by exit, on the same tokens.
+
+    The twin read (an arm against the run it changes one thing from): the difference is taken per
+    token, so the document mix and the token count cancel and only the models differ. Positive
+    means the twin ``b`` is worse (its CE is higher).
+
+    Args:
+        ce_a: ``[T, N]`` per token cross entropy of the first checkpoint at each exit.
+        ce_b: ``[T, N]`` the twin's, on the same tokens in the same order.
+        clusters: ``[N]`` cluster ids (one per document); None reads iid only.
+
+    Returns:
+        ``{"per_exit": [{"exit": 1, "ce_a", "ce_b", mean, se_iid, se_cluster, se, z, clusters},
+        ...]}`` with ``mean = ce_b - ce_a`` averaged over tokens.
+    """
+    assert ce_a.shape == ce_b.shape, (
+        f"the two reads cover different tokens ({tuple(ce_a.shape)} against {tuple(ce_b.shape)}): "
+        f"the pair must share the split, the batch size and the batch count")
+    ce_a, ce_b = ce_a.double(), ce_b.double()
+    per_exit = []
+    for t in range(ce_a.size(0)):
+        per_exit.append({"exit": t + 1, "ce_a": _f(ce_a[t].mean()), "ce_b": _f(ce_b[t].mean()),
+                         **_paired(ce_b[t] - ce_a[t], clusters)})
+    return {"per_exit": per_exit}
+
+
 def oracle_stats(ce: torch.Tensor) -> dict:
     """Per token minimum over exits, argmin shares and headroom over the last exit.
 
@@ -510,6 +537,8 @@ def main():
     parser.add_argument("--thresholds", default="0.5,0.7,0.9,0.99")
     parser.add_argument("--json-out", default=None)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--pair", default=None,
+                        help="a twin checkpoint read on the same tokens: paired per token CE per exit")
     args = parser.parse_args()
 
     from config import SFTConfig
@@ -538,11 +567,27 @@ def main():
 
     report = analyze(ce, p_max, correct, _floats(args.betas), _floats(args.thresholds), clusters)
     print_report(report, f"{os.path.basename(args.checkpoint)} {args.split}")
+    pair = None
+    if args.pair:
+        del model
+        torch.cuda.empty_cache()
+        pair_path = args.pair if os.path.isabs(args.pair) else os.path.join(BASE_DIR, args.pair)
+        twin = load_model(pair_path, args.device)
+        ce_b, p_max_b, correct_b, clusters_b = collect_exits(twin, dataset, args.device,
+                                                             tokenizer.pad_token_id, args.max_batches)
+        assert clusters_b is None or torch.equal(clusters, clusters_b), "the twin read other documents"
+        pair = pair_stats(ce, ce_b, clusters)
+        print(f"=== paired against {os.path.basename(args.pair)}: twin CE minus this CE per token, "
+              f"per exit (mean, se, z; positive means the twin is worse) ===")
+        for row in pair["per_exit"]:
+            z = "n/a" if row["z"] is None else f"{row['z']:+.1f}"
+            print(f"  exit {row['exit']}: this {row['ce_a']:.4f}  twin {row['ce_b']:.4f}  "
+                  f"diff {row['mean']:+.4f}  se {row['se']:.4f}  z {z}")
     if args.json_out:
         out = args.json_out if os.path.isabs(args.json_out) else os.path.join(BASE_DIR, args.json_out)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w") as f:
-            json.dump({"flags": vars(args), "report": report}, f)
+            json.dump({"flags": vars(args), "report": report, "pair": pair}, f)
         logger.info(f"wrote {out}")
 
 
