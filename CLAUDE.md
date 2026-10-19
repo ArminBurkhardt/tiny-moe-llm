@@ -96,8 +96,13 @@ night, the instrument with the power the micro leak read lacks) or Muon out of t
 spec.** Every save of the chain continuation is read (2026-10-19, the per-save table in its
 record): 1-hop 0.82 to 0.99 in a smooth climb, every composition cell at chance at all eleven
 reads, the paired held-out Delta within one sigma throughout; no transition anywhere inside the
-epoch. **R8 built 2026-10-19 (loss-free balancing, the Config bullet) and its micro arm
-launched** (`launch_lossfree.sh`, arm (a) recipe against arm (a), about 85 minutes plus reads).
+epoch. **R8 (loss-free balancing, the Config bullet) run and read 2026-10-19
+([lossfree_micro.md](docs/measurements/lossfree_micro.md)): loss and storage pass, the load
+comparison unread.** Held-out CE 3.9055 against arm (a)'s 3.9037 (paired at exit 3 -0.0055,
+z -1.8, inside the 0.029 seed spread), storage inside the two AdamW seeds cell for cell, MLP
+load max over mean 1.03 to 1.05 per pass; the logged aux value saturates in bf16 (hard counts
+stop at 256) and reads the batch, so arm (a)'s aux term was a floor, not a balancer. Decision
+pending (the user): loss-free into the real-run spec, or aux stays.
 Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
@@ -280,7 +285,9 @@ asks (decided 2026-10-11); a new session reads the file.
      ckpts/inject/launch_lossfree.sh` on the arm (a) recipe from `seed_micro.pt` against
      `ckpts/evidence_inject_full`, run directory `ckpts/evidence_lossfree_full`, reads
      `ckpts/inject/lossfree_full_{TAG}_{rank_none,exit}`; bar: CE not worse beyond the paired
-     sigma and the seed spread, load at least as even), rung R9
+     sigma and the seed spread, load at least as even; **run and read 2026-10-19**: loss and
+     storage pass, MLP load even by its own field, the comparison unread as the logged aux
+     saturates in bf16; the real-run spec choice is the user's), rung R9
      (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
      distillation, RL past the pass@8 gate with credit over passes, depth record and routing
