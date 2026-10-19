@@ -29,6 +29,8 @@ print(json.dumps({
     "evidence_contrastive_weight": TrainingConfig.evidence_contrastive_weight,
     "evidence_contrastive_temperature": TrainingConfig.evidence_contrastive_temperature,
     "optimizer": TrainingConfig.optimizer,
+    "moe_balancing": TrainingConfig.moe_balancing,
+    "moe_balance_bias_rate": TrainingConfig.moe_balance_bias_rate,
     "target_tokens": TrainingConfig.target_tokens,
     "sft_seq_length": SFTConfig.Seq_length,
     "sft_data_dir": SFTConfig.data_dir,
@@ -73,6 +75,7 @@ def main():
     assert micro["evidence_contrastive_weight"] == 0.0
     assert micro["evidence_contrastive_temperature"] == 0.07
     assert micro["optimizer"] == "adamw"
+    assert micro["moe_balancing"] == "aux" and micro["moe_balance_bias_rate"] == 0.001
     assert micro["sft_seq_length"] == 1024 and micro["sft_data_dir"] == "data/prepared_inject"
     ev = micro["evidence"]
     assert ev["train_split"] == "inject_full_train" and ev["val_split"] == "inject_val"
@@ -107,6 +110,8 @@ def main():
     assert default["evidence_contrastive_weight"] == raw["training"]["evidence_contrastive_weight"]
     assert default["evidence_contrastive_temperature"] == raw["training"]["evidence_contrastive_temperature"]
     assert default["optimizer"] == raw["training"]["optimizer"] == "adamw"
+    assert default["moe_balancing"] == raw["training"]["moe_balancing"] == "aux"
+    assert default["moe_balance_bias_rate"] == raw["training"]["moe_balance_bias_rate"] == 0.001
     assert default != micro and not default["model_imported"]
     print("2. unset: every value is config.yaml's                                     PASS")
 

@@ -170,6 +170,34 @@ NEUTRAL_LOOP_KEYS = (
 # marker) leaves the freshly built zero in place. Resume paths use plain load_state_dict and stay
 # strict, so a run cannot silently change mode across a restart.
 READER_MODE_KEYS = ("moe.evidence_reader_rotary_off", "moe.evidence_reader_kv")
+# the loss-free balancing bias on the router's selection. Zero IS the unbiased router every
+# checkpoint before 2026-10-19 routed with, so an absent buffer loads as exactly that model; a
+# checkpoint that carries one routes with it from the load on, in any training mode.
+BALANCE_KEYS = ("moe.balance_bias",)
+
+
+def with_balance_default(model, state_dict):
+    """The state dict with the balance bias filled from the model when a checkpoint lacks it.
+
+    For the strict resume paths: a run saved before the buffer existed resumes as the unbiased
+    router it was, which is the one tolerance those paths grant (``load_model_state`` grants
+    several; a resume stays strict on every learned tensor).
+
+    Args:
+        model: the model about to load ``state_dict``.
+        state_dict: the checkpoint's model state.
+
+    Returns:
+        ``state_dict`` itself when it carries the buffer, else a copy with the model's own zeros.
+    """
+    own = model.state_dict()
+    missing = [k for k in own if k.endswith(BALANCE_KEYS) and k not in state_dict]
+    if not missing:
+        return state_dict
+    state = dict(state_dict)
+    for key in missing:
+        state[key] = own[key]
+    return state
 
 
 def load_model_state(model, state_dict):
@@ -189,7 +217,7 @@ def load_model_state(model, state_dict):
     state = dict(state_dict)
     own = model.state_dict()
     for key in own:
-        if key.endswith(IR_TEMPERATURE_KEYS + NEUTRAL_LOOP_KEYS + READER_MODE_KEYS) and key not in state:
+        if key.endswith(IR_TEMPERATURE_KEYS + NEUTRAL_LOOP_KEYS + READER_MODE_KEYS + BALANCE_KEYS) and key not in state:
             state[key] = own[key]
     model.load_state_dict(state)
     return model
@@ -218,7 +246,7 @@ def load_checkpoint(model, optimizer, scheduler, path):
     # keeps modules.model out of its own import time
     from modules.model.optim import check_resume_kind
     check_resume_kind(optimizer, checkpoint["optimizer_state_dict"], os.path.basename(path))
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(with_balance_default(model, checkpoint["model_state_dict"]))
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     epoch = checkpoint["epoch"]

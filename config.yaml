@@ -82,6 +82,8 @@ training:
   num_epochs: 1 # was 10 -- training now stops at target_tokens (PLAN.md Step 6), not a fixed epoch count
   lambda_mtp: 0.1
   aux_loss_weight: 0.01 # load balancing loss coefficient
+  moe_balancing: aux         # aux | loss_free (a per pass selection bias on the MLP slots moved by the sign of the load error, no aux term); aux is every run before 2026-10-19
+  moe_balance_bias_rate: 0.001
   evidence_selection_weight: 0.1 # coefficient on the supervised selection loss (BCE between the
                                  # selector's per chunk external read share and the corpus's gold
                                  # flag, see information_retrieval.evidence_selection_loss). Only a

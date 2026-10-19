@@ -93,7 +93,12 @@ z 2.6, tier 1000 in distribution) while worse by the sign (1.6x at tier 1000 and
 early and more at every tier above 1, far outside the seed spread, the wrong direction for the
 goal. Decision pending (the user): the pilot-shape Muon arm P (the row's next step, one
 night, the instrument with the power the micro leak read lacks) or Muon out of the real-run
-spec.** Next on the GPU: the eight unread chain saves (`read_chain_saves.sh`). Intermediate pilot saves deleted
+spec.** Every save of the chain continuation is read (2026-10-19, the per-save table in its
+record): 1-hop 0.82 to 0.99 in a smooth climb, every composition cell at chance at all eleven
+reads, the paired held-out Delta within one sigma throughout; no transition anywhere inside the
+epoch. **R8 built 2026-10-19 (loss-free balancing, the Config bullet) and its micro arm
+launched** (`launch_lossfree.sh`, arm (a) recipe against arm (a), about 85 minutes plus reads).
+Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
 The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
@@ -270,7 +275,12 @@ asks (decided 2026-10-11); a new session reads the file.
      pass, the leak bar passes by the letter and is worse by the sign, storage twice as early
      on arm (a); the pilot-shape arm is the user's call. A checkpoint resumes only under its
      own optimizer.
-  4. Proposed 2026-10-12: rung R8 (loss-free MoE balancing against the aux loss, micro), rung R9
+  4. Proposed 2026-10-12: rung R8 (loss-free MoE balancing against the aux loss, micro; **built
+     2026-10-19**: `moe_balancing: loss_free` in the Config bullet below, arm `bash
+     ckpts/inject/launch_lossfree.sh` on the arm (a) recipe from `seed_micro.pt` against
+     `ckpts/evidence_inject_full`, run directory `ckpts/evidence_lossfree_full`, reads
+     `ckpts/inject/lossfree_full_{TAG}_{rank_none,exit}`; bar: CE not worse beyond the paired
+     sigma and the seed spread, load at least as even), rung R9
      (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
      distillation, RL past the pass@8 gate with credit over passes, depth record and routing
@@ -378,9 +388,17 @@ asks (decided 2026-10-11); a new session reads the file.
 
 ## Subagents
 
-- Sonnet only. Every subagent runs caveman full or above (`/caveman:caveman full`, `ultra` for a
-  pure lookup); say so in the spawn prompt, the mode is not inherited. Caveman is for the report
-  only: code, comments and docs are plain English in the repo's style.
+- **Delegate the routine work to Opus subagents** (user request 2026-10-19, to keep the main
+  model's usage down): log and JSON extraction, measurement notes and tables, the plan-file and
+  design-page mirroring of a result, launcher and config files, and code builds against a
+  written spec. The main thread keeps the decisions, the final reading of a result, the launches
+  under a watch and the handovers. Detached reviews stay on Sonnet (below). Every subagent runs
+  caveman full or above (`/caveman:caveman full`, `ultra` for a pure lookup); say so in the
+  spawn prompt, the mode is not inherited. Caveman is for the report only: code, comments and
+  docs are plain English in the repo's style.
+- **Watches wake the main thread once per event**, so a training watch filters to evals, saves,
+  failures, the trainer's exit and the reads, never the per-step or per-thousand-step lines
+  (user request 2026-10-19); the rate is checked once after launch and on a stall.
 - Subagents share one checkout and cannot coordinate, so they never run git that changes the
   working tree or index (`stash`, `reset`, `checkout`, `restore`, `switch`, `clean`, `add`,
   `commit`, ...). Read-only git is fine; baselines come from `git show <rev>:<path>`. The main
@@ -513,7 +531,8 @@ plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_toke
 `test_prepare_evidence_heldout`, `test_heldout_sources`, `test_entity_swap`, `test_entity_frequency`,
 `test_counterfactual_condition`, `test_biographies`, `test_prepare_injection`, `test_closed_book_rank`,
 `test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`,
-`test_evidence_contrastive`, `test_muon_optimizer`. `TINY_LLM_CONFIG=path.yaml`
+`test_evidence_contrastive`, `test_muon_optimizer` (`test_loss_free_balancing` needs the GPU).
+`TINY_LLM_CONFIG=path.yaml`
 swaps the config yaml for every script (the checkpoint still decides shape and mode on load, so a
 micro checkpoint under the default yaml fails the strict load, as it should).
 
@@ -533,7 +552,20 @@ Tables in [configuration.md](docs/configuration.md).
   halves; the momentum buffer stays fp32 across a bf16 resume; a checkpoint resumes only under
   its own optimizer, `check_resume_kind` names both kinds before `load_state_dict`; the step
   loops per tensor with no foreach batching, so time a Muon step at the pilot shape before
-  relying on it there, reviewed 2026-10-18).
+  relying on it there, reviewed 2026-10-18) and the `moe_balancing` choice (`aux`, every run
+  before 2026-10-19: `aux_loss_weight` times the router's balancing loss; or `loss_free`: no aux
+  term, a per-pass selection bias `moe.balance_bias` `[n_loops, num_experts]` on the MLP slots
+  moved after each optimizer step by `moe_balance_bias_rate` times the sign of the load error,
+  centred over the MLP slots so the update is zero sum and the MLP against dense split stays the
+  router's (reviewed 2026-10-19: raw signs under a skewed load drift every MLP bias up against
+  the attention and IR slots, whose bias is pinned at zero), `LoopMixtureOfExperts.update_balance_bias`;
+  the bias is added to the routing probabilities for the top-k selection only, the weights stay
+  the unbiased probabilities, zero is exactly the old router and an absent buffer loads as zero
+  through `BALANCE_KEYS` on every load path (the strict resume paths grant this one tolerance
+  through `with_balance_default`); the buffer follows the model's bf16 cast, so the update runs
+  on an fp32 shadow; counts accumulate on device across micro steps, a pass a sampled depth
+  skipped is left alone; `load max/mean` and `dense share` per pass in the step line;
+  `tests/test_loss_free_balancing.py`).
   `total_steps = target_tokens // (batch * seq * grad_accum)`.
   `loop_ce_weights` length is asserted against `n_loops` at import.
 - `RepairConfig` / `IRConfig` / `EvidenceConfig` subclass `SFTConfig` and read only the keys their
@@ -576,7 +608,8 @@ Constraints:
   `evidence_query_bias` by name) from tensor presence. `load_model_state` is strict except
   `IR_TEMPERATURE_KEYS` and `NEUTRAL_LOOP_KEYS` (whose inits are the old behaviour) and
   `READER_MODE_KEYS` (markers with no learned value).
-  Resume paths (`utils.load_checkpoint`, `sft.load_sft_checkpoint`) are fully strict.
+  Resume paths (`utils.load_checkpoint`, `sft.load_sft_checkpoint`) are strict on every learned
+  tensor; their one tolerance is `moe.balance_bias` (zero, `with_balance_default`).
   `evidence_encoder` always comes from the yaml.
 - Hardcoded: `NUM_DATA_WORKERS=4`, `LOG_INTERVAL` 20 (pretrain) / 10 (sft), expert heads 16/4,
   `rope_theta`, `CE_CHUNK_SIZE=8192`, `ROUTER_NOISE_SCALE=0.3`, `MAX_CHUNKS_PER_SEGMENT=256`.

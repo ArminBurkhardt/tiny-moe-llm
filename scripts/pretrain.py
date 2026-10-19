@@ -243,7 +243,10 @@ def train_step(
             )
             loss, loss_ce, metrics = out if collect_metrics else (out[0], out[1], None)
 
-            loss = loss + TrainingConfig.aux_loss_weight * aux_loss
+            # under loss-free balancing the aux loss is logged, not trained on: the selection
+            # bias moved after the optimizer step below does the balancing instead
+            if TrainingConfig.moe_balancing == "aux":
+                loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 
             # the selector's only supervision toward relevance. Read off the forward that just ran
             # rather than recomputed: the IR module keeps this recurrence's per (token, chunk) read
@@ -343,6 +346,10 @@ def train_step(
                 if no_decay_master_pairs is not None:
                     sync_master_grads_(no_decay_master_pairs)
             optimizer.step()
+            if accelerator.sync_gradients and TrainingConfig.moe_balancing == "loss_free":
+                # once per real update, from the hard counts the micro steps since the last one
+                # accumulated; on device, no sync
+                unwrapped.moe.update_balance_bias(TrainingConfig.moe_balance_bias_rate)
             if accelerator.sync_gradients and no_decay_master_pairs is not None:
                 sync_master_values_(no_decay_master_pairs)
                 # the bf16 no_decay params sit in NO optimizer param group (only their fp32 masters
@@ -526,8 +533,9 @@ def dry_run(model: TinyMoETransformer, device="cuda", dtype=BF16, config=ModelCo
             loop_ce_weights=TrainingConfig.loop_ce_weights,
             loop_ce_subsample=TrainingConfig.loop_ce_subsample,
         )
-        
-        loss = loss + TrainingConfig.aux_loss_weight * aux_loss
+
+        if TrainingConfig.moe_balancing == "aux":
+            loss = loss + TrainingConfig.aux_loss_weight * aux_loss
 
         loss.backward()
         model.zero_grad(set_to_none=True)
@@ -736,6 +744,11 @@ def pretrain(phase=None):
         model, optimizer, dataloader
     )
     unwrapped_model = accelerator.unwrap_model(model)
+    unwrapped_model.moe.set_balance_tracking(TrainingConfig.moe_balancing == "loss_free")
+    logger.info(f"moe balancing: {TrainingConfig.moe_balancing}" + (
+        f" (bias rate {TrainingConfig.moe_balance_bias_rate})"
+        if TrainingConfig.moe_balancing == "loss_free" else f" (weight {TrainingConfig.aux_loss_weight})"
+    ))
 
     timer = time.time()
     last_token_count = unwrapped_model._token_tracker.sync()
@@ -983,6 +996,14 @@ def pretrain(phase=None):
                         + ", ".join(f"{e:.4f}" for e in ir_entropy) + "]"
                         if ir_entropy else ""
                     )
+                    # per pass, the most loaded MLP expert over the mean (1.0 even); only under
+                    # loss-free balancing, where the aux loss is a read and not the lever
+                    balance, dense_share = unwrapped_model.moe.balance_load_stats()
+                    if balance:
+                        ir_entropy_str += (
+                            " | load max/mean: [" + ", ".join(f"{r:.2f}" for r in balance) + "]"
+                            + " | dense share: [" + ", ".join(f"{d:.3f}" for d in dense_share) + "]"
+                        )
                     p_max_val = metrics["p_max"].item() if metrics["p_max"] is not None else float("nan")
                     top1_val = metrics["top1_acc"].item() if metrics["top1_acc"] is not None else float("nan")
 

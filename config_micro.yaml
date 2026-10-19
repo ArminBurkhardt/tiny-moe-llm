@@ -36,6 +36,8 @@ training:                    # loss weights, read by train_step for every profil
   num_epochs: 1
   lambda_mtp: 0.1
   aux_loss_weight: 0.01
+  moe_balancing: aux         # aux | loss_free (a per pass selection bias on the MLP slots moved by the sign of the load error, no aux term); aux is every run before 2026-10-19
+  moe_balance_bias_rate: 0.001
   evidence_selection_weight: 0.1
   groundedness_weight: 0.0
   evidence_contrastive_weight: 0.0   # the retriever's in-batch InfoNCE; 0 is the objective before 2026-10-17

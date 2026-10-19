@@ -83,8 +83,22 @@ rest after the retriever micro arm, which has the GPU next:
 | save | 1-hop | 2-hop (0.185) | 3-hop (0.206) | held out (0.191) | 4-hop (0.210) | Delta |
 |---|---|---|---|---|---|---|
 | 10M | 0.819 | 0.202 | 0.199 | 0.180 | 0.202 | -0.007 +- 0.006 |
+| 20M | 0.911 | 0.190 | 0.195 | 0.204 | 0.211 | +0.002 +- 0.006 |
+| 30M | 0.932 | 0.185 | 0.194 | 0.196 | 0.214 | +0.005 +- 0.007 |
+| 40M | 0.951 | 0.199 | 0.193 | 0.205 | 0.207 | +0.003 +- 0.007 |
 | 50M | 0.966 | 0.180 | 0.217 | 0.211 (z 2.3) | 0.201 | +0.002 +- 0.007 |
+| 60M | 0.977 | 0.192 | 0.192 | 0.206 | 0.203 | +0.002 +- 0.008 |
+| 70M | 0.982 | 0.183 | 0.199 | 0.195 | 0.184 | +0.002 +- 0.008 |
+| 80M | 0.985 | 0.200 | 0.202 | 0.202 | 0.189 | -0.004 +- 0.008 |
+| 90M | 0.989 | 0.205 | 0.192 | 0.189 | 0.210 | -0.002 +- 0.009 |
+| 100M | 0.992 | 0.191 | 0.181 | 0.216 (z 2.7) | 0.225 | +0.003 +- 0.009 |
 | final | 0.991 | 0.185 | 0.180 | 0.201 | 0.215 | +0.004 +- 0.008 |
+
+Every save is read (the remaining eight on 2026-10-18 and 2026-10-19, about 5 minutes each).
+The 1-hop column saturates smoothly; the four composition columns stay at chance at all eleven
+reads (the two held-out cells at z 2.3 and 2.7 are what 44 chance cells produce, and the
+paired Delta next to them is within one sigma), so there is no transition anywhere inside the
+epoch, not only at its end.
 
 ## Verdict
 

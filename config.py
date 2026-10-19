@@ -97,6 +97,17 @@ class TrainingConfig:
     # keys rather than per profile.
     optimizer = str(Config["training"].get("optimizer", "adamw")).lower()
     assert optimizer in ("adamw", "muon"), f"optimizer ({optimizer}) must be adamw or muon"
+    # how the MoE load is balanced: "aux" adds aux_loss_weight times the router's balancing loss
+    # to the objective (every run before 2026-10-19); "loss_free" adds no such term and instead
+    # moves a per-pass selection bias on the MLP slots after each optimizer step by
+    # moe_balance_bias_rate times the sign of each expert's load error
+    # (LoopMixtureOfExperts.update_balance_bias). The balancing loss is still logged under both.
+    moe_balancing = str(Config["training"].get("moe_balancing", "aux")).lower()
+    assert moe_balancing in ("aux", "loss_free"), (
+        f"moe_balancing ({moe_balancing}) must be aux or loss_free"
+    )
+    moe_balance_bias_rate = float(Config["training"].get("moe_balance_bias_rate", 0.001))
+    assert moe_balance_bias_rate > 0.0, f"moe_balance_bias_rate ({moe_balance_bias_rate}) must be > 0"
     target_tokens = int(Config["training"]["target_tokens"])
     grad_accumulation_steps = int(Config["training"].get("grad_accumulation_steps", 1))
     total_steps = int((Config["training"]["target_tokens"] // (Config["training"]["batch_size"] * Config["training"]["seq_length"] * grad_accumulation_steps)))

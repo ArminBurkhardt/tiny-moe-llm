@@ -89,7 +89,7 @@ from scripts.eval_calibration import roc_auc
 # imported rather than restated, so the condition index -> name mapping used for validation and
 # training logs can never drift from what the corpus builder actually wrote into `.cond`
 from scripts.prepare_evidence_data import CONDITIONS, SOURCE_KEYS
-from utils import (BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, load_model_state,
+from utils import (BASE_DIR, BF16, HF_UPLOAD_REPO, TOKENIZER_DIR, get_hf_token, load_model_state, with_balance_default,
                    logger, model_params_for_state_dict)
 
 # the phase label baked into checkpoint filenames and the run-state sidecar. Distinct from
@@ -512,7 +512,7 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
             f"{checkpoint_dir} for {expected_phase} checkpoints only."
         )
     check_resume_kind(optimizer, checkpoint["optimizer_state_dict"], os.path.basename(path))
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(with_balance_default(model, checkpoint["model_state_dict"]))
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     sft_extra = checkpoint.get("sft", {}) or {}
@@ -1095,6 +1095,11 @@ def sft(args):
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
+    model.moe.set_balance_tracking(TrainingConfig.moe_balancing == "loss_free")
+    logger.info(f"moe balancing: {TrainingConfig.moe_balancing}" + (
+        f" (bias rate {TrainingConfig.moe_balance_bias_rate})"
+        if TrainingConfig.moe_balancing == "loss_free" else f" (weight {TrainingConfig.aux_loss_weight})"
+    ))
     # before the param groups are built, so the gate lands in none of them and gets no fp32 master
     frozen_gate = None
     if args.evidence and getattr(cfg, "freeze_evidence_gate", False):
@@ -1634,6 +1639,14 @@ def sft(args):
                     + ", ".join(f"{e:.4f}" for e in ir_entropy) + "] | "
                     if ir_entropy else ""
                 )
+                # per pass, the most loaded MLP expert over the mean (1.0 even); only under
+                # loss-free balancing, the same field pretrain.py logs
+                balance, dense_share = unwrapped_model.moe.balance_load_stats()
+                if balance:
+                    ir_entropy_str += (
+                        "load max/mean: [" + ", ".join(f"{r:.2f}" for r in balance) + "] | "
+                        + "dense share: [" + ", ".join(f"{d:.3f}" for d in dense_share) + "] | "
+                    )
                 if args.ir:
                     ir_module = unwrapped_model.moe.ir_modules[0]
                     # g_proj carries the migration's neutrality zero, so it is the tensor the whole

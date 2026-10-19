@@ -442,6 +442,23 @@ class LoopMixtureOfExperts(nn.Module):
         self.loop_router_bias = nn.Linear(loop_enc_dim, self.num_experts, bias=False)
         nn.init.zeros_(self.loop_router_bias.weight)
 
+        # loss-free balancing (arXiv 2408.15664): a per-pass, per-expert bias added to the routing
+        # probabilities for the top-k SELECTION only; the routing weights stay the unbiased
+        # probabilities. Moved by the trainer after each optimizer step by a fixed rate times the
+        # sign of each expert's load error, over the MLP slots only (the attention and IR experts
+        # run densely whatever the router picks). Zero is exactly the unbiased router, so every
+        # checkpoint written before the buffer existed loads as itself; it is part of the routing
+        # function once nonzero, hence persistent and always applied. The buffer follows the
+        # model's dtype (bf16 after the trainer's cast), which cannot hold 0.001 steps once the
+        # bias passes a few tenths, so the update runs on an fp32 shadow and the counts and the
+        # load EMA are fp32 attributes, lazily placed on device like the expert tracker's; none of
+        # the three is checkpoint state.
+        self.register_buffer("balance_bias", torch.zeros(n_loops, self.num_experts), persistent=True)
+        self._balance_bias_fp32 = None
+        self._balance_counts = None
+        self._balance_load = None
+        self.balance_tracking = False
+
         # re-presents the block's input to every loop (see loop_inject in the docstring). Same
         # zero-init neutrality as loop_router_bias above: it starts as an exact no-op, so a
         # checkpoint migrated to carry it scores identically to the one it came from. Attribute
@@ -600,9 +617,17 @@ class LoopMixtureOfExperts(nn.Module):
         expert_scores = F.softmax(expert_logits / temperature, dim=-1)
 
         # one topk, reused for both the aux loss and the selection (the aux loss only needs the
-        # indices, which the score normalization below does not change)
-        topk_scores, topk_indices = torch.topk(expert_scores, self.top_k, dim=-1) # [batch_size, seq_len, top_k], [batch_size, seq_len, top_k]
+        # indices, which the score normalization below does not change). The selection reads the
+        # probabilities plus the balance bias; the weights are gathered from the probabilities
+        # themselves. A zero bias is an exact no-op (adding zero is exact, and the gathered values
+        # are the topk values), so a run without balancing routes as it always did.
+        bias_row = min(int(loop_idx), self.balance_bias.size(0) - 1)
+        selection_scores = expert_scores + self.balance_bias[bias_row].to(expert_scores.dtype)
+        topk_indices = torch.topk(selection_scores, self.top_k, dim=-1).indices   # [batch_size, seq_len, top_k]
+        topk_scores = expert_scores.gather(-1, topk_indices)                       # [batch_size, seq_len, top_k]
         load_balancing_loss = compute_aux_loss(topk_indices, expert_scores, self.num_experts, token_mask=token_mask)
+        if self.balance_tracking and self.training:
+            self._count_balance_load(bias_row, topk_indices, token_mask)
 
         # normalize the topk scores
         topk_scores = topk_scores / torch.sum(topk_scores, dim=-1, keepdim=True)
@@ -923,6 +948,98 @@ class LoopMixtureOfExperts(nn.Module):
     def set_router_noise(self, noise_factor: float):
         """set the global multiplier on the router's exploration noise (annealed 1 -> 0 by the trainer over training). 0 disables the noise entirely."""
         self.router.noise_factor = noise_factor
+
+    def set_balance_tracking(self, enabled: bool):
+        """Turn the per-pass hard load counting on or off (loss-free balancing only).
+
+        Off, ``route`` does no bookkeeping and ``update_balance_bias`` has nothing to read. The
+        bias itself is applied either way, so a checkpoint carrying a nonzero bias routes with it
+        in any mode.
+
+        Args:
+            enabled: True while a trainer moves the bias after each optimizer step.
+        """
+        self.balance_tracking = bool(enabled)
+
+    def _count_balance_load(self, row: int, topk_indices: torch.Tensor, token_mask: torch.Tensor):
+        """Accumulate this routing call's hard counts into ``balance_counts[row]``, no host sync.
+
+        Every (token, slot) selection counts once; a padded token's slots count for nothing when
+        a mask is given. Under activation checkpointing the recompute pass would count every
+        expert a second time, which leaves the sign of every load error unchanged.
+        """
+        counts = self._balance_state(topk_indices.device)[1]
+        flat = topk_indices.reshape(-1)
+        if token_mask is None:
+            weight = torch.ones(flat.numel(), device=flat.device, dtype=counts.dtype)
+        else:
+            weight = (
+                token_mask.reshape(-1).to(counts.dtype)
+                .unsqueeze(-1).expand(-1, topk_indices.size(-1)).reshape(-1)
+            )
+        counts[row].scatter_add_(0, flat, weight)
+
+    def _balance_state(self, device):
+        """The fp32 shadow of the bias, the hard counts and the load EMA, created on first use.
+
+        The shadow starts from the buffer, so a resumed run continues from the saved bias (rounded
+        once to the buffer's dtype at the save, which is the only rounding the bias ever sees).
+        """
+        if self._balance_bias_fp32 is None or self._balance_bias_fp32.device != device:
+            self._balance_bias_fp32 = self.balance_bias.detach().to(device=device, dtype=torch.float32).clone()
+            self._balance_counts = torch.zeros_like(self._balance_bias_fp32)
+            self._balance_load = torch.zeros_like(self._balance_bias_fp32)
+        return self._balance_bias_fp32, self._balance_counts, self._balance_load
+
+    @torch.no_grad()
+    def update_balance_bias(self, rate: float):
+        """Move the balance bias one step from the counts gathered since the last call.
+
+        For every pass and every MLP slot, ``bias += rate * (sign(mean_load - load) - mean of
+        the signs)``, so an expert under the pass's mean MLP load gains bias and one over it
+        loses it (arXiv 2408.15664's update, with the error measured against the mean over the
+        routed slots alone). The signs are centred before they are applied: with a skewed load
+        more slots sit under the mean than over it, and the raw signs would push every MLP bias
+        up together against the attention and IR slots, whose bias stays at zero, until the
+        router stopped selecting those. Centred, the update moves load between MLP slots and
+        leaves the MLP against dense split to the router. A pass whose counts are all zero (a
+        shallower sampled depth did not run it) is left alone. The per-pass load fraction goes
+        into an EMA for the log line, then the counts reset. On device, no host sync.
+
+        Args:
+            rate: the fixed step on the bias per optimizer step (the paper's ``u``).
+        """
+        first = self.first_mlp_index
+        bias, counts, load = self._balance_state(self.balance_bias.device)
+        mlp = counts[:, first:]
+        ran = mlp.sum(dim=-1, keepdim=True) > 0
+        error = mlp.mean(dim=-1, keepdim=True) - mlp
+        step = torch.sign(error)
+        step = step - step.mean(dim=-1, keepdim=True)
+        bias[:, first:] += rate * step * ran.to(bias.dtype)
+        self.balance_bias.copy_(bias.to(self.balance_bias.dtype))
+        share = counts / counts.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        load.copy_(torch.where(ran, 0.9 * load + 0.1 * share, load))
+        counts.zero_()
+
+    def balance_load_stats(self) -> tuple[list[float], list[float]]:
+        """Per pass, the MLP load ratio and the dense slots' share of the selections.
+
+        The ratio is the most loaded MLP expert's share over the mean MLP share (1.0 is even);
+        the dense share is the fraction of (token, slot) selections that went to the attention
+        and IR slots, the number the centred update deliberately leaves to the router. Read off
+        the EMA ``update_balance_bias`` keeps; one host sync, for the log line only. Both empty
+        when tracking is off or nothing has been counted yet.
+        """
+        if not self.balance_tracking or self._balance_load is None:
+            return [], []
+        first = self.first_mlp_index
+        mlp = self._balance_load[:, first:]
+        mean = mlp.mean(dim=-1)
+        ratio = torch.where(mean > 0, mlp.max(dim=-1).values / mean.clamp_min(1e-12), torch.zeros_like(mean))
+        dense = self._balance_load[:, :first].sum(dim=-1)
+        ratio, dense = torch.stack([ratio, dense]).tolist()
+        return ratio, dense
 
     @property
     def ir_modules(self):
