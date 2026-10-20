@@ -51,7 +51,9 @@ Only the MLP experts are dispatched sparsely.
    be excluded (a mostly-padding batch reads a near-uniform routing signal on its pad rows and
    moved the aux loss 3x with row fill); `None` is bit-identical to the unmasked form. Both
    trainers pass `input_ids != pad` through `TinyMoETransformer.forward`'s `token_mask`, so
-   numbers from a run before that are not comparable to one after it.
+   numbers from a run before that are not comparable to one after it. The masked branch counts,
+   masks and reduces in fp32 since 2026-10-20: a bf16 count stops at 256, so every masked value
+   logged before then was a constant and the term balanced nothing.
 5. `top_k` selection → renormalize the selected weights to sum to 1. One `torch.topk` feeds both the
    aux loss and the selection.
 

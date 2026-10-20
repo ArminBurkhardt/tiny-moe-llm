@@ -1095,7 +1095,9 @@ def sft(args):
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
-    model.moe.set_balance_tracking(TrainingConfig.moe_balancing == "loss_free")
+    # counted in every mode so the step line reads the load under the aux term too; the rate
+    # train_step passes is zero outside loss-free, so the bias never moves there
+    model.moe.set_balance_tracking(True)
     logger.info(f"moe balancing: {TrainingConfig.moe_balancing}" + (
         f" (bias rate {TrainingConfig.moe_balance_bias_rate})"
         if TrainingConfig.moe_balancing == "loss_free" else f" (weight {TrainingConfig.aux_loss_weight})"
@@ -1639,8 +1641,8 @@ def sft(args):
                     + ", ".join(f"{e:.4f}" for e in ir_entropy) + "] | "
                     if ir_entropy else ""
                 )
-                # per pass, the most loaded MLP expert over the mean (1.0 even); only under
-                # loss-free balancing, the same field pretrain.py logs
+                # per pass, the most loaded MLP expert over the mean (1.0 even); counted in
+                # every balancing mode, the same field pretrain.py logs
                 balance, dense_share = unwrapped_model.moe.balance_load_stats()
                 if balance:
                     ir_entropy_str += (

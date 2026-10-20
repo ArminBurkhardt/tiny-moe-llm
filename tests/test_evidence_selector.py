@@ -232,6 +232,34 @@ def test_aux_loss_mask():
     print("13. token_mask=None stays bit-identical to today's numerics                      PASS")
 
 
+def test_aux_loss_mask_bf16_counts():
+    # bf16 router probabilities over a batch where every expert gets more than 256 picks: a count
+    # kept in the probabilities' dtype stops at 256 and the hard fraction reads uniform whatever
+    # the load, so the loss sits at a constant with no gradient toward balance
+    torch.manual_seed(0)
+    num_experts = 4
+    B, S, top_k = 8, 1024, 2
+    # three quarters of the picks on expert 0, the rest spread over the other three
+    skew = torch.rand(B, S, top_k, device=DEVICE)
+    indices = torch.where(skew < 0.75, 0, torch.randint(1, num_experts, (B, S, top_k), device=DEVICE))
+    probs = torch.full((B, S, num_experts), 0.25, device=DEVICE, dtype=torch.bfloat16)
+    mask = torch.ones(B, S, device=DEVICE)
+    counts = torch.bincount(indices.reshape(-1), minlength=num_experts)
+    assert (counts > 256).all(), f"fixture must put every expert past 256 picks, got {counts.tolist()}"
+
+    masked_loss = compute_aux_loss(indices, probs, num_experts, token_mask=mask)
+    reference = compute_aux_loss(indices, probs.float(), num_experts)
+    assert torch.allclose(masked_loss.float(), reference, atol=1e-3), (
+        f"masked aux loss under bf16 probabilities does not match the fp32 count: "
+        f"{masked_loss.item()} vs {reference.item()}"
+    )
+    assert masked_loss.item() > 0.99, (
+        f"aux loss under uniform probabilities must read num_experts * sum(f_i) / num_experts = 1, "
+        f"got {masked_loss.item()}: the hard counts saturated"
+    )
+    print(f"13b. bf16 router probabilities keep exact hard counts ({masked_loss.item():.4f})      PASS")
+
+
 MODEL_P = dict(
     vocab_size=512, max_seq_len=128, hidden_size=256, intermediate_size=512,
     head_dim=32, num_layers=2, num_heads=8, num_mlp_experts=8, num_attn_experts=1,
@@ -493,6 +521,7 @@ def main():
     test_chunk_mean_mass()
     test_reader_gate()
     test_aux_loss_mask()
+    test_aux_loss_mask_bf16_counts()
     test_selection_term_wiring()
     test_forward_token_mask()
     test_groundedness_wiring()

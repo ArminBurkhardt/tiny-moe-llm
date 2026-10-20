@@ -96,13 +96,21 @@ night, the instrument with the power the micro leak read lacks) or Muon out of t
 spec.** Every save of the chain continuation is read (2026-10-19, the per-save table in its
 record): 1-hop 0.82 to 0.99 in a smooth climb, every composition cell at chance at all eleven
 reads, the paired held-out Delta within one sigma throughout; no transition anywhere inside the
-epoch. **R8 (loss-free balancing, the Config bullet) run and read 2026-10-19
-([lossfree_micro.md](docs/measurements/lossfree_micro.md)): loss and storage pass, the load
-comparison unread.** Held-out CE 3.9055 against arm (a)'s 3.9037 (paired at exit 3 -0.0055,
+epoch. **R8 (loss-free balancing, the Config bullet) run and read 2026-10-19 and 2026-10-20
+([lossfree_micro.md](docs/measurements/lossfree_micro.md)): loss-free passes on all three
+bars.** Held-out CE 3.9055 against arm (a)'s 3.9037 (paired at exit 3 -0.0055,
 z -1.8, inside the 0.029 seed spread), storage inside the two AdamW seeds cell for cell, MLP
 load max over mean 1.03 to 1.05 per pass; the logged aux value saturates in bf16 (hard counts
-stop at 256) and reads the batch, so arm (a)'s aux term was a floor, not a balancer. Decision
-pending (the user): loss-free into the real-run spec, or aux stays.
+stop at 256) and reads the batch, so arm (a)'s aux term was a floor, not a balancer. Fixed
+2026-10-20 (fp32 counts in `compute_aux_loss`, `test_evidence_selector.py`); the comparison half
+of the load bar was read on an arm (a) rerun under the fixed term on 2026-10-20 (`bash
+ckpts/inject/launch_auxfix.sh`, `ckpts/evidence_auxfix_full`, `auxfix_full.log`, reads
+`ckpts/inject/auxfix_full_{TAG}_{rank_none,exit}` paired against arm (a)). **Loss-free is better
+on all three bars:** the working aux term ends at CE 3.9142 (paired -0.0076 at exit 3, z -2.3),
+puts 0.35 to 0.54 of the picks on the dense slots with the MLP load at 1.08 to 1.26, and stores
+the biographies more in distribution (tier 100 z 14.5 against arm (a), z 14.4 against the
+reseed, far outside the seed spread). Decision pending (the user): loss-free into the real-run
+spec (recommended in the record), or aux stays.
 Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
@@ -285,9 +293,10 @@ asks (decided 2026-10-11); a new session reads the file.
      ckpts/inject/launch_lossfree.sh` on the arm (a) recipe from `seed_micro.pt` against
      `ckpts/evidence_inject_full`, run directory `ckpts/evidence_lossfree_full`, reads
      `ckpts/inject/lossfree_full_{TAG}_{rank_none,exit}`; bar: CE not worse beyond the paired
-     sigma and the seed spread, load at least as even; **run and read 2026-10-19**: loss and
-     storage pass, MLP load even by its own field, the comparison unread as the logged aux
-     saturates in bf16; the real-run spec choice is the user's), rung R9
+     sigma and the seed spread, load at least as even; **run and read 2026-10-19 and
+     2026-10-20**: passes for loss-free on all three bars against the fixed aux term, which
+     stores more and balances the dense slots; the real-run spec choice is the user's,
+     loss-free recommended), rung R9
      (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
      distillation, RL past the pass@8 gate with credit over passes, depth record and routing
@@ -571,7 +580,9 @@ Tables in [configuration.md](docs/configuration.md).
   through `BALANCE_KEYS` on every load path (the strict resume paths grant this one tolerance
   through `with_balance_default`); the buffer follows the model's bf16 cast, so the update runs
   on an fp32 shadow; counts accumulate on device across micro steps, a pass a sampled depth
-  skipped is left alone; `load max/mean` and `dense share` per pass in the step line;
+  skipped is left alone; `load max/mean` and `dense share` per pass in the step line in every
+  balancing mode since 2026-10-20 (the counting is always on, the aux mode passes a zero rate so
+  the bias never moves there);
   `tests/test_loss_free_balancing.py`).
   `total_steps = target_tokens // (batch * seq * grad_accum)`.
   `loop_ce_weights` length is asserted against `n_loops` at import.
@@ -652,6 +663,9 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
 - Aux loss is on the router softmax, normalized by `loops_run`, one `topk` feeds loss and
   selection. Both trainers pass `token_mask = input_ids != pad` (`None` is bit-identical), so aux
   values before that are not comparable. Selection fraction is the signal, not mean weight.
+  The masked branch counts in fp32 since 2026-10-20: bf16 counts saturate at 256, so every aux
+  value logged on the mask path before that date is a constant, not a load read, and the aux
+  term of those runs balanced nothing.
 - Router noise is scaled by 0.3 and annealed to 0 over `noise_anneal_tokens`.
 - Trackers guard recompute double counting (`begin_forward(expected_updates)`), sample every 8th
   forward, never sync in `update()`. IR entropy is logged as `IR E/ln32` (1.0 = uniform).

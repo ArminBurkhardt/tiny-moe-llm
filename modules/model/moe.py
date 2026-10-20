@@ -143,8 +143,9 @@ class _ExpertTracking():
         # compute once (not inside a per expert loop)
         one_hot_mask = F.one_hot(topk_indices_flat, num_classes=n).any(dim=1)      # [T, n] bool
 
-        prob_updates = torch.zeros(n, device=device, dtype=topk_scores.dtype)
-        prob_updates.scatter_add_(0, topk_indices_flat.reshape(-1), topk_scores_flat.reshape(-1))
+        # fp32: a bf16 running sum stops absorbing adds a few hundred times smaller than itself
+        prob_updates = torch.zeros(n, device=device, dtype=torch.float32)
+        prob_updates.scatter_add_(0, topk_indices_flat.reshape(-1), topk_scores_flat.reshape(-1).float())
 
         post_skew_updates = (expert_scores_flat * one_hot_mask.to(expert_scores.dtype)).sum(dim=0)
         choices_updates = one_hot_mask.sum(dim=0).float()
@@ -950,14 +951,16 @@ class LoopMixtureOfExperts(nn.Module):
         self.router.noise_factor = noise_factor
 
     def set_balance_tracking(self, enabled: bool):
-        """Turn the per-pass hard load counting on or off (loss-free balancing only).
+        """Turn the per-pass hard load counting on or off.
 
-        Off, ``route`` does no bookkeeping and ``update_balance_bias`` has nothing to read. The
-        bias itself is applied either way, so a checkpoint carrying a nonzero bias routes with it
-        in any mode.
+        Off, ``route`` does no bookkeeping and ``update_balance_bias`` has nothing to read. Both
+        trainers turn it on in every balancing mode so the load log reads under the aux term
+        too; under that term they pass ``update_balance_bias`` a rate of zero, which folds the
+        counts into the load EMA and leaves the bias exactly where it is. The bias itself is
+        applied either way, so a checkpoint carrying a nonzero bias routes with it in any mode.
 
         Args:
-            enabled: True while a trainer moves the bias after each optimizer step.
+            enabled: True while a trainer reads the load after each optimizer step.
         """
         self.balance_tracking = bool(enabled)
 

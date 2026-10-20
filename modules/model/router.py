@@ -83,13 +83,15 @@ def compute_aux_loss(
     else:
         # each token contributes top_k (token, slot) events; every slot inherits its own token's
         # mask so a padded token's top_k selections do not count toward any expert's hard fraction
-        mask_flat = token_mask.reshape(-1).to(router_probs.dtype)                       # [T]
+        # fp32 on purpose: a bf16 count cannot step past 256, so counts in the router's dtype
+        # saturate on any real batch and the hard fraction reads uniform whatever the load
+        mask_flat = token_mask.reshape(-1).to(torch.float32)                             # [T]
         slot_weight = mask_flat.unsqueeze(-1).expand(-1, top_k).reshape(-1)              # [T * top_k]
-        hard_counts = torch.zeros(num_experts, device=indices.device, dtype=router_probs.dtype)
+        hard_counts = torch.zeros(num_experts, device=indices.device, dtype=torch.float32)
         hard_counts.scatter_add_(0, flat_indices, slot_weight)
         f_i = hard_counts / slot_weight.sum().clamp_min(1.0)
 
-        P_i = (router_probs.reshape(-1, num_experts) * mask_flat.unsqueeze(-1)).sum(dim=0)
+        P_i = (router_probs.reshape(-1, num_experts).float() * mask_flat.unsqueeze(-1)).sum(dim=0)
         P_i = P_i / mask_flat.sum().clamp_min(1.0)
 
     # Dot product optimization function minimizes when vectors are uniform

@@ -103,6 +103,18 @@ def main():
     moe.update_balance_bias(rate)
     assert abs(moe.balance_load_stats()[0][2] - 1.0) < 1e-6 and torch.all(bias[2] == 0)
     assert bias[1, first] < 0 and torch.all(bias[1, first + 1:] > 0) and abs(bias[1].sum().item()) < 1e-6
+    # a zero rate (the aux mode's call) reads the load into the EMA and resets the counts
+    # without moving the bias by a single bit
+    with torch.no_grad():
+        bias.zero_()
+        moe.balance_bias.zero_()
+        counts.zero_()
+        counts[0, first:] = 1.0
+        counts[0, first] = 50.0
+    before = moe.balance_bias.clone()
+    moe.update_balance_bias(0.0)
+    assert torch.equal(moe.balance_bias, before) and torch.all(bias == 0), "a zero rate moved the bias"
+    assert counts.sum() == 0 and moe.balance_load_stats()[0][0] > 1.0, "a zero rate must still read the load"
     print("3. masked counts, one centred rate step toward the under loaded MLP slots, reset  PASS")
 
     # 4. the round trip, the absent buffer and the fp32 shadow

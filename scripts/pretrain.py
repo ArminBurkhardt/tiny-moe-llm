@@ -346,10 +346,13 @@ def train_step(
                 if no_decay_master_pairs is not None:
                     sync_master_grads_(no_decay_master_pairs)
             optimizer.step()
-            if accelerator.sync_gradients and TrainingConfig.moe_balancing == "loss_free":
+            if accelerator.sync_gradients:
                 # once per real update, from the hard counts the micro steps since the last one
-                # accumulated; on device, no sync
-                unwrapped.moe.update_balance_bias(TrainingConfig.moe_balance_bias_rate)
+                # accumulated; on device, no sync. under the aux term the rate is zero, so the
+                # call only folds the counts into the load log and resets them
+                unwrapped.moe.update_balance_bias(
+                    TrainingConfig.moe_balance_bias_rate if TrainingConfig.moe_balancing == "loss_free" else 0.0
+                )
             if accelerator.sync_gradients and no_decay_master_pairs is not None:
                 sync_master_values_(no_decay_master_pairs)
                 # the bf16 no_decay params sit in NO optimizer param group (only their fp32 masters
@@ -744,7 +747,9 @@ def pretrain(phase=None):
         model, optimizer, dataloader
     )
     unwrapped_model = accelerator.unwrap_model(model)
-    unwrapped_model.moe.set_balance_tracking(TrainingConfig.moe_balancing == "loss_free")
+    # the hard load is counted in every mode so the log line reads it under the aux term too;
+    # only loss-free moves the bias (the rate is zero otherwise)
+    unwrapped_model.moe.set_balance_tracking(True)
     logger.info(f"moe balancing: {TrainingConfig.moe_balancing}" + (
         f" (bias rate {TrainingConfig.moe_balance_bias_rate})"
         if TrainingConfig.moe_balancing == "loss_free" else f" (weight {TrainingConfig.aux_loss_weight})"
@@ -996,8 +1001,8 @@ def pretrain(phase=None):
                         + ", ".join(f"{e:.4f}" for e in ir_entropy) + "]"
                         if ir_entropy else ""
                     )
-                    # per pass, the most loaded MLP expert over the mean (1.0 even); only under
-                    # loss-free balancing, where the aux loss is a read and not the lever
+                    # per pass, the most loaded MLP expert over the mean (1.0 even); counted in
+                    # every balancing mode, so the aux and loss-free runs read the same field
                     balance, dense_share = unwrapped_model.moe.balance_load_stats()
                     if balance:
                         ir_entropy_str += (
