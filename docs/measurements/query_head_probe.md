@@ -104,6 +104,8 @@ Recall of the gold chunk at loop 1, held-out folds, 8,715 questions over 274,212
 - A separate search tower that reads the trunk's detached states is capped the same way, since
   it sees the same states the probe's heads see. A working tower would be a small bge-style
   encoder over the prompt text, a retriever beside the model rather than the trunk searching.
-  The decision between building that and holding is the user's.
+  Decided 2026-10-21 (the user): the tower is held, bge keys the store and embeds the question
+  at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's
+  size (the two keys stay as the knob).
 - Not tested: a larger model (the cap may lift with width), later loops (loop 1 is the pass the
   store read uses), and heads wider than one hidden layer.

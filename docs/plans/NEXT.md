@@ -95,7 +95,8 @@ bar of the pilot's own noise (0.013), the load fields even, while store recall@5
 read 0.006 against arm P's final 0.004 and the port read lagged arm P's (content gain +0.43
 against +1.76 at step 2660). The term as built, with its gradient into the trunk, stays out of
 the real-run spec; next are an offline probe of the hidden state and one head-only micro arm
-(trunk gradient stopped, loop 1 only), with a separate search tower the other live direction.
+(trunk gradient stopped, loop 1 only), with a separate search tower the other direction (held
+2026-10-21).
 A research round on
 training the model's own retrieval without the language cost started the same day; its
 write-up is [review_2026-10-21_retriever.md](../review_2026-10-21_retriever.md): the term trains loops 2 and 3, which already hold the gold chunk, while the eval reads loop 1; the cheap arms are the term at loop 1 only, a stopped trunk gradient, bge query distillation and a fixed key bank of negatives, after an offline probe of whether the loop 1 state carries the question at all. The model-keyed variant (keys from the model's own encoder, Co-LMLM's) stays
@@ -109,8 +110,8 @@ bge at k5 at any position or pooling; the term's gain split between the head and
 (a head on the untouched trunk reaches about 0.025 at k5, on the term-trained trunk about 0.055,
 the model's own query 0.059), so the head-only arm reads what the head alone gets from an
 untouched trunk, and the trunk's share cost 0.30 nats at pilot shape; a tower on detached states is capped the same way, so a working tower would be a small
-bge-style encoder over the prompt text beside the model, the choice between that and holding the
-user's. **The head-only micro arm, read the same day ([infonce_micro.md](../measurements/infonce_micro.md), `bash
+bge-style encoder over the prompt text beside the model (held, decided 2026-10-21, below).
+**The head-only micro arm, read the same day ([infonce_micro.md](../measurements/infonce_micro.md), `bash
 ckpts/inject/launch_infonce_head.sh`, `config_micro_infonce_head_e3.yaml`: the `w25e3` recipe
 with `evidence_contrastive_loops: [0]` and `evidence_contrastive_trunk_grad: 0.0`, 104.46M
 tokens, log `infonce_head_e3.log`, read `infonce_head_e3_store_recall.{json,log}`), costs no
@@ -118,9 +119,11 @@ language and finds nothing:** held-out CE 4.3904 against `w0e3`'s 4.3809 (within
 eval, `w25e3` 0.05 to 0.08 behind) and store recall@5 / @20 0.003 / 0.007 at loop 1 against
 `w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), the probe's weakest row. The whole of `w25e3`'s
 search therefore needed the trunk to change, so training only the search head is closed at this
-size, and the choice between a separate search tower (a small bge-style encoder over the prompt
-text beside the model, no language cost) and holding (bge for serving, A4 untested, revisit at
-the real run's size) is the user's. **Built
+size. **Decided 2026-10-21 (the user): the separate search tower (a small bge-style encoder over
+the prompt text beside the model) is held, not built; bge keys the store and embeds the question
+at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size
+(`evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` stay as the knob); the
+real-run spec carries no retriever term.** **Built
 2026-10-18 while that pair ran: the optimizer rung's code** (R7 in the ladder: `MuonAdamW` in
 `modules/model/optim.py`, the `optimizer` key, `eval_exit.py --pair`, the test); its three micro
 arms (`ckpts/inject/launch_muon.sh`) ran after the InfoNCE pair (the partition at micro: 60
@@ -812,7 +815,7 @@ cannot see the chains.
 | depth | Drawn per step from {3: 0.7, 4: 0.2, 5: 0.1}; the first D minus 3 passes run under `no_grad` and are detached; minimum 3, so no pass is an exit. Inference 3, at most 4. |
 | loop tensors | `loop_scale` and `evidence_loop_scale` length 5, fresh `1/sqrt(5)`; `loop_inject` on; loop code clamped to the trained depth. |
 | selection supervision | Union over the passes in the gradient window: `u_c = 1 - prod(1 - p_hat[k, c])`, BCE against the gold flag. Never a target per hop and per loop. |
-| query training | InfoNCE on the in-model query against the bge key of the gold chunk, in-batch negatives plus store-mined hard negatives, same-document and near-duplicate negatives masked. Keys stay bge, so the index is never rebuilt; Atlas (Izacard et al. 2022) justifies query-side-only tuning against a fixed index. |
+| query training | InfoNCE on the in-model query against the bge key of the gold chunk, in-batch negatives plus store-mined hard negatives, same-document and near-duplicate negatives masked. Keys stay bge, so the index is never rebuilt; Atlas (Izacard et al. 2022) justifies query-side-only tuning against a fixed index. Decided 2026-10-21 (the user): the real-run spec carries no retriever term and no separate search tower (held, not built); bge keys the store and embeds the question at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size, with `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` kept in the code as the knob for that revisit ([infonce_micro.md](../measurements/infonce_micro.md), [query_head_probe.md](../measurements/query_head_probe.md)). |
 | token tables | One table, tied to the LM head and the MTP head through small adapters; no weight decay on it. The per-layer and router tables become projections of it, gated on the per-layer table zero-ablation on the seed (Phase 4b). G9 gates the head tie only. |
 | shape | Shape L: width 1024, 16 heads x 64, 4 KV heads; 8 prelude layers; looped core of 3 sublayers per pass with 8 MLP experts each, top 2; 2 coda layers. About 470M total, 300M active per token. Sublayer count and expert count are pilot arms. |
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
@@ -1612,8 +1615,11 @@ above are a different, live series).
   `evidence_contrastive_trunk_grad` (0.0 trains only the query head, 1.0 is bit-identical to
   before); the head-only micro arm (`launch_infonce_head.sh`, loop 1, trunk gradient 0) launched.
   The head-only arm read the same day: held-out CE 4.3904 against `w0e3`'s 4.3809, recall@5
-  0.003 against `w25e3`'s 0.059, so training only the search head is closed at this size; a
-  separate search tower or holding is the user's call.
+  0.003 against `w25e3`'s 0.059, so training only the search head is closed at this size.
+  Decided (the user): the separate search tower is held, not built; bge keys the store and
+  embeds the question at serving, A4 stays untested, the model's own retrieval is revisited at
+  the real run's size with `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad`
+  kept as the knob, and the real-run spec carries no retriever term.
 - 2026-10-20: the aux loss's masked branch fixed (`compute_aux_loss`): hard counts, mask and the
   probability reduction now run in fp32. In bf16 every slot's count saturated at 256, so on every
   masked aux-balanced run since the token mask (the R0b arms, both pilot arms, the Muon arms) the

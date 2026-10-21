@@ -164,7 +164,8 @@ the micro arms read 2.2 at 35M (one epoch) and 1.0 at 80M (three epochs, both he
 trunk stays large for longer. Consequence: the term as built does not enter the real-run spec.
 The live directions are the head-only term (trunk gradient stopped, loop 1 only) and a separate
 search tower, per [review_2026-10-21_retriever.md](../review_2026-10-21_retriever.md); an
-offline probe of the hidden state and one head-only micro arm are being built the same day.
+offline probe of the hidden state and one head-only micro arm are being built the same day
+(both read the same day; the tower held, the Decision below).
 
 ## Head-only arm (2026-10-21): the term on loop 1 with no gradient into the trunk
 
@@ -228,8 +229,9 @@ of `w25e3`'s 0.059 therefore needed the trunk to change, and that change cost 0.
 micro and 0.30 at pilot shape (arm PI). The "train only the search head" direction is closed at
 this size. What remains: a separate search tower (a small bge-style encoder over the prompt
 text beside the model, exactly zero language cost, a retriever beside the model rather than the
-trunk searching) or holding (bge for serving, A4 untested, revisit at the real run's size). The
-user's call.
+trunk searching) or holding. Decided 2026-10-21 (the user): the tower is held, bge keys the
+store and embeds the question at serving, A4 stays untested, and the model's own retrieval is
+revisited at the real run's size (the two keys stay as the knob).
 
 ## Decision
 
@@ -241,4 +243,9 @@ user's call.
 - Next: the offline probe of the hidden state, then the head-only micro arm.
 - The head-only arm, read 2026-10-21: zero language cost (4.3904 against `w0e3`'s 4.3809)
   and zero search (recall@5 0.003 against `w25e3`'s 0.059), so training only the search head
-  is closed at this size; a separate search tower or holding is the user's call.
+  is closed at this size.
+- Decided 2026-10-21 (the user): the separate search tower (a small bge-style encoder over the
+  prompt text beside the model) is held, not built; bge keys the store and embeds the question at
+  serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size.
+  `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` stay in the code as the knob
+  for that revisit; the real-run spec carries no retriever term.

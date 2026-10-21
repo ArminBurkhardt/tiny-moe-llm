@@ -90,7 +90,8 @@ arm P at steps 890 / 1770 / 2660 against the pilot's noise of 0.013, load fields
 recall@5 0.006 on the 75M save against arm P's 0.004, the port read lagging arm P's (content
 gain +0.43 against +1.76 at step 2660). The term as built (trunk gradient, every loop) stays out
 of the real-run spec; next are an offline probe of the hidden state and one head-only micro arm
-(trunk gradient stopped, loop 1 only), a separate search tower the other live direction. A
+(trunk gradient stopped, loop 1 only), a separate search tower the other direction (held
+2026-10-21). A
 research round on
 training the model's own retrieval without the language cost started the same day (write-up
 written the same day, [review_2026-10-21_retriever.md](docs/review_2026-10-21_retriever.md): term at loop 1 only, a stopped trunk gradient, bge query distillation and a key bank as the cheap arms, an offline probe of the hidden state first); the model-keyed retriever variant stays held.
@@ -102,8 +103,8 @@ bge at k5 at any position or pooling; the term's gain split between the head and
 (a head on the untouched trunk reaches about 0.025 at k5, on the term-trained trunk about 0.055,
 the model's own query 0.059), so the head-only arm reads what the head alone gets from an
 untouched trunk, and the trunk's share cost 0.30 nats at pilot shape; a tower on detached states is capped the same way, so a working tower would be a small
-bge-style encoder over the prompt text beside the model, the choice between that and holding the
-user's. **The head-only micro arm, read the same day ([infonce_micro.md](docs/measurements/infonce_micro.md), `bash
+bge-style encoder over the prompt text beside the model (held, decided 2026-10-21, below).
+**The head-only micro arm, read the same day ([infonce_micro.md](docs/measurements/infonce_micro.md), `bash
 ckpts/inject/launch_infonce_head.sh`, `config_micro_infonce_head_e3.yaml`: the `w25e3` recipe
 with `evidence_contrastive_loops: [0]` and `evidence_contrastive_trunk_grad: 0.0`, 104.46M
 tokens, log `infonce_head_e3.log`, read `infonce_head_e3_store_recall.{json,log}`), costs no
@@ -111,9 +112,11 @@ language and finds nothing:** held-out CE 4.3904 against `w0e3`'s 4.3809 (within
 eval, `w25e3` 0.05 to 0.08 behind) and store recall@5 / @20 0.003 / 0.007 at loop 1 against
 `w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), the probe's weakest row. The whole of `w25e3`'s
 search therefore needed the trunk to change, so training only the search head is closed at this
-size, and the choice between a separate search tower (a small bge-style encoder over the prompt
-text beside the model, no language cost) and holding (bge for serving, A4 untested, revisit at
-the real run's size) is the user's. **The Muon rung's three micro arms ran and were read 2026-10-18
+size. **Decided 2026-10-21 (the user): the separate search tower (a small bge-style encoder over
+the prompt text beside the model) is held, not built; bge keys the store and embeds the question
+at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size
+(`evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` stay as the knob); the
+real-run spec carries no retriever term.** **The Muon rung's three micro arms ran and were read 2026-10-18
 ([muon_micro.md](docs/measurements/muon_micro.md)): the loss bar passes (Muon 0.07 to 0.15
 nats below its AdamW twin on both recipes, z 16 to 25 paired per token, 2 to 4x the one seed
 pair's spread of 0.03), copying is no later (both warm-up arms switch between 50M and 100M,
