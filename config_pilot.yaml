@@ -46,6 +46,8 @@ training:                    # loss weights, read by train_step for every profil
   groundedness_weight: 0.1   # the seed carries the head (migrate_groundedness_head.py); gated on labels
   evidence_contrastive_weight: 0.0   # the retriever's in-batch InfoNCE; 0 is what both pilot arms trained under
   evidence_contrastive_temperature: 0.07
+  evidence_contrastive_loops: null   # zero-based loops the term averages over; null is every loop; only loop 0 runs at every sampled depth
+  evidence_contrastive_trunk_grad: 1.0   # share of the term's gradient reaching the trunk via the query; 0.0 trains the query head alone
   target_tokens: 1000000000
   warmup_steps: 0
   noise_anneal_tokens: 0

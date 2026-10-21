@@ -237,6 +237,40 @@ def evidence_contrastive_loss(
     return 0.5 * (loss + loss_k)
 
 
+class _ScaleGradient(torch.autograd.Function):
+    """identity in the forward, the incoming gradient times a constant in the backward."""
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
+def scale_gradient(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pass ``x`` through unchanged and scale the gradient that flows back into it.
+
+    The forward value is exactly ``x`` at every scale (no ``x * a + x.detach() * (1 - a)``
+    rounding), 1.0 returns ``x`` itself and 0.0 returns ``x.detach()``, so neither end adds a node.
+
+    Args:
+        x: any tensor.
+        scale: the share of the gradient that reaches ``x``, in [0, 1].
+
+    Returns:
+        ``x`` with its backward scaled by ``scale``.
+    """
+    scale = float(scale)
+    if scale == 1.0:
+        return x
+    if scale == 0.0:
+        return x.detach()
+    return _ScaleGradient.apply(x, scale)
+
+
 def _group_starts(group_ids: torch.Tensor, num_groups: int) -> torch.Tensor:
     """exclusive prefix sum of the per group counts of an already sorted ``group_ids``.
 
@@ -579,6 +613,12 @@ class InformationRetrievalModule(nn.Module):
         self.last_adapted_keys = None
         self.memory_query_by_loop = {}
         self.adapted_keys_by_loop = {}
+        # the owning expert's input (the trunk state the query head reads), per loop, written by
+        # InformationRetrievalExpert.forward only while autograd records and stash_query_input is
+        # set (the trainers set it when the contrastive term runs under a scaled trunk gradient):
+        # the term recomputes its query from it (see InformationRetrievalExpert.contrastive_query)
+        self.stash_query_input = False
+        self.query_input_by_loop = {}
 
         if self.num_clusters > 0:
             assert num_entries % self.num_clusters == 0, (
@@ -713,11 +753,26 @@ class InformationRetrievalModule(nn.Module):
         self.memory_weights_by_loop = {}
         self.memory_query_by_loop = {}
         self.adapted_keys_by_loop = {}
+        self.query_input_by_loop = {}
 
     def _loop_query_bias(self, loop_idx: int, dtype: torch.dtype) -> torch.Tensor:
         """per-loop additive bias on the query, shape ``[latent_dim]``. See ``__init__``."""
         row = min(int(loop_idx), self.loop_enc.size(0) - 1)
         return self.loop_query_bias(self.loop_enc[row].to(dtype))
+
+    def unit_query(self, x_flat: torch.Tensor, loop_idx: int) -> torch.Tensor:
+        """the unit query rows the table and the external store are scored with. ``[T, latent]``.
+
+        Args:
+            x_flat: ``[T, latent_dim]`` module input rows (the expert's ``down_proj`` output).
+            loop_idx: the loop of the recurrence, which picks the per-loop query bias.
+        """
+        # per-loop query conditioning, added BEFORE normalization so it can also rotate the query's
+        # direction and not just rescale it. zero-init, so this is an exact no-op until it learns
+        # something; the raw `x` used by the residual branch in forward() is untouched.
+        x_flat = x_flat + self._loop_query_bias(loop_idx, x_flat.dtype)
+        # for cosine similarity (via dot product)
+        return F.normalize(x_flat, p=2, dim=-1)
 
     def forward(self, x: torch.Tensor, return_weights=False, loop_idx: int = 0, memory=None, **kwargs) -> (torch.Tensor | tuple[torch.Tensor, torch.Tensor]):
         """
@@ -740,14 +795,8 @@ class InformationRetrievalModule(nn.Module):
         else:
             x_flat = x
 
-        # per-loop query conditioning, added BEFORE normalization so it can also rotate the query's
-        # direction and not just rescale it. zero-init, so this is an exact no-op until it learns
-        # something; the raw `x` used by the residual branch further down is untouched.
-        x_flat = x_flat + self._loop_query_bias(loop_idx, x_flat.dtype)
-
-        # 1. normalization
-        # for Cosine Similarity (via dot product)
-        x_norm = F.normalize(x_flat, p=2, dim=-1)
+        # 1. the loop-biased unit query
+        x_norm = self.unit_query(x_flat, loop_idx)
 
         if self.key_adapter is None:
             memory = None  # no adapters to read it with; a checkpoint without the port ignores it

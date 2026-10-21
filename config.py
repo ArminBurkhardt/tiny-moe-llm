@@ -85,6 +85,29 @@ class TrainingConfig:
     assert evidence_contrastive_temperature > 0.0, (
         f"evidence_contrastive_temperature ({evidence_contrastive_temperature}) must be > 0"
     )
+    # which loops the term averages over (zero-based; None is every loop, the objective before
+    # 2026-10-21), and the share of its gradient that reaches the trunk through the query's input
+    # state (1.0 is the objective before 2026-10-21; 0.0 trains the query head alone). The store
+    # recall eval reads the first loop's query with no evidence read yet, so [0] trains that query.
+    # Loop 0 is the only pass every sampled depth runs; a list without it drops the term on the
+    # steps whose depth skipped every listed loop.
+    _contrastive_loops = Config["training"].get("evidence_contrastive_loops", None)
+    evidence_contrastive_loops = (
+        None if _contrastive_loops is None else [int(loop) for loop in _contrastive_loops]
+    )
+    assert evidence_contrastive_loops is None or (
+        len(evidence_contrastive_loops) > 0
+        and all(0 <= loop < ModelConfig.Params["n_loops"] for loop in evidence_contrastive_loops)
+    ), (
+        f"evidence_contrastive_loops ({evidence_contrastive_loops}) must be null or a non empty list "
+        f"of zero-based loop indices below n_loops ({ModelConfig.Params['n_loops']})"
+    )
+    evidence_contrastive_trunk_grad = float(
+        Config["training"].get("evidence_contrastive_trunk_grad", 1.0)
+    )
+    assert 0.0 <= evidence_contrastive_trunk_grad <= 1.0, (
+        f"evidence_contrastive_trunk_grad ({evidence_contrastive_trunk_grad}) must be in [0, 1]"
+    )
     num_epochs = int(Config["training"]["num_epochs"])
     learning_rate = float(Config["training"]["lr"])
     lr = float(Config["training"]["lr"])

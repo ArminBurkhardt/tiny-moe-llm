@@ -102,6 +102,8 @@ training:
                                    # selector trained on it alone retrieves nothing from a store.
                                    # 0.0 is the objective of every run before 2026-10-17.
   evidence_contrastive_temperature: 0.07 # the fixed softmax temperature on the cosine for that term
+  evidence_contrastive_loops: null # zero-based loops the term averages over; null is every loop; only loop 0 runs at every sampled depth
+  evidence_contrastive_trunk_grad: 1.0 # share of the term's gradient reaching the trunk via the query; 0.0 trains the query head alone
   groundedness_weight: 0.1 # coefficient on the groundedness readout's BCE (evidence.py's
                            # GroundednessHead, label "a gold chunk is present AND the row is
                            # answerable", read at the last prompt token of each answer span).

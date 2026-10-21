@@ -1116,8 +1116,21 @@ class LoopMixtureOfExperts(nn.Module):
             return None
         return torch.stack(terms).mean()
 
+    def set_contrastive_query_stash(self, enabled: bool):
+        """keep each IR expert's input per loop for the contrastive term's scaled-gradient query.
+
+        Off by default, so no forward holds the ``[B, S, H]`` input past its own use; the trainers
+        turn it on once when the term runs with ``trunk_grad`` below 1.
+
+        Args:
+            enabled: whether the IR experts stash their input on grad-enabled forwards.
+        """
+        for module in self.ir_modules:
+            module.stash_query_input = bool(enabled)
+
     def evidence_contrastive_term(self, chunk_gold: torch.Tensor, positions: torch.Tensor,
-                                  temperature: float = 0.07, symmetric: bool = True):
+                                  temperature: float = 0.07, symmetric: bool = True,
+                                  loops=None, trunk_grad: float = 1.0):
         """The retriever's contrastive loss over the read the forward pass just did. Scalar, or None.
 
         ``evidence_contrastive_loss`` (information_retrieval.py) on the selector's unit query at the
@@ -1130,10 +1143,19 @@ class LoopMixtureOfExperts(nn.Module):
             positions: ``[B * S]`` bool, the query positions (``answer_start_positions``).
             temperature: the fixed softmax temperature on the cosine.
             symmetric: also train the key-to-query direction.
+            loops: zero-based loop indices the term averages over, or None for every loop that
+                read the store. A listed loop a sampled depth skipped is left out; loop 0 is the
+                only pass every depth runs, so a list without it gives None on those steps.
+            trunk_grad: the share of the term's gradient that reaches the trunk through the query's
+                input state, in [0, 1]. Below 1 (and only while autograd records) the query is
+                recomputed at the positions from the stashed expert input under a scaled gradient
+                (``InformationRetrievalExpert.contrastive_query``), which needs
+                ``set_contrastive_query_stash(True)`` before the forward; 1.0 reads the stashed
+                query.
 
         Returns:
-            Scalar loss, or None when the forward carried no external store or no position was
-            selected.
+            Scalar loss, or None when the forward carried no external store, no position was
+            selected, or no listed loop ran.
         """
         visible = self.last_memory_visible
         if visible is None or chunk_gold is None:
@@ -1142,17 +1164,33 @@ class LoopMixtureOfExperts(nn.Module):
         if index.numel() == 0:
             return None
         positive = visible.index_select(0, index) & chunk_gold.to(torch.bool).unsqueeze(0)
-        terms = [
-            evidence_contrastive_loss(
-                module.memory_query_by_loop[loop].index_select(0, index),
-                module.adapted_keys_by_loop[loop],
-                positive, temperature=temperature, symmetric=symmetric,
-            )
-            for module in self.ir_modules
-            for loop in module.memory_query_by_loop
-            if module.memory_query_by_loop[loop] is not None
-            and module.adapted_keys_by_loop.get(loop) is not None
-        ]
+        keep = None if loops is None else {int(loop) for loop in loops}
+        rebuild = float(trunk_grad) < 1.0 and torch.is_grad_enabled()
+        terms = []
+        for expert in self.experts:
+            if not isinstance(expert, InformationRetrievalExpert):
+                continue
+            module = expert.ir_module
+            for loop, query in module.memory_query_by_loop.items():
+                keys = module.adapted_keys_by_loop.get(loop)
+                if query is None or keys is None or (keep is not None and loop not in keep):
+                    continue
+                if rebuild:
+                    source = module.query_input_by_loop.get(loop)
+                    assert source is not None, (
+                        f"no stashed expert input for loop {loop}: set_contrastive_query_stash(True) "
+                        f"was not called, or the forward ran without autograd"
+                    )
+                    # the P query rows are not a multiple of 16, which an FP8 GEMM asserts on
+                    with te.autocast(enabled=False):
+                        rows = expert.contrastive_query(
+                            source.reshape(-1, source.shape[-1]).index_select(0, index), loop, trunk_grad
+                        )
+                else:
+                    rows = query.index_select(0, index)
+                terms.append(evidence_contrastive_loss(
+                    rows, keys, positive, temperature=temperature, symmetric=symmetric,
+                ))
         if not terms:
             return None
         return torch.stack(terms).mean()

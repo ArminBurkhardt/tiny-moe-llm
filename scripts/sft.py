@@ -777,6 +777,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
                     contrastive = model.moe.evidence_contrastive_term(
                         evidence.chunk_gold, answer_start_positions(labels).reshape(-1),
                         temperature=TrainingConfig.evidence_contrastive_temperature,
+                        loops=TrainingConfig.evidence_contrastive_loops,
                     )
                     if contrastive is not None:
                         contrastive_sum += contrastive.item()
@@ -1092,6 +1093,10 @@ def sft(args):
     model = TinyMoETransformer(**model_params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
+    model.moe.set_contrastive_query_stash(
+        TrainingConfig.evidence_contrastive_weight > 0.0
+        and TrainingConfig.evidence_contrastive_trunk_grad < 1.0
+    )
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)

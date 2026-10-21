@@ -87,23 +87,40 @@ rows' external mass under gold 0.123 against 0.076. The term is the whole of the
 recall at this dose, one sixth of bge and growing; whether the retrieved mass becomes answer
 gain is unread at micro scale. **Decided 2026-10-21 (the user): the term enters the pilot-shape
 recipe at 0.25, and its language cost is read on one pilot-size arm before the real-run spec
-commits to it.** That arm, PI, launched the same day (`bash ckpts/inject/launch_pilot_pi.sh`,
-`ckpts/inject/config_pilot_infonce.yaml`: `config_pilot.yaml` with
-`evidence_contrastive_weight: 0.25` and `moe_balancing: loss_free`, AdamW, so it runs under the
-real-run spec; `ckpts/evidence_pilot_pi`, `ckpts/inject/pilot_pi.log`), on arm P's two-stage
-recipe: `pilot_warm_train` to the 300M save (`stop_after_save.sh pi '30[0-4]M'`), the switch
-criterion read with `read_pilot_save.sh CKPT pi 300M`, then `SPLIT=pilot_main_train bash
-ckpts/inject/launch_pilot_pi.sh` to the end. Reads at the final: the per-save set, `eval_store.py
-recall` against bge on `openqa` (A4's precondition) and `eval_exit.py --pair` against arm P's
-final at the same tokens; bar: held-out CE against arm P's 3.2321 on `inject_val` within the
-pilot's own noise, store recall@5 above arm P's 0.004, leak and copying unchanged from arm P.
-The arm carries two changes against arm P, accepted because at micro loss-free matched the
-unbalanced twin within 0.002 nats and arm P's saturated aux term left it in effect unbalanced,
-so a CE gap is read as the term's unless the load fields say otherwise. A research round on
+commits to it.** **That arm, PI (`config_pilot_infonce.yaml`: arm P's recipe with the term at
+0.25 and loss-free balancing, `ckpts/evidence_pilot_pi`, `pilot_pi.log`), was stopped at 87M the
+same day on the language bar** ([infonce_micro.md](../measurements/infonce_micro.md)): held-out
+CE on `inject_val` 0.03 / 0.11 / 0.30 nats behind arm P at steps 890 / 1770 / 2660 against a
+bar of the pilot's own noise (0.013), the load fields even, while store recall@5 on the 75M save
+read 0.006 against arm P's final 0.004 and the port read lagged arm P's (content gain +0.43
+against +1.76 at step 2660). The term as built, with its gradient into the trunk, stays out of
+the real-run spec; next are an offline probe of the hidden state and one head-only micro arm
+(trunk gradient stopped, loop 1 only), with a separate search tower the other live direction.
+A research round on
 training the model's own retrieval without the language cost started the same day; its
 write-up is [review_2026-10-21_retriever.md](../review_2026-10-21_retriever.md): the term trains loops 2 and 3, which already hold the gold chunk, while the eval reads loop 1; the cheap arms are the term at loop 1 only, a stopped trunk gradient, bge query distillation and a fixed key bank of negatives, after an offline probe of whether the loop 1 state carries the question at all. The model-keyed variant (keys from the model's own encoder, Co-LMLM's) stays
 held: A4 is the model's query against a bge-keyed store, which is exactly the pairing the term
-trains, and model keys would change the store format and the gate's meaning. **Built
+trains, and model keys would change the store format and the gate's meaning.
+**The query head probe, read 2026-10-21 ([query_head_probe.md](../measurements/query_head_probe.md),
+`scripts/probe_query_head.py`, eval only), caps a head on the frozen state:** ridge and MLP maps
+from the IR expert's loop 1 input onto bge's question vector reach at best recall@5 / @20 0.025 /
+0.055 on `w0e3` and 0.055 / 0.122 on `w25e3` (mean and last token concatenated, MLP), under 7% of
+bge at k5 at any position or pooling; the term's gain split between the head and the trunk state
+(a head on the untouched trunk reaches about 0.025 at k5, on the term-trained trunk about 0.055,
+the model's own query 0.059), so the head-only arm reads what the head alone gets from an
+untouched trunk, and the trunk's share cost 0.30 nats at pilot shape; a tower on detached states is capped the same way, so a working tower would be a small
+bge-style encoder over the prompt text beside the model, the choice between that and holding the
+user's. **The head-only micro arm, read the same day ([infonce_micro.md](../measurements/infonce_micro.md), `bash
+ckpts/inject/launch_infonce_head.sh`, `config_micro_infonce_head_e3.yaml`: the `w25e3` recipe
+with `evidence_contrastive_loops: [0]` and `evidence_contrastive_trunk_grad: 0.0`, 104.46M
+tokens, log `infonce_head_e3.log`, read `infonce_head_e3_store_recall.{json,log}`), costs no
+language and finds nothing:** held-out CE 4.3904 against `w0e3`'s 4.3809 (within 0.02 at every
+eval, `w25e3` 0.05 to 0.08 behind) and store recall@5 / @20 0.003 / 0.007 at loop 1 against
+`w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), the probe's weakest row. The whole of `w25e3`'s
+search therefore needed the trunk to change, so training only the search head is closed at this
+size, and the choice between a separate search tower (a small bge-style encoder over the prompt
+text beside the model, no language cost) and holding (bge for serving, A4 untested, revisit at
+the real run's size) is the user's. **Built
 2026-10-18 while that pair ran: the optimizer rung's code** (R7 in the ladder: `MuonAdamW` in
 `modules/model/optim.py`, the `optimizer` key, `eval_exit.py --pair`, the test); its three micro
 arms (`ckpts/inject/launch_muon.sh`) ran after the InfoNCE pair (the partition at micro: 60
@@ -1207,7 +1224,8 @@ R7 to R9 (added 2026-10-12) sit outside that rule: they decide the run spec and 
 pilot's claims, and cost hours, not 1B-token arms. They queue behind arm C and its reads.
 Outside the table, arm PI (launched 2026-10-21) is arm P's recipe with the retriever's InfoNCE
 term at 0.25 under loss-free balancing, read against arm P's final on held-out CE, store recall
-at k5, the leak and copying, before the term enters the real-run spec.
+at k5, the leak and copying, before the term enters the real-run spec; stopped at 87M the same
+day on the language gap.
 
 ### Later, after the pilot passes
 
@@ -1579,8 +1597,23 @@ above are a different, live series).
   Also decided (the user): the retriever's InfoNCE term enters the pilot-shape recipe at 0.25 and
   is read on one pilot-size arm before the real-run spec commits to it; arm PI launched
   (`launch_pilot_pi.sh`, `config_pilot_infonce.yaml`, loss-free, AdamW, arm P's two stages).
+  Arm PI stopped at 87M the same day: held-out CE 0.30 nats behind arm P and growing (0.03 /
+  0.11 / 0.30 at steps 890 / 1770 / 2660), store recall@5 0.006 against 0.004, so the term as
+  built stays out of the real-run spec; the hidden-state probe and a head-only micro arm next.
   A research round on training the model's own retrieval without the language cost started;
   write-up [review_2026-10-21_retriever.md](../review_2026-10-21_retriever.md) written the same day.
+  The query head probe ([query_head_probe.md](../measurements/query_head_probe.md)): no ridge or
+  MLP head on the frozen loop 1 state, last token, mean or both, gets past about 7% of bge at k5
+  (best 0.055 on `w25e3` against its trained query's 0.059, 0.025 on `w0e3`), so the term's gain
+  split between the head and the trunk state, the head-only arm reads what the head alone gets
+  from an untouched trunk (about 0.02 to 0.03 predicted), and a tower on detached states is
+  capped the same way.
+  Two training keys built and reviewed, `evidence_contrastive_loops` and
+  `evidence_contrastive_trunk_grad` (0.0 trains only the query head, 1.0 is bit-identical to
+  before); the head-only micro arm (`launch_infonce_head.sh`, loop 1, trunk gradient 0) launched.
+  The head-only arm read the same day: held-out CE 4.3904 against `w0e3`'s 4.3809, recall@5
+  0.003 against `w25e3`'s 0.059, so training only the search head is closed at this size; a
+  separate search tower or holding is the user's call.
 - 2026-10-20: the aux loss's masked branch fixed (`compute_aux_loss`): hard counts, mask and the
   probability reduction now run in fp32. In bf16 every slot's count saturated at 256, so on every
   masked aux-balanced run since the token mask (the R0b arms, both pilot arms, the Muon arms) the

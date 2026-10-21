@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import transformer_engine.pytorch as te
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm, Gemma4TextAttention as GroupedQueryAttention
-from modules.model.information_retrieval import InformationRetrievalModule
+from modules.model.information_retrieval import InformationRetrievalModule, scale_gradient
 from modules.model.evidence import EvidenceBatch
 
    
@@ -201,6 +201,12 @@ class InformationRetrievalExpert(nn.Module):
         # the retrieval itself is loop independent, which is exactly what the Stage 0 query drift
         # measurement found and what NEXT.md's loop conditioned query is meant to change
         ir_output = self.ir_module(down, loop_idx=loop_idx, memory=memory)
+        if (
+            self.ir_module.stash_query_input
+            and torch.is_grad_enabled()
+            and int(loop_idx) in self.ir_module.memory_query_by_loop
+        ):
+            self.ir_module.query_input_by_loop[int(loop_idx)] = x
         information = self.up_proj(ir_output)
 
         if self.direct_read:
@@ -219,4 +225,23 @@ class InformationRetrievalExpert(nn.Module):
             kv_cache=kv_cache,
         )
         return self.dropout(attn_output)
+
+    def contrastive_query(self, rows: torch.Tensor, loop_idx: int, trunk_grad: float) -> torch.Tensor:
+        """The selector's unit query recomputed from expert input rows under a scaled trunk gradient.
+
+        Same arithmetic as the forward's query (``norm``, ``down_proj``, the module's per-loop bias,
+        normalize), so the value matches the stashed ``memory_query_by_loop`` row; only the gradient
+        that flows back into ``rows`` is scaled, which leaves the query head's own tensors (``norm``,
+        ``down_proj``, ``loop_query_bias``) on their full gradient and the IR read itself untouched.
+
+        Args:
+            rows: ``[P, input_size]`` expert input rows at the query positions.
+            loop_idx: the loop whose query is rebuilt.
+            trunk_grad: the share of the gradient that reaches ``rows``, in [0, 1].
+
+        Returns:
+            ``[P, ir_dim]`` unit query rows.
+        """
+        rows = scale_gradient(rows, trunk_grad)
+        return self.ir_module.unit_query(self.down_proj(self.norm(rows)), loop_idx)
 

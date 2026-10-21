@@ -83,17 +83,37 @@ against 0.000, recall@20 0.133 against 0.002 (one sixth of bge), at a cost of 0.
 held-out language on the arm (4.45 against 4.38, the gap widening with dose), selection 0.01
 better, the port read on neither.** **Decided 2026-10-21 (the user): the term enters the
 pilot-shape recipe at 0.25, its language cost read on one pilot-size arm before the real-run
-spec commits to it.** Arm PI launched the same day (`bash ckpts/inject/launch_pilot_pi.sh`,
-`config_pilot_infonce.yaml`: `config_pilot.yaml` with the term at 0.25 and `moe_balancing:
-loss_free`, AdamW; `ckpts/evidence_pilot_pi`, `ckpts/inject/pilot_pi.log`; arm P's two stages,
-`stop_after_save.sh pi '30[0-4]M'`, `read_pilot_save.sh CKPT pi 300M`, then
-`SPLIT=pilot_main_train`). Final reads: the per-save set, `eval_store.py recall` against bge,
-`eval_exit.py --pair` against arm P's final; bar: held-out CE within the pilot's noise of arm
-P's 3.2321, recall@5 above 0.004, leak and copying unchanged. Two changes against arm P,
-accepted since loss-free matched the unbalanced twin at micro and arm P's aux term was
-saturated; a CE gap is the term's unless the load fields say otherwise. A research round on
+spec commits to it.** **Arm PI (`config_pilot_infonce.yaml`: arm P's recipe with the term at
+0.25 and loss-free balancing; `ckpts/evidence_pilot_pi`, `ckpts/inject/pilot_pi.log`) was
+stopped at 87M the same day on the language bar:** held-out CE 0.03 / 0.11 / 0.30 nats behind
+arm P at steps 890 / 1770 / 2660 against the pilot's noise of 0.013, load fields even, store
+recall@5 0.006 on the 75M save against arm P's 0.004, the port read lagging arm P's (content
+gain +0.43 against +1.76 at step 2660). The term as built (trunk gradient, every loop) stays out
+of the real-run spec; next are an offline probe of the hidden state and one head-only micro arm
+(trunk gradient stopped, loop 1 only), a separate search tower the other live direction. A
+research round on
 training the model's own retrieval without the language cost started the same day (write-up
-written the same day, [review_2026-10-21_retriever.md](docs/review_2026-10-21_retriever.md): term at loop 1 only, a stopped trunk gradient, bge query distillation and a key bank as the cheap arms, an offline probe of the hidden state first); the model-keyed retriever variant stays held. **The Muon rung's three micro arms ran and were read 2026-10-18
+written the same day, [review_2026-10-21_retriever.md](docs/review_2026-10-21_retriever.md): term at loop 1 only, a stopped trunk gradient, bge query distillation and a key bank as the cheap arms, an offline probe of the hidden state first); the model-keyed retriever variant stays held.
+**The query head probe, read 2026-10-21 ([query_head_probe.md](docs/measurements/query_head_probe.md),
+`scripts/probe_query_head.py`, eval only), caps a head on the frozen state:** ridge and MLP maps
+from the IR expert's loop 1 input onto bge's question vector reach at best recall@5 / @20 0.025 /
+0.055 on `w0e3` and 0.055 / 0.122 on `w25e3` (mean and last token concatenated, MLP), under 7% of
+bge at k5 at any position or pooling; the term's gain split between the head and the trunk state
+(a head on the untouched trunk reaches about 0.025 at k5, on the term-trained trunk about 0.055,
+the model's own query 0.059), so the head-only arm reads what the head alone gets from an
+untouched trunk, and the trunk's share cost 0.30 nats at pilot shape; a tower on detached states is capped the same way, so a working tower would be a small
+bge-style encoder over the prompt text beside the model, the choice between that and holding the
+user's. **The head-only micro arm, read the same day ([infonce_micro.md](docs/measurements/infonce_micro.md), `bash
+ckpts/inject/launch_infonce_head.sh`, `config_micro_infonce_head_e3.yaml`: the `w25e3` recipe
+with `evidence_contrastive_loops: [0]` and `evidence_contrastive_trunk_grad: 0.0`, 104.46M
+tokens, log `infonce_head_e3.log`, read `infonce_head_e3_store_recall.{json,log}`), costs no
+language and finds nothing:** held-out CE 4.3904 against `w0e3`'s 4.3809 (within 0.02 at every
+eval, `w25e3` 0.05 to 0.08 behind) and store recall@5 / @20 0.003 / 0.007 at loop 1 against
+`w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), the probe's weakest row. The whole of `w25e3`'s
+search therefore needed the trunk to change, so training only the search head is closed at this
+size, and the choice between a separate search tower (a small bge-style encoder over the prompt
+text beside the model, no language cost) and holding (bge for serving, A4 untested, revisit at
+the real run's size) is the user's. **The Muon rung's three micro arms ran and were read 2026-10-18
 ([muon_micro.md](docs/measurements/muon_micro.md)): the loss bar passes (Muon 0.07 to 0.15
 nats below its AdamW twin on both recipes, z 16 to 25 paired per token, 2 to 4x the one seed
 pair's spread of 0.03), copying is no later (both warm-up arms switch between 50M and 100M,
@@ -496,6 +516,7 @@ scripts/
   eval_chains.py      accuracy by hops and by kept read sites (reader_sites_kept) at fixed depth
   eval_exit.py        per-exit CE without evidence: paired gains, oracle and beta optimum bounds, confidence exit vs fixed depths
   eval_store.py       store recall of the model's query vs bge, open-book pathway EM vs oracle, store-edit flip rate
+  probe_query_head.py ridge and MLP heads from the frozen IR input onto bge's question vector, scored as store recall
   entity_frequency.py exact token-sequence counts in a .bin (the counterfactual strata)
   eval_calibration.py eval_probe.py eval_stage0.py evidence_ceiling_probe.py (--fixed-split: ceiling on evidence_fixed)
   inference.py gradio_app.py prune_vocab.py fetch_tokenizer.py setup.sh onstart.sh run_sft_after_pretrain.sh
@@ -547,6 +568,7 @@ python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_e
 python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max-questions 3000 --chunk-tokens 128 --device cuda --seed 42
 python scripts/build_store.py --edit-from openqa --name openqa_edit --edit-fraction 0.5 --neighbour-cos 0.85 --device cpu --seed 42
 python scripts/eval_store.py recall|pathway|edit -c CKPT --store data/index/openqa [--edit-store data/index/openqa_edit] --buffer 4 --loop 1 --json-out OUT.json
+TINY_LLM_CONFIG=config_micro.yaml python scripts/probe_query_head.py -c CKPT --store data/index/openqa --batch-size 16 --pool last|mean|meanlast --json-out OUT.json
 python scripts/eval_benchmarks.py -c CKPT --tasks popqa --rank-candidates 20 --json-out OUT.json
 python scripts/inference.py -c CKPT -p PROMPT -n 200 [--evidence chunks.json] [--converge-tol T]
 bash tests/run_env_check.sh; bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
@@ -568,8 +590,8 @@ micro checkpoint under the default yaml fails the strict load, as it should).
 Tables in [configuration.md](docs/configuration.md).
 - `ModelConfig.Params` is splatted into `TinyMoETransformer(**...)`.
 - `TrainingConfig` holds **every loss weight** (`lambda_mtp`, `aux_loss_weight`,
-  `evidence_selection_weight`, `evidence_contrastive_weight` + `evidence_contrastive_temperature`,
-  `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
+  `evidence_selection_weight`, `evidence_contrastive_weight` + `evidence_contrastive_temperature`
+  + `evidence_contrastive_loops` + `evidence_contrastive_trunk_grad`, `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
   `loop_count_sampling`) and the `optimizer` choice (`adamw`, every run before 2026-10-18, or
   `muon`: `modules/model/optim.py`, Muon on the hidden 2D matrices by the name rule `muon_kind`
   with Nesterov 0.95, five Newton-Schulz steps in bf16 and the update scaled to AdamW's RMS so
@@ -760,7 +782,20 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   `moe.evidence_contrastive_term(chunk_gold, positions, temperature)` averages over (loop, expert).
   Weight `evidence_contrastive_weight`, 0 by default and in every run before 2026-10-17; logged
   `contrastive:` in the step line and the held-out eval when on. Same no-checkpointing rule as the
-  selection term. `tests/test_evidence_contrastive.py`.
+  selection term. Two keys added 2026-10-21: `evidence_contrastive_loops` (null = every loop, else
+  zero-based loop indices the term averages over; loop 0 is the only pass stochastic depth always
+  runs, so a listed later loop can be skipped and the term then returns `None` for that step) and
+  `evidence_contrastive_trunk_grad` (in [0, 1], the share of the term's gradient reaching the
+  trunk through the query's hidden state; 1.0 is bit-identical to before, 0.0 trains only the
+  query head: `norm`, `down_proj`, `loop_query_bias`, `key_adapter`). Under 1.0 the IR expert
+  stashes its input per loop in `ir_module.query_input_by_loop` (cleared in `begin_forward`) only
+  while `ir_module.stash_query_input` is on, which both trainers set once after the model build
+  through `moe.set_contrastive_query_stash(True)` when the weight is above 0; the term then
+  rebuilds the query at the answer-start rows through `InformationRetrievalExpert.contrastive_query`
+  (`scale_gradient`: identity forward, scaled backward; then norm, `down_proj`, `unit_query`) under
+  `te.autocast(enabled=False)`, since the row count is not a multiple of 16.
+  `tests/test_evidence_contrastive.py` (tests 7 to 10: bit-identity of value and gradient at the
+  defaults, the loop filter, zero trunk gradient with the head still learning, half scaling exact).
 - `GroundednessHead` + `groundedness_loss`: label "gold present AND answerable" from the corpus
   (`.ans`, not the condition; never the model's argmax). Reads `moe.last_reader_output` at
   `pretrain.answer_start_positions` (last prompt token of each supervised span), weight 0.1. **Its

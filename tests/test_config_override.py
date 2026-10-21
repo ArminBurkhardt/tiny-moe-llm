@@ -28,6 +28,8 @@ print(json.dumps({
     "groundedness_weight": TrainingConfig.groundedness_weight,
     "evidence_contrastive_weight": TrainingConfig.evidence_contrastive_weight,
     "evidence_contrastive_temperature": TrainingConfig.evidence_contrastive_temperature,
+    "evidence_contrastive_loops": TrainingConfig.evidence_contrastive_loops,
+    "evidence_contrastive_trunk_grad": TrainingConfig.evidence_contrastive_trunk_grad,
     "optimizer": TrainingConfig.optimizer,
     "moe_balancing": TrainingConfig.moe_balancing,
     "moe_balance_bias_rate": TrainingConfig.moe_balance_bias_rate,
@@ -74,6 +76,8 @@ def main():
     assert micro["groundedness_weight"] == 0.0 and micro["target_tokens"] == 300_000_000
     assert micro["evidence_contrastive_weight"] == 0.0
     assert micro["evidence_contrastive_temperature"] == 0.07
+    assert micro["evidence_contrastive_loops"] is None
+    assert micro["evidence_contrastive_trunk_grad"] == 1.0
     assert micro["optimizer"] == "adamw"
     assert micro["moe_balancing"] == "aux" and micro["moe_balance_bias_rate"] == 0.001
     assert micro["sft_seq_length"] == 1024 and micro["sft_data_dir"] == "data/prepared_inject"
@@ -109,6 +113,8 @@ def main():
     assert default["evidence"]["batch"] == raw["evidence"]["batch_size"]
     assert default["evidence_contrastive_weight"] == raw["training"]["evidence_contrastive_weight"]
     assert default["evidence_contrastive_temperature"] == raw["training"]["evidence_contrastive_temperature"]
+    assert default["evidence_contrastive_loops"] is raw["training"]["evidence_contrastive_loops"] is None
+    assert default["evidence_contrastive_trunk_grad"] == raw["training"]["evidence_contrastive_trunk_grad"] == 1.0
     assert default["optimizer"] == raw["training"]["optimizer"] == "adamw"
     assert default["moe_balancing"] == raw["training"]["moe_balancing"] == "aux"
     assert default["moe_balance_bias_rate"] == raw["training"]["moe_balance_bias_rate"] == 0.001
