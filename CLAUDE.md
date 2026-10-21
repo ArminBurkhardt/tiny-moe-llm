@@ -81,9 +81,19 @@ InfoNCE micro arm against its twin, one epoch of the QA slice
 pair at three epochs (`w25e3`, `w0e3`, 104M tokens each, read 2026-10-18): recall@5 0.059
 against 0.000, recall@20 0.133 against 0.002 (one sixth of bge), at a cost of 0.07 nats of
 held-out language on the arm (4.45 against 4.38, the gap widening with dose), selection 0.01
-better, the port read on neither.** Decision pending (the user): the term enters the pilot-shape
-recipe at 0.25 (recommended in the record), at a lower weight, or stays held; the model-keyed
-retriever variant stays held. **The Muon rung's three micro arms ran and were read 2026-10-18
+better, the port read on neither.** **Decided 2026-10-21 (the user): the term enters the
+pilot-shape recipe at 0.25, its language cost read on one pilot-size arm before the real-run
+spec commits to it.** Arm PI launched the same day (`bash ckpts/inject/launch_pilot_pi.sh`,
+`config_pilot_infonce.yaml`: `config_pilot.yaml` with the term at 0.25 and `moe_balancing:
+loss_free`, AdamW; `ckpts/evidence_pilot_pi`, `ckpts/inject/pilot_pi.log`; arm P's two stages,
+`stop_after_save.sh pi '30[0-4]M'`, `read_pilot_save.sh CKPT pi 300M`, then
+`SPLIT=pilot_main_train`). Final reads: the per-save set, `eval_store.py recall` against bge,
+`eval_exit.py --pair` against arm P's final; bar: held-out CE within the pilot's noise of arm
+P's 3.2321, recall@5 above 0.004, leak and copying unchanged. Two changes against arm P,
+accepted since loss-free matched the unbalanced twin at micro and arm P's aux term was
+saturated; a CE gap is the term's unless the load fields say otherwise. A research round on
+training the model's own retrieval without the language cost started the same day (write-up
+written the same day, [review_2026-10-21_retriever.md](docs/review_2026-10-21_retriever.md): term at loop 1 only, a stopped trunk gradient, bge query distillation and a key bank as the cheap arms, an offline probe of the hidden state first); the model-keyed retriever variant stays held. **The Muon rung's three micro arms ran and were read 2026-10-18
 ([muon_micro.md](docs/measurements/muon_micro.md)): the loss bar passes (Muon 0.07 to 0.15
 nats below its AdamW twin on both recipes, z 16 to 25 paired per token, 2 to 4x the one seed
 pair's spread of 0.03), copying is no later (both warm-up arms switch between 50M and 100M,
@@ -91,9 +101,8 @@ Muon copies held out at 0.90 against 0.67), and the leak passes by the letter (l
 z 2.6, tier 1000 in distribution) while worse by the sign (1.6x at tier 1000 and 2.4x at tier
 100 in distribution, held out equal); on arm (a) Muon stores the biographies about twice as
 early and more at every tier above 1, far outside the seed spread, the wrong direction for the
-goal. Decision pending (the user): the pilot-shape Muon arm P (the row's next step, one
-night, the instrument with the power the micro leak read lacks) or Muon out of the real-run
-spec.** Every save of the chain continuation is read (2026-10-19, the per-save table in its
+goal. Decided 2026-10-21 (the user): Muon is out of the real-run spec, the pilot-shape arm is
+not run, the real run stays on AdamW.** Every save of the chain continuation is read (2026-10-19, the per-save table in its
 record): 1-hop 0.82 to 0.99 in a smooth climb, every composition cell at chance at all eleven
 reads, the paired held-out Delta within one sigma throughout; no transition anywhere inside the
 epoch. **R8 (loss-free balancing, the Config bullet) run and read 2026-10-19 and 2026-10-20
@@ -109,8 +118,10 @@ ckpts/inject/launch_auxfix.sh`, `ckpts/evidence_auxfix_full`, `auxfix_full.log`,
 on all three bars:** the working aux term ends at CE 3.9142 (paired -0.0076 at exit 3, z -2.3),
 puts 0.35 to 0.54 of the picks on the dense slots with the MLP load at 1.08 to 1.26, and stores
 the biographies more in distribution (tier 100 z 14.5 against arm (a), z 14.4 against the
-reseed, far outside the seed spread). Decision pending (the user): loss-free into the real-run
-spec (recommended in the record), or aux stays.
+reseed, far outside the seed spread). **Decided 2026-10-21 (the user): loss-free balancing
+enters the real-run spec.** Decided the same day (the user): the 100B-token corpus build runs on
+the rented cluster, not locally, and the throughput work starts only after every other spec
+decision is made, so nothing optimized has to be redone.
 Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
@@ -286,8 +297,8 @@ asks (decided 2026-10-11); a new session reads the file.
      the exit read paired against the twin's save at the same tokens), **run and read
      2026-10-18** ([muon_micro.md](docs/measurements/muon_micro.md)): loss and copying bars
      pass, the leak bar passes by the letter and is worse by the sign, storage twice as early
-     on arm (a); the pilot-shape arm is the user's call. A checkpoint resumes only under its
-     own optimizer.
+     on arm (a). A checkpoint resumes only under its own optimizer. Decided 2026-10-21 (the
+     user): Muon dropped, the real run stays on AdamW.
   4. Proposed 2026-10-12: rung R8 (loss-free MoE balancing against the aux loss, micro; **built
      2026-10-19**: `moe_balancing: loss_free` in the Config bullet below, arm `bash
      ckpts/inject/launch_lossfree.sh` on the arm (a) recipe from `seed_micro.pt` against
@@ -295,8 +306,8 @@ asks (decided 2026-10-11); a new session reads the file.
      `ckpts/inject/lossfree_full_{TAG}_{rank_none,exit}`; bar: CE not worse beyond the paired
      sigma and the seed spread, load at least as even; **run and read 2026-10-19 and
      2026-10-20**: passes for loss-free on all three bars against the fixed aux term, which
-     stores more and balances the dense slots; the real-run spec choice is the user's,
-     loss-free recommended), rung R9
+     stores more and balances the dense slots; decided 2026-10-21 (the user): loss-free enters
+     the real-run spec), rung R9
      (a written bridge on arm P's chains: does reasoning in written tokens compose where the loop
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
      distillation, RL past the pass@8 gate with credit over passes, depth record and routing
