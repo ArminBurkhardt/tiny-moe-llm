@@ -545,6 +545,9 @@ class LoopMixtureOfExperts(nn.Module):
         # the evidence reader's own output from the most recent loop, [B, S, H], for a groundedness
         # readout to attach to. See forward_step for why it is the ungated, unscaled read.
         self.last_reader_output = None
+        # the last forward's detach_loops: the passes before it ran without a graph, so the
+        # selection and contrastive terms average over the passes after it only
+        self.last_detach_loops = 0
 
         self.expert_tracker = _ExpertTracking(num_experts=self.num_experts)
 
@@ -803,9 +806,21 @@ class LoopMixtureOfExperts(nn.Module):
         evidence: EvidenceBatch = None,
         token_mask: torch.Tensor = None,
         reader_sites_kept: int = None,
+        detach_loops: int = 0,
     ):
         """
         Args:
+            detach_loops (int, optional): the detached depth prefix. The first ``detach_loops``
+                passes run under ``torch.no_grad()``, so no gradient reaches any parameter through
+                them and the hidden state entering the first pass with gradient carries no graph.
+                Their hidden states still go into ``hidden_states_all`` (without a graph). The
+                returned aux loss is the mean over the passes after the prefix, and
+                ``evidence_selection_term`` / ``evidence_contrastive_term`` skip the prefix passes
+                (``last_detach_loops``), so no term's gradient shrinks with the prefix length.
+                Under ``use_checkpointing`` they run outside the per pass checkpoint wrapper: a pass
+                with no graph has nothing to recompute. Must be below the number of loops run. 0
+                (the default) is the forward this model ran before the argument existed, bit for
+                bit.
             reader_sites_kept (int, optional): read ablation. Evidence read sites are numbered 1, 2,
                 ... in execution order across the whole recurrence (``read_sites_per_loop`` per
                 loop, so site k is loop k on the built model). Every site numbered above this value
@@ -870,6 +885,9 @@ class LoopMixtureOfExperts(nn.Module):
         assert reader_sites_kept is None or (
             reader_sites_kept >= 0 and not self.training and kv_cache is None and exit_check is None
         ), "reader_sites_kept is a non negative inference-only argument, exclusive with the KV cache and exit_check"
+        assert 0 <= detach_loops < n_loops, (
+            f"detach_loops={detach_loops} must be in [0, n_loops={n_loops}): at least one pass needs a gradient"
+        )
         total_load_balancing_loss = 0.0
         hidden_states_all = []
 
@@ -917,6 +935,7 @@ class LoopMixtureOfExperts(nn.Module):
         # evidence-bearing batch's activations against this batch's labels
         if evidence is None or reader_sites_kept == 0:
             self.last_reader_output = None
+        self.last_detach_loops = detach_loops
 
         loops_run = 0
         for loop in range(n_loops):
@@ -924,7 +943,14 @@ class LoopMixtureOfExperts(nn.Module):
             read_live = reader_sites_kept is None or loop * self.read_sites_per_loop + 1 <= reader_sites_kept
             step_evidence = evidence if read_live else None
             step_memory = memory if read_live else None
-            if self.training and use_checkpointing:
+            if loop < detach_loops:
+                # a pass with no graph. its aux term would be a constant, so it stays out of the
+                # mean. under the transformer level checkpoint the recompute reruns this pass, so
+                # its compute is paid twice while it saves no activations
+                with torch.no_grad():
+                    hidden_states, _ = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=step_evidence, memory=step_memory, token_mask=token_mask)
+                load_balancing_loss = 0.0
+            elif self.training and use_checkpointing:
                 hidden_states, load_balancing_loss = checkpoint(self.forward_step, hidden_states, cu_seqlens, max_seqlen, other, position_embeddings, loop, loop_cache, inject_bias, evidence, memory, token_mask, use_reentrant=False)
             else:
                 hidden_states, load_balancing_loss = self.forward_step(hidden_states, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, other=other, position_embeddings=position_embeddings, loop_idx=loop, kv_cache=loop_cache, inject_bias=inject_bias, evidence=step_evidence, memory=step_memory, token_mask=token_mask)
@@ -939,7 +965,10 @@ class LoopMixtureOfExperts(nn.Module):
         hidden_states_all = torch.stack(hidden_states_all, dim=0)
 
         if return_loss:
-            return hidden_states, total_load_balancing_loss / loops_run, hidden_states_all
+            # with a detached prefix the aux mean is over the live passes only, so its gradient
+            # per pass keeps the size it has without a prefix
+            live_loops = loops_run - detach_loops if detach_loops > 0 else loops_run
+            return hidden_states, total_load_balancing_loss / max(live_loops, 1), hidden_states_all
         else:
             return hidden_states, hidden_states_all
 
@@ -1086,7 +1115,8 @@ class LoopMixtureOfExperts(nn.Module):
         produces its own mass split, and supervising only the final one leaves the earlier reads --
         which is where the table demonstrably sharpens -- unsupervised. Uniform weights rather than
         ``loop_ce_weights``' ascending ones, because a relevant chunk is relevant at every depth;
-        nothing here is a readout whose later loops should dominate.
+        nothing here is a readout whose later loops should dominate. The passes of a detached
+        prefix (``forward(detach_loops=)``) are left out: they carry no graph.
 
         Must be called right after the forward that produced the reads, and only from a forward
         that ran WITHOUT gradient checkpointing: the stashed weights of a checkpointed segment were
@@ -1109,8 +1139,8 @@ class LoopMixtureOfExperts(nn.Module):
         terms = [
             evidence_selection_loss(weights, visible, chunk_gold, supervised=supervised)
             for module in self.ir_modules
-            for weights in module.memory_weights_by_loop.values()
-            if weights is not None
+            for loop, weights in module.memory_weights_by_loop.items()
+            if weights is not None and loop >= self.last_detach_loops
         ]
         if not terms:
             return None
@@ -1136,7 +1166,8 @@ class LoopMixtureOfExperts(nn.Module):
         ``evidence_contrastive_loss`` (information_retrieval.py) on the selector's unit query at the
         given positions against every chunk in the batch, the other documents' chunks included as
         negatives; the positives are the position's own document's gold chunks. Averaged over every
-        (loop, IR expert) read, like the selection term, and under the same no-checkpointing rule.
+        (loop, IR expert) read, like the selection term, and under the same no-checkpointing rule;
+        the passes of a detached prefix are left out the same way.
 
         Args:
             chunk_gold: ``[M]`` bool/float on the flat chunk axis.
@@ -1173,7 +1204,9 @@ class LoopMixtureOfExperts(nn.Module):
             module = expert.ir_module
             for loop, query in module.memory_query_by_loop.items():
                 keys = module.adapted_keys_by_loop.get(loop)
-                if query is None or keys is None or (keep is not None and loop not in keep):
+                # a detached prefix pass has no graph and, under no_grad, no stashed input
+                if (query is None or keys is None or loop < self.last_detach_loops
+                        or (keep is not None and loop not in keep)):
                     continue
                 if rebuild:
                     source = module.query_input_by_loop.get(loop)

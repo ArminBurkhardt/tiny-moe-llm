@@ -593,6 +593,7 @@ class TinyMoETransformer(nn.Module):
         evidence: EvidenceBatch = None,
         token_mask: torch.Tensor = None,
         reader_sites_kept: int = None,
+        detach_loops: int = 0,
     ):
         """forward pass of the model
 
@@ -641,6 +642,10 @@ class TinyMoETransformer(nn.Module):
                 every evidence read site numbered above this value reads nothing. 0 is the residual
                 stream of ``evidence=None``; None (the default) is today's forward, bit for bit.
                 Inference only. Defaults to None.
+            detach_loops (int, optional): the detached depth prefix, see
+                ``LoopMixtureOfExperts.forward``: the first ``detach_loops`` passes run under
+                ``no_grad`` and their hidden states are returned without a graph. Must be below the
+                number of loops run; 0 (the default) is today's forward, bit for bit.
 
         Returns:
             torch.Tensor: output logits, shape [batch_size, seq_len, vocab_size]. If return_hidden
@@ -661,7 +666,7 @@ class TinyMoETransformer(nn.Module):
         if self.training and self.use_checkpointing:
             assert converge_tol is None, "converge_tol is inference-only"
             x = checkpoint(self.gemma_decoder, input_ids, cu_seqlens, max_seqlen, use_reentrant=False)
-            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, None, 0, None, evidence, token_mask, use_reentrant=False)
+            _, aux_loss, hidden_states_all = checkpoint(self.moe, x.last_hidden_state, self._moe_ple(input_ids), True, cu_seqlens, max_seqlen, self.use_sub_checkpointing, n_loops, None, 0, None, evidence, token_mask, None, detach_loops, use_reentrant=False)
             # final RMSNorm applied at every loop, not just the last -- lm_head reads self.norm(x),
             # never the raw residual stream, so per-loop CE needs this too.
             x_all = self.norm(hidden_states_all)
@@ -675,7 +680,7 @@ class TinyMoETransformer(nn.Module):
             moe_cache = kv_cache.moe if kv_cache is not None else None
             exit_check = None if converge_tol is None else self._convergence_exit(converge_tol, min_loops)
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
-            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence, token_mask=token_mask, reader_sites_kept=reader_sites_kept)
+            _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence, token_mask=token_mask, reader_sites_kept=reader_sites_kept, detach_loops=detach_loops)
             x_all = self.norm(hidden_states_all)
             x = x_all[-1]
             extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=False)

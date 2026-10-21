@@ -188,6 +188,43 @@ for n in (1, 2, 3):
     assert torch.count_nonzero(g[n:]).item() == 0, f"loops beyond {n} must get no gradient: {g}"
     print(f"[ok] depth {n}: loss={loss_n.item():.4f}, loop_scale grad touches exactly loops 0..{n-1}")
 
+# --- detached depth prefix: the first passes run without a graph, the forward is unchanged ---
+# torch.equal between two training forwards is sound only with no dropout and no router noise
+assert model.moe.dropout.p == 0.0, "the block's dropout must be 0 for bit-identical training forwards"
+noise_before = model.moe.router.noise_factor
+model.moe.set_router_noise(0.0)
+try:
+    fwd = dict(input_ids=input_ids, cu_seqlens=cu, max_seqlen=ms, return_aux_loss=True, return_hidden=True)
+    h_ref, aux_ref, mtp_ref = model(**fwd)
+    h_d0, aux_d0, mtp_d0 = model(**fwd, detach_loops=0)
+    assert torch.equal(h_d0, h_ref) and torch.equal(aux_d0, aux_ref) and torch.equal(mtp_d0, mtp_ref),         "detach_loops=0 must be the plain forward, bit for bit"
+    model.zero_grad(set_to_none=True)
+    h_dn, aux_dn, mtp_dn = model(**fwd, detach_loops=N_LOOPS - 1)
+    for li in range(N_LOOPS):
+        assert torch.equal(h_dn[li], h_ref[li]), f"detaching the prefix changed loop {li}'s hidden state"
+    assert torch.equal(mtp_dn, mtp_ref), "detaching the prefix changed the MTP input"
+    # the aux mean is over the live pass alone, so it is that pass's term and carries a graph
+    assert aux_dn.requires_grad and torch.isfinite(aux_dn), aux_dn
+    loss_dn, _ = compute_mtp_loss(h_dn, labels, main_lm_head=model.lm_head, pad_mask=pad_mask,
+                                  loop_ce_weights=[0.0] * (N_LOOPS - 1) + [1.0])
+    loss_dn.backward()
+    g = model.moe.loop_scale.grad
+    assert g is not None and torch.count_nonzero(g[:N_LOOPS - 1]).item() == 0, f"prefix passes got gradient: {g}"
+    assert g[-1].item() != 0.0, f"the last pass must get gradient: {g}"
+    model.zero_grad(set_to_none=True)
+    h_5, _, _ = model(**fwd, n_loops=5, detach_loops=2)
+    assert h_5.shape[0] == 5 and torch.equal(h_5[:N_LOOPS], h_ref), "depth override with a detached prefix"
+    for bad in (N_LOOPS, -1):
+        try:
+            model(**fwd, detach_loops=bad)
+            raise SystemExit(f"detach_loops={bad} must be rejected")
+        except AssertionError:
+            pass
+finally:
+    model.moe.set_router_noise(noise_before)
+print(f"[ok] detach_loops: 0 bit-identical, {N_LOOPS - 1} keeps every loop's state bit-identical, "
+      f"loop_scale grad {g.tolist()} reaches only the last pass, {N_LOOPS} and -1 rejected")
+
 # --- weight decay param grouping ---
 from scripts.pretrain import build_param_groups, sync_master_grads_, sync_master_values_
 groups, no_decay_master_pairs = build_param_groups(model, 0.02)

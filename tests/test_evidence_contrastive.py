@@ -22,7 +22,10 @@ On a toy model (needs CUDA and transformer_engine, skipped otherwise), the train
    ``down_proj``, ``loop_query_bias`` and ``key_adapter``) without gradient from the term while
    ``down_proj`` and ``key_adapter`` get one, at the same value; at 1.0 the trunk does get one;
 10. ``trunk_grad=0.5`` halves the trunk's gradient and leaves the head's; under ``no_grad`` the
-    term reads the stashed query at any ``trunk_grad``.
+    term reads the stashed query at any ``trunk_grad``;
+11. after a forward with ``detach_loops=2`` the prefix passes are skipped: with ``loops=None`` and
+    ``trunk_grad=0.0`` the term runs (the prefix stashed no input) and equals the live pass's term,
+    at 1.0 it is that term bit for bit, and the selection term is the live pass's alone.
 
 The function is pure torch, so it is imported through ``modules.model.information_retrieval``
 with transformer_engine stubbed when it is not installed (the module imports it at top level).
@@ -52,7 +55,7 @@ except Exception:  # pragma: no cover - the CPU box has no TE
     sys.modules["transformer_engine"] = te
     sys.modules["transformer_engine.pytorch"] = te_pt
 
-from modules.model.information_retrieval import evidence_contrastive_loss  # noqa: E402
+from modules.model.information_retrieval import evidence_contrastive_loss, evidence_selection_loss  # noqa: E402
 
 
 def close(a, b, tol=1e-5):
@@ -291,6 +294,22 @@ def model_checks(tau):
         assert not ir.query_input_by_loop, "the expert input was stashed without autograd"
         assert torch.equal(term(loops=[0]), term(loops=[0], trunk_grad=0.0))
     print(f"10. trunk_grad=0.5 halves the trunk gradient (rel err {worst_trunk:.1e}, head {worst_head:.1e}) PASS")
+
+    # 11. a detached prefix: its passes stash no input and carry no graph, so both terms skip them
+    forward()
+    live_ref = loop_term(2).detach()
+    select_ref = evidence_selection_loss(ir.memory_weights_by_loop[2], moe.last_memory_visible, chunk_gold).detach()
+    model(input_ids, skip_mtp=True, evidence=evidence, detach_loops=2)
+    assert sorted(ir.query_input_by_loop) == [2], sorted(ir.query_input_by_loop)
+    t_scaled = term(loops=None, trunk_grad=0.0)
+    assert abs(t_scaled.item() - live_ref.item()) < 1e-3, (t_scaled.item(), live_ref.item())
+    t_plain = term(loops=None, trunk_grad=1.0)
+    assert torch.equal(t_plain.detach(), live_ref), (t_plain.item(), live_ref.item())
+    t_select = moe.evidence_selection_term(chunk_gold)
+    assert torch.equal(t_select.detach(), select_ref), (t_select.item(), select_ref.item())
+    forward()
+    assert moe.last_detach_loops == 0 and torch.equal(term().detach(), old.detach()), "the skip outlived its forward"
+    print(f"11. detach_loops=2: both terms read the live pass only ({t_scaled.item():.4f} against {live_ref.item():.4f}) PASS")
 
 
 if __name__ == "__main__":

@@ -116,7 +116,12 @@ size. **Decided 2026-10-21 (the user): the separate search tower (a small bge-st
 the prompt text beside the model) is held, not built; bge keys the store and embeds the question
 at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size
 (`evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` stay as the knob); the
-real-run spec carries no retriever term.** **The Muon rung's three micro arms ran and were read 2026-10-18
+real-run spec carries no retriever term.** **R1b, the depth memory probe, run 2026-10-21
+([depth_memory_probe.md](docs/measurements/depth_memory_probe.md)): depth 5 is trainable at pilot
+shape with full gradient at batch 4 x 2 (17.3 GB, about 31 GB at batch 8 over the card, 1.27x
+the time per token of depth 3), and the detached prefix (`detach_loops`, built the same day)
+fits at 21.5 GB but cuts the prelude off from the language loss until a straight-through route
+exists; nothing changes in the real-run spec.** **The Muon rung's three micro arms ran and were read 2026-10-18
 ([muon_micro.md](docs/measurements/muon_micro.md)): the loss bar passes (Muon 0.07 to 0.15
 nats below its AdamW twin on both recipes, z 16 to 25 paired per token, 2 to 4x the one seed
 pair's spread of 0.03), copying is no later (both warm-up arms switch between 50M and 100M,
@@ -520,6 +525,7 @@ scripts/
   eval_exit.py        per-exit CE without evidence: paired gains, oracle and beta optimum bounds, confidence exit vs fixed depths
   eval_store.py       store recall of the model's query vs bge, open-book pathway EM vs oracle, store-edit flip rate
   probe_query_head.py ridge and MLP heads from the frozen IR input onto bge's question vector, scored as store recall
+  probe_depth_memory.py peak memory and time of one training step per depth:detach_loops, one child process per setting
   entity_frequency.py exact token-sequence counts in a .bin (the counterfactual strata)
   eval_calibration.py eval_probe.py eval_stage0.py evidence_ceiling_probe.py (--fixed-split: ceiling on evidence_fixed)
   inference.py gradio_app.py prune_vocab.py fetch_tokenizer.py setup.sh onstart.sh run_sft_after_pretrain.sh
@@ -572,6 +578,7 @@ python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max
 python scripts/build_store.py --edit-from openqa --name openqa_edit --edit-fraction 0.5 --neighbour-cos 0.85 --device cpu --seed 42
 python scripts/eval_store.py recall|pathway|edit -c CKPT --store data/index/openqa [--edit-store data/index/openqa_edit] --buffer 4 --loop 1 --json-out OUT.json
 TINY_LLM_CONFIG=config_micro.yaml python scripts/probe_query_head.py -c CKPT --store data/index/openqa --batch-size 16 --pool last|mean|meanlast --json-out OUT.json
+TINY_LLM_CONFIG=config_pilot.yaml python scripts/probe_depth_memory.py -c ckpts/inject/seed_pilot_grounded.pt --settings 3:0,5:0,5:2 --json-out OUT.json   # [--batch-size 4]
 python scripts/eval_benchmarks.py -c CKPT --tasks popqa --rank-candidates 20 --json-out OUT.json
 python scripts/inference.py -c CKPT -p PROMPT -n 200 [--evidence chunks.json] [--converge-tol T]
 bash tests/run_env_check.sh; bash tests/run_tests.sh tests/test_attention_equiv.py tests/test_overfit.py
@@ -822,6 +829,12 @@ signal everywhere**, as `1 / sum(exp(l_j - l_max))`; a replacement must add info
 - `return_aux_loss=True` -> `(x, aux_loss)` plus `extra_token_outputs` with MTP. `skip_mtp=True`
   drops it (bit-identical logits); evals and non-drafting inference pass it. `evidence=` takes an
   `EvidenceBatch`.
+- `detach_loops=k` (on `TinyMoETransformer.forward` and `LoopMixtureOfExperts.forward`, 0 by
+  default and bit-identical): the first `k` passes run under `no_grad` as plain steps before the
+  checkpoint branch, their states kept in `hidden_states_all`, their aux terms constants;
+  asserted `0 <= k < n_loops`. Under it the prelude decoder gets no gradient from the language
+  loss (0 of 26 decoder parameters at `k = 2` on the test fixture), so it is not a training recipe
+  until a straight-through route to the first live pass exists. `tests/test_loop_machinery.py`.
 - The dataset emits `document_ids [B, S]`; the trainer builds `cu_seqlens` in-thread. **Never put
   `cu_seqlens` in the batch dict** (ragged; accelerate truncates dim 0). `max_seqlen` is `S`.
 - `TokenTracker` counts on-device, drains on `sync()`; `get_count()` is sync-free; assign

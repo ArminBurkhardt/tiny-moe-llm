@@ -123,7 +123,12 @@ size. **Decided 2026-10-21 (the user): the separate search tower (a small bge-st
 the prompt text beside the model) is held, not built; bge keys the store and embeds the question
 at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size
 (`evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` stay as the knob); the
-real-run spec carries no retriever term.** **Built
+real-run spec carries no retriever term.** **R1b, the depth memory probe, run 2026-10-21
+([depth_memory_probe.md](../measurements/depth_memory_probe.md)): depth 5 is trainable at pilot
+shape with full gradient at batch 4 x 2 (17.3 GB, about 31 GB at batch 8 over the card, 1.27x
+the time per token of depth 3), and the detached prefix (`detach_loops`, built the same day)
+fits at 21.5 GB but cuts the prelude off from the language loss until a straight-through route
+exists; nothing changes in the real-run spec.** **Built
 2026-10-18 while that pair ran: the optimizer rung's code** (R7 in the ladder: `MuonAdamW` in
 `modules/model/optim.py`, the `optimizer` key, `eval_exit.py --pair`, the test); its three micro
 arms (`ckpts/inject/launch_muon.sh`) ran after the InfoNCE pair (the partition at micro: 60
@@ -1029,7 +1034,11 @@ checkpoints; it is on the critical path because the pilot cannot be read without
   LR group in graft arms. **FAIL 2026-09-30** on both checkpoints, monotone in the multiplier
   ([loop_scale_probe.md](../measurements/loop_scale_probe.md)): it does not join.
 - **R1b, the depth memory probe.** One micro step at depth 3 and at depth 5 with the detached
-  prefix, pilot shape; read peak memory. Decides whether the depth schedule is trainable.
+  prefix, pilot shape; read peak memory. Decides whether the depth schedule is trainable. **Run
+  2026-10-21: fits** ([depth_memory_probe.md](../measurements/depth_memory_probe.md)): depth 5
+  with full gradient OOMs at batch 8 x 4096 and fits at batch 4 (17.3 GB, 1.27x the time per token
+  of depth 3), and the detached prefix fits at 21.5 GB but leaves the prelude without a language
+  gradient until a straight-through route at the first live pass is built.
 - **The in-context ceiling on the `evidence_fixed` rows**, read with the seed, and a source
   sidecar on `evidence_fixed` so every gain splits per source (SQuAD, HotpotQA). The printed
   ceiling fraction is against the SQuAD-only 3.23 nats on other rows and another checkpoint until
@@ -1082,7 +1091,7 @@ checkpoints; it is on the critical path because the pilot cannot be read without
 
 The first experiment that can falsify the goal. About 120M parameters at width 512, 1 to 2B
 tokens per arm on the 5090, with a matched-token control without retrieval. Run times are
-unmeasured; the R1b memory probe comes first, and the R0b micro-pilot (ladder below) reads the
+unmeasured; the R1b memory probe ran 2026-10-21 (fits, depth 5 at batch 4 x 2), and the R0b micro-pilot (ladder below) reads the
 externalization recipe before any 1B-token arm.
 
 ### The model, from scratch
@@ -1209,7 +1218,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 | R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
 | R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop. **Read 2026-10-01**: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 by loop and the per-loop content gain 0.070 / 0.078 / 0.081 (arm B), so loop 1 reads best and later loops add little |
 | R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; the anonymization sweep dropped 2026-10-04; the swap rate sweep set aside 2026-10-05 for a copy-first warm-up arm of (c), reopened as a candidate by the warm-up arm's 150M read | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms. **(c) read 2026-10-05: fails** on both forms. In distribution 0.027 (z 4.1) at tier 100 and 0.120 (z 8.8) at tier 1000, held out 0.013 (z 3.6) and 0.071 (z 8.2), while the reader copies (top-1 1.000, swapped card followed on every item); the leak is present at 50M before copying (0.010, z 4.0; 0.105, z 14.4) and flat after 100M (paired +0.001, z 0.2 at tier 100). **Copy-first warm-up arm, read 2026-10-05**: nothing stored at 50M and 100M without real-value targets (every cell within 3 sigma), copying at 100M (top-1 0.95 to 0.97); at 300M 0.015 (z 2.6) at tier 100 and 0.085 (z 6.4) at tier 1000 in distribution, held out 0.007 (z 2.0) and 0.047 (z 5.1): the rule holds through tier 100 on both forms, tier 1000 is a leak on both. **Accepted 2026-10-05 on the warm-up arm**, the tier 1000 leak recorded as known; the swap rate 0.30 branch (read 2026-10-06) leaves tier 1000 at 0.083 (z 6.2), paired -0.002 (z -0.3) against the warm-up arm, and holds the rule with more margin (tier 100 0.010, z 1.7; 0.003, z 0.9); the pilot's swap rate stays at 0.15 (decided 2026-10-06) | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
-| R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable |
+| R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable. **Run 2026-10-21** ([depth_memory_probe.md](../measurements/depth_memory_probe.md)): fits; depth 5 full gradient needs batch 4 x 2 at pilot shape (about 31 GB at batch 8, 17.3 at batch 4, 1.27x the time per token); the detached prefix fits (21.5 GB) but cuts the prelude off from the language loss until a straight-through route exists. |
 | R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
 | R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
 | R4 | 4 x 2 x 1B | from scratch: loss placement by coda, 2 x 2, two seeds per compared arm (training-seed sigma is unmeasured), shared fresh `loop_scale`, inject and data | held-out-template 2-hop at D = 3 | best arm 10 points over per-loop loss without coda, outside the seed spread; 3-hop above chance | objective and coda |
@@ -1463,7 +1472,7 @@ above are a different, live series).
 - **Reader bandwidth.** One read per sublayer in two of three sublayers is still narrower than
   per-layer designs. The dense-layer reads are the prepared arm.
 - **Ambiguous pilot null.** 1B tokens at 120M with 10% synthetic may undertrain. The prefix and
-  inject interaction and the depth-5 memory are untested. R1b and the saturating 1-hop curve are
+  inject interaction and the depth-5 memory is read (R1b, 2026-10-21: fits at batch 4 x 2; the prefix needs a straight-through route). R1b and the saturating 1-hop curve are
   the guards.
 - **Benchmark contamination.** Standard val and test splits only; a single suspiciously strong
   benchmark is suspect, not a win; the A1 probe answers are held out of the pretraining text.
@@ -1620,6 +1629,9 @@ above are a different, live series).
   embeds the question at serving, A4 stays untested, the model's own retrieval is revisited at
   the real run's size with `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad`
   kept as the knob, and the real-run spec carries no retriever term.
+  R1b run ([depth_memory_probe.md](../measurements/depth_memory_probe.md), `detach_loops` and
+  `scripts/probe_depth_memory.py` built): fits, depth 5 at batch 4 x 2, the detached prefix needs
+  a straight-through route to the prelude before use.
 - 2026-10-20: the aux loss's masked branch fixed (`compute_aux_loss`): hard counts, mask and the
   probability reduction now run in fp32. In bf16 every slot's count saturated at 256, so on every
   masked aux-balanced run since the token mask (the R0b arms, both pilot arms, the Muon arms) the
