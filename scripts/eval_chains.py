@@ -23,11 +23,26 @@ fewest and the most kept sites with a paired bootstrap sigma. The JSON holds one
 question and cell (candidate scores, gold rank, margin, NLLs) under ``records``, so any two cells
 can be paired by position.
 
+``--generate-bridge`` reads a model trained on the written bridge form (``prepare_chain_data.py
+--bridge``): at each depth and kept-site count it first greedy decodes from the prompt, with the
+buffer attached and the same cut, until the text holds the answer marker (or
+``--bridge-max-tokens`` runs out), then scores every candidate after that generated prefix, so
+the grid and the NLL tables mean the same thing one step later. Each record gains ``generated``
+(the decoded text), ``bridge_marker`` (whether the marker came out), ``bridge_hits`` (per
+intermediate hop, whether its entity was written as whole words) and ``bridge_all``. A row with
+``bridge_marker`` false is still scored, after the whole generated text and a space, but that
+prefix is off the trained distribution, so such rows are excluded from accuracy claims; the extra
+table gives the marker rate, the hit rate per intermediate hop, the accuracy among marker rows
+only, and the accuracy among questions with every intermediate written against the rest. The
+candidate tail carries the closing "." token here, so ``gold_nll`` and ``ce_per_token`` are not
+comparable to a plain run; ``ln_k`` is.
+
 Usage:
 
     python scripts/eval_chains.py -c CKPT --data-dir data/prepared \\
         --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all \\
-        --max-questions 1000 --batch-size 16 --json-out ckpts/chains_eval.json
+        --max-questions 1000 --batch-size 16 --json-out ckpts/chains_eval.json \\
+        [--generate-bridge --bridge-max-tokens 48]
 """
 import os
 import sys
@@ -98,7 +113,7 @@ def encode_items(split: ChainSplit, indices: Sequence[int], tokenizer, template:
         pieces = tokenizer(cands, add_special_tokens=False)["input_ids"]
         items.append({
             "index": i, "hops": m["hops"], "answer": m["answer"], "candidates": cands,
-            "gold": cands.index(m["answer"]), "prompt": prompt,
+            "entities": m["entities"], "gold": cands.index(m["answer"]), "prompt": prompt,
             "cand_ids": [p + [template.eos_id] for p in pieces], "evidence": split.evidence_row(i),
         })
     return items
@@ -112,10 +127,12 @@ def score_items(model, items: List[dict], *, depth: int, kept: Optional[int], pa
 
     Rows are right padded with one extra pad column, which gives every row a second attention
     segment to dump the shared evidence width into (see ``_pack_evidence_batch``). The head is
-    applied only at the positions that predict a candidate token.
+    applied only at the positions that predict a candidate token. An item carrying ``prefix``
+    (generated bridge ids, from ``bridge_items``) places it between the prompt and each candidate,
+    and the scored positions move past it (``chains.scored_row``).
 
     Args:
-        items: from ``encode_items``.
+        items: from ``encode_items`` or ``bridge_items``.
         depth: ``n_loops`` for the forward.
         kept: ``reader_sites_kept`` for the forward; None keeps every site.
         batch_size: rows (question, candidate pairs) per forward.
@@ -131,19 +148,19 @@ def score_items(model, items: List[dict], *, depth: int, kept: Optional[int], pa
     token_lps = [[[] for _ in item["candidates"]] for item in items]
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
-        seqs = [items[n]["prompt"] + items[n]["cand_ids"][c] for n, c in chunk]
-        width = max(len(s) for s in seqs) + 1
+        built = [chains.scored_row(items[n]["prompt"], items[n].get("prefix", []), items[n]["cand_ids"][c])
+                 for n, c in chunk]
+        width = max(len(seq) for seq, _, _ in built) + 1
         assert width <= max_seq_len, f"row of {width} tokens exceeds --max-seq-len {max_seq_len}"
         ids = torch.full((len(chunk), width), pad_id, dtype=torch.long)
         doc = torch.zeros((len(chunk), width), dtype=torch.long)
         predict, target, owner = [], [], []
-        for r, ((n, c), seq) in enumerate(zip(chunk, seqs)):
+        for r, (seq, positions, targets) in enumerate(built):
             ids[r, :len(seq)] = torch.tensor(seq, dtype=torch.long)
             doc[r, :len(seq)] = 1
-            p, k = len(items[n]["prompt"]), len(items[n]["cand_ids"][c])
-            predict.extend(r * width + p - 1 + t for t in range(k))
-            target.extend(seq[p:p + k])
-            owner.extend([r] * k)
+            predict.extend(r * width + p for p in positions)
+            target.extend(targets)
+            owner.extend([r] * len(targets))
         ids, doc = ids.to(device), doc.to(device)
         cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(doc)
         seg = _segment_ids(cu_seqlens, len(chunk), width, device)
@@ -168,6 +185,160 @@ def score_items(model, items: List[dict], *, depth: int, kept: Optional[int], pa
             token_lps[n][c] = flat[at:at + k]
             at += k
     return (scores, token_lps) if return_tokens else scores
+
+
+@torch.no_grad()
+def generate_bridges(model, tokenizer, items: List[dict], *, depth: int, kept: Optional[int], pad_id: int,
+                     eos_id: int, batch_size: int, device: str, max_seq_len: int,
+                     max_new_tokens: int) -> List[List[int]]:
+    """Greedy decode from each item's prompt with its buffer attached, until the answer marker.
+
+    Batched over questions and left padded, with no KV cache (the reader has no cache slot), the
+    way ``eval_abstention.generate_batch`` decodes: the pad run is each row's first segment and
+    takes the shared evidence width, the real run its last, and the evidence batch is rebuilt every
+    step against that step's ``cu_seqlens``. A row stops at EOS or once its decoded text contains
+    ``chains.BRIDGE_ANSWER_MARKER``; a stopped row emits pad inside its own segment so the batch
+    stays rectangular.
+
+    Args:
+        items: from ``encode_items``.
+        depth: ``n_loops`` for every forward.
+        kept: ``reader_sites_kept`` for every forward; None keeps every site.
+        eos_id: ends a row; never kept in the returned ids.
+        batch_size: questions per forward.
+        max_seq_len: longest row allowed, prompt plus generated tokens.
+        max_new_tokens: decode budget per row.
+
+    Returns:
+        Per item, the generated ids, EOS excluded.
+    """
+    out: List[List[int]] = []
+    for start in range(0, len(items), batch_size):
+        chunk = items[start:start + batch_size]
+        b = len(chunk)
+        width = max(len(it["prompt"]) for it in chunk) + 1
+        assert width + max_new_tokens <= max_seq_len, \
+            f"prompt of {width} plus {max_new_tokens} generated tokens exceeds --max-seq-len {max_seq_len}"
+        ids = torch.full((b, width), pad_id, dtype=torch.long, device=device)
+        doc = torch.zeros((b, width), dtype=torch.long, device=device)
+        for r, it in enumerate(chunk):
+            p = len(it["prompt"])
+            ids[r, width - p:] = torch.tensor(it["prompt"], dtype=torch.long, device=device)
+            doc[r, width - p:] = 1
+        generated: List[List[int]] = [[] for _ in chunk]
+        finished = [False] * b
+        rows = [it["evidence"] for it in chunk]
+        for _ in range(max_new_tokens):
+            cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(doc)
+            seg = _segment_ids(cu_seqlens, b, doc.shape[1], device)
+            evidence = _pack_evidence_batch(model, seg[:, -1], seg[:, 0], rows,
+                                            num_segments=int(cu_seqlens.numel() - 1), device=device)
+            res = model(
+                input_ids=ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_hidden=True,
+                skip_mtp=True, evidence=evidence, n_loops=depth, reader_sites_kept=kept,
+            )
+            hidden = (res[0] if isinstance(res, tuple) else res)[-1]
+            nxt = model.lm_head(hidden[:, -1, :]).float().argmax(-1).tolist()
+            for r, token in enumerate(nxt):
+                # a finished row's last token (EOS or the one completing the marker) is its end;
+                # from then on it emits pad inside its own segment, which no other row reads
+                if finished[r]:
+                    nxt[r] = pad_id
+                    continue
+                if token == eos_id:
+                    finished[r] = True
+                    continue
+                generated[r].append(token)
+                text = tokenizer.decode(generated[r], skip_special_tokens=True)
+                if chains.BRIDGE_ANSWER_MARKER in text:
+                    finished[r] = True
+            if all(finished):
+                break
+            step = torch.tensor(nxt, dtype=torch.long, device=device).unsqueeze(-1)
+            ids = torch.cat([ids, step], dim=-1)
+            doc = torch.cat([doc, torch.ones_like(step)], dim=-1)
+        out.extend(generated)
+    return out
+
+
+def bridge_items(items: List[dict], generated: List[List[int]], tokenizer, eos_id: int) -> List[dict]:
+    """Copies of the items whose candidates are scored after the generated bridge.
+
+    The decoded text is cut after the answer marker (``chains.split_bridge``); without a marker the
+    whole text is the prefix and the row is flagged ``bridge_marker`` false: it is scored after an
+    off-distribution prefix and is left out of accuracy claims. The prefix and each candidate (with its
+    leading space, closing period and EOS) are tokenized as training tokenized the assistant turn
+    (``chains.bridge_candidate_ids``), and the prefix ids go under ``prefix`` for ``score_items``.
+
+    Args:
+        items: from ``encode_items``.
+        generated: from ``generate_bridges``, one id list per item.
+        eos_id: closes every candidate.
+    """
+    out = []
+    for item, gen in zip(items, generated):
+        text = tokenizer.decode(gen, skip_special_tokens=True)
+        prefix_text, rest = chains.split_bridge(text)
+        marker = rest is not None
+        body = prefix_text[:-1] if marker else text.rstrip()
+        prefix, cand_ids = None, []
+        for cand in item["candidates"]:
+            p, c = chains.bridge_candidate_ids(tokenizer, body, cand, eos_id)
+            prefix = p if prefix is None else prefix
+            cand_ids.append(c)
+        hits = chains.bridge_hits(text, item["entities"])
+        out.append(dict(item, prefix=prefix, cand_ids=cand_ids, generated=text, bridge_marker=marker,
+                        bridge_hits=hits, bridge_all=all(hits)))
+    return out
+
+
+def bridge_stats(records: List[dict]) -> dict:
+    """Marker rate, hit rate per intermediate hop, accuracy among marker rows, and accuracy split by
+    whether every hop was written.
+
+    Rows without the marker were scored after an off-distribution prefix; ``acc_marker`` leaves
+    them out and is the accuracy to quote.
+
+    Args:
+        records: ``build_records`` entries of one cell carrying the bridge fields.
+    """
+    n = len(records)
+    hops = max((len(r["bridge_hits"]) for r in records), default=0)
+    marked = [r for r in records if r["bridge_marker"]]
+    full = [r for r in records if r["bridge_all"]]
+    part = [r for r in records if not r["bridge_all"]]
+
+    def acc(rs):
+        return sum(1 for r in rs if r["correct"]) / len(rs) if rs else float("nan")
+
+    return {
+        "bridge_marker_rate": sum(1 for r in records if r["bridge_marker"]) / n if n else float("nan"),
+        "bridge_hit_rate": [sum(1 for r in records if r["bridge_hits"][h]) / n for h in range(hops)],
+        "acc_marker": acc(marked), "n_marker": len(marked),
+        "acc_bridge_all": acc(full), "n_bridge_all": len(full),
+        "acc_bridge_not_all": acc(part), "n_bridge_not_all": len(part),
+    }
+
+
+def bridge_table(by_kept: Dict[int, Dict[int, dict]]) -> List[str]:
+    """One line per kept count and hops: marker rate, hit rate by hop, accuracy among marker rows
+    and accuracy by full bridge.
+
+    Args:
+        by_kept: grid cells of one split and depth carrying the ``bridge_stats`` keys.
+    """
+    lines = [f"{'kept':>4} {'hops':>4} {'n':>5} {'marker':>7}  {'hits by hop':<20} "
+             f"{'acc | marker (n)':>18} {'acc | all written (n)':>22} {'acc | not (n)':>18}"]
+    for kept, by_hops in by_kept.items():
+        for h, s in sorted(by_hops.items()):
+            if "bridge_marker_rate" not in s:
+                continue
+            hits = "/".join(f"{v:.2f}" for v in s["bridge_hit_rate"]) or "-"
+            lines.append(f"{kept:>4} {h:>4} {s['n']:>5} {s['bridge_marker_rate']:>7.3f}  {hits:<20} "
+                         f"{s['acc_marker']:>10.3f} ({s['n_marker']:>5}) "
+                         f"{s['acc_bridge_all']:>14.3f} ({s['n_bridge_all']:>5}) "
+                         f"{s['acc_bridge_not_all']:>10.3f} ({s['n_bridge_not_all']:>5})")
+    return lines
 
 
 def parse_sites(text: str, depth: int) -> List[int]:
@@ -370,6 +541,10 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=1024)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--json-out", default=None)
+    parser.add_argument("--generate-bridge", action="store_true",
+                        help="greedy decode the written bridge first, then score the candidates after it")
+    parser.add_argument("--bridge-max-tokens", type=int, default=48,
+                        help="decode budget per question under --generate-bridge")
     args = parser.parse_args()
 
     device = args.device
@@ -400,15 +575,30 @@ def main():
             grid[split_name][depth], ce_by_split[split_name][depth] = {}, {}
             records[split_name][depth] = {}
             for kept in parse_sites(args.sites, depth):
-                scores, token_lps = score_items(model, items, depth=depth, kept=None if kept >= depth else kept,
+                kept_arg = None if kept >= depth else kept
+                cell_items = items
+                if args.generate_bridge:
+                    generated = generate_bridges(
+                        model, tokenizer, items, depth=depth, kept=kept_arg, pad_id=pad_id,
+                        eos_id=template.eos_id, batch_size=args.batch_size, device=device,
+                        max_seq_len=args.max_seq_len, max_new_tokens=args.bridge_max_tokens)
+                    cell_items = bridge_items(items, generated, tokenizer, template.eos_id)
+                    logger.info(f"{split_name} D={depth} kept={kept}: generated {len(cell_items)} bridges")
+                scores, token_lps = score_items(model, cell_items, depth=depth, kept=kept_arg,
                                                 return_tokens=True, **common)
-                by_hops = tally(items, scores)
-                records[split_name][depth][kept] = build_records(items, scores, token_lps)
+                by_hops = tally(cell_items, scores)
+                records[split_name][depth][kept] = build_records(cell_items, scores, token_lps)
+                if args.generate_bridge:
+                    for rec, it in zip(records[split_name][depth][kept], cell_items):
+                        rec.update({k: it[k] for k in ("generated", "bridge_marker", "bridge_hits", "bridge_all")})
                 grid[split_name][depth][kept] = {}
                 ce_by_split[split_name][depth][kept] = {}
                 for hops, cell in sorted(by_hops.items()):
                     stats = chains.cell_stats(cell["correct"], cell["chance"])
-                    extras = cell_extras([r for r in records[split_name][depth][kept] if r["hops"] == hops])
+                    cell_records = [r for r in records[split_name][depth][kept] if r["hops"] == hops]
+                    extras = cell_extras(cell_records)
+                    if args.generate_bridge:
+                        extras.update(bridge_stats(cell_records))
                     grid[split_name][depth][kept][hops] = dict(stats, **extras)
                     ce_by_split[split_name][depth][kept][hops] = answer_ce(cell)
                     cells.append(dict(stats, split=split_name, depth=depth, hops=hops, kept=kept))
@@ -437,6 +627,14 @@ def main():
             print(f"\n{split_name}  depth {depth}")
             for line in nll_table(by_kept):
                 print(line)
+
+    if args.generate_bridge:
+        print("\n=== written bridge: marker rate | hit rate by intermediate hop | acc by full bridge ===")
+        for split_name, by_depth in grid.items():
+            for depth, by_kept in by_depth.items():
+                print(f"\n{split_name}  depth {depth}")
+                for line in bridge_table(by_kept):
+                    print(line)
 
     readings: dict = {"paired_delta": {}}
     for split_name, by_depth in records.items():
@@ -472,7 +670,9 @@ def main():
 
     if args.json_out:
         payload = {
-            "checkpoint": args.checkpoint, "args": vars(args),
+            "checkpoint": args.checkpoint,
+            "args": {k: v for k, v in vars(args).items()
+                     if args.generate_bridge or k not in ("generate_bridge", "bridge_max_tokens")},
             "grid": {s: {str(d): {str(k): {str(h): v for h, v in bh.items()} for k, bh in bk.items()}
                          for d, bk in bd.items()} for s, bd in grid.items()},
             "validity": {"valid": verdict["valid"], "readable": verdict["readable"],

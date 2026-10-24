@@ -150,6 +150,72 @@ reseed, far outside the seed spread). **Decided 2026-10-21 (the user): loss-free
 enters the real-run spec.** Decided the same day (the user): the 100B-token corpus build runs on
 the rented cluster, not locally, and the throughput work starts only after every other spec
 decision is made, so nothing optimized has to be redone.
+**Run order, decided 2026-10-23 (the user, after a cost read):** R4b's expert arm first (it needs
+no build) with builds beside it, R9 next (hours; its read gates R4's corner arm), R6 last (its data
+build is the longest CPU job). One training run at a time on the card (a second GPU process spills
+the first into shared memory); builds, data preparation, docs and save reads run beside it, but
+corpus builds and evals are not resumable, and a run paused through its STOP file loses the tokens
+since its last save and resumes on the code in the tree, so builds land behind flags that default
+to the old behaviour. **R4 is staged:** arm P is the per-pass-loss, no-coda cell (at chance on
+every composition read, run under the aux term, accepted as the baseline); the far corner
+(last-pass loss through the coda; the coda is a half-day build behind a flag plus review) runs
+first as one arm, a chance corner makes the table a null, and only a positive corner earns the two
+single-switch arms and second seeds of the corner and the baseline (five arms in all); the corner
+runs only if R9 says the loop, not written tokens, must compose (optional if the bridge composes;
+if neither does, R4 waits for the real run's size). **R4b's sublayer half is not a config change:**
+today's core is one block per pass, and 2 against 3 sublayers is the unbuilt blueprint core (reader
+in sublayers 1 and 3, per-sublayer norm and scale), a day of architecture work plus review before
+two arms; open for the user: build it, or read one arm of the three-sublayer core against today's
+one block. **Arm E4 launched 2026-10-23 17:09** (`bash ckpts/inject/launch_pilot_e4.sh`,
+`ckpts/inject/config_pilot_e4.yaml`: `config_pilot.yaml` with `num_mlp_experts: 4` and
+`moe_balancing: loss_free`; seed `ckpts/inject/seed_pilot_e4_grounded.pt` from
+`init_scratch_seed.py` seed 0 then `migrate_groundedness_head.py`, 89.6M total, 84.9M active, arm
+P's active compute; run directory `ckpts/evidence_pilot_e4`, log `ckpts/inject/pilot_e4.log`; arm
+P's recipe: the warm-up on `pilot_warm_train` stopped after the 300M save by `stop_after_save.sh e4
+'30[0-4]M'`, then `SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_e4.sh`; reads `bash
+ckpts/inject/read_pilot_save.sh CKPT e4 TAG`, which loads the e4 yaml): 44k to 48k tokens per
+second, peak 26.3 GB, step 0 evals neutral. Read against arm P on held-out CE on `inject_val`,
+closed-book rank by tier on both forms, the 1-hop gate and L1, the port read and the load fields;
+caveat on record: E4 runs loss-free where arm P ran under the aux term the bf16 saturation had made
+a constant, two changes, and at micro loss-free alone moved CE and storage inside the seed spread,
+so a difference is read as the expert count with that caveat. **R9 built 2026-10-23** (code by a
+subagent, review pending, nothing run): `prepare_chain_data.py --bridge` renders the assistant turn
+as "Step 1: e1. Step 2: e2. Answer: ek." (1 hop: "Answer: e1.") with every buffer and sidecar byte
+identical to the plain build and `bridge` in the meta; `eval_chains.py --generate-bridge
+[--bridge-max-tokens 48]` greedily decodes the bridge with evidence attached (left padded, no KV
+cache, stop at "Answer:") and scores the candidates after the generated prefix through the
+unchanged scoring path, with per-record `generated`, `bridge_marker`, `bridge_hits`, `bridge_all`
+and one extra table (marker rate, hit rate per intermediate hop, accuracy with and without a fully
+written bridge); helpers in `modules/data/chains.py`, tests in `test_chain_generator.py` (5c, 8b)
+and `test_eval_chains_bridge.py`. Planned: `bash ckpts/inject/build_chains_bridge.sh` (500k train
+and 2000 val questions, seed 42, GPU embedder, in E4's 300M stop window), then `bash
+ckpts/inject/launch_pilot_bridge.sh` (`config_pilot_bridge.yaml`: the chain continuation config on
+the bridge splits, two epochs, saves every 10M, from arm P's final; `ckpts/evidence_pilot_bridge`,
+`pilot_bridge.log`), about 50M tokens, read save by save in the generate mode on `chains_eval`,
+`chains_heldout_tmpl` and `chains_hop4` against arm P's latent read; bar: held-out 2-hop 3 sigma
+above chance with the 1-hop gate kept.
+**Arm E4 complete and read 2026-10-24 ([expert_count_pilot.md](docs/measurements/expert_count_pilot.md)):
+halving the routed experts from 8 to 4 at top 2 (10M fewer parameters, the same active compute)
+costs nothing measurable at this shape and dose.** 858.40M tokens, one epoch (killed once at about
+680M on the user's request on 2026-10-23 and resumed from the 652M save, which replays the same
+documents; the 675M eval reproduced within 0.001; final `ckpts/evidence_pilot_e4/checkpoint_evidence_final.pt`,
+reads `ckpts/inject/pilot_e4_{300M,final}_*`, `compare_pilot_e4_vs_p.log`). Held-out CE 3.2396
+against arm P's 3.2321, E4 above at every read by 0.001 to 0.019, under the pilot's noise of 0.013
+at every read but 25M and 276M; the switch criterion met at 300M as on arm P; copying equal (gold
+top-1 1.000 in distribution, 0.96 to 0.97 held out; swapped followed 1.000 / 0.91 to 0.93); the
+1-hop gate 0.875 against 0.848, every composition cell at chance, so L1 fails as on arm P; port
+gold gain +4.19, content +3.82, grounded AUROC 0.972 against +4.00, +3.97, 0.994; the leak equal at
+tier 100 (entity `delta` 0.017 / 0.012 by form against 0.010 / 0.013, paired z -1.2) and smaller at
+tier 1000 (0.053 / 0.041 against 0.064 / 0.046; paired raw rank z -3.8, about one sigma on
+`delta`, since E4's prior ranks worse too); MLP load max over mean 1.01 to 1.06 per pass. Caveat
+on record: two changes (loss-free against the saturated aux term) and one seed each. For shape L
+the expert count is a cost choice, not a quality one, until a read at the real run's size says
+otherwise; R4b's sublayer half stays open. **R9's bridge decode smoke ran 2026-10-23** on arm P's
+final (8 questions per hop, `ckpts/inject/bridge_smoke.json`): the decode runs end to end and
+writes entity-like text, marker rate 0 as expected on a model that never saw the form. **R9's SFT
+launched 2026-10-24** (`bash ckpts/inject/launch_pilot_bridge.sh`, `ckpts/evidence_pilot_bridge`,
+log `ckpts/inject/pilot_bridge.log`; the bridge split 500k questions, 33.7M prompt tokens per pass
+at evidence ratio 3.26, two passes), read pending.
 Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
@@ -340,6 +406,14 @@ asks (decided 2026-10-11); a new session reads the file.
      did not), and NEXT.md 6f, reasoning post-training after the real run (SFT, on-policy
      distillation, RL past the pass@8 gate with credit over passes, depth record and routing
      replay; prerequisite: decode with evidence through a KV cache).
+  5. Run order decided 2026-10-23 (the user): R4b's expert arm (arm E4, run and read 2026-10-24,
+     [expert_count_pilot.md](docs/measurements/expert_count_pilot.md): 4 experts cost nothing
+     measurable against 8 at the same active compute), then R9 (built 2026-10-23, review pending:
+     `prepare_chain_data.py --bridge`, `eval_chains.py --generate-bridge`,
+     `build_chains_bridge.sh`, `launch_pilot_bridge.sh`; SFT launched 2026-10-24, read pending), whose
+     read gates R4's corner arm (R4 staged: arm P the baseline cell, the far corner with the
+     unbuilt coda first, five arms at most), then R6; R4b's sublayer half needs the unbuilt
+     three-sublayer core, its build open for the user.
   Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)); build list done 2026-10-10 (its
   "Build" section). Launch: `bash ckpts/inject/launch_pilot_p.sh` (warm-up split; after the switch
   criterion holds, `SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_p.sh` resumes the same
@@ -521,7 +595,7 @@ scripts/
   eval_abstention.py  THE acceptance metric (SQuAD v2); --evidence-port scores gold/none/distractors/mixed/counterfactual
   eval_benchmarks.py  fixed 13-task suite, one scoring path for this model and the peers; popqa is a rank task outside `all`
   closed_book_rank.py likelihood rank of the gold among same-type candidates (bios: by exposure tier; compare: paired)
-  eval_chains.py      accuracy by hops and by kept read sites (reader_sites_kept) at fixed depth
+  eval_chains.py      accuracy by hops and by kept read sites (reader_sites_kept) at fixed depth; --generate-bridge decodes the written bridge, then scores
   eval_exit.py        per-exit CE without evidence: paired gains, oracle and beta optimum bounds, confidence exit vs fixed depths
   eval_store.py       store recall of the model's query vs bge, open-book pathway EM vs oracle, store-edit flip rate
   probe_query_head.py ridge and MLP heads from the frozen IR input onto bge's question vector, scored as store recall
@@ -574,6 +648,8 @@ TINY_LLM_CONFIG=config_micro.yaml python scripts/eval_exit.py -c CKPT --data-dir
 python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits eval,heldout_tmpl,hop4 --eval-questions-per-hop 1000 --seed 42 --device cpu   # train,val on cuda
 python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains --splits train,val --train-questions 2000000 --val-questions 2000 --seed 42 --device cuda
 python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --json-out OUT.json
+python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains_bridge --splits train,val --train-questions 200000 --val-questions 2000 --seed 42 --device cuda --bridge   # the written bridge form
+python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --generate-bridge [--bridge-max-tokens 48] --json-out OUT.json
 python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max-questions 3000 --chunk-tokens 128 --device cuda --seed 42
 python scripts/build_store.py --edit-from openqa --name openqa_edit --edit-fraction 0.5 --neighbour-cos 0.85 --device cpu --seed 42
 python scripts/eval_store.py recall|pathway|edit -c CKPT --store data/index/openqa [--edit-store data/index/openqa_edit] --buffer 4 --loop 1 --json-out OUT.json

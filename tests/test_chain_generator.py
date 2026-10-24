@@ -18,8 +18,12 @@ so this checks the properties the measurement leans on:
 7. the assistant answer and the eval prompt agree: ``encode_prompt`` of the user turn is a prefix of
    the training row, so the eval scores the same context training saw;
 8. ``EvidenceDataset`` reads the splits back;
+8b. the ``--bridge`` build writes the same buffers and sidecars with the written bridge as the
+   supervised span and the intermediates in the metadata;
 5b. the statistics helpers: a cell at chance passes, a cell above it fails, an unsaturated 1-hop
-   curve reads "not readable".
+   curve reads "not readable";
+5c. the written bridge form: ``bridge_answer``, ``split_bridge``, ``bridge_hits``, and the plain
+   conversation still answers with ``q.answer``.
 
 Needs the pruned tokenizer (``utils.TOKENIZER_DIR``); no GPU.
 """
@@ -184,6 +188,34 @@ def main():
     assert not flat["valid"] and not flat["readable"] and not flat["failing"]
     print("5b. cell statistics and the validity verdict (valid / failing / not readable)  PASS")
 
+    # 5c. the written bridge form
+    q1 = draw(1, 6, held, hops=1)[0]
+    q3 = draw(1, 7, held, hops=3)[0]
+    marker = chains.BRIDGE_ANSWER_MARKER
+    assert chains.bridge_answer(q1) == f"{marker} {q1.answer}.", chains.bridge_answer(q1)
+    e = q3.entities
+    want3 = f"Step 1: {e[1]}. Step 2: {e[2]}. {marker} {e[3]}."
+    assert chains.bridge_answer(q3) == want3, chains.bridge_answer(q3)
+    for q in (q1, q3):
+        text = chains.bridge_answer(q)
+        assert text.endswith(f"{marker} {q.answer}.") and text.count(marker) == 1
+        at = [text.index(x) for x in q.entities[1:-1]]
+        assert at == sorted(at) and all(a < text.index(marker) for a in at)
+    prefix, rest = chains.split_bridge(want3)
+    assert prefix == f"Step 1: {e[1]}. Step 2: {e[2]}. {marker} " and rest == f"{e[3]}."
+    assert chains.split_bridge(f"Step 1: {e[1]}. {marker}") == (f"Step 1: {e[1]}. {marker} ", "")
+    assert chains.split_bridge(f"Step 1: {e[1]}.") == (f"Step 1: {e[1]}.", None)
+    assert chains.bridge_hits(want3, e) == [True, True]
+    assert chains.bridge_hits(f"Step 1: {e[1]}. {marker} {e[3]}.", e) == [True, False]
+    assert chains.bridge_hits("anything", q1.entities) == []
+    longer = ["Kiva Dorn", "Port Vala", "Lis Amber", "Rho Teln"]
+    assert chains.bridge_hits("Step 1: Port Valada. Step 2: Lis Amberly. Answer: Rho Teln.", longer) == [False, False]
+    assert chains.bridge_hits("Step 1: Port Vala. Step 2: XLis Amber. Answer: Rho Teln.", longer) == [True, False]
+    assert pcd.conversation(q3) == [{"role": "user", "content": evidence_prompt(q3.question)},
+                                    {"role": "assistant", "content": q3.answer}]
+    assert pcd.conversation(q3, bridge=True)[1]["content"] == want3
+    print(f"5c. written bridge: {want3!r}   PASS")
+
     if not os.path.isdir(TOKENIZER_DIR):
         print(f"SKIP: no tokenizer at {TOKENIZER_DIR}, builder checks 6 to 8 not run")
         return
@@ -233,6 +265,29 @@ def main():
             assert batches and "evidence_ids" in batches[0], split
             assert ds.has_condition_labels
         print("8. EvidenceDataset reads every split                                              PASS")
+
+        # 8b. the bridge build: same questions, chunks and sidecars, only the assistant turn and
+        # the metadata's bridge field differ
+        questions = built["chains_eval"][0]
+        pcd.build_split(tmp, "chains_bridge_eval", questions, template, FakeEmbedder(), held, batch=64,
+                        bridge=True)
+        for suffix in ("ev", "evidx", "evchunk", "evkey", "evkeyidx", "evgold", "evhop", "cond", "ans"):
+            with open(os.path.join(tmp, f"chains_eval.{suffix}"), "rb") as a, \
+                    open(os.path.join(tmp, f"chains_bridge_eval.{suffix}"), "rb") as b:
+                assert a.read() == b.read(), f"bridge build changed .{suffix}"
+        docs = read_split(tmp, "chains_bridge_eval")[0]
+        for q, d, plain in zip(questions, docs, built["chains_eval"][1]):
+            prompt = template.encode_prompt([{"role": "user", "content": evidence_prompt(q.question)}])
+            assert d["ids"][:len(prompt)] == prompt and not any(d["mask"][:len(prompt)])
+            supervised = [t for t, m in zip(d["ids"], d["mask"]) if m]
+            assert supervised == tokenizer(chains.bridge_answer(q), add_special_tokens=False)["input_ids"] + \
+                [template.eos_id]
+            meta, plain_meta = dict(d["meta"]), dict(plain["meta"])
+            assert meta.pop("bridge") == q.entities[1:-1]
+            assert meta.pop("qid").split("-")[-1] == plain_meta.pop("qid").split("-")[-1]
+            assert meta == plain_meta
+            assert "bridge" not in plain["meta"]
+        print("8b. bridge build: buffers and sidecars byte identical, assistant turn is the bridge  PASS")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("all chain generator checks passed")

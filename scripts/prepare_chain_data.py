@@ -19,7 +19,12 @@ Two sidecars ride along, both eval-only (no trainer reads them):
     {split}.evhop         uint8 per chunk (the ``.evkey`` / ``.evgold`` axis): 0 distractor, h the
                           gold chunk at hop h
     {split}.chains.jsonl  one line per document: qid, question, answer, answer_type, hops,
-                          composition, held_out, candidates, chunk_kind, entities
+                          composition, held_out, candidates, chunk_kind, entities (and bridge,
+                          the intermediates e1..e(k-1), under ``--bridge``)
+
+``--bridge`` writes the written bridge form: the assistant turn names the chain's intermediate
+entities before the answer (``chains.bridge_answer``); the questions, chunks and sidecars are the
+same as without it.
 
 The 200k question train split is about 2.6M short chunks and wants the GPU for the embedder; the
 eval splits embed on CPU in minutes (``--device cpu``).
@@ -28,7 +33,11 @@ Usage:
 
     python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains \\
         --train-questions 200000 --val-questions 2000 --eval-questions-per-hop 1000 --seed 42 \\
-        --device cuda [--splits eval,heldout_tmpl,hop4] [--overwrite]
+        --device cuda [--splits eval,heldout_tmpl,hop4] [--overwrite] [--bridge]
+
+    python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains_bridge \\
+        --splits train,val --train-questions 200000 --val-questions 2000 --seed 42 --device cuda \\
+        --bridge
 """
 import os
 import sys
@@ -93,8 +102,20 @@ def make_split_questions(name: str, count: int, seed: int, held_out: Set[Tuple[s
     return out
 
 
+def conversation(q: chains.ChainQuestion, bridge: bool = False) -> List[dict]:
+    """The rendered chat of one question: the evidence prompt, then the answer or the written bridge.
+
+    Args:
+        q: the question.
+        bridge: write the intermediates before the answer (``chains.bridge_answer``).
+    """
+    answer = chains.bridge_answer(q) if bridge else q.answer
+    return [{"role": "user", "content": evidence_prompt(q.question)},
+            {"role": "assistant", "content": answer}]
+
+
 def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion], template: ChatTemplate,
-                embedder, held_out: Set[Tuple[str, ...]], batch: int = 1000) -> dict:
+                embedder, held_out: Set[Tuple[str, ...]], batch: int = 1000, bridge: bool = False) -> dict:
     """Write one split and return its build report.
 
     Args:
@@ -105,6 +126,8 @@ def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion]
         embedder: anything with ``encode(texts) -> [n, 384] float32`` (``ChunkEmbedder`` or a fake).
         held_out: held out 2-tuples, for the ``held_out`` flag in the metadata.
         batch: questions encoded and embedded per call.
+        bridge: the assistant turn is the written bridge and the metadata carries ``bridge``, the
+            intermediate entities e1..e(k-1).
     """
     state: dict = {}
     writer = EvidenceWriter(data_dir, split, state)
@@ -116,8 +139,7 @@ def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion]
     try:
         for start in range(0, len(questions), batch):
             group = questions[start:start + batch]
-            convs = [[{"role": "user", "content": evidence_prompt(q.question)},
-                      {"role": "assistant", "content": q.answer}] for q in group]
+            convs = [conversation(q, bridge) for q in group]
             encoded = template.encode_batch(convs)
             flat = [c for q in group for c in q.chunks]
             pieces = template.tokenizer(flat, add_special_tokens=False)["input_ids"]
@@ -143,6 +165,8 @@ def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion]
                     "held_out": chains.contains_held_out(q.composition, held_out),
                     "candidates": q.candidates, "chunk_kind": q.chunk_kind, "entities": q.entities,
                 }
+                if bridge:
+                    meta["bridge"] = q.entities[1:-1]
                 meta_file.write((json.dumps(meta) + "\n").encode("utf-8"))
                 report["questions"] += 1
                 report["prompt_tokens"] += len(ids)
@@ -203,6 +227,8 @@ def main():
     parser.add_argument("--splits", default=",".join(SPLIT_NAMES))
     parser.add_argument("--overwrite", action="store_true",
                         help="delete an existing split of the same name first")
+    parser.add_argument("--bridge", action="store_true",
+                        help="write the chain's intermediate entities before the answer")
     args = parser.parse_args()
 
     if args.prefix.startswith("evidence"):
@@ -228,7 +254,8 @@ def main():
         split = f"{args.prefix}_{name}"
         count = args.train_questions if name == "train" else args.val_questions
         questions = make_split_questions(name, count, args.seed, held_out, args.eval_questions_per_hop)
-        log_report(split, build_split(args.out_dir, split, questions, template, embedder, held_out))
+        log_report(split, build_split(args.out_dir, split, questions, template, embedder, held_out,
+                                      bridge=args.bridge))
 
 
 if __name__ == "__main__":

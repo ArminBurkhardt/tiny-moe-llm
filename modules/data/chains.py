@@ -20,9 +20,10 @@ The distractors are built so a shortcut has nothing to hold on to:
 them: a generator whose answer can be picked by frequency or by the question's own subject would
 make every composition reading meaningless.
 
-The module is pure Python and builds no embedder and no tokenizer. The statistics helpers at the
-bottom (``cell_stats``, ``validity_report``) live here rather than in the eval script so they can be
-tested without a GPU.
+The module is pure Python and builds no embedder and no tokenizer. The written bridge helpers
+(``bridge_answer`` and the eval's row bookkeeping) and the statistics helpers at the bottom
+(``cell_stats``, ``validity_report``) live here rather than in the scripts so they can be tested
+without a GPU.
 """
 import math
 import random
@@ -553,6 +554,104 @@ def shortcut_baselines(questions: List[ChainQuestion]) -> Dict[str, float]:
         totals["named_subject"] += (float(named[0] == q.answer) if named else 1.0 / len(q.candidates))
     n = max(len(questions), 1)
     return {k: v / n for k, v in totals.items()}
+
+
+# --------------------------------------------------------------------------------- written bridge
+
+BRIDGE_ANSWER_MARKER = "Answer:"
+
+
+def bridge_answer(q: ChainQuestion) -> str:
+    """The assistant turn of the written bridge form: the chain's intermediates, then the answer.
+
+    ``"Step 1: {e1}. Step 2: {e2}. ... Answer: {ek}."`` for k hops, ``"Answer: {e1}."`` for one;
+    every form ends in the marker, a space, the answer and a period.
+
+    Args:
+        q: the question; ``q.entities`` is the true chain e0..ek.
+    """
+    steps = [f"Step {h}: {e}." for h, e in enumerate(q.entities[1:-1], start=1)]
+    return " ".join(steps + [f"{BRIDGE_ANSWER_MARKER} {q.entities[-1]}."])
+
+
+def split_bridge(text: str) -> Tuple[str, Optional[str]]:
+    """Split generated text at the first answer marker.
+
+    Args:
+        text: decoded model output.
+
+    Returns:
+        ``(prefix, remainder)``: the text up to and including the marker plus one space, and what
+        follows the marker (one leading space dropped); ``(text, None)`` when the marker is absent.
+    """
+    at = text.find(BRIDGE_ANSWER_MARKER)
+    if at < 0:
+        return text, None
+    end = at + len(BRIDGE_ANSWER_MARKER)
+    rest = text[end:]
+    return text[:end] + " ", rest[1:] if rest.startswith(" ") else rest
+
+
+def bridge_hits(text: str, q_entities: Sequence[str]) -> List[bool]:
+    """Whether each intermediate entity e1..e(k-1) occurs in the text as whole words, by hop.
+
+    The name must sit on word boundaries, so a name inside a longer name or word is not a hit.
+
+    Args:
+        text: decoded model output.
+        q_entities: the true chain e0..ek.
+    """
+    return [re.search(rf"\b{re.escape(e)}\b", text) is not None for e in q_entities[1:-1]]
+
+
+def bridge_candidate_ids(tokenizer, body: str, candidate: str, eos_id: int) -> Tuple[List[int], List[int]]:
+    """Prefix ids and candidate ids for scoring one candidate after a written bridge.
+
+    The row is tokenized as training tokenized the assistant turn, in one piece: ``body`` (the
+    generated text through the marker), a space, the candidate and the closing period, so the
+    space attaches to the candidate's first piece as it did in training. When the joint ids do not
+    start with the body's own ids (a merge across the boundary) the candidate is tokenized alone
+    with its leading space.
+
+    Args:
+        tokenizer: callable returning ``{"input_ids": [...]}`` for a string.
+        body: the generated prefix without the trailing space; empty when nothing was generated.
+        candidate: one answer option.
+        eos_id: appended after the period.
+
+    Returns:
+        ``(prefix_ids, cand_ids)``; ``cand_ids`` ends in the period's ids and EOS.
+    """
+    if not body:
+        return [], tokenizer(f"{candidate}.", add_special_tokens=False)["input_ids"] + [eos_id]
+    prefix = tokenizer(body, add_special_tokens=False)["input_ids"]
+    joint = tokenizer(f"{body} {candidate}.", add_special_tokens=False)["input_ids"]
+    if joint[:len(prefix)] == prefix and len(joint) > len(prefix):
+        tail = joint[len(prefix):]
+    else:
+        tail = tokenizer(f" {candidate}.", add_special_tokens=False)["input_ids"]
+    return prefix, tail + [eos_id]
+
+
+def scored_row(prompt: Sequence[int], prefix: Sequence[int],
+               cand: Sequence[int]) -> Tuple[List[int], List[int], List[int]]:
+    """The token row of one candidate and the positions whose next-token prediction scores it.
+
+    Position ``t`` predicts token ``t + 1``, so candidate token ``i`` (at ``len(prompt) +
+    len(prefix) + i``) is scored at the position before it. An empty ``prefix`` is the plain
+    answer-after-prompt row.
+
+    Args:
+        prompt: chat prompt ids ending in the assistant marker.
+        prefix: generated bridge ids placed between the prompt and the candidate.
+        cand: candidate ids (answer pieces, then EOS).
+
+    Returns:
+        ``(row, positions, targets)`` with ``row[positions[i] + 1] == targets[i] == cand[i]``.
+    """
+    row = list(prompt) + list(prefix) + list(cand)
+    start = len(prompt) + len(prefix)
+    return row, [start - 1 + t for t in range(len(cand))], list(cand)
 
 
 # --------------------------------------------------------------------------------- eval statistics
