@@ -16,15 +16,30 @@ Restructured 2026-10-24 after the repository review.
 
 ### State (2026-10-24)
 
-- **Running:** the three micro retriever arms the review proposed, launched 2026-10-24 about
-  20:25 in sequence (`bash ckpts/inject/launch_review_arms.sh`, about 40 minutes each plus the
-  store recall read, on the code in the tree): `w0e3b`, the `w0e3` recipe rerun on the reviewed
+- **Ran and read this evening:** two of the three micro retriever arms the review proposed,
+  launched 2026-10-24 about 20:25 in sequence (`bash ckpts/inject/launch_review_arms.sh`, about 40
+  minutes each plus the store recall read, on the code in the tree, three passes over
+  `evidence_nomany_train` from `seed_micro.pt`): `w0e3b`, the `w0e3` recipe rerun on the reviewed
   code as the twin the other two are read against (`ckpts/inject/config_micro_infonce0_e3.yaml`);
   `l0e3`, the `w25e3` recipe with the contrastive term on the first pass only and the trunk
-  gradient on (`config_micro_infonce_l0_e3.yaml`); `seg_e3`, the `w0e3` recipe with the selection
-  loss weighted per query segment (`config_micro_segsel_e3.yaml`). Run directories
-  `ckpts/evidence_infonce_{ARM}`, logs `ckpts/inject/infonce_{ARM}.log`, reads
-  `ckpts/inject/infonce_{ARM}_store_recall.{json,log}`.
+  gradient on (`config_micro_infonce_l0_e3.yaml`). The third, `seg_e3`, the `w0e3` recipe with the
+  selection loss weighted per query segment (`config_micro_segsel_e3.yaml`), runs 2026-10-25. Run
+  directories `ckpts/evidence_infonce_{ARM}`, logs `ckpts/inject/infonce_{ARM}.log`, reads
+  `ckpts/inject/infonce_{ARM}_store_recall.{json,log}`. **Order changed the same evening:** the
+  watch on the launcher expired at 20:58 and took the launcher and the twin (at 74M, last save
+  50M) down with it; the relaunch ran detached from any watch. The resumed twin read epoch 0's
+  permutation from the epoch 1 position (the SFT resume epoch bug, found and fixed that evening:
+  accelerate's prepared loader sets the dataset's epoch from its own pass counter, which starts
+  at zero in a new process, so a resume past epoch 0 trained on epoch 0's order; `sft.select_epoch`
+  sets it through the loader, `tests/test_sft_resume_state.py` test 8; no recorded run ever resumed
+  past epoch 0, so nothing on record is affected); it was killed before any save. `l0e3` ran
+  first (fresh, 21:02; 104.46M tokens in 39.3 minutes at about 45k tokens per second, exit 0),
+  then `w0e3b` resumed at 21:45 from its 50M save under the fix
+  (`ckpts/inject/queue_twin_after_l0e3.sh`; its 60M eval reproduced the original run's within
+  0.0001, 4.6262 against 4.6261; 104.56M tokens, exit 0); `seg_e3` runs 2026-10-25 (its yaml
+  parked as `config_micro_segsel_e3.yaml.hold` so the first launcher skipped it; rename it back
+  before `bash ckpts/inject/launch_review_arms.sh seg_e3`), then the leak arms and the clean-slice
+  read. The card pauses around 22:30 on 2026-10-24 (the user).
 - **Decided 2026-10-24 (the user):** R4 (loss placement by coda) is dropped, obsolete on R9: the
   model composes at 0.997 on held-out compositions once the intermediate entity is written out,
   so the loop no longer has to compose in silence; the coda stays unbuilt. R6 (the
@@ -43,7 +58,18 @@ Restructured 2026-10-24 after the repository review.
   builds cap a training row at 4093 tokens). Run order: the three micro retriever arms, then the
   two leak arms, then the clean-slice CE re-read, with R5's eval set between them when the card
   is idle.
-- **Just read:** nothing new this evening. Earlier on 2026-10-24: R9, the written bridge
+- **Just read:** this evening, two of the three micro retriever arms
+  (`docs/measurements/infonce_micro.md`, the first pass only section): `l0e3`, the contrastive
+  term on the first pass alone, reaches store recall@5 / @20 at loop 1 of 0.049 / 0.122 against
+  the every-loop arm `w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), loops 2 and 3 at 0.010 and
+  0.005 at k5, held-out CE 4.4404 against the fresh twin `w0e3b`'s 4.3996 (a cost of 0.041 nats;
+  the recorded every-loop pair cost 0.074), gate failed (z -174.3); the twin reads 0.000 / 0.002
+  (gate z -205.6) at final CE 4.3996, 0.019 from the old `w0e3`'s 4.3809, inside the micro seed
+  spread of about 0.03. The term on the first pass alone keeps about five sixths of the small
+  recall gain at a bit over half the language cost, so the cost sits in the trunk's change and not
+  in the later passes, which find almost nothing; the decision of 2026-10-21 (no retriever term in
+  the real-run spec, the model's own retrieval revisited at the real run's size) is unchanged.
+  Earlier on 2026-10-24: R9, the written bridge
   (`docs/measurements/written_bridge_pilot.md`): held-out 2-hop 0.997 against chance 0.191 at the
   final (0.982 already at 10M), 3-hop 0.997, read sites past the first adding +0.002 +- 0.001,
   4-hop at chance because the model writes the two steps it was trained on; at this shape
@@ -59,8 +85,10 @@ Restructured 2026-10-24 after the repository review.
   attached directly, a generation weakness on real questions, not a store failure. Arm E4
   (`docs/measurements/expert_count_pilot.md`: the expert count is a cost choice); the repository
   review (`docs/review_2026-10-24.md`).
-- **Next, in order:** the three retriever arms' reads (store recall and held-out CE against the
-  fresh twin `w0e3b`); then the two leak arms (`bash ckpts/inject/launch_leak_arm.sh m1`, then
+- **Next, in order:** `seg_e3` on 2026-10-25 (rename
+  `ckpts/inject/config_micro_segsel_e3.yaml.hold` back to `config_micro_segsel_e3.yaml`, then
+  `bash ckpts/inject/launch_review_arms.sh seg_e3`; store recall and held-out CE against the fresh
+  twin `w0e3b`); then the two leak arms (`bash ckpts/inject/launch_leak_arm.sh m1`, then
   `g1`: the copy-first warm-up recipe on the flagged splits, run directories
   `ckpts/evidence_leak_{m1,g1}`, reads `ckpts/inject/rank_leak_{ARM}_{100M,final}_*` and
   `compare_cf_vs_leak_{ARM}.log` against the warm-up arm); then the clean-slice CE re-read (`bash
@@ -83,7 +111,7 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 | a value-to-name closed-book probe | proposed, mode not built | arm P's final | a build |
 | R4, the coda corner | closed: dropped 2026-10-24 (the user), obsolete on R9 (composition at 0.997 held out once the intermediate entity is written out); the coda stays unbuilt | none | nothing |
 | R4b, the sublayer half | open; the review recommends a cost choice, no arms | none at pilot scale | the user |
-| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | running, launched 2026-10-24 about 20:25 (`bash ckpts/inject/launch_review_arms.sh`) | store recall and held-out CE against `w0e3b` | the runs |
+| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | two read 2026-10-24 (`bash ckpts/inject/launch_review_arms.sh`; `docs/measurements/infonce_micro.md`): the twin `w0e3b` final CE 4.3996, recall@5 0.000; `l0e3` recall@5 / @20 at loop 1 0.049 / 0.122 against `w25e3`'s 0.059 / 0.133 at 0.041 nats against the twin (the every-loop pair 0.074), gate failed, so the cost sits in the trunk's change and the decision of 2026-10-21 stands; `seg_e3` runs 2026-10-25 (rename `config_micro_segsel_e3.yaml.hold` back first) | store recall and held-out CE against `w0e3b` | `seg_e3` |
 | two leak candidates (value-first templates; distractor-collision spans) | built, queued: builder flags `--mask-first-name-mention` and `--support-gold-only` (`.mask` only), splits `inject_retrieval_s100a50m1_train`, `s100a50g1`, `s15a50m1`, `s15a50g1` built 2026-10-24; arms `bash ckpts/inject/launch_leak_arm.sh m1` and `g1` | closed-book rank at 100M and at the final against the copy-first warm-up arm (`compare_cf_vs_leak_{ARM}.log`) | the retriever arms |
 | R6, pretraining-text facts | closed: skipped 2026-10-24 (the user); its mechanism is read at micro (arm (a) stores plain-text facts, tier 100 `delta` 0.378; arm (b), spans masked, stores nothing; arm C repeats arm (a) at pilot shape) and the run spec uses that lever | none | nothing |
 | the goal's reasoning clause reworded | open since 2026-10-17; R9 read 2026-10-24: composes in written tokens, not in the loop | none | the user |
@@ -687,6 +715,10 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   `Traceback|Error|Killed|OOM|assert|device not ready` plus `Step` / `Tokens/sec`, and for
   `--evidence` also `eval fixed|KILL|kill check`. Tee the watched output to a gitignored `*.log`
   so the eval blocks survive a crash.
+  **The watch never owns the process** (2026-10-24: a Monitor kills its command when it expires,
+  after 30 minutes at most, and took a launcher and its trainer down at 74M): launch detached
+  (`setsid nohup bash launcher.sh > launcher.log 2>&1 < /dev/null & disown`) and watch with
+  `tail -n 0 -F` on the log, re-armed on every expiry.
 - STOP files are per run directory: `ckpts/evidence/STOP`, `ckpts/evidence_<run-name>/STOP`
   (polled every 10 micro steps, save, exit 10). A glob such as `ckpts/evidence*/STOP` creates
   nothing.
@@ -1298,6 +1330,12 @@ prompt. `--target-tokens` counts prompt tokens.
   the masters are saved in the payload (`fp32_masters`, about 0.4 GB at 99M) and restored when
   present, and the depth-sampling and CUDA RNG states are saved and restored; an older checkpoint
   loads as before and reseeds its masters from bf16.
+  Since 2026-10-24 (evening) the epoch loop selects the permutation through the prepared loader
+  (`select_epoch`): accelerate's `DataLoaderShard.__iter__` calls `dataset.set_epoch(iteration)`
+  at the start of every pass and `iteration` counts the passes of the current process from zero,
+  so a resume past epoch 0 that set the epoch on the dataset alone trained on epoch 0's order
+  again (found on the `w0e3b` twin's resume at epoch 1, killed before a save; no recorded run
+  resumed past epoch 0). A fresh run is unchanged; `tests/test_sft_resume_state.py` test 8.
 - The SFT cosine floors at `lr_min_factor: 0.05` of lr (pretrain floors at 0.1); the pilot profile
   (`config_pilot.yaml` and the pilot-shape yamls under `ckpts/inject/`) sets `lr_min_factor` 0.1.
 - `fresh_lr` group: `--ir` = `is_rebuilt_ir_param or is_fresh_loop_param`; `--evidence` =
