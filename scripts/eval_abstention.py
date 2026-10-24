@@ -320,7 +320,12 @@ def _pack_evidence_batch(model, real_segment: torch.Tensor, dump_segment: torch.
     uses for its trailing pad segment, generalized because the caller decides which of a row's two
     segments plays which role: ``generate_batch`` pads on the left (so the dump is the row's FIRST
     segment) and ``teacher_forced_calibration`` pads on the right (so the dump is its LAST), and both
-    need a genuine second segment to exist -- see each caller's ``extra_pad`` reservation.
+    need a genuine second segment to exist -- see each caller's ``extra_pad`` reservation. The
+    row's own tokens sit before the dump width when the real segment comes first and after it when
+    the dump segment comes first, so the flattened evidence axis stays sorted by segment id, which
+    ``evidence_cu_seqlens`` requires (fixed 2026-10-24: the left padded layout used to put the
+    dump width after the row's tokens, and every left padded decode with evidence read its buffer
+    shifted by that width).
 
     Args:
         evidence_rows: one entry per row, ``{"ids": [...], "chunk_ids": [...], "keys": [C, 384] or
@@ -351,15 +356,22 @@ def _pack_evidence_batch(model, real_segment: torch.Tensor, dump_segment: torch.
         if not row or not row.get("ids"):
             continue
         n = len(row["ids"])
-        ids[i, :n] = torch.tensor(row["ids"], dtype=torch.long)
-        chunk_ids[i, :n] = torch.tensor(row["chunk_ids"], dtype=torch.long)
-        ev_segments[i, :n] = real_list[i]
+        # evidence_cu_seqlens counts tokens per segment and assumes the flattened evidence axis is
+        # sorted by segment id, so a row whose dump segment precedes its real one (left padding)
+        # keeps its own tokens at the end of the row, after the dump width; before 2026-10-24 they
+        # sat at the front and the real segment read its own evidence shifted by the dump width
+        off = S_ev - n if dump_list[i] < real_list[i] else 0
+        ids[i, off:off + n] = torch.tensor(row["ids"], dtype=torch.long)
+        chunk_ids[i, off:off + n] = torch.tensor(row["chunk_ids"], dtype=torch.long)
+        ev_segments[i, off:off + n] = real_list[i]
         keys_row = row.get("keys")
         k = keys_row.shape[0] if keys_row is not None else 0
         if k:
             keys[i, :k] = torch.as_tensor(keys_row, dtype=torch.float32)
             chunk_segments_local[i, :k] = real_list[i]
 
+    flat_segments = ev_segments.reshape(-1)
+    assert bool((flat_segments[1:] >= flat_segments[:-1]).all()), "evidence tokens must be sorted by segment"
     valid = chunk_segments_local >= 0
     chunk_segments = chunk_segments_local[valid].to(device)
     chunk_keys = keys[valid].to(device)
