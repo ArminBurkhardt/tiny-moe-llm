@@ -13,7 +13,12 @@ on 2026-10-24 (66.35M tokens) with its final read running; its 30M read meets R9
 adds two corpus caveats (Limitations) and a packer bug under the A3 generation, A7 pathway and
 A4 edit reads (the read table and the Run section). Gate labels follow NEXT.md's table since
 2026-10-24: the store recall read is A7's recall half, the oracle-buffer EM read A7's pathway
-half, the edit flip rate A4.
+half, the edit flip rate A4. Decided 2026-10-24 (the user): the evidence reader keeps dropping the
+4094-token rows, so arms after P on these merges stay matched to P, E4 and PI (new evidence builds
+cap a training row at 4093 tokens and the row estimator now replays the reader's rule), and
+`data/prepared_pilot/inject_val_clean` (974 windows, 650,125 tokens, 0.99% verbatim overlap with
+the QA training rows against 13.3% for `inject_val`) exists for the held-out CE re-read of the
+three finals (`ckpts/inject/read_clean_val.sh`, queued).
 
 Status 2026-10-11: spec written 2026-10-09, build list done 2026-10-10 (the "Build"
 section), arm P launched 2026-10-10 19:03, switched to the main split at the 300M save the same
@@ -368,13 +373,22 @@ the query training).
   the plain reader the control uses keeps them). The row estimator still counts them, so the
   evidence arms' cosine ended at LR 6.55e-5 where arm C reached the 6.0e-5 floor; arm P's 860.6M
   against arm C's 909.7M is this. P against C is matched on the biographies and the chains, not on
-  the QA slice or the schedule; P against E4 stays matched.
+  the QA slice or the schedule; P against E4 stays matched. Decided 2026-10-24 (the user): the
+  reader keeps dropping these rows by decision, so later evidence arms on these merges stay
+  matched to P (new evidence builds cap a training row at 4093; the row estimator now counts only
+  the rows the reader keeps, 241,398 on `pilot_main_train` against 258,852, so a new arm's cosine
+  reaches the floor where arm P's stopped at 6.55e-5).
 - Added 2026-10-24: `inject_val` is partly a training read. Its windows come from the same
   `ir.bin` documents the evidence QA builder cuts its web rows from, excluded per window, not per
   document: about 7.4% of its tokens appear verbatim as supervised text in rows both arms train on
   (two passes) and another 6.7% in the dropped 4094-token rows only arm C trains on. Every held-out
   CE on `inject_val` (the language bar, arm PI's stop, the E4 read, arm C's 0.013 edge) leans
-  toward the arm that saw more of it; the rank reads that decide A1(b) are unaffected.
+  toward the arm that saw more of it; the rank reads that decide A1(b) are unaffected. Built
+  2026-10-24 for the re-read: `inject_val_clean` (`scripts/prepare_clean_val.py`, 974 windows,
+  650,125 tokens, `inject_val`'s windows minus those from the first 80,672 `ir.bin` documents the
+  evidence QA builder used; verbatim 64-token overlap with the QA training rows' supervised tokens
+  0.99% against 13.3% for `inject_val` under the same check, the 7.4% above a narrower
+  definition); the `eval_exit.py` read of the P, C and E4 finals on both slices is queued.
 - The in-context ceiling for A2 comes from arm P itself, which never sees a QA passage in the prompt
   during training; NEXT.md's absolute bar (1.6 nats, half the 3.23-nat ceiling of the full model) is
   printed beside it.

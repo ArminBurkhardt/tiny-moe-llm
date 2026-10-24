@@ -16,9 +16,15 @@ Restructured 2026-10-24 after the repository review.
 
 ### State (2026-10-24)
 
-- **Running:** nothing; the three re-reads on arm P's final with the fixed packer and the bge
-  routed A4 flip read are done
-  (`ckpts/inject/pilot_p_ladder2_{abstention,store_pathway,store_edit,store_edit_bge}.*`).
+- **Running:** the three micro retriever arms the review proposed, launched 2026-10-24 about
+  20:25 in sequence (`bash ckpts/inject/launch_review_arms.sh`, about 40 minutes each plus the
+  store recall read, on the code in the tree): `w0e3b`, the `w0e3` recipe rerun on the reviewed
+  code as the twin the other two are read against (`ckpts/inject/config_micro_infonce0_e3.yaml`);
+  `l0e3`, the `w25e3` recipe with the contrastive term on the first pass only and the trunk
+  gradient on (`config_micro_infonce_l0_e3.yaml`); `seg_e3`, the `w0e3` recipe with the selection
+  loss weighted per query segment (`config_micro_segsel_e3.yaml`). Run directories
+  `ckpts/evidence_infonce_{ARM}`, logs `ckpts/inject/infonce_{ARM}.log`, reads
+  `ckpts/inject/infonce_{ARM}_store_recall.{json,log}`.
 - **Decided 2026-10-24 (the user):** R4 (loss placement by coda) is dropped, obsolete on R9: the
   model composes at 0.997 on held-out compositions once the intermediate entity is written out,
   so the loop no longer has to compose in silence; the coda stays unbuilt. R6 (the
@@ -28,28 +34,41 @@ Restructured 2026-10-24 after the repository review.
   spans to keep out of the weights are masked, or plain-text facts are accepted into them) in
   place of a new arm. A4's flip read gets a bge routed variant (retrieval through the store's bge
   query keys, the serving configuration, in place of the model's own query, which finds nothing).
-- **Just read:** R9, the written bridge (`docs/measurements/written_bridge_pilot.md`): held-out
-  2-hop 0.997 against chance 0.191 at the final (0.982 already at 10M), 3-hop 0.997, read sites
-  past the first adding +0.002 +- 0.001, 4-hop at chance because the model writes the two steps it
-  was trained on; at this shape reasoning composes in written tokens, not in the loop. The eval
-  packer bug (fixed 2026-10-24, same record): every left padded decode with evidence before the
-  fix read its buffer shifted. The A3 generation and A7 pathway re-reads on arm P's final: A3 weak
-  in generation (EM 0.05, abstention 0.77 under gold; likelihood unchanged), A7 oracle-buffer EM
-  0.09 against the model's query at 0.001; the A4 edit flip read still unreadable on the model's
-  query route (1 of 2,000 answered before the edit). The A4 flip read on the bge route (2026-10-24,
-  `eval_store.py edit --route bge`, built the same day, the serving configuration; 95 of 2,000
-  answered before the edit, same record): delete flip 0.90 +- 0.035 (n 72, stuck 7) against the bar
-  0.70, so the facts the model answers from live in the store; edit flip 0.13 +- 0.07 (n 23,
-  follow 3, stuck 1), and 0.09 follow with the edited chunk attached directly, a generation
-  weakness on real questions, not a store failure. Arm E4
+- **Decided 2026-10-24, evening (the user, on the review's recommendations):** the review's held
+  code changes land (landed the same evening, uncommitted, tests passing on the GPU, a detached
+  Sonnet review with no high or medium finding; the Open items row and the Record), except the
+  eval-pass rewrite (deferred to 6a) and the `eval_chains.py` bridge-mode items. The evidence
+  reader keeps dropping the 4094-token rows: future evidence arms on the existing builds stay
+  matched to the arms already run (the pilot merges keep dropping the 12,240 rows; new evidence
+  builds cap a training row at 4093 tokens). Run order: the three micro retriever arms, then the
+  two leak arms, then the clean-slice CE re-read, with R5's eval set between them when the card
+  is idle.
+- **Just read:** nothing new this evening. Earlier on 2026-10-24: R9, the written bridge
+  (`docs/measurements/written_bridge_pilot.md`): held-out 2-hop 0.997 against chance 0.191 at the
+  final (0.982 already at 10M), 3-hop 0.997, read sites past the first adding +0.002 +- 0.001,
+  4-hop at chance because the model writes the two steps it was trained on; at this shape
+  reasoning composes in written tokens, not in the loop. The eval packer bug (fixed 2026-10-24,
+  same record): every left padded decode with evidence before the fix read its buffer shifted.
+  The A3 generation and A7 pathway re-reads on arm P's final: A3 weak in generation (EM 0.05,
+  abstention 0.77 under gold; likelihood unchanged), A7 oracle-buffer EM 0.09 against the model's
+  query at 0.001; the A4 edit flip read still unreadable on the model's query route (1 of 2,000
+  answered before the edit). The A4 flip read on the bge route (`eval_store.py edit --route bge`,
+  the serving configuration; 95 of 2,000 answered before the edit, same record): delete flip 0.90
+  +- 0.035 (n 72, stuck 7) against the bar 0.70, so the facts the model answers from live in the
+  store; edit flip 0.13 +- 0.07 (n 23, follow 3, stuck 1), and 0.09 follow with the edited chunk
+  attached directly, a generation weakness on real questions, not a store failure. Arm E4
   (`docs/measurements/expert_count_pilot.md`: the expert count is a cost choice); the repository
   review (`docs/review_2026-10-24.md`).
-- **Next, in order:** R5 on the chosen shape and the run spec; nothing training. The review's
-  held code changes wait on the GPU (their Open items row).
-- **Open for the user:** the goal's reasoning
-  clause reworded on R9 (written tokens); R4b's sublayer half; how the next pilot-shape arm is
-  matched after the 4094-token finding; a clean validation slice; the two micro retriever arms;
-  6f's abstention reward against the A3 re-read.
+- **Next, in order:** the three retriever arms' reads (store recall and held-out CE against the
+  fresh twin `w0e3b`); then the two leak arms (`bash ckpts/inject/launch_leak_arm.sh m1`, then
+  `g1`: the copy-first warm-up recipe on the flagged splits, run directories
+  `ckpts/evidence_leak_{m1,g1}`, reads `ckpts/inject/rank_leak_{ARM}_{100M,final}_*` and
+  `compare_cf_vs_leak_{ARM}.log` against the warm-up arm); then the clean-slice CE re-read (`bash
+  ckpts/inject/read_clean_val.sh`: `eval_exit.py` on the arm P, C and E4 finals on
+  `inject_val_clean` and `inject_val`); R5's eval set between them when the card is idle; then the
+  run spec.
+- **Open for the user:** the goal's reasoning clause reworded on R9 (written tokens); R4b's
+  sublayer half; 6f's abstention reward against the A3 re-read.
 
 ### Open items
 
@@ -57,20 +76,19 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 
 | item | status | the read that gates it | waiting on |
 |---|---|---|---|
-| the review's held code changes (bf16 CE accumulation in `mtp.py`; per-segment and log-space selection loss; the `evidence_contrastive_loops` default; an evidence-only groundedness input; the evidence reader's 4094 rule and the row estimator; the evidence-padding chunk boundary; the dense-slot GEMM skip; the frozen-gate skip; the eval-pass rewrite; fp32 selection scores under loss-free) | held | bit-identity tests on the GPU | the GPU |
+| the review's code changes | landed 2026-10-24 (uncommitted; tests pass on the GPU; a detached Sonnet review found no high or medium issue): fp32 CE, top-1 and `p_max` sums in `mtp.py`; the log-space selection loss with `evidence_selection_weighting` (`token` default, `segment`); `evidence_contrastive_loops` default `[0]`; the groundedness head input detached under the key/value reader; the row estimator replaying each reader's rule and a 4093-token training cap in the evidence builder (the reader itself unchanged by decision); the evidence padding cut into 128-token blocks; the dense-slot GEMM skip; the frozen-gate skip; fp32 selection scores under loss-free. Held: the eval-pass rewrite, deferred to 6a; the `eval_chains.py` bridge-mode items (in `--generate-bridge` the latent verdict lines suppressed and the kept 3 minus kept 1 line labelled bridge-internal; the evidence built once per batch) | none | 6a (the eval pass); a free card for the `eval_chains.py` identity check |
 | A4 edit, a flip read routed through bge | closed: read 2026-10-24 (`scripts/eval_store.py edit --route bge` on arm P's final, retrieval through the store's bge query keys, the serving configuration; `ckpts/inject/pilot_p_ladder2_store_edit_bge.*`; 95 of 2,000 answered before the edit): delete holds (flip 0.90 +- 0.035, n 72, bar 0.70), edit fails on generation (flip 0.13 +- 0.07, n 23; the edited chunk attached directly followed 0.09); the edit half goes to 6f with A3 | none | nothing |
-| R5, the winner, eval only | next, on the chosen shape (the A4 bge read done 2026-10-24) | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | the chosen shape |
-| a clean validation slice (documents neither builder used) | proposed, not built | `eval_exit.py` on the arm P, C and E4 finals | the user (a corpus decision) |
+| R5, the winner, eval only | next, on the chosen shape (the A4 bge read done 2026-10-24); runs between the micro arms when the card is idle | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | the chosen shape; an idle card |
+| a clean validation slice (documents neither builder used) | built 2026-10-24, re-read queued: `scripts/prepare_clean_val.py`, `data/prepared_pilot/inject_val_clean` (974 windows, 650,125 tokens; verbatim 64-token overlap with the QA training rows' supervised tokens 0.99% against 13.3% for `inject_val`) | `bash ckpts/inject/read_clean_val.sh` (`eval_exit.py` on the arm P, C and E4 finals on both slices) | the two leak arms |
 | a value-to-name closed-book probe | proposed, mode not built | arm P's final | a build |
-| how the next pilot-shape arm is matched | open (arm C alone trained on the 4094-token rows, 50.11M tokens) | none | the user |
 | R4, the coda corner | closed: dropped 2026-10-24 (the user), obsolete on R9 (composition at 0.997 held out once the intermediate entity is written out); the coda stays unbuilt | none | nothing |
 | R4b, the sublayer half | open; the review recommends a cost choice, no arms | none at pilot scale | the user |
-| two micro retriever arms (the contrastive term at loop 1 with the trunk gradient on; per-segment selection weighting) | proposed | store recall and held-out CE against `w0e3` | the user |
-| two leak candidates (value-first templates; distractor-collision spans) | proposed, builder changes | one micro warm-up arm each | the user |
+| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | running, launched 2026-10-24 about 20:25 (`bash ckpts/inject/launch_review_arms.sh`) | store recall and held-out CE against `w0e3b` | the runs |
+| two leak candidates (value-first templates; distractor-collision spans) | built, queued: builder flags `--mask-first-name-mention` and `--support-gold-only` (`.mask` only), splits `inject_retrieval_s100a50m1_train`, `s100a50g1`, `s15a50m1`, `s15a50g1` built 2026-10-24; arms `bash ckpts/inject/launch_leak_arm.sh m1` and `g1` | closed-book rank at 100M and at the final against the copy-first warm-up arm (`compare_cf_vs_leak_{ARM}.log`) | the retriever arms |
 | R6, pretraining-text facts | closed: skipped 2026-10-24 (the user); its mechanism is read at micro (arm (a) stores plain-text facts, tier 100 `delta` 0.378; arm (b), spans masked, stores nothing; arm C repeats arm (a) at pilot shape) and the run spec uses that lever | none | nothing |
 | the goal's reasoning clause reworded | open since 2026-10-17; R9 read 2026-10-24: composes in written tokens, not in the loop | none | the user |
 | 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
-| 6a throughput, 6c corpus on the rented cluster, 6d run spec | after every other spec decision (2026-10-21) | none | the rows above |
+| 6a throughput, 6c corpus on the rented cluster, 6d run spec | after every other spec decision (2026-10-21); 6a carries the deferred eval-pass rewrite | none | the rows above |
 
 **The design page moves with the architecture and the plan.** Any change to the architecture (a
 tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
@@ -457,7 +475,7 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   0.176 against 0.210 (z -2.6): the model writes exactly two steps and then "Answer:" on 999 of 1000
   questions (trained on hops 1 to 3), not a decode truncation (bridges of 52 to 88 characters
   against the 48-token cap). The log's `instrument valid: no` and four FAIL lines are the latent
-  read's sub-hop rule in a mode it does not fit (suppressed in that mode since). Bar met at 30M on
+  read's sub-hop rule in a mode it does not fit (their suppression in that mode is held). Bar met at 30M on
   this read (the final read below).
 - **The repository review, 2026-10-24** ([review_2026-10-24.md](docs/review_2026-10-24.md)):
   externalization demonstrated at pilot shape against the matched control with the tier 1000
@@ -474,10 +492,13 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   and 5.9), the decided reading stands. Landed 2026-10-24 (default behaviour byte identical): the
   splits, fp32 masters and RNG states in the checkpoint, `--switch-split`, the fixed save and eval
   grid, a finished run exiting 0, the `evidence_cu_seqlens` order assert, the `n_valid` syncs
-  removed, the bridge eval's verdict lines suppressed and its evidence built once per batch, the
+  removed, the
   clustered sigma and paired `delta` lines, the shortcut baseline, the merge tool's over-limit
   report, the training-distractor gold exclusion (next build only), `migrate_groundedness_head.py`
-  on pre-2026-10-19 sources. Held: the Open items row. Its plan proposals are a NEXT.md Decisions
+  on pre-2026-10-19 sources. Held then: the rest, landed the same evening but for the eval-pass
+  rewrite (next entry). The bridge eval's two items (verdict lines suppressed, evidence built once
+  per batch) were first recorded here as landed; `scripts/eval_chains.py` is unchanged since
+  `fee6a5c`, so both stay held. Its plan proposals are a NEXT.md Decisions
   row ("repository review"), waiting on the user.
 - **The eval packer bug, found and fixed 2026-10-24**
   ([written_bridge_pilot.md](docs/measurements/written_bridge_pilot.md), record in NEXT.md):
@@ -504,6 +525,54 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   reasons in written tokens; R4's corner recommended dropped (open for the user); the real run's
   mix needs multi-hop rows at the serving depth; transfer to real questions and retrieved chunks
   unmeasured.
+- **The review's code changes, landed 2026-10-24 (evening)** (uncommitted; tests pass on the GPU; a
+  detached Sonnet review found no high or medium issue; decided by the user on the review's
+  recommendations). `mtp.py`: the unweighted CE, top-1 and `p_max` sums accumulate in fp32 (the
+  logged CE leaves its 1/64-nat grid, `top1_acc` cannot pass 1; `tests/test_chunked_ce_fp32.py`).
+  `moe.py`: under loss-free balancing the selection scores are formed in fp32 for the topk (a zero
+  bias is bit-identical; at bias 0.30 the bf16 sum picked differently on 2% of tokens); the frozen
+  chunk gate is skipped (no selector mass, scatter or multiply by ones per loop; the zero test is
+  cached against the scale's `_version`, no per-step sync; forward and key/value reader gradients
+  bit-identical, `tests/test_evidence_gate_skip.py`); `ParallelSparseMoELayer.forward` delegates to
+  `experts.grouped_mlp_forward` with `null_mask=~mlp_mask` (dense-slot picks sorted after the real
+  experts, counted in the same `bincount().tolist()` sync and sliced off before the grouped GEMM;
+  exact zeros as before, outputs differ only by bf16 summation order; about 5% of the MoE layer's
+  time at micro shape, more at larger expert widths; `tests/test_efficiency_2026_10_24.py`).
+  `transformer.py`: evidence padding cut into 128-token blocks (`EVIDENCE_PAD_SEGMENT`) before the
+  encoder's `cu_seqlens` (real-token states and logits bit-identical; at pilot shape 9.61 to 7.57 ms
+  on a 4608/600/600/600 batch, no change when every row is full); `groundedness_term` detaches the
+  head input under the key/value reader (the head still learns, no trunk parameter gets a gradient
+  from it; the evidence-only signal of the review's finding 9 is not built); the cross reader's
+  rotary gather skipped under the key/value reader; the eval path norms only the last loop when
+  `return_hidden` is False. `evidence_selection_loss`: log-space BCE with no clamp on the
+  renormalized share, rows with fewer than two visible chunks excluded, and
+  `evidence_selection_weighting` (`token` default, `segment`) plumbed through
+  `moe.evidence_selection_term(segment_ids=, num_segments=)` from the `pretrain.py` call site
+  (`tests/test_evidence_selector.py`). `evidence_contrastive_loops` falls back to `[0]` in
+  `config.py` and the three yamls (null still accepted; the recorded arms' gitignored configs under
+  `ckpts/inject/` are pinned to null). `sft.py estimate_packed_rows` replays each reader's rule
+  (evidence reader `len + mtp <= max_length - 1`, plain reader `<= max_length`;
+  `tests/test_packed_rows_estimate.py`): `pilot_main_train` estimates 241,398 rows (about 30.17k
+  steps) against the old 258,852 (32,356), matching arm P's observed epoch end at about 30.3k; the
+  control's 252,912 unchanged. `prepare_evidence_data.py`: the training cap is 4093
+  (`MAX_DOC_TOKENS_TRAIN`), the held-out cap 4094 unchanged. `evidence_dataset.py` logs the
+  documents and tokens over the row limit at startup and per worker. The reader itself is unchanged
+  (decided 2026-10-24: future evidence arms stay matched to the arms already run on the existing
+  builds; the existing pilot merges keep dropping the 12,240 rows). `prepare_injection_data.py`
+  gains two flags, default off and byte identical at the default, each changing only `.mask`:
+  `--mask-first-name-mention` (the first run of name tokens per document gets mask 0; 1,474,885
+  tokens of 300M on the micro builds) and `--support-gold-only` (gold-absent documents count no
+  value as supported); built the same day `inject_retrieval_s100a50m1_train`, `s100a50g1`,
+  `s15a50m1`, `s15a50g1` (44 of 44 companion files byte identical to the flagless builds;
+  `ckpts/inject/build_leak_arms.sh`, log `build_leak_arms.log`). `scripts/prepare_clean_val.py`
+  (`tests/test_prepare_clean_val.py`) built `data/prepared_pilot/inject_val_clean`: 974 windows,
+  650,125 tokens, from `inject_val`'s windows whose documents the evidence QA builder never used
+  (the first 80,672 `ir.bin` documents excluded; phase1 and phase2 kept); verbatim 64-token overlap
+  with the QA training rows' supervised tokens 0.99% against 13.3% for `inject_val` under the same
+  check (the review's 7.4% was a narrower definition); read by `ckpts/inject/read_clean_val.sh`, not
+  yet run. Held: the eval-pass rewrite (deferred to 6a) and the two `eval_chains.py` bridge-mode
+  items. Launchers: `ckpts/inject/launch_review_arms.sh [w0e3b|l0e3|seg_e3]` (launched 2026-10-24
+  about 20:25, running) and `ckpts/inject/launch_leak_arm.sh m1|g1` (queued after it).
 
 - **The former "Next, in order" list, closed 2026-10-24** (items 1 to 4 done or closed, item 5
   moved to the Open items table; the full ladder with its done steps is in NEXT.md):
@@ -734,6 +803,7 @@ scripts/
   prepare_sft_data.py, prepare_evidence_data.py, archive_corpus.py  (the builders delete shards as they go)
   prepare_injection_data.py  fictional biographies at 1/10/100/1000 exposures, arms full/masked/retrieval -> data/prepared_inject
   prepare_chain_data.py      synthetic k-hop chains with .evhop and .chains.jsonl sidecars -> data/prepared/chains_*
+  prepare_clean_val.py       inject_val's filler windows minus those whose document the evidence builder read -> data/prepared_pilot/inject_val_clean
   merge_evidence_splits.py   merges evidence-format splits by token share into one split (the pilot corpus)
   build_store.py      retrieval stores (NQ, TriviaQA, HotpotQA) and edit stores -> data/index/<name>/
   init_scratch_seed.py       random-init seed for a from-scratch sft.py run (TINY_LLM_CONFIG picks the shape)
@@ -788,6 +858,11 @@ TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence -c ckpts/inje
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv --data-dir data/prepared_inject --train-split inject_retrieval_train --val-split inject_val   # the key/value reader arm (c)
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --arms retrieval --suffix s100a50 --device cuda   # the copy-first warm-up split
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 0.15 --anon-rate 0.5 --gold-drop-rate 0.2 --placeholder-rate 0.5 --distractors 3 --seed 42 --arms retrieval --suffix s15a50p50 --device cuda   # the placeholder name split
+python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --arms retrieval --suffix s100a50m1 --mask-first-name-mention --device cuda   # a leak arm's warm-up split; also s15a50m1 at swap 0.15, and --support-gold-only for s100a50g1 and s15a50g1 (all four: bash ckpts/inject/build_leak_arms.sh)
+bash ckpts/inject/launch_leak_arm.sh m1|g1   # the copy-first warm-up recipe on a flag's splits, stop at 100M, read, switch, read the final and compare against the warm-up arm
+bash ckpts/inject/launch_review_arms.sh [w0e3b|l0e3|seg_e3]   # the micro retriever arms of the 2026-10-24 review, then store recall at loop 1
+python scripts/prepare_clean_val.py [--check-against PREFIX --check-baseline data/prepared_pilot/inject_val]   # inject_val_clean: inject_val's windows from documents the evidence builder never used
+bash ckpts/inject/read_clean_val.sh   # eval_exit.py on the arm P, C and E4 finals on inject_val_clean and inject_val
 TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -c ckpts/inject/seed_micro.pt --run-name inject_retrieval_kv_cf --data-dir data/prepared_inject --train-split inject_retrieval_s100a50_train --val-split inject_val   # warm-up to 100M, then the same line with --train-split inject_retrieval_train --switch-split
 TINY_LLM_CONFIG=config_micro.yaml python scripts/closed_book_rank.py bios -c CKPT --form both --evidence none|gold|swapped|prompt --batch-size 1024 [--n-loops N] --json-out ckpts/inject/rank_full.json
 python scripts/closed_book_rank.py compare rank_full.json rank_masked.json rank_retrieval.json
@@ -815,9 +890,11 @@ plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_toke
 `test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`,
 `test_evidence_contrastive` (tests 1 to 6; 7 to 11 skip without CUDA and TE), `test_muon_optimizer`,
 `test_eval_chains_bridge`, `test_merge_evidence_splits`, `test_dataset_real`, `test_dataset_resume`,
-`test_accelerate_batch` (`test_loss_free_balancing` needs the GPU; `test_eval_chains`,
-`test_evidence_pack_layout` and `test_mtp_alignment` import TE through `eval_abstention.py` or
-`mtp.py`).
+`test_accelerate_batch`, `test_prepare_clean_val` (`test_loss_free_balancing`,
+`test_evidence_gate_skip` and `test_efficiency_2026_10_24` need the GPU; `test_eval_chains`,
+`test_evidence_pack_layout`, `test_mtp_alignment`, `test_chunked_ce_fp32` and
+`test_packed_rows_estimate` run on the CPU but import TE through `eval_abstention.py`, `mtp.py` or
+`sft.py`).
 `TINY_LLM_CONFIG=path.yaml`
 swaps the config yaml for every script (the checkpoint still decides shape and mode on load, so a
 micro checkpoint under the default yaml fails the strict load, as it should).
@@ -827,8 +904,10 @@ micro checkpoint under the default yaml fails the strict load, as it should).
 Tables in [configuration.md](docs/configuration.md).
 - `ModelConfig.Params` is splatted into `TinyMoETransformer(**...)`.
 - `TrainingConfig` holds **every loss weight** (`lambda_mtp`, `aux_loss_weight`,
-  `evidence_selection_weight`, `evidence_contrastive_weight` + `evidence_contrastive_temperature`
-  + `evidence_contrastive_loops` + `evidence_contrastive_trunk_grad`, `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
+  `evidence_selection_weight` + `evidence_selection_weighting` (`token`, default, or `segment`,
+  since 2026-10-24), `evidence_contrastive_weight` + `evidence_contrastive_temperature`
+  + `evidence_contrastive_loops` (fallback `[0]` since 2026-10-24, null every loop) +
+  `evidence_contrastive_trunk_grad`, `groundedness_weight`, `loop_ce_weights` + `loop_ce_subsample`,
   `loop_count_sampling`) and the `optimizer` choice (`adamw`, every run before 2026-10-18, or
   `muon`: `modules/model/optim.py`, Muon on the hidden 2D matrices by the name rule `muon_kind`
   with Nesterov 0.95, five Newton-Schulz steps in bf16 and the update scaled to AdamW's RMS so
@@ -930,6 +1009,14 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   readout, not `||dh||`. Asserted inference-only and exclusive with `kv_cache`.
 - `ParallelSparseMoELayer` runs under `te.autocast(enabled=False)` (NVFP4 needs rows % 16);
   `argsort(stable=True)` for recompute determinism; `m_splits.tolist()` is the one accepted sync.
+  Since 2026-10-24 `ParallelSparseMoELayer.forward` delegates to `experts.grouped_mlp_forward`
+  with `null_mask=~mlp_mask`: the dense-slot picks (`(index 0, weight 0)`) sort after the real
+  experts, are counted in the same `bincount().tolist()` sync and are sliced off before the
+  grouped GEMM (exact zeros as before; outputs differ from the old path only by bf16 summation
+  order; about 5% of the MoE layer's time at micro shape, more at larger expert widths;
+  `tests/test_efficiency_2026_10_24.py`). Under loss-free balancing the selection scores (the
+  probabilities plus `balance_bias`) are formed in fp32 for the topk (a zero bias is
+  bit-identical; at bias 0.30 the bf16 sum picked differently on 2% of tokens).
 - Aux loss is on the router softmax, normalized by `loops_run` (`loops_run - detach_loops`, the
   live passes, under `detach_loops`), one `topk` feeds loss and
   selection. Both trainers pass `token_mask = input_ids != pad` (`None` is bit-identical), so aux
@@ -974,13 +1061,22 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   `cu_seqlens`, positions restarting per chunk, no LM head, cached across loops.
   `evidence_encoder: true | N | false` (false = raw embedding, A/B only). **Padding is not a
   chunk**: negative id, position 0 (otherwise positions overrun the rotary cache: a silent
-  device-side assert).
+  device-side assert). Since 2026-10-24 the padding is cut into 128-token segments
+  (`transformer.EVIDENCE_PAD_SEGMENT`; 0 restores one causal segment per row) before the
+  encoder's `cu_seqlens`, so a row's trailing pad run is no longer one long causal segment
+  (real-token states and logits bit-identical; at pilot shape 9.61 to 7.57 ms on a
+  4608/600/600/600 batch, no change when every row is full). Under the key/value reader
+  `build_evidence` skips the cross reader's rotary gather (`position_embeddings` None).
 - One evidence segment per query segment, paired by position; a document that retrieved nothing
   gets a zero-length segment, never dropped (else later documents read the wrong evidence).
 - The reader reads `step_input + evidence_query_bias` every loop, bidirectional, scaled by
   one-init `evidence_loop_scale[loop]`; evidence states are gated per chunk by
   `1 + evidence_gate_scale * sigmoid(selector mass)` before `k_proj`/`v_proj` (zero-init scale is
-  exactly neutral). IR experts run before the shared seed so this loop's selector gates. No KV
+  exactly neutral). Since 2026-10-24 a frozen zero gate (`freeze_evidence_gate: true`, scale
+  exactly 0, every config) is skipped under both readers: no selector mass, scatter or multiply
+  by ones per loop; `_evidence_gate_is_identity` caches the zero test against the scale's
+  `_version`, so there is no per-step sync; forward and key/value reader gradients bit-identical
+  (`tests/test_evidence_gate_skip.py`). IR experts run before the shared seed so this loop's selector gates. No KV
   slot; cached and uncached greedy decodes can diverge by reduction order (`--no-kv-cache`).
 - **Key/value reader** (`evidence_reader="kv"`, marker buffer `moe.evidence_reader_kv`, `sft.py
   --reader-kv`): no `shared_evidence`, no `evidence_query_bias`. The evidence states go through
@@ -1019,6 +1115,12 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   produce a supervised token (`labels[:, 1:] != -100` shifted to `:-1`), the positions
   `answer_start_positions` and the readouts use. **Asserts gradient checkpointing off**
   (it reads stashed tensors a recompute would produce under `no_grad`). Logged `selection:`.
+  Since 2026-10-24 the per-chunk BCE runs in log space with no clamp on the renormalized share (a
+  gold chunk under 1e-6 of the visible mass now gets a gradient; the old clamp zeroed it), and rows
+  with fewer than two visible chunks are excluded. `evidence_selection_weighting` (`token`,
+  default, the mean over supervised predicting positions; `segment`, each query segment averaged
+  first from `cu_seqlens`, then the segments) is read at the pretrain.py call site and passed
+  through `evidence_selection_term(segment_ids=, num_segments=)`.
 - `evidence_contrastive_loss` (added 2026-10-17, the pilot's A7 recall fix): in-batch InfoNCE on the
   selector's unit query at the answer-start positions against every chunk in the batch, the other
   documents' chunks as negatives, positives = the position's own document's gold chunks (joint
@@ -1041,6 +1143,11 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   rebuilds the query at the answer-start rows through `InformationRetrievalExpert.contrastive_query`
   (`scale_gradient`: identity forward, scaled backward; then norm, `down_proj`, `unit_query`) under
   `te.autocast(enabled=False)`, since the row count is not a multiple of 16.
+  `evidence_contrastive_loops` defaults to `[0]` since 2026-10-24 (config.py fallback and the
+  three yamls): past the first pass the IR query position has already read the evidence through
+  the key/value reader, so in-batch InfoNCE there can be solved by matching the chunk content it
+  read, and the store eval reads the first pass's query; null (every loop) is still accepted, and
+  the recorded arms w0e3 and w25e3 ran with it.
   `tests/test_evidence_contrastive.py` (tests 1 to 6 on the loss alone, GPU-free; tests 7 to 11 need
   CUDA and TE: bit-identity of value and gradient at the defaults, the loop filter, zero trunk
   gradient with the head still learning, half scaling exact, a detached prefix skipped by both terms).
@@ -1052,7 +1159,10 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   reader only: under the key/value reader `last_reader_output` is `shared_attn`'s whole output (own
   context plus evidence), nonzero from step 0, so the BCE gradient reaches the trunk's own attention
   and the head can read the label off the prompt context or the base rate (review 2026-10-24,
-  finding 9; an evidence-only input is held).
+  finding 9). Since 2026-10-24 `groundedness_term` detaches the head input under the key/value
+  reader: the head still learns and no trunk parameter gets a gradient from it, but the head can
+  still read the label off the prompt context in the forward; an evidence-only input (the
+  prefix-only softmax mass) is not built.
 - `SQUAD_INSTRUCTION` stays verbatim; evidence mode has its own. `is_fresh_loop_param` names every
   port/loop tensor on `fresh_lr`.
 
@@ -1067,7 +1177,11 @@ signal everywhere**, as `1 / sum(exp(l_j - l_max))`; a replacement must add info
 - Training forward returns per-loop normed hidden states `[loops_run, B, S, H]`, not logits
   (`return_hidden=True` + `delayed_mtp_loss(True)`); `compute_mtp_loss` applies the head in a
   chunked checkpointed CE. **New call sites must pass `main_lm_head=`** or double the activation
-  peak; `loop_ce_weights` is then required. `loss_ce` is the final loop's raw CE.
+  peak; `loop_ce_weights` is then required. `loss_ce` is the final loop's raw CE. Since
+  2026-10-24 the unweighted CE, top-1 and `p_max` sums of `_chunked_linear_ce` accumulate in fp32
+  (before, the logged and `[eval]` CE sat on a 1/64-nat grid and `top1_acc` could read 1.0078;
+  `tests/test_chunked_ce_fp32.py`), and the eval path (`return_hidden` False) norms only the last
+  loop's state.
 - `return_aux_loss=True` -> `(x, aux_loss)` plus `extra_token_outputs` with MTP. `skip_mtp=True`
   drops it (bit-identical logits); evals and non-drafting inference pass it. `evidence=` takes an
   `EvidenceBatch`.
@@ -1109,6 +1223,11 @@ prompt. `--target-tokens` counts prompt tokens.
   conditions and distractors up to `--max-source-epochs`.
 - **`--max-evidence-tokens` default 1536 silently deletes `many`** (over-budget rows are dropped,
   never truncated). Pass 4608.
+- `--max-doc-tokens` defaults to 4093 for training builds since 2026-10-24
+  (`MAX_DOC_TOKENS_TRAIN` = 4096 - 2 MTP pads - 1, what the evidence reader keeps) and stays 4094
+  under `--heldout` (`MAX_DOC_TOKENS_HELDOUT`, byte identical held-out builds). Every build before
+  that date, the pilot merges included, carries 4094-token rows the evidence reader drops (12,240
+  documents, 50.11M tokens in each pilot split); by decision they stay as built.
 - Read each source's conversation share, token share and `too_long` count from the print.
 - `--heldout` writes `{split}.src` (per document, `SOURCE_KEYS` index). `--heldout --sources-only`
   backfills it onto an existing build: a zero-embedder replay that must match every existing
@@ -1119,7 +1238,13 @@ prompt. `--target-tokens` counts prompt tokens.
   in `.mask` only; `retrieval` carries the store card buffer with swaps and name placeholders;
   `--placeholder-rate` (default 0, byte identical at 0, its own rng stream) renames gold-present
   documents: the document and its gold card share a placeholder, each distractor its own;
-  `inject_val` is filler only and identical across arms) and `prepare_chain_data.py` (fictional
+  two flags added 2026-10-24, default off and byte identical, change only `.mask` in the
+  retrieval arm: `--mask-first-name-mention` (mask 0 on the first run of name or placeholder
+  tokens per document, suffix `m1`) and `--support-gold-only` (a value counts as supported by the
+  gold card only, so gold-absent documents supervise no value span, suffix `g1`);
+  `inject_val` is filler only and identical across arms; `scripts/prepare_clean_val.py` cuts
+  `inject_val_clean` from the same validation windows minus those whose document the evidence
+  builder read) and `prepare_chain_data.py` (fictional
   k-hop chains, `.evhop` per chunk and `.chains.jsonl` per document, eval-only sidecars; held-out
   2-hop compositions are absent from every seen split including 3-hop). Stores
   (`data/index/<name>/`: `chunks.jsonl`, `keys.npy` fp16 bge, `meta.json`, optional
@@ -1184,7 +1309,14 @@ prompt. `--target-tokens` counts prompt tokens.
   splits and `data_dir`, a relaunch on a different split than the one recorded is refused unless
   `--switch-split` is passed (the warm-up to main switch), the save and eval grid stays fixed in
   tokens across relaunches (arm P's 300, 351, 426, 530M reads sat on the old shifting grid), and a
-  finished run exits 0 instead of resuming from `_final.pt`.
+  finished run exits 0 instead of resuming from `_final.pt`. `estimate_packed_rows` (which sets
+  `total_steps` and so the cosine) replays each reader's rule since 2026-10-24: the evidence
+  reader keeps a document when `len + num_mtp_tokens <= max_length - 1`, the plain reader when it
+  is `<= max_length`; empty documents are skipped. On `pilot_main_train` it estimates 241,398 rows
+  (about 30.17k steps) against the old 258,852 (32,356; arm P's epoch ended at about 30.3k), so a
+  new evidence arm's cosine reaches its floor where arm P's stopped at 6.55e-5; the control's
+  252,912 is unchanged. `EvidenceDataset` logs the documents and tokens over the row limit at
+  startup and per worker.
   `--ceiling-json` reads `evidence_ceiling_probe.py --fixed-split` output and prints the gold gain
   against the same-rows ceiling, pooled and per source. The from-scratch micro runs are
   `TINY_LLM_CONFIG=config_micro.yaml sft.py --evidence -c ckpts/inject/seed_micro.pt` with

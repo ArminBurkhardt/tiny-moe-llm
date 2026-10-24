@@ -17,9 +17,15 @@ files. Restructured 2026-10-24 after the repository review; the history moved un
 
 ### State (2026-10-24)
 
-- **Running:** nothing; the three re-reads on arm P's final with the fixed packer and the bge
-  routed A4 flip read are done
-  (`ckpts/inject/pilot_p_ladder2_{abstention,store_pathway,store_edit,store_edit_bge}.*`).
+- **Running:** the three micro retriever arms the review proposed, launched 2026-10-24 about
+  20:25 in sequence (`bash ckpts/inject/launch_review_arms.sh`, about 40 minutes each plus the
+  store recall read, on the code in the tree): `w0e3b`, the `w0e3` recipe rerun on the reviewed
+  code as the twin the other two are read against (`ckpts/inject/config_micro_infonce0_e3.yaml`);
+  `l0e3`, the `w25e3` recipe with the contrastive term on the first pass only and the trunk
+  gradient on (`config_micro_infonce_l0_e3.yaml`); `seg_e3`, the `w0e3` recipe with the selection
+  loss weighted per query segment (`config_micro_segsel_e3.yaml`). Run directories
+  `ckpts/evidence_infonce_{ARM}`, logs `ckpts/inject/infonce_{ARM}.log`, reads
+  `ckpts/inject/infonce_{ARM}_store_recall.{json,log}`.
 - **Decided 2026-10-24 (the user):** R4 (loss placement by coda) is dropped, obsolete on R9: the
   model composes at 0.997 on held-out compositions once the intermediate entity is written out,
   so the loop no longer has to compose in silence; the coda stays unbuilt. R6 (the
@@ -29,28 +35,41 @@ files. Restructured 2026-10-24 after the repository review; the history moved un
   spans to keep out of the weights are masked, or plain-text facts are accepted into them) in
   place of a new arm. A4's flip read gets a bge routed variant (retrieval through the store's bge
   query keys, the serving configuration, in place of the model's own query, which finds nothing).
-- **Just read:** R9, the written bridge (`docs/measurements/written_bridge_pilot.md`): held-out
-  2-hop 0.997 against chance 0.191 at the final (0.982 already at 10M), 3-hop 0.997, read sites
-  past the first adding +0.002 +- 0.001, 4-hop at chance because the model writes the two steps it
-  was trained on; at this shape reasoning composes in written tokens, not in the loop. The eval
-  packer bug (fixed 2026-10-24, same record): every left padded decode with evidence before the
-  fix read its buffer shifted. The A3 generation and A7 pathway re-reads on arm P's final: A3 weak
-  in generation (EM 0.05, abstention 0.77 under gold; likelihood unchanged), A7 oracle-buffer EM
-  0.09 against the model's query at 0.001; the A4 edit flip read still unreadable on the model's
-  query route (1 of 2,000 answered before the edit). The A4 flip read on the bge route (2026-10-24,
-  `eval_store.py edit --route bge`, built the same day, the serving configuration; 95 of 2,000
-  answered before the edit, same record): delete flip 0.90 +- 0.035 (n 72, stuck 7) against the bar
-  0.70, so the facts the model answers from live in the store; edit flip 0.13 +- 0.07 (n 23,
-  follow 3, stuck 1), and 0.09 follow with the edited chunk attached directly, a generation
-  weakness on real questions, not a store failure. Arm E4
+- **Decided 2026-10-24, evening (the user, on the review's recommendations):** the review's held
+  code changes land (landed the same evening, uncommitted, tests passing on the GPU, a detached
+  Sonnet review with no high or medium finding; the Open items row and the Record), except the
+  eval-pass rewrite (deferred to 6a) and the `eval_chains.py` bridge-mode items. The evidence
+  reader keeps dropping the 4094-token rows: future evidence arms on the existing builds stay
+  matched to the arms already run (the pilot merges keep dropping the 12,240 rows; new evidence
+  builds cap a training row at 4093 tokens). Run order: the three micro retriever arms, then the
+  two leak arms, then the clean-slice CE re-read, with R5's eval set between them when the card
+  is idle.
+- **Just read:** nothing new this evening. Earlier on 2026-10-24: R9, the written bridge
+  (`docs/measurements/written_bridge_pilot.md`): held-out 2-hop 0.997 against chance 0.191 at the
+  final (0.982 already at 10M), 3-hop 0.997, read sites past the first adding +0.002 +- 0.001,
+  4-hop at chance because the model writes the two steps it was trained on; at this shape
+  reasoning composes in written tokens, not in the loop. The eval packer bug (fixed 2026-10-24,
+  same record): every left padded decode with evidence before the fix read its buffer shifted.
+  The A3 generation and A7 pathway re-reads on arm P's final: A3 weak in generation (EM 0.05,
+  abstention 0.77 under gold; likelihood unchanged), A7 oracle-buffer EM 0.09 against the model's
+  query at 0.001; the A4 edit flip read still unreadable on the model's query route (1 of 2,000
+  answered before the edit). The A4 flip read on the bge route (`eval_store.py edit --route bge`,
+  the serving configuration; 95 of 2,000 answered before the edit, same record): delete flip 0.90
+  +- 0.035 (n 72, stuck 7) against the bar 0.70, so the facts the model answers from live in the
+  store; edit flip 0.13 +- 0.07 (n 23, follow 3, stuck 1), and 0.09 follow with the edited chunk
+  attached directly, a generation weakness on real questions, not a store failure. Arm E4
   (`docs/measurements/expert_count_pilot.md`: the expert count is a cost choice); the repository
   review (`docs/review_2026-10-24.md`).
-- **Next, in order:** R5 on the chosen shape and the run spec; nothing training. The review's
-  held code changes wait on the GPU (their Open items row).
-- **Open for the user:** the goal's reasoning
-  clause reworded on R9 (written tokens); R4b's sublayer half; how the next pilot-shape arm is
-  matched after the 4094-token finding; a clean validation slice; the two micro retriever arms;
-  6f's abstention reward against the A3 re-read.
+- **Next, in order:** the three retriever arms' reads (store recall and held-out CE against the
+  fresh twin `w0e3b`); then the two leak arms (`bash ckpts/inject/launch_leak_arm.sh m1`, then
+  `g1`: the copy-first warm-up recipe on the flagged splits, run directories
+  `ckpts/evidence_leak_{m1,g1}`, reads `ckpts/inject/rank_leak_{ARM}_{100M,final}_*` and
+  `compare_cf_vs_leak_{ARM}.log` against the warm-up arm); then the clean-slice CE re-read (`bash
+  ckpts/inject/read_clean_val.sh`: `eval_exit.py` on the arm P, C and E4 finals on
+  `inject_val_clean` and `inject_val`); R5's eval set between them when the card is idle; then the
+  run spec.
+- **Open for the user:** the goal's reasoning clause reworded on R9 (written tokens); R4b's
+  sublayer half; 6f's abstention reward against the A3 re-read.
 
 ### Open items
 
@@ -58,20 +77,19 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 
 | item | status | the read that gates it | waiting on |
 |---|---|---|---|
-| the review's held code changes (bf16 CE accumulation in `mtp.py`; per-segment and log-space selection loss; the `evidence_contrastive_loops` default; an evidence-only groundedness input; the evidence reader's 4094 rule and the row estimator; the evidence-padding chunk boundary; the dense-slot GEMM skip; the frozen-gate skip; the eval-pass rewrite; fp32 selection scores under loss-free) | held | bit-identity tests on the GPU | the GPU |
+| the review's code changes | landed 2026-10-24 (uncommitted; tests pass on the GPU; a detached Sonnet review found no high or medium issue): fp32 CE, top-1 and `p_max` sums in `mtp.py`; the log-space selection loss with `evidence_selection_weighting` (`token` default, `segment`); `evidence_contrastive_loops` default `[0]`; the groundedness head input detached under the key/value reader; the row estimator replaying each reader's rule and a 4093-token training cap in the evidence builder (the reader itself unchanged by decision); the evidence padding cut into 128-token blocks; the dense-slot GEMM skip; the frozen-gate skip; fp32 selection scores under loss-free. Held: the eval-pass rewrite, deferred to 6a; the `eval_chains.py` bridge-mode items (in `--generate-bridge` the latent verdict lines suppressed and the kept 3 minus kept 1 line labelled bridge-internal; the evidence built once per batch) | none | 6a (the eval pass); a free card for the `eval_chains.py` identity check |
 | A4 edit, a flip read routed through bge | closed: read 2026-10-24 (`scripts/eval_store.py edit --route bge` on arm P's final, retrieval through the store's bge query keys, the serving configuration; `ckpts/inject/pilot_p_ladder2_store_edit_bge.*`; 95 of 2,000 answered before the edit): delete holds (flip 0.90 +- 0.035, n 72, bar 0.70), edit fails on generation (flip 0.13 +- 0.07, n 23; the edited chunk attached directly followed 0.09); the edit half goes to 6f with A3 | none | nothing |
-| R5, the winner, eval only | next, on the chosen shape (the A4 bge read done 2026-10-24) | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | the chosen shape |
-| a clean validation slice (documents neither builder used) | proposed, not built | `eval_exit.py` on the arm P, C and E4 finals | the user (a corpus decision) |
+| R5, the winner, eval only | next, on the chosen shape (the A4 bge read done 2026-10-24); runs between the micro arms when the card is idle | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | the chosen shape; an idle card |
+| a clean validation slice (documents neither builder used) | built 2026-10-24, re-read queued: `scripts/prepare_clean_val.py`, `data/prepared_pilot/inject_val_clean` (974 windows, 650,125 tokens; verbatim 64-token overlap with the QA training rows' supervised tokens 0.99% against 13.3% for `inject_val`) | `bash ckpts/inject/read_clean_val.sh` (`eval_exit.py` on the arm P, C and E4 finals on both slices) | the two leak arms |
 | a value-to-name closed-book probe | proposed, mode not built | arm P's final | a build |
-| how the next pilot-shape arm is matched | open (arm C alone trained on the 4094-token rows, 50.11M tokens) | none | the user |
 | R4, the coda corner | closed: dropped 2026-10-24 (the user), obsolete on R9 (composition at 0.997 held out once the intermediate entity is written out); the coda stays unbuilt | none | nothing |
 | R4b, the sublayer half | open; the review recommends a cost choice, no arms | none at pilot scale | the user |
-| two micro retriever arms (the contrastive term at loop 1 with the trunk gradient on; per-segment selection weighting) | proposed | store recall and held-out CE against `w0e3` | the user |
-| two leak candidates (value-first templates; distractor-collision spans) | proposed, builder changes | one micro warm-up arm each | the user |
+| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | running, launched 2026-10-24 about 20:25 (`bash ckpts/inject/launch_review_arms.sh`) | store recall and held-out CE against `w0e3b` | the runs |
+| two leak candidates (value-first templates; distractor-collision spans) | built, queued: builder flags `--mask-first-name-mention` and `--support-gold-only` (`.mask` only), splits `inject_retrieval_s100a50m1_train`, `s100a50g1`, `s15a50m1`, `s15a50g1` built 2026-10-24; arms `bash ckpts/inject/launch_leak_arm.sh m1` and `g1` | closed-book rank at 100M and at the final against the copy-first warm-up arm (`compare_cf_vs_leak_{ARM}.log`) | the retriever arms |
 | R6, pretraining-text facts | closed: skipped 2026-10-24 (the user); its mechanism is read at micro (arm (a) stores plain-text facts, tier 100 `delta` 0.378; arm (b), spans masked, stores nothing; arm C repeats arm (a) at pilot shape) and the run spec uses that lever | none | nothing |
 | the goal's reasoning clause reworded | open since 2026-10-17; R9 read 2026-10-24: composes in written tokens, not in the loop | none | the user |
 | 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
-| 6a throughput, 6c corpus on the rented cluster, 6d run spec | after every other spec decision (2026-10-21) | none | the rows above |
+| 6a throughput, 6c corpus on the rented cluster, 6d run spec | after every other spec decision (2026-10-21); 6a carries the deferred eval-pass rewrite | none | the rows above |
 
 ### Record
 
@@ -635,8 +653,8 @@ questions (it trained on hops 1 to 3, so at most two intermediate steps; hit rat
 0.00 by hop), not a decode truncation (the bridges run 52 to 88 characters against the 48-token
 cap). The log's `instrument valid: no` and its four FAIL lines are the latent read's sub-hop rule
 applied in a mode it does not fit: with the bridge written every decode step is a fresh forward,
-so one read site composes by writing (the review note; the verdict lines are suppressed in that
-mode since). R9's bar (held-out 2-hop 3 sigma above chance with the 1-hop gate kept) is met at 30M
+so one read site composes by writing (the review note; their suppression in that
+mode is held). R9's bar (held-out 2-hop 3 sigma above chance with the 1-hop gate kept) is met at 30M
 on this read; the verdict was left to the user after the final read (read 2026-10-24, below).
 
 **The repository review, 2026-10-24 ([review_2026-10-24.md](../review_2026-10-24.md)).** Six
@@ -661,14 +679,16 @@ byte identical): the merge tool reports documents over the evidence reader's lim
 packer assert in `evidence_cu_seqlens`; the splits, fp32 masters and RNG states stored in the
 checkpoint with `--switch-split` required to change split on a relaunch; the save and eval grid
 fixed across relaunches; a finished run exits 0 instead of resuming from its final; the `n_valid`
-syncs removed; the bridge eval's verdict lines suppressed and its evidence built once per batch;
-the clustered sigma and a paired `delta` compare as extra output lines (run on the arm P and E4
+syncs removed; the clustered sigma and a paired `delta` compare as extra output lines (run on the arm P and E4
 rank JSONs the same day: sigma moves by 0.9x to 1.1x; arm P held-out tier 100 z 3.2 item and 3.2
 clustered, in distribution 2.2 and 2.3, tier 1000 7.2 and 8.0 in distribution, 5.5 and 5.9 held
 out); the shortcut baseline
 printed by the chain builder; the training-distractor gold exclusion in the builder (next build
 only); `migrate_groundedness_head.py` accepting pre-2026-10-19 sources. Held (the Open items row):
-the changes that move a number or need the GPU for their bit-identity test. Its plan proposals
+the changes that move a number or need the GPU for their bit-identity test, landed the same
+evening but for the eval-pass rewrite (below). The bridge eval's two items (verdict lines
+suppressed, evidence built once per batch) were first listed here as landed; they were not, and
+stay held. Its plan proposals
 are in Decisions ("repository review"), waiting on the user.
 
 **The eval packer bug, found and fixed 2026-10-24 ([written_bridge_pilot.md](../measurements/written_bridge_pilot.md),
@@ -731,6 +751,73 @@ needed for the real run and is recommended dropped (open for the user); the real
 multi-hop rows at the depth wanted at serving, since the written depth does not generalize past the
 trained one. Unmeasured: transfer to real questions (A3, HotpotQA bridge questions) and to
 retrieved rather than handed chunks; one seed, synthetic chains with the gold chunks in the buffer.
+
+**The review's code changes, landed 2026-10-24 (evening; decided by the user on the review's
+recommendations).** Uncommitted at the time of writing, tests passing on the GPU, a detached Sonnet
+review with no high or medium finding. Landed, each with its test: the unweighted CE, top-1 and
+`p_max` sums of `mtp.py` accumulate in fp32, so the logged CE no longer sits on a 1/64-nat grid and
+`top1_acc` cannot exceed 1 (`tests/test_chunked_ce_fp32.py`); under loss-free balancing the
+selection scores are formed in fp32 for the topk (a zero bias is bit-identical; at bias 0.30 the
+bf16 sum picked differently on 2% of tokens); the frozen chunk gate (every config sets
+`freeze_evidence_gate: true`, scale exactly 0) is skipped, with no selector mass, scatter or
+multiply by ones per loop, the check cached against the tensor's `_version` so there is no
+per-step sync, forward and key/value reader gradients bit-identical
+(`tests/test_evidence_gate_skip.py`); `ParallelSparseMoELayer.forward` delegates to
+`experts.grouped_mlp_forward` with `null_mask=~mlp_mask`, so the dense-slot picks sort after the
+real experts, are counted in the same `bincount().tolist()` sync and are sliced off before the
+grouped GEMM (exact zeros as before; outputs differ from the old path only by bf16 summation order;
+about 5% of the MoE layer's time at micro shape, more at larger expert widths;
+`tests/test_efficiency_2026_10_24.py`); evidence padding is cut into 128-token blocks
+(`EVIDENCE_PAD_SEGMENT`) before the encoder's `cu_seqlens`, so it is no longer one long causal
+segment (real-token states and logits bit-identical; at pilot shape 9.61 to 7.57 ms on a
+4608/600/600/600 batch, no change when every row is full); `groundedness_term` detaches the head
+input under the key/value reader (the head still learns, no trunk parameter gets a gradient from
+it; the evidence-only signal the review proposed for finding 9 is not built); the cross reader's
+rotary gather is skipped under the key/value reader; the eval path norms only the last loop when
+`return_hidden` is False. `evidence_selection_loss` is a log-space BCE with no clamp on the
+renormalized share (a gold share under 1e-6 now gets a gradient; the old clamp zeroed it), rows
+with fewer than two visible chunks are excluded, and a new `TrainingConfig.evidence_selection_weighting`
+(`token`, default, the mean over supervised positions as before; `segment`, each query segment
+averaged first from `cu_seqlens`) is plumbed through `moe.evidence_selection_term(segment_ids=,
+num_segments=)` and the `pretrain.py` call site. `evidence_contrastive_loops` falls back to `[0]`
+(first pass only) in `config.py` and the three yamls, null still accepted; the recorded arms'
+gitignored configs under `ckpts/inject/` are pinned to null. `sft.py estimate_packed_rows` replays
+each reader's rule (evidence reader `len + mtp <= max_length - 1`, plain reader `<= max_length`;
+`tests/test_packed_rows_estimate.py`): `pilot_main_train` estimates 241,398 rows (about 30.17k
+steps) against the old 258,852 (32,356), matching arm P's observed epoch end at about 30.3k; the
+control's 252,912 is unchanged. `prepare_evidence_data.py` caps a training row at 4093 tokens
+(`MAX_DOC_TOKENS_TRAIN`), the held-out cap 4094 unchanged; `evidence_dataset.py` logs the documents
+and tokens over the row limit at startup and per worker. The reader itself is unchanged: decided
+2026-10-24, future evidence arms stay matched to the arms already run on the existing builds, and
+the existing pilot merges keep dropping the 12,240 rows. `prepare_injection_data.py` gains two
+builder flags, default off and byte identical at the default, each changing only `.mask`:
+`--mask-first-name-mention` (the first run of name tokens per document gets mask 0; 1,474,885
+tokens of 300M on the micro builds) and `--support-gold-only` (gold-absent documents count no
+value as supported). Built the same day: `inject_retrieval_s100a50m1_train`, `s100a50g1`,
+`s15a50m1`, `s15a50g1` (44 of 44 companion files byte identical to the flagless builds;
+`ckpts/inject/build_leak_arms.sh`, log `build_leak_arms.log`). `scripts/prepare_clean_val.py`
+(new, `tests/test_prepare_clean_val.py`) built `data/prepared_pilot/inject_val_clean`: 974
+windows, 650,125 tokens, from `inject_val`'s windows whose documents the evidence QA builder never
+used (the first 80,672 `ir.bin` documents excluded; phase1 and phase2 kept); its verbatim 64-token
+overlap with the QA training rows' supervised tokens is 0.99% against 13.3% for `inject_val` under
+the same check (the review's 7.4% was a narrower definition). The read, `ckpts/inject/read_clean_val.sh`
+(`eval_exit.py` on the P, C and E4 finals on both slices), is not yet run. Launchers:
+`ckpts/inject/launch_review_arms.sh [w0e3b|l0e3|seg_e3]` (`config_micro_infonce0_e3.yaml`, the
+fresh `w0e3` twin on the reviewed code; `config_micro_infonce_l0_e3.yaml`, the `w25e3` recipe with
+`evidence_contrastive_loops: [0]` and the trunk gradient on; `config_micro_segsel_e3.yaml`, the
+`w0e3` recipe with `evidence_selection_weighting: segment`; run directories
+`ckpts/evidence_infonce_{ARM}`, logs `infonce_{ARM}.log`, store recall reads
+`infonce_{ARM}_store_recall.{json,log}`), launched 2026-10-24 about 20:25 and running, the three
+arms in sequence, about 40 minutes each plus the recall read; `ckpts/inject/launch_leak_arm.sh
+m1|g1` (the copy-first warm-up recipe on the flagged splits, run directories
+`ckpts/evidence_leak_{m1,g1}`, reads `rank_leak_{ARM}_{100M,final}_*` and
+`compare_cf_vs_leak_{ARM}.log`), queued after the retriever arms. Held: the eval-pass rewrite
+(deferred to 6a) and the two `eval_chains.py` bridge-mode items (the latent verdict lines
+suppressed and the paired line labelled bridge-internal in `--generate-bridge`; the evidence built
+once per batch). The review paragraph above first recorded those two as landed;
+`scripts/eval_chains.py` is unchanged since `fee6a5c`. Run order (the user): the three micro
+retriever arms, then the two leak arms, then the clean-slice CE re-read, with R5's eval set between
+them when the card is idle.
 
 **The ladder, in order** (done steps kept so the order reads whole):
 
@@ -1090,7 +1177,7 @@ cannot see the chains.
 | depth | Drawn per step from {3: 0.7, 4: 0.2, 5: 0.1}; the first D minus 3 passes run under `no_grad` and are detached; minimum 3, so no pass is an exit. Inference 3, at most 4. R1b (2026-10-21, [depth_memory_probe.md](../measurements/depth_memory_probe.md)): depth 5 trains at pilot shape at batch 4 x 2; the detached prefix (`detach_loops`, built) cuts the prelude off the language loss until a straight-through route to the first live pass exists, so it is not a training recipe yet. |
 | loop tensors | `loop_scale` and `evidence_loop_scale` length 5, fresh `1/sqrt(5)`; `loop_inject` on; loop code clamped to the trained depth. |
 | selection supervision | Union over the passes in the gradient window: `u_c = 1 - prod(1 - p_hat[k, c])`, BCE against the gold flag. Never a target per hop and per loop. |
-| query training | Decided 2026-10-21 (the user): the real-run spec carries no retriever term and no separate search tower (held, not built); bge keys the store and embeds the question at serving, A7's recall half stays untested, and the model's own retrieval is revisited at the real run's size, with `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` kept in the code as the knob for that revisit ([infonce_micro.md](../measurements/infonce_micro.md), [query_head_probe.md](../measurements/query_head_probe.md)). The review of 2026-10-24 proposes two micro arms before the spec closes this row (the term at loop 1 only with the trunk gradient on; the selection loss weighted per segment; Decisions, repository review), waiting on the user. Was (the proposal before the pilot): infoNCE on the in-model query against the bge key of the gold chunk, in-batch negatives plus store-mined hard negatives, same-document and near-duplicate negatives masked. Keys stay bge, so the index is never rebuilt; Atlas (Izacard et al. 2022) justifies query-side-only tuning against a fixed index. |
+| query training | Decided 2026-10-21 (the user): the real-run spec carries no retriever term and no separate search tower (held, not built); bge keys the store and embeds the question at serving, A7's recall half stays untested, and the model's own retrieval is revisited at the real run's size, with `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` kept in the code as the knob for that revisit ([infonce_micro.md](../measurements/infonce_micro.md), [query_head_probe.md](../measurements/query_head_probe.md)). The review of 2026-10-24 proposed two micro arms before the spec closes this row (the term at loop 1 only with the trunk gradient on; the selection loss weighted per segment; Decisions, repository review); approved by the user the same day and running since about 20:25 with a fresh `w0e3` twin on the reviewed code (`ckpts/inject/launch_review_arms.sh`: `w0e3b`, `l0e3`, `seg_e3`). Their store recall and held-out CE against `w0e3b` are the open read before the run spec closes this row; `evidence_contrastive_loops` defaults to `[0]` since the same day. Was (the proposal before the pilot): infoNCE on the in-model query against the bge key of the gold chunk, in-batch negatives plus store-mined hard negatives, same-document and near-duplicate negatives masked. Keys stay bge, so the index is never rebuilt; Atlas (Izacard et al. 2022) justifies query-side-only tuning against a fixed index. |
 | token tables | One table, tied to the LM head and the MTP head through small adapters; no weight decay on it. The per-layer and router tables become projections of it, gated on the per-layer table zero-ablation on the seed (Phase 4b). G9 gates the head tie only. |
 | shape | Shape L: width 1024, 16 heads x 64, 4 KV heads; 8 prelude layers; looped core of 3 sublayers per pass with 8 MLP experts each, top 2; 2 coda layers. About 470M total, 300M active per token. Sublayer count and expert count are pilot arms. After arm E4 (2026-10-24, [expert_count_pilot.md](../measurements/expert_count_pilot.md): 4 experts against 8 at the same active compute cost nothing measurable, two changes and one seed each) the expert count is a cost choice, not a quality one, until a read at the real run's size; the sublayer count is open (the review proposes a cost choice too). |
 | context | 4096 for the pilot and the main run; a short 8k to 16k extension phase at the end on long documents with retrieval attached. Never 32k from the start. |
@@ -1107,7 +1194,7 @@ cannot see the chains.
 | matched compute | SMELT's definition: equal compute per token, equal non-embedding parameters and equal KV-cache size, or the comparison is not quoted as compute-matched. |
 | IR key init, `num_ir_experts > 1`, B1 | Moot: the table is dropped. |
 | gate names | 2026-10-24: the records from 2026-10-14 to 2026-10-23 called the store recall read (the model's query at recall@5 0.004 against bge 0.829) "A4 fails" and the oracle-buffer pathway read (EM 2.6%) "A7 unreadable". By the gate table the recall read is A7's recall half, the pathway read A7's pathway half, and A4 is the store edit (flip rate), read in the same run with zero correct answers to flip. The records in this file, CLAUDE.md, PILOT.md and the design page are renamed to match; logs, JSON and script names keep the old labels (`ladder_pilot.sh`, `pilot_{p,c}_ladder_*`), and so does [review_2026-10-16.md](../review_2026-10-16.md) (its "A4 fix" is the recall fix, its deletion audit "as the A7 read" replaces the flip rate, so A4). |
-| repository review 2026-10-24 | [review_2026-10-24.md](../review_2026-10-24.md). Proposals, waiting on the user: R4's coda corner not run (optional under the 2026-10-23 rule now that the bridge composes at one read site; R4 waits for the real run's size); R4b's sublayer count chosen on cost and the two-sites-per-pass argument and recorded as a cost choice like the expert count, no arms; R6 kept (the only read of pretraining-text facts reaching the weights); the two corpus flaws fixed and the matching rule for arms after P decided before the next pilot-shape arm; two micro retriever arms (the contrastive term at loop 1 with the trunk gradient on; the selection loss weighted per segment), about 1.5 hours each, before the spec closes "no retriever term"; A3 in generation and the A7 pathway and A4 edit reads re-read with the fixed packer before 6f's abstention reward is called the step that must not fail; the goal's reasoning clause read as "reasoning in written tokens, the loop as computation per token". Instrument caveats on record (facts): arm C trained on 12,240 documents, 50.11M tokens, of 4094-token QA rows the evidence arms drop (the evidence reader packs to 4095 and adds two MTP pads), so arm P against arm C is matched on the biographies and the chains, not on the QA slice or the schedule (arm C's cosine reached the 6.0e-5 floor, the evidence arms stopped at 6.55e-5), while P against E4 stays matched; about 7.4% of `inject_val` tokens appear verbatim as supervised text in rows both arms train on and another 6.7% in the rows only arm C trains on, so every held-out CE on `inject_val` (the pilot's language bar, arm PI's stop, the E4 read) leans toward the arm that saw more of it. The rank reads that decide A1 are unaffected. Decided 2026-10-24 (the user): R4's corner dropped as proposed (obsolete on R9); R6 skipped against the proposal to keep it (its mechanism read at micro); the A4 flip re-read gets a bge route (`eval_store.py edit --route bge`). |
+| repository review 2026-10-24 | [review_2026-10-24.md](../review_2026-10-24.md). Proposals, waiting on the user: R4's coda corner not run (optional under the 2026-10-23 rule now that the bridge composes at one read site; R4 waits for the real run's size); R4b's sublayer count chosen on cost and the two-sites-per-pass argument and recorded as a cost choice like the expert count, no arms; R6 kept (the only read of pretraining-text facts reaching the weights); the two corpus flaws fixed and the matching rule for arms after P decided before the next pilot-shape arm; two micro retriever arms (the contrastive term at loop 1 with the trunk gradient on; the selection loss weighted per segment), about 1.5 hours each, before the spec closes "no retriever term"; A3 in generation and the A7 pathway and A4 edit reads re-read with the fixed packer before 6f's abstention reward is called the step that must not fail; the goal's reasoning clause read as "reasoning in written tokens, the loop as computation per token". Instrument caveats on record (facts): arm C trained on 12,240 documents, 50.11M tokens, of 4094-token QA rows the evidence arms drop (the evidence reader packs to 4095 and adds two MTP pads), so arm P against arm C is matched on the biographies and the chains, not on the QA slice or the schedule (arm C's cosine reached the 6.0e-5 floor, the evidence arms stopped at 6.55e-5), while P against E4 stays matched; about 7.4% of `inject_val` tokens appear verbatim as supervised text in rows both arms train on and another 6.7% in the rows only arm C trains on, so every held-out CE on `inject_val` (the pilot's language bar, arm PI's stop, the E4 read) leans toward the arm that saw more of it. The rank reads that decide A1 are unaffected. Decided 2026-10-24 (the user): R4's corner dropped as proposed (obsolete on R9); R6 skipped against the proposal to keep it (its mechanism read at micro); the A4 flip re-read gets a bge route (`eval_store.py edit --route bge`). Decided 2026-10-24, evening (the user): the held code changes land and landed the same evening (fp32 CE sums in `mtp.py`; the log-space selection loss with `evidence_selection_weighting` `token` or `segment`; `evidence_contrastive_loops` default `[0]`; the groundedness head input detached under the key/value reader, the evidence-only signal not built; the row estimator replaying each reader's rule and a 4093-token training cap in the evidence builder; the evidence padding in 128-token blocks; the dense-slot GEMM skip; the frozen-gate skip; fp32 selection scores under loss-free); held: the eval-pass rewrite (deferred to 6a) and the two `eval_chains.py` bridge-mode items. The matching rule: the evidence reader keeps dropping the 4094-token rows, so arms after P on the existing builds stay matched to the arms already run (the corpus flaw is kept, not fixed); the `inject_val` flaw gets `inject_val_clean` (built, 0.99% verbatim overlap against 13.3%) and a CE re-read of the three finals. Both leak candidates are built as builder flags with their splits; the two micro retriever arms and the two leak arms run in that order, then the clean-slice re-read, with R5's eval set between them when the card is idle. |
 
 ## Where this stands
 
@@ -1490,7 +1577,7 @@ Retrieval is attached to every slice. The only evidence-free case is the abstent
 |---|---|---|---|---|---|
 | R0 | 0 | loop scale probe on existing checkpoints | CE gain loop 2 to 3 | 0.02 nats, loops 1 and 2 not worse | `loop_scale` in the fresh group for grafts. **FAIL**: it stays at the trunk's rate |
 | R1 | 10M | the Phase 4 run | chunk AUROC (per token) and reader gain per loop | descriptive: read, not decided (a 0.02 bar is under one sigma of the 0.030 floor, and the POC objective gives every loop the same target); a decided form needs a 0.09 bar | nothing; describes whether reads differ by loop. **Read 2026-10-01**: both arms killed on the content gain (0.058 / 0.081); chunk AUROC 0.650 / 0.643 / 0.644 by loop and the per-loop content gain 0.070 / 0.078 / 0.081 (arm B), so loop 1 reads best and later loops add little |
-| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; the anonymization sweep dropped 2026-10-04; the swap rate sweep set aside 2026-10-05 for a copy-first warm-up arm of (c), reopened as a candidate by the warm-up arm's 150M read | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms. **(c) read 2026-10-05: fails** on both forms. In distribution 0.027 (z 4.1) at tier 100 and 0.120 (z 8.8) at tier 1000, held out 0.013 (z 3.6) and 0.071 (z 8.2), while the reader copies (top-1 1.000, swapped card followed on every item); the leak is present at 50M before copying (0.010, z 4.0; 0.105, z 14.4) and flat after 100M (paired +0.001, z 0.2 at tier 100). **Copy-first warm-up arm, read 2026-10-05**: nothing stored at 50M and 100M without real-value targets (every cell within 3 sigma), copying at 100M (top-1 0.95 to 0.97); at 300M 0.015 (z 2.6) at tier 100 and 0.085 (z 6.4) at tier 1000 in distribution, held out 0.007 (z 2.0) and 0.047 (z 5.1): the rule holds through tier 100 on both forms, tier 1000 is a leak on both. **Accepted 2026-10-05 on the warm-up arm**, the tier 1000 leak recorded as known; the swap rate 0.30 branch (read 2026-10-06) leaves tier 1000 at 0.083 (z 6.2), paired -0.002 (z -0.3) against the warm-up arm, and holds the rule with more margin (tier 100 0.010, z 1.7; 0.003, z 0.9); the pilot's swap rate stays at 0.15 (decided 2026-10-06) | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
+| R0b | 3 x 0.3B | externalization micro-pilot, 35M params, about 1.5 5090 hours per arm: (a) full CE, no retrieval; (b) span weights with facts masked, no retrieval (the input-side leak test); (c) span weights plus swaps plus anonymization, with store retrieval through the key/value reader. Fictional biographies injected at 1 / 10 / 100 / 1000 exposures; the anonymization sweep dropped 2026-10-04; the swap rate sweep set aside 2026-10-05 for a copy-first warm-up arm of (c), reopened as a candidate by the warm-up arm's 150M read | closed-book likelihood rank among 100 same-type candidates, by exposure, against a fresh-name prior; on every (c) save also gold, swapped and prompt reads | (b) and (c) within 3 sigma of their prior through tier 100 while (a) is 3 sigma above at tier 100 or 1000; tier 1000 in distribution read alongside: a (b) or (c) arm 3 sigma off its prior there is a leak even when tier 100 holds, because the 95% filler weakens tier-100 storage (Physics 3.3, arXiv 2404.05405), so tier 1000 is where (a) stores reliably and a leak shows first. **(a) read 2026-10-02**: 0.378 (z 51) at tier 100, 0.467 at tier 1000. **(c) at 100M**: 0.026 (z 5.2) at tier 100, 0.149 (z 12.3) at tier 1000 with the key/value reader. **(b) read 2026-10-04**: 0.002 (z 0.6) at tier 100, 0.011 (z 1.7) at tier 1000, within its prior on both forms. **(c) read 2026-10-05: fails** on both forms. In distribution 0.027 (z 4.1) at tier 100 and 0.120 (z 8.8) at tier 1000, held out 0.013 (z 3.6) and 0.071 (z 8.2), while the reader copies (top-1 1.000, swapped card followed on every item); the leak is present at 50M before copying (0.010, z 4.0; 0.105, z 14.4) and flat after 100M (paired +0.001, z 0.2 at tier 100). **Copy-first warm-up arm, read 2026-10-05**: nothing stored at 50M and 100M without real-value targets (every cell within 3 sigma), copying at 100M (top-1 0.95 to 0.97); at 300M 0.015 (z 2.6) at tier 100 and 0.085 (z 6.4) at tier 1000 in distribution, held out 0.007 (z 2.0) and 0.047 (z 5.1): the rule holds through tier 100 on both forms, tier 1000 is a leak on both. **Accepted 2026-10-05 on the warm-up arm**, the tier 1000 leak recorded as known; the swap rate 0.30 branch (read 2026-10-06) leaves tier 1000 at 0.083 (z 6.2), paired -0.002 (z -0.3) against the warm-up arm, and holds the rule with more margin (tier 100 0.010, z 1.7; 0.003, z 0.9); the pilot's swap rate stays at 0.15 (decided 2026-10-06). **Follow-ups built 2026-10-24**: the review's two leak candidates (value-first templates supervising the name from the value; gold-absent documents counting a value supported on a distractor collision) as the builder flags `--mask-first-name-mention` and `--support-gold-only`, read by two copy-first warm-up arms, `m1` and `g1` (`ckpts/inject/launch_leak_arm.sh`), queued after the micro retriever arms | if (b) or (c) climb with exposure like (a), the recipe fails before any 1B-token spend |
 | R1b | 0 | one micro step at depth 3 and at depth 5 with the prefix, pilot shape | peak memory | fits | whether the depth schedule is trainable. **Run 2026-10-21** ([depth_memory_probe.md](../measurements/depth_memory_probe.md)): fits; depth 5 full gradient needs batch 4 x 2 at pilot shape (about 31 GB at batch 8, 17.3 at batch 4, 1.27x the time per token); the detached prefix fits (21.5 GB) but cuts the prelude off from the language loss until a straight-through route exists. |
 | R2 | 0 | synthetic chains scored on the R1 checkpoint | accuracy by hops and read sites (loops, on the POC) | after the 1-hop curve saturates: chance wherever read sites are fewer than hops | whether the instrument is valid |
 | R3 | 2 x 30M | graft: proposed objective against the current recipe, 15% synthetic, `loop_scale` kept at the migrated values and the trunk's rate | 2-hop accuracy at 3 loops minus 1 loop | +0.15 and proposed beats current | a pass helps; a null decides nothing |
@@ -1847,6 +1934,17 @@ above are a different, live series).
 
 ## What changed from the previous plan
 
+- 2026-10-24 (night): the review's code changes landed (fp32 CE sums, the log-space selection
+  loss with `evidence_selection_weighting`, `evidence_contrastive_loops` default `[0]`, the
+  groundedness detach under the key/value reader, the row estimator and the 4093-token builder cap
+  with the reader unchanged by decision, the evidence pad blocks, the dense-slot GEMM skip, the
+  frozen-gate skip, fp32 selection scores under loss-free); held the eval-pass rewrite (6a) and the
+  `eval_chains.py` bridge-mode items, which the review's Record paragraph had listed as landed by
+  mistake. Built: the two leak candidate flags and their four splits, `inject_val_clean`. Running:
+  the three micro retriever arms. The State block, the Open items table (the code row landed, the
+  matching row out, the clean slice built, the retriever arms running, the leak arms built and
+  queued), a Record paragraph, the R0b ladder row and the query training and repository review
+  Decisions rows.
 - 2026-10-24 (evening): the eval packer bug and R9's final read
   ([written_bridge_pilot.md](../measurements/written_bridge_pilot.md)). Every left padded decode
   with evidence before the fix read its buffer shifted by the dump width; the A3 generation, A7
