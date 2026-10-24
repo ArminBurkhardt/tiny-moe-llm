@@ -1,9 +1,9 @@
 # What evidence is worth before the port exists
 
 Gate G3 asks for a gold-vs-no-evidence CE gap of ~0.3 nats on the answer span, read through a port
-that costs 300–500M tokens to train. That gap has a ceiling, and the ceiling is measurable today for
-free: hand the model the same gold passage through **in-context attention** — the pathway it already
-has and was finetuned on — and read the same quantity. The port is trying to reach what in-context
+that costs 300 to 500M tokens to train. That gap has a ceiling, and the ceiling is measurable today for
+free: hand the model the same gold passage through **in-context attention** (the pathway it already
+has and was finetuned on), and read the same quantity. The port is trying to reach what in-context
 reading already delivers. If in-context evidence were not worth 0.3 nats on this checkpoint, the
 gate would be measuring the wrong thing rather than the model failing, and the spend would be
 unjustified before it started.
@@ -46,13 +46,13 @@ the measured zero is the correct answer. Evidence is the opposite case: the gold
 content this model demonstrably lacks, and the size of that gap is exactly the 3.2 nats above.
 
 So the previous arms' failure and this arm's headroom are the same fact seen twice. **Phase 4 has a
-ceiling to reach that arms A–D never had.**
+ceiling to reach that arms A to D never had.**
 
 ## 3. The unplanned finding: a distractor is worse than nothing
 
 A passage from another question costs **0.628 nats more than supplying no passage at all** (5.4987
 against 4.8707), and drops top-1 below the no-evidence condition too. Note that `p_max` goes *up*
-slightly in the distractor condition — the model is not merely uninformed by the irrelevant passage,
+slightly in the distractor condition: the model is not merely uninformed by the irrelevant passage,
 it is somewhat more confident while being more wrong.
 
 The model reads whatever it is handed, uncritically. Two consequences, both of which change what
@@ -63,7 +63,7 @@ Phase 4 is for rather than merely adding detail to it:
   trained only on gold evidence would make the model strictly worse the moment a real retriever
   handed it something irrelevant, which is what a real retriever mostly does.
 - **It sharpens G3b.** The groundedness signal has to separate "retrieved something relevant" from
-  "retrieved something". Those are currently indistinguishable to this model — and the confidence
+  "retrieved something". Those are currently indistinguishable to this model, and the confidence
   scalar moves the wrong way across them, so nothing existing supplies it.
 
 ## 4. Scope

@@ -1,7 +1,7 @@
 # Looped Mixture-of-Experts
 
 `LoopMixtureOfExperts` ([modules/model/moe.py](../modules/model/moe.py)) routes each token to a
-mixture of heterogeneous experts, and repeats this `n_loops` times over a shared pool — a recurrent
+mixture of heterogeneous experts, and repeats this `n_loops` times over a shared pool: a recurrent
 (LoopLM-style) refinement of the representation rather than a single MoE pass.
 
 ## Expert pool
@@ -17,18 +17,19 @@ The router indexes a single flat expert list, ordered:
 With the default config: `A=1`, `I=1`, `M=32` → **35 experts** (`num_attn_experts` counts self *and*
 cross, so it contributes `2A`). Types:
 
-- **Self-attention** ([experts.py](../modules/model/experts.py)) — GQA over the sequence, its own
+- **Self-attention** ([experts.py](../modules/model/experts.py)): GQA over the sequence, its own
   head count (16 heads / 4 KV heads) and RoPE cache.
-- **Cross-attention** — same, but keys/values come from the `other` stream (the projected MoE
+- **Cross-attention**: same, but keys/values come from the `other` stream (the projected MoE
   per-layer embedding of the same tokens).
-- **Information-retrieval (IR)** — the selector; see below.
-- **MLP** — SwiGLU FFNs, run sparsely as one grouped GEMM (see Sparse MLP dispatch).
+- **Information-retrieval (IR)**: the selector; see below.
+- **MLP**: SwiGLU FFNs, run sparsely as one grouped GEMM (see Sparse MLP dispatch).
 
-There is no identity expert. Three always-on modules seed every loop's accumulator unconditionally,
+There is no identity expert. Always-on modules seed every loop's accumulator unconditionally,
 outside the router pool entirely (not in `Router`'s output dim, not in the aux loss): `shared_mlp`, a
-dense SwiGLU MLP; `shared_attn`, a `SelfAttention` reused for its RoPE/varlen path; and, when a
-checkpoint carries the evidence port *and* a batch attaches evidence, `shared_evidence`, the
-evidence reader. Static row count, so they run inside `te.autocast`.
+dense SwiGLU MLP; `shared_attn`, a `SelfAttention` reused for its RoPE/varlen path (under the
+key/value reader it also reads the evidence, below); and, when a checkpoint carries the cross
+reader *and* a batch attaches evidence, `shared_evidence`, the cross evidence reader. Static row
+count, so they run inside `te.autocast`.
 
 Attention/IR experts run over the **full sequence regardless of routing**, so each is computed
 **once per loop** and cached across the `top_k` slots; the top-k mask only scales their output.
@@ -41,21 +42,45 @@ Only the MLP experts are dispatched sparsely.
 1. Router ([router.py](../modules/model/router.py)) = `RMSNorm -> Linear` produces logits. During
    training it adds **annealed exploration noise** `noise_factor * 0.3 * softplus(noise_proj(x)) * ε`
    (the 0.3 caps the initial level, which otherwise swamped the clean logits' ~0.33 std).
-2. `loop_router_bias(loop_enc[loop])` is added — a zero-init linear over a **sinusoidal encoding of
+2. `loop_router_bias(loop_enc[loop])` is added: a zero-init linear over a **sinusoidal encoding of
    the absolute loop index**, not a learned `[n_loops, num_experts]` table, so `n_loops` stays a
    runtime choice and indices past the table reuse its last row.
-3. Single softmax over the logits gives the selection distribution.
-4. **Load-balancing aux loss** is computed directly from that softmax: `num_experts * Σ f_i * P_i`
-   (hard token fraction `f_i` × mean soft prob `P_i`), minimized at a uniform distribution.
-   Normalized by the loops actually run. It takes an optional `token_mask` so padded positions can
-   be excluded (a mostly-padding batch reads a near-uniform routing signal on its pad rows and
-   moved the aux loss 3x with row fill); `None` is bit-identical to the unmasked form. Both
-   trainers pass `input_ids != pad` through `TinyMoETransformer.forward`'s `token_mask`, so
-   numbers from a run before that are not comparable to one after it. The masked branch counts,
+3. Single softmax over the logits gives the routing probabilities `expert_scores`.
+4. **Selection**: one `torch.topk` over `expert_scores + balance_bias[loop]` picks the `top_k`
+   experts; the weights are gathered from the **unbiased** `expert_scores` at those indices and
+   renormalized to sum to 1. `balance_bias` is the loss-free balancing buffer (below); at zero, which
+   is every checkpoint before 2026-10-19 and every run under `moe_balancing: aux`, the selection is
+   exactly the old router's.
+5. **Load-balancing aux loss** is computed from the same softmax and the same top-k indices:
+   `num_experts * Σ f_i * P_i` (hard token fraction `f_i` times mean soft prob `P_i`), minimized at a
+   uniform distribution. It is computed in every mode but added to the objective only under
+   `moe_balancing: aux` (weight `aux_loss_weight`); under `loss_free` it is logged and not trained
+   on. Normalized by the loops actually run; under `detach_loops=k` the passes of the detached
+   prefix contribute nothing and the sum is divided by the live passes alone
+   (`loops_run - k`), so the per-pass gradient keeps its size. It takes an optional `token_mask` so
+   padded positions can be excluded (a mostly-padding batch reads a near-uniform routing signal on
+   its pad rows and moved the aux loss 3x with row fill); `None` is bit-identical to the unmasked
+   form. Both trainers pass `input_ids != pad` through `TinyMoETransformer.forward`'s `token_mask`,
+   so numbers from a run before that are not comparable to one after it. The masked branch counts,
    masks and reduces in fp32 since 2026-10-20: a bf16 count stops at 256, so every masked value
    logged before then was a constant and the term balanced nothing.
-5. `top_k` selection → renormalize the selected weights to sum to 1. One `torch.topk` feeds both the
-   aux loss and the selection.
+
+**Loss-free balancing** (`moe_balancing: loss_free`, arXiv 2408.15664). `balance_bias` is a
+persistent buffer `[n_loops, num_experts]`, zero at init. Both trainers turn on per-pass hard load
+counting (`set_balance_tracking(True)`, in every mode): `route` adds each selection's count into an
+fp32 per-pass counter on device, a padded token counting for nothing. After each optimizer step the
+trainers call `update_balance_bias(rate)`: for every pass and every MLP slot the step is
+`sign(mean MLP load - load)`, the signs are **centred** over the MLP slots (their mean subtracted,
+so the update is zero sum), and the bias moves by `rate` times that. The attention and IR slots
+keep a zero bias, and centring keeps every MLP bias from drifting up together against them under a
+skewed load, so the MLP against dense split stays the router's. A pass whose counts are all zero
+(a shallower sampled depth did not run it) is left alone. The update runs on an fp32 shadow of the
+buffer (the buffer follows the model's bf16 cast) and copies back; the rate is
+`moe_balance_bias_rate` under `loss_free` and 0 under `aux`, which folds the counts into the load
+EMA and leaves the bias where it is. `balance_load_stats` reads that EMA for the log line:
+`load max/mean` (the most loaded MLP expert's share over the mean MLP share, 1.0 even) and
+`dense share` (the attention and IR slots' share of the selections) per pass, logged in every mode
+since 2026-10-20. A checkpoint without the buffer loads as zero (`BALANCE_KEYS`).
 
 Non-MLP experts are applied through one `[B, S, first_mlp_index]` gate built by `scatter_add_` (a
 mask multiply, never boolean indexing, which is a device sync per expert); MLP slots are remapped to
@@ -68,9 +93,10 @@ hidden_states = hidden_states + loop_scale[loop] * dropout(post_norm(output))
 
 `loop_scale` is an `nn.Parameter` of shape `[n_loops]`, init `1/sqrt(n_loops)`, excluded from weight
 decay; indices past `n_loops - 1` reuse the last entry. A checkpoint migrated by
-`scripts/migrate_phase0.py` carries much smaller values (`[0.63, 0.32, 0.11]` on the phase2
-lineage) because the deleted halt gate's measured per-loop mean was folded in — correct, not a
-collapsed loop.
+`scripts/migrate_phase0.py` carries much smaller values because the deleted halt gate's measured
+per-loop mean was folded in: `[0.637, 0.326, 0.098]` on `checkpoint_phase2_final` and
+`[0.501, 0.242, 0.115]` on `checkpoint_sft_final`
+([phase0_migration.md](measurements/phase0_migration.md)). Correct, not a collapsed loop.
 
 `loop_inject` (arm D, `scripts/migrate_loop_inject.py`) adds `inject(e)` of the block's input to
 what the router and experts *read* at every loop, without touching the residual. It is zero-init,
@@ -81,7 +107,7 @@ record and the control.
 
 [information_retrieval.py](../modules/model/information_retrieval.py). The token is normed,
 down-projected to `ir_dim` (384), given a zero-init **per-loop query bias** (same sinusoidal
-encoding as the router's, so the query can differ between loops — Stage 0 measured
+encoding as the router's, so the query can differ between loops; Stage 0 measured
 `cos(q2, q3) = 0.99` without it), and unit-normalized. It then reads:
 
 - **The learned table**, `z_keys`/`y_values` `[65536, 384]`, through a **two stage read**: score 256
@@ -111,22 +137,40 @@ by its batch mean cost 0.0000 nats.
 retrieves: zeroing the read costs 0.0002 nats across three key inits and two widths, trained or not
 ([ir_sharpening.md](measurements/ir_sharpening.md), [ir_scale_fix.md](measurements/ir_scale_fix.md)).
 A table trained on the trunk's own corpus can only offer content the trunk already holds. Its size
-is frozen out of the real run spec; the external store — content the trunk provably lacks, worth
-+3.23 nats in context ([evidence_ceiling.md](measurements/evidence_ceiling.md)) — is the mechanism.
+is frozen out of the real run spec; the external store, content the trunk provably lacks, worth
++3.23 nats in context ([evidence_ceiling.md](measurements/evidence_ceiling.md)), is the mechanism.
 
 ## The evidence reader
 
-`shared_evidence` is a `CrossAttention` whose key/value side is the encoded evidence
-(`EvidenceBatch.states`, built by `TinyMoETransformer.build_evidence`; see
-[architecture.md](architecture.md) §3), with its own `cu_seqlens_k`, per-chunk RoPE and
-`causal=False`. At every loop it reads `step_input + evidence_query_bias(loop_enc[loop])` and its
-output is scaled by `evidence_loop_scale[loop]` (one-init) before joining the accumulator, so
-`loop_scale`'s own shrinkage does not stunt a later re-read. Before the projections, the evidence
-states are multiplied per chunk by `1 + evidence_gate_scale * sigmoid(chunk mass)`, where the chunk
-mass is the selector's mean external weight on that chunk over the document's own tokens — a
-zero-init scale makes the gate *exactly* 1, and it gives the selector a dense, always-on gradient
-through the reader. Its `o_proj` is zero-init. All of these tensors are in `is_fresh_loop_param`
-and train at the from-scratch rate under `sft.py --evidence`.
+Two readers exist; the checkpoint's marker buffers decide which one a model builds (see
+[architecture.md](architecture.md) §3 for both).
+
+**The key/value reader** (`evidence_reader="kv"`, marker `moe.evidence_reader_kv`, `sft.py
+--reader-kv`), the measured reader since 2026-10-03 and the pilot's. No reader module and no
+`evidence_query_bias`: inside `forward_step` the encoded evidence (`EvidenceBatch.states`) goes to
+`shared_attn`, which passes it through its own norm, multiplies it per token by the chunk gate
+(after the norm), projects it with its own `k_proj`/`v_proj`, scales the values by
+`evidence_loop_scale[loop]`, and reads it as leading keys of each query segment under one softmax
+with the segment's own causal keys (`attention.prefix_varlen_attention`), the prefix rotated at
+`start_s - E_s + i` (`evidence.prefix_position_ids`). The read shares the softmax with the
+segment's own keys, so this reader is **not neutral with evidence attached**, even at init; without
+evidence it is bit-identical to the model without the port.
+
+**The cross reader** (`shared_evidence`, the legacy mode) is a `CrossAttention` whose key/value
+side is the encoded evidence (built by `TinyMoETransformer.build_evidence`), with its own
+`cu_seqlens_k`, per-chunk RoPE and `causal=False`. At every loop it reads
+`step_input + evidence_query_bias(loop_enc[loop])` and its output is scaled by
+`evidence_loop_scale[loop]` (one-init) before joining the accumulator, so `loop_scale`'s own
+shrinkage does not stunt a later re-read. Its `o_proj` is zero-init, which makes a fresh cross
+reader neutral even with evidence attached; that neutrality argument holds for the cross reader
+only.
+
+**The chunk gate** is shared by both: the evidence states are multiplied per chunk by
+`1 + evidence_gate_scale * sigmoid(chunk mass)`, where the chunk mass is this loop's selector mean
+external weight on that chunk over the document's own tokens. A zero-init scale makes the gate
+*exactly* 1, and a nonzero one gives the selector a dense, always-on gradient through the reader.
+All of these tensors are in `is_fresh_loop_param` and train at the from-scratch rate under
+`sft.py --evidence`.
 
 `information_retrieval.evidence_selection_loss` (BCE between the per-chunk external share and the
 gold flag) is the selector's supervised half, reached through
@@ -134,20 +178,22 @@ gold flag) is the selector's supervised half, reached through
 (the per-chunk breakdown before the sum-and-detach) against the mask the recurrence built once in
 `last_memory_visible`, averages over every loop and IR expert, and `train_step` adds it at
 `TrainingConfig.evidence_selection_weight`. Uniform loop weights, not `loop_ce_weights`' ascending
-ones — a relevant chunk is relevant at every depth. `None` whenever the batch had no external
+ones: a relevant chunk is relevant at every depth. `None` whenever the batch had no external
 store or the corpus no gold flag, which is every profile but `--evidence`.
 
 [evidence.py](../modules/model/evidence.py) also holds `GroundednessHead` + `groundedness_loss`
 (BCE against the corpus label "gold chunk present AND answerable", on the reader's output), added
 to a checkpoint by `migrate_groundedness_head.py` and inferred from the state dict.
-`TinyMoETransformer.groundedness_term` reads `moe.last_reader_output` — the read before the
-per-loop gain and before the shared/routed sum, because the question is about the read rather than
-about what the accumulator did with it — at the last prompt token of each supervised span, and
+`TinyMoETransformer.groundedness_term` reads `moe.last_reader_output` (under the cross reader, the
+read before the per-loop gain and before the shared/routed sum, because the question is about the
+read rather than about what the accumulator did with it; under the key/value reader, `shared_attn`'s
+whole output, the attention that did the read) at the last prompt token of each supervised span, and
 `train_step` adds it at `TrainingConfig.groundedness_weight`. `gold_present` comes from
 `last_memory_visible @ chunk_gold`, `answerable` from the corpus's `.ans` sidecar.
 
-Its weight gradient is **exactly zero until the reader's `o_proj` leaves zero**, because the head
-reads a zero vector until then and only its bias can move. So an early falling `grounded:` is the
+Under the cross reader its weight gradient is **exactly zero until the reader's `o_proj` leaves
+zero**, because the head reads a zero vector until then and only its bias can move (the key/value
+reader's output is never zero, so this does not apply there). So an early falling `grounded:` is the
 base rate being learned; the held-out AUROC in the `[eval]` line is what says otherwise.
 
 ## Depth policy
@@ -156,7 +202,7 @@ There is no identity expert and, since Phase 0, no halt head either. **What used
 learned `p_halt = sigmoid(halt_proj(hidden_states))` gated the update as
 `(1 - p_halt) * loop_scale * delta`, trained by a "ponder" loss. It failed structurally: `p_halt`
 pinned at ~0.78 (0.92 on the final loop) for 14B tokens while a runtime controller cut its weight
-11 times with no effect — a saturated sigmoid has no gradient. Full post-mortem in
+11 times with no effect: a saturated sigmoid has no gradient. Full post-mortem in
 [CONCLUSION.md](CONCLUSION.md); the fold into `loop_scale` is above.
 
 **What replaced it.** Two things, neither learned:
@@ -168,7 +214,7 @@ pinned at ~0.78 (0.92 on the final loop) for 14B tokens while a runtime controll
   loop it reads out the **last position only** and stops when the top-1 token is unchanged *and* its
   log-probability moved less than `converge_tol`. It reads the **readout**, not `‖Δh‖` (`loop_scale`
   still injects a sizeable hidden delta while the prediction is stationary); it is asserted
-  inference-only; and it is asserted **mutually exclusive with the KV cache** — an exited loop
+  inference-only; and it is asserted **mutually exclusive with the KV cache**: an exited loop
   appends no K/V for that token. `scripts/eval_calibration.py` prints per-transition top-1
   agreement and mean `|Δ log p_top|`, which is how the threshold gets picked.
 
@@ -193,7 +239,7 @@ from-scratch test in [NEXT.md](plans/NEXT.md) 7c.
 
 ## Confidence signal
 
-`p_max = softmax(logits).max()` is the confidence signal everywhere — training logs, `sft.py`'s
+`p_max = softmax(logits).max()` is the confidence signal everywhere: training logs, `sft.py`'s
 validation pass, `eval_calibration.py`, `eval_abstention.py`. Computed as `1 / Σ_j exp(l_j - l_max)`
 to avoid two ~2GB fp32 transients per chunk. It carries no answerability signal (AUROC at or below
 chance on every checkpoint); a linear probe of the final loop's last-position hidden state reads
@@ -209,7 +255,7 @@ keeps it from collapsing the same way.
 
 1. Flatten `(token, slot)` assignments, **sort by expert id** (`stable=True`, for deterministic
    checkpoint recompute).
-2. `bincount(...).tolist()` gives per-expert group sizes — the one accepted host sync per loop.
+2. `bincount(...).tolist()` gives per-expert group sizes, the one accepted host sync per loop.
 3. One variable-sized grouped GEMM per expert via TE `GroupedLinear` (fused gate+up, then down).
 4. Scale each output by its routing weight (non-MLP slots carry weight 0), `index_add_` back.
 

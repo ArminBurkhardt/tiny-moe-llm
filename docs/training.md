@@ -10,7 +10,7 @@ Two entry points share one `train_step`:
   **verbatim**, so every loss term is identical across all five runs by construction.
 
 Both use HuggingFace `accelerate` for device placement and gradient accumulation. For the
-operational side of a real run — starting, stopping, monitoring, recovering — see
+operational side of a real run (starting, stopping, monitoring, recovering), see
 [runbook.md](runbook.md). This document covers what the code does.
 
 ## Pretraining pipeline
@@ -18,7 +18,7 @@ operational side of a real run — starting, stopping, monitoring, recovering �
 1. Load the tokenizer from `utils.TOKENIZER_DIR` and build the mmap `Dataset` for the selected phase
 2. Build `TinyMoETransformer` from `ModelConfig.Params`, cast to BF16, `.train()`
 3. Optimizer over **two param groups**: weight decay applies only to tensors with
-   `ndim >= 2` — norms, biases and gates are excluded because their zero is a degenerate state
+   `ndim >= 2`: norms, biases and gates are excluded because their zero is a degenerate state
    (`loop_scale` decayed to 0 is the loop switched off). The undecayed group is stepped through
    fp32 masters. `training.optimizer` picks `adamw` (`torch.optim.AdamW`, every run before
    2026-10-18) or `muon` (`modules/model/optim.MuonAdamW`: the hidden 2D matrices take Muon's
@@ -28,14 +28,14 @@ operational side of a real run — starting, stopping, monitoring, recovering �
 4. Clean up stale files, then resume from the newest checkpoint that actually **loads**
 5. Verify the resume against `run_state.json`, aborting with exit 30 if this process came back
    materially behind where the last one got to
-6. **Dry run** — one synthetic packed batch forward+backward to fail fast on shape/precision
+6. **Dry run**: one synthetic packed batch forward+backward to fail fast on shape/precision
    issues. Its tokens are excluded from the counter and a non-finite loss aborts startup
 7. Train loop: for each batch, build `cu_seqlens` from `document_ids`, anneal router noise, sample
    this step's loop depth, run `train_step`; at the log cadence, log throughput, write
    `status.json`, poll for stop requests, and checkpoint on the token cadence
 
-Everything that needs the host — loss `.item()`, the token sync, tokens/sec, peak memory, the
-metrics dict — is throttled to `LOG_INTERVAL`. The model is small enough that per-step syncs
+Everything that needs the host (loss `.item()`, the token sync, tokens/sec, peak memory, the
+metrics dict) is throttled to `LOG_INTERVAL`. The model is small enough that per-step syncs
 dominate, so nothing in the step path may add one.
 
 ## Data & document packing
@@ -43,13 +43,13 @@ dominate, so nothing in the step path may add one.
 `Dataset` ([modules/data/dataset.py](../modules/data/dataset.py)) is an `IterableDataset` reading a
 pre-tokenized flat-file corpus built by [scripts/prepare_data.py](../scripts/prepare_data.py):
 
-- `{data_dir}/{phase}.bin` — a flat `uint16` token stream (hence `vocab_size <= 65536`)
-- `{data_dir}/{phase}.idx` — `uint64` document-start offsets, one per document plus a trailing
+- `{data_dir}/{phase}.bin`: a flat `uint16` token stream (hence `vocab_size <= 65536`)
+- `{data_dir}/{phase}.idx`: `uint64` document-start offsets, one per document plus a trailing
   entry equal to `len(bin)`
 
 Documents are read **once, in on-disk order, with no shuffling**. `prepare_data.py` already
 interleaves the seven sources at the target mix ratios while writing, so a sequential read
-reproduces that mix — reshuffling here would undo it. Both files are `np.memmap`ed inside the
+reproduces that mix; reshuffling here would undo it. Both files are `np.memmap`ed inside the
 worker iterator rather than held on the `Dataset` across worker restarts.
 
 Workers shard the stream by pure `doc_idx % num_workers == worker_id` arithmetic, which is why a
@@ -64,7 +64,7 @@ from it.
   positions set to `-100`), and `doc_idx`/`worker_id` as `[B]`-shaped tensors so accelerate's batch
   splitting treats them like `input_ids`
 - The dataset yields **fully assembled batches**, hence `batch_size=None` on the `DataLoader`
-- `cu_seqlens` is built in-thread by the trainer and never carried in the batch dict — it is ragged
+- `cu_seqlens` is built in-thread by the trainer and never carried in the batch dict: it is ragged
   (`dim0 = num_segments + 1`) and accelerate's `split_batches` would truncate it, silently
   corrupting the attention segmentation
 
@@ -78,16 +78,22 @@ dropped); and documents are shuffled per epoch by a `(seed, epoch)` permutation,
 `1 / (supervised tokens in the conversation)`; the trainer decides whether to pass them.
 
 `EvidenceDataset` ([modules/data/evidence_dataset.py](../modules/data/evidence_dataset.py)) is
-`SFTDataset` plus a second token stream per row, from the seven extra files
-`prepare_evidence_data.py` writes (`.ev`, `.evidx`, `.evchunk`, `.evkey`, `.evkeyidx`, `.evgold`,
-`.cond`). Each batch additionally carries `evidence_ids` / `evidence_chunk_ids` /
-`evidence_doc_slot` `[B, S_ev]`, `chunk_keys [B, C, 384]`, `chunk_slot` / `chunk_gold [B, C]`, and
-`condition_ids [B, S]`; the trainer flattens them in-thread (`evidence_from_batch`) into an
+`SFTDataset` plus a second token stream per row. It reads five required files
+(`.ev`, `.evidx`, `.evchunk`, `.evkey`, `.evkeyidx`), three label files that exist all together or
+not at all (`.evgold` per chunk, `.cond` and `.ans` per document; a mixed set is a hard error, a
+missing set is warned once and the labels are omitted from every batch), and an optional `.src`
+(per document source index, backfillable onto a corpus already in use). Each batch additionally
+carries `evidence_ids` / `evidence_chunk_ids` / `evidence_doc_slot` `[B, S_ev]`,
+`chunk_keys [B, C, 384]`, `chunk_slot` / `chunk_gold [B, C]`, and on the query axis
+`condition_ids`, `answerable_ids` (1 for a real answer target, 0 for a refusal, -1 on padding; not
+derivable from the condition) and, when `.src` exists, `source_ids`, each `[B, S]`. A batch in
+which nothing retrieved anything omits the five evidence keys and takes the bit-identical
+no-evidence forward. The trainer flattens them in-thread (`evidence_from_batch`) into an
 `EvidenceBatch` once it has the query side's segmentation. One evidence segment per query segment,
 paired by position; a document that retrieved nothing contributes a zero-length one. Rows pack to
 `max_length - 1` so the evidence padding always has a trailing pad segment to belong to. A row's
 evidence is capped by `max_evidence_tokens`, which must be set against the corpus's
-evidence-to-prompt ratio — below it, evidence closes every row early and the run pays a full-width
+evidence-to-prompt ratio: below it, evidence closes every row early and the run pays a full-width
 forward for mostly padding, visible only as throughput. The dataset logs realized row fill and how
 many rows the evidence budget closed. The per-conversation weight is floored at
 `loss_weight_floor_tokens`.
@@ -104,7 +110,7 @@ Pretraining runs in two phases over two different corpora and mix ratios:
 
 `target_tokens` is the **combined** budget and `token_count` carries across the boundary, so phase
 2 continues the same cosine decay rather than restarting it. Crossing phases resets the document
-offset, epoch and step to zero (`resolve_resume_scope`) — a phase-1 offset of ~23M documents fed
+offset, epoch and step to zero (`resolve_resume_scope`): a phase-1 offset of ~23M documents fed
 into phase 2's ~4M-document corpus makes every worker's range empty, and the run would exit looking
 successful having trained nothing.
 
@@ -118,7 +124,10 @@ Either "reached the token target" or "the corpus ran out" ends a phase; both wri
 ```
 loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-final loops subsampled
      + lambda_mtp · Σ_i CE(token at offset i+2)      # MTP heads, final loop only
-     + aux_loss_weight · load_balance_loss           # normalized by loops actually run
+     + aux_loss_weight · load_balance_loss           # moe_balancing: aux only; mean over live passes
+     + evidence_selection_weight · selection_loss    # evidence with gold flags only
+     + evidence_contrastive_weight · contrastive     # default weight 0; evidence with gold flags only
+     + groundedness_weight · groundedness_loss       # head present, evidence with labels only
 ```
 
 - **Main CE**: the trainer receives hidden states for every loop (`return_hidden=True`) and applies
@@ -127,8 +136,11 @@ loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-fi
   With `loss_weights` given, every CE term becomes `sum(w · ce) / sum(w)`; `p_max` and top-1 stay
   unweighted so they remain comparable across every run.
 - **MTP CE**: each extra head `i` predicts the token at offset `i + 2`; pad positions are masked to
-  `-100`. `lambda_mtp: 0.0` does **not** skip the compute — pass `mtp_outputs=None` for that.
-- **Aux loss**: the MoE load-balancing term (see [moe.md](moe.md)).
+  `-100`. `lambda_mtp: 0.0` does **not** skip the compute; pass `mtp_outputs=None` for that.
+- **Aux loss**: the MoE load-balancing term (see [moe.md](moe.md)), added only under
+  `moe_balancing: aux`. Under `loss_free` it is computed and logged but not trained on; the
+  balance bias moves after each optimizer step instead (`update_balance_bias`). With
+  `detach_loops=k` the mean is over the live passes only.
 - **Stochastic depth**: `loop_count_sampling` runs 30% of steps at a random reduced depth with
   `loop_ce_weights` truncated and rescaled so the deepest loop run carries weight 1.0; log steps are
   pinned to full depth so every logged number is read at one operating point.
@@ -141,15 +153,28 @@ loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-fi
   corpus's per-chunk gold flag, so it is structurally absent from every profile but `--evidence`
   and from any corpus built before the flag. It reads the mass split the forward already produced
   (`LoopMixtureOfExperts.evidence_selection_term`, averaged over every loop and every IR expert),
-  so it costs one `[tokens, chunks]` BCE and no second pass — and it asserts gradient checkpointing
+  so it costs one `[tokens, chunks]` BCE and no second pass, and it asserts gradient checkpointing
   is off, because a checkpointed segment's stashed weights carry no graph.
 
-- **Groundedness loss**: `groundedness_weight * groundedness_term(...)`, BCE on the evidence
-  reader's own output at the last prompt token of each supervised span
-  (`pretrain.answer_start_positions`), against the corpus label "a gold chunk is present AND the
-  row is answerable". Needs a checkpoint carrying the head (`migrate_groundedness_head.py`) and a
-  corpus carrying `.evgold`/`.ans`, so like the selection term it is structurally absent
-  everywhere else. Reads the same stashed forward, with the same no-checkpointing requirement.
+- **Contrastive loss**: `evidence_contrastive_weight * evidence_contrastive_term(...)`, the
+  retriever's in-batch InfoNCE: the selector's unit query at each answer-start position against
+  every chunk in the batch, the other documents' chunks as negatives, positives the position's own
+  gold chunks, fixed temperature `evidence_contrastive_temperature` (0.07), both directions
+  averaged. Weight 0 by default and in every run before 2026-10-17. Two keys added 2026-10-21:
+  `evidence_contrastive_loops` (null is every loop, else the zero-based loops the term averages
+  over; a listed loop a sampled depth skipped drops out, and the term is absent for that step when
+  every listed loop was skipped) and `evidence_contrastive_trunk_grad` (the share of the term's
+  gradient reaching the trunk through the query's hidden state; 1.0 is the old term, 0.0 trains the
+  query head alone). Same evidence and gold-flag condition and the same no-checkpointing assert as
+  the selection term.
+
+- **Groundedness loss**: `groundedness_weight * groundedness_term(...)`, BCE on
+  `moe.last_reader_output` (the cross reader's read, or `shared_attn`'s output under the key/value
+  reader) at the last prompt token of each supervised span (`pretrain.answer_start_positions`),
+  against the corpus label "a gold chunk is present AND the row is answerable" (`.evgold` and the
+  `answerable_ids` from `.ans`). Needs a checkpoint carrying the head
+  (`migrate_groundedness_head.py`) and a corpus carrying the label files, so like the selection
+  term it is structurally absent everywhere else. Reads the same stashed forward.
 
 ## The finetune profiles
 
@@ -165,7 +190,7 @@ What is genuinely different from pretraining:
 - **fp32 master weights for every parameter** (`build_sft_param_groups`), not only the undecayed
   ones. At `lr = 3e-5` an AdamW step on a bf16 2D weight near its init std is below that weight's
   own ulp, so `param -= lr · update` rounds to the old value forever. A parameter stepped through
-  a master is in no optimizer group, so `train_step` clears its `.grad` by hand on sync steps —
+  a master is in no optimizer group, so `train_step` clears its `.grad` by hand on sync steps:
   otherwise the bf16 grads accumulate for the whole run, the clip norm grows without bound and
   every other parameter's LR silently collapses.
 - **A fresh-parameter LR group** (`fresh_lr`) for the `--ir` and `--evidence` profiles, with a
@@ -186,7 +211,8 @@ What is genuinely different from pretraining:
   re-armed when the pass read nothing, and `kill_checked` is persisted in the checkpoint.
 - **Per-loss-and-gate instrumentation** at every log step: `|g_proj|rms` and `|y|row` (`--ir`),
   `|inject|rms` (when the injection exists), `|shared_evidence.o_proj|rms` and the external mass per
-  condition (`--evidence`), the evidence token count as its own field, and `IR E/ln32` per loop.
+  condition (`--evidence`), the evidence token count as its own field, `IR E/ln32` per loop, and
+  `load max/mean` and `dense share` per pass in every balancing mode.
 - The model's global token counter is **continued**, not reset (the router noise anneal reads it
   and finished at ~1B tokens); profile progress is `token_count - start_token_count`, and the
   checkpoint payload is a strict superset of pretraining's.
@@ -200,7 +226,7 @@ Modules are built on TE `Linear` / `RMSNorm` / `GroupedLinear`, enabling FP8 / M
 `te.autocast`. Recipes are defined at the top of `pretrain.py` and selected by the `USE_FP8`
 environment variable; **default is off** (BF16 everywhere), and every local finetune stays off.
 NVFP4 cannot be used for the sparse MLP experts (row counts not divisible by 16). **Gradient
-checkpointing uses TE's `checkpoint`, not `torch.utils.checkpoint`** — required for correct
+checkpointing uses TE's `checkpoint`, not `torch.utils.checkpoint`**, required for correct
 FP8/NVFP4 recompute. Toggle with `model.set_checkpointing(stage, sub_stage)`; training runs with
 both off.
 
@@ -215,8 +241,13 @@ content plus the prepended BOS but **not** its terminating EOS or pad separators
 ## Checkpointing & resume
 
 Checkpoints save model/optimizer/scheduler state plus `epoch`, `token_count`, `global_offset`,
-`phase`, and the loss history ([utils.py](../utils.py)); the SFT payload adds `start_token_count`
-and the shuffle seed.
+`phase`, and the loss history ([utils.py](../utils.py)); the SFT payload adds `start_token_count`,
+the shuffle seed and `kill_checked`. From 2026-10-24 it also carries the fp32 masters (top-level
+`fp32_masters`, about 4 bytes per parameter on disk), the depth-sampling and CUDA RNG states
+(`loop_rng_state`, `cuda_rng_state`) and the data fields (`data_dir`, `train_split`,
+`val_split`) under `sft`. A resume restores what is present; a checkpoint written before then
+carries none of them and loads as before. A resume on other data than the checkpoint's is refused
+unless `--switch-split` is passed.
 
 - **Cadence is in tokens** (`checkpoint_every_tokens`), checked inside the existing log block so it
   costs no extra host sync. `SIGUSR1` forces one immediately.
@@ -226,7 +257,7 @@ and the shuffle seed.
   `checkpoint_{phase}_final.pt` per phase that is never pruned.
 - **Retention** keeps the newest `keep_local_checkpoints` and deletes the rest **only** once their
   upload is confirmed. Sustained upload failure therefore fills the disk rather than discarding
-  history — the loud, recoverable failure.
+  history: the loud, recoverable failure.
 - **Resume picks the newest checkpoint that loads**, not simply the newest file. A corrupt newest
   file is logged and skipped; only if *every* candidate fails does startup raise. "A checkpoint
   exists but will not load" must never degrade into "start from token 0".
@@ -237,18 +268,25 @@ and the shuffle seed.
   aborts with exit 30 rather than silently retraining ground already covered.
 - **Migrated checkpoints are seeds, not resume points.** Every `migrate_*.py` output drops its
   optimizer state (Adam moments are indexed by param-group position and the migration adds or
-  removes tensors); `utils.load_checkpoint` names that case when you try. Loading goes through
-  `utils.load_model_state`, which is strict except for a named set of neutrally-initialized tensors
-  (`IR_TEMPERATURE_KEYS`, `NEUTRAL_LOOP_KEYS`) whose absence means "the old value", never "state was
-  lost" — the two resume paths stay fully strict.
-- The fp32 masters are optimizer-only shadows built before the resume and reseeded from the
-  just-loaded BF16 weights; sub-ulp progress since the last save is lost, bounded by one interval.
+  removes tensors); `utils.load_checkpoint` names that case when you try. Seeding goes through
+  `utils.load_model_state`, which is strict except for four named key sets whose absence means "the
+  old value", never "state was lost": `IR_TEMPERATURE_KEYS` (the read temperature, init 1.0),
+  `NEUTRAL_LOOP_KEYS` (the loop-conditioned query biases, the reader's per-loop gain and the chunk
+  gate scale, all neutral at init), `READER_MODE_KEYS` (the marker buffers
+  `moe.evidence_reader_rotary_off` and `moe.evidence_reader_kv`, which carry no learned value) and
+  `BALANCE_KEYS` (`moe.balance_bias`, zero is the unbiased router). The two resume paths
+  (`utils.load_checkpoint`, `sft.load_sft_checkpoint`) stay strict on every learned tensor; their
+  one tolerance is `moe.balance_bias` (`utils.with_balance_default`).
+- The fp32 masters are optimizer shadows built before the resume. On an SFT resume they are
+  restored from `fp32_masters` when every master is present with its shape and rounds to the
+  just-loaded BF16 weight; otherwise (an older checkpoint, or pretraining) they are reseeded from
+  the BF16 weights, and the sub-ulp progress since the last save is lost, bounded by one interval.
 
 ## Stopping
 
 `modules/runtime/control.py` maps stop requests to an exit-code contract the supervisor reads:
 `0` phase complete, `10` user stop, `20` preempted, `30` resume verification failed. Signal
 handlers only set flags; the flags and the `STOP` sentinel file are read at the log cadence.
-`input()` on `KeyboardInterrupt` is gated on `sys.stdin.isatty()` — on a box with no tty it would
+`input()` on `KeyboardInterrupt` is gated on `sys.stdin.isatty()`: on a box with no tty it would
 raise `EOFError` and save nothing. `sft.py` honours the same contract with no phase supervisor.
 See [runbook.md](runbook.md) §4.

@@ -1,5 +1,20 @@
 # The from-scratch pilot (Phase 5): the spec, written 2026-10-09 before the build
 
+Status 2026-10-24: both arms complete and read (arm P 860.61M tokens on 2026-10-11, arm C 909.72M
+on 2026-10-14), the verdicts decided by the user on 2026-10-17 (A1(b) passes with the leak known
+under the amended paired reading; L1 failed at this shape after the chain continuation). Two more
+pilot-shape arms ran on this recipe and are recorded elsewhere: arm PI, the retriever's InfoNCE
+term at 0.25 under loss-free balancing, stopped at 87M on the language bar on 2026-10-21
+([infonce_micro.md](../measurements/infonce_micro.md)); arm E4, 4 routed experts under loss-free
+balancing, complete at 858.40M and read 2026-10-24 ([expert_count_pilot.md](../measurements/expert_count_pilot.md)).
+The written-bridge arm (R9, from arm P's final, `ckpts/evidence_pilot_bridge`) trained to its end
+on 2026-10-24 (66.35M tokens) with its final read running; its 30M read meets R9's bar (NEXT.md
+"Now"). The repository review of 2026-10-24 ([review_2026-10-24.md](../review_2026-10-24.md))
+adds two corpus caveats (Limitations) and a packer bug under the A3 generation, A7 pathway and
+A4 edit reads (the read table and the Run section). Gate labels follow NEXT.md's table since
+2026-10-24: the store recall read is A7's recall half, the oracle-buffer EM read A7's pathway
+half, the edit flip rate A4.
+
 Status 2026-10-11: spec written 2026-10-09, build list done 2026-10-10 (the "Build"
 section), arm P launched 2026-10-10 19:03, switched to the main split at the 300M save the same
 evening, complete at 860.61M (one epoch) on 2026-10-11 and read; arm C launched the same day,
@@ -10,8 +25,10 @@ intact; A2 and A5 clear on the trainer's numbers. Arm C's final read: the contro
 at 0.467 in distribution and 0.049 held out, 47x and 4x arm P; the paired compare is at z -81 and
 -6.4 there. The ladder's remaining reads (2026-10-14): A5 holds (port gain 1.56x the in-context
 ceiling), A6 holds (within noise of the control), A3 holds in likelihood (+3.75 nats gold against
-none, the swapped answer wins) and is unreadable in generation (96% abstention under gold), A4
-fails (the model's query at recall@5 0.004 against bge 0.829), A7 unreadable (oracle EM 2.6%);
+none, the swapped answer wins) and is unreadable in generation (96% abstention under gold), A7's
+recall half fails (the model's query at recall@5 0.004 against bge 0.829), A7's pathway half (oracle
+EM 2.6%) and the A4 edit unreadable (the generation, pathway and edit reads were taken before the
+2026-10-24 packer fix, re-read pending);
 the exit and depth reads repeat the micro shape on both arms. Decided 2026-10-17 (the user, after
 the research round in [review_2026-10-16.md](../review_2026-10-16.md)): A1(b) passes with the
 leak recorded as known and the criterion amended to the paired reading (the read table above); L1
@@ -228,8 +245,8 @@ Gate names as NEXT.md. Every closed-book read at full depth. `closed_book_rank.p
 | 1-hop gate | `eval_chains.py`, `chains_eval` 1-hop, D 3, all sites | at least 3 sigma above chance (1 over type-matched candidates; 0.146 against 0.115 at n 1,000) and rising, by the 500M save | every save | at the final save: L1 inconclusive at this shape too |
 | L1 | `eval_chains.py`, `chains_heldout_tmpl` 2-hop, D 3, kept 1, 2, 3 | Delta = kept 3 minus kept 1 at least 0.05 and at least 3 sigma | once the 1-hop gate holds, and final | falsified: Delta + 2 sigma under 0.05 with the 1-hop gate passed; inconclusive: the gate failed, or Delta between the two |
 | A2, A5 | `[eval fixed]` on `evidence_fixed`; `--ceiling-json` from `evidence_ceiling_probe.py --fixed-split evidence_fixed` on arm P's final checkpoint | gold gain at least half that ceiling, distractors gain at least 0; chunk AUROC per loop at least 0.59; grounded AUROC at least 0.674 | every 25M in the trainer; final verdict | the port does not recover evidence on held-out QA |
-| A3 | `eval_abstention.py --evidence-port --evidence-condition gold,counterfactual,distractors,none --json-out`; the swapped bios read for the injected facts | memorization ratio at most 0.05, follow at least 0.9 per stratum, ratio-binned or baseline-paired | swapped bios at every save; `eval_abstention.py` at final | weights override a chunk |
-| A4, A7 | `eval_store.py recall\|pathway\|edit`, `data/index/openqa`, `openqa_edit` | flip rate at least 70%; model-query recall@k at least bge-query recall@k; pathway EM against oracle-buffer EM | final | store edits do not reach the answer; the query loses to bge |
+| A3 | `eval_abstention.py --evidence-port --evidence-condition gold,counterfactual,distractors,none --json-out`; the swapped bios read for the injected facts | memorization ratio at most 0.05, follow at least 0.9 per stratum, ratio-binned or baseline-paired | swapped bios at every save; `eval_abstention.py` at final | weights override a chunk. The generation half of the 2026-10-14 read (abstention, EM, follow rate, `mr_gen`) is void (a decode bug in the eval packer, fixed 2026-10-24, [written_bridge_pilot.md](../measurements/written_bridge_pilot.md)); the likelihood half (`mr_ll`, answer CE) is right padded and unaffected. Generation re-read 2026-10-24 after the decode fix: A3 weak in generation (EM 0.05, abstention 0.77 under gold), likelihood identical to the old read |
+| A4, A7 | `eval_store.py recall\|pathway\|edit`, `data/index/openqa`, `openqa_edit` | flip rate at least 70%; model-query recall@k at least bge-query recall@k; pathway EM against oracle-buffer EM | final | store edits do not reach the answer; the query loses to bge. Labels: the edit flip rate is A4, recall@k and pathway EM are A7. The pathway and edit reads of 2026-10-14 are void (a decode bug in the eval packer, fixed 2026-10-24, [written_bridge_pilot.md](../measurements/written_bridge_pilot.md)); `recall` is unaffected. Generation re-read 2026-10-24 after the decode fix: A7 oracle EM 0.09 (the model's query 0.001, the pathway gate still failing at z -23.7): the oracle route readable now, the A4 flip read still unreadable on the model's query route (1 of 2,000 answered before the edit); a flip read routed through bge would need the eval extended |
 | A6 | `eval_benchmarks.py`, both arms, against `docs/measurements/benchmark_snapshot.md` | arm P within noise of arm C | final | the pathway costs language |
 
 **A1(b) detail.** Tier 1000 is read alongside; the leak is known from R0b (0.085 at micro, z 6.4)
@@ -343,6 +360,19 @@ the query training).
   transfer as is.
 - `loop_scale` of the third pass collapsed at micro on chains (0.07); it is read per save.
 - No counterfactual or partial-hop training condition; A3 is read without training for it.
+- Added 2026-10-24 (the repository review): arm C trained on 12,240 documents, 50.11M tokens, of
+  4094-token QA rows that arms P, E4 and PI never saw (the evidence QA builder caps a windowed web
+  row at 4094 tokens, the evidence reader packs to 4095 and adds two MTP pads, so it drops them;
+  the plain reader the control uses keeps them). The row estimator still counts them, so the
+  evidence arms' cosine ended at LR 6.55e-5 where arm C reached the 6.0e-5 floor; arm P's 860.6M
+  against arm C's 909.7M is this. P against C is matched on the biographies and the chains, not on
+  the QA slice or the schedule; P against E4 stays matched.
+- Added 2026-10-24: `inject_val` is partly a training read. Its windows come from the same
+  `ir.bin` documents the evidence QA builder cuts its web rows from, excluded per window, not per
+  document: about 7.4% of its tokens appear verbatim as supervised text in rows both arms train on
+  (two passes) and another 6.7% in the dropped 4094-token rows only arm C trains on. Every held-out
+  CE on `inject_val` (the language bar, arm PI's stop, the E4 read, arm C's 0.013 edge) leans
+  toward the arm that saw more of it; the rank reads that decide A1(b) are unaffected.
 - The in-context ceiling for A2 comes from arm P itself, which never sees a QA passage in the prompt
   during training; NEXT.md's absolute bar (1.6 nats, half the 3.23-nat ceiling of the full model) is
   printed beside it.
@@ -654,7 +684,9 @@ splits). Nothing in the spec changed.
   now stores tier 10 (0.20) as well. **The paired `compare`** (`compare_pilot_c_vs_p.log`, arm C
   minus arm P on the raw rank of the real name, all classes, negative means the control ranks it
   better): in distribution tier 10 -0.226 (z -30), tier 100 -0.480 (z -81), tier 1000 -0.372
-  (z -29); held out tier 100 -0.033 (z -6.4), tier 1000 -0.050 (z -3.7); tier 1 flat on both forms.
+  (z -29); held out tier 100 -0.033 (z -6.4; entities only: raw z -3.8, clustered -4.0, and the
+  prior-controlled `delta` z +7.0, clustered +6.5, both with the control storing more, read
+  2026-10-24), tier 1000 -0.050 (z -3.7); tier 1 flat on both forms.
   **A1(b) as the read table states it: arm C is far above its prior at tiers 100 and 1000 on both
   forms (the first half holds), and arm P is within 3 sigma through tier 100 in distribution but
   not held out (0.0125, z 3.2), so the second half fails on one form.** In ratio the pathway
@@ -662,7 +694,9 @@ splits). Nothing in the spec changed.
   held out (0.0125 against 0.049), 7x less at tier 1000 in distribution (0.064 against 0.468),
   2.6x less held out (0.046 against 0.118). The decision table's first matching row is "A1(b)
   fails on either form"; the cell that fails is 4x under the control on the same form and 47x
-  under it on the other. The user decides the row.
+  under it on the other. The user decides the row (decided 2026-10-17: A1(b) passes with the leak
+  known, under the amended paired reading of the read table; the person-clustered sigma, run
+  2026-10-24, is within 10% of the item sigma, so the reading stands).
 - **The ladder's remaining reads, 2026-10-14** (`ckpts/inject/ladder_pilot.sh`, log
   `ladder_pilot.log`, outputs `ckpts/inject/pilot_{p,c}_ladder_*.{json,log}`; 45 minutes for the
   twelve reads).
@@ -685,17 +719,19 @@ splits). Nothing in the spec changed.
     arm (a) did (0.269 / 0.369 / 0.378). Arm P tier 100 0.005 / 0.010 / 0.010 and tier 1000
     0.050 / 0.059 / 0.064 in distribution, held out 0.0125 / 0.012 / 0.0125 and 0.040 / 0.044 /
     0.046: a small growth with depth at tier 1000 in distribution, under the unpaired noise.
-  - **A4, fails.** `eval_store.py recall` on `data/index/openqa` (8,715 questions, 274,212
+  - **A7 recall half, fails** (recorded as "A4" until 2026-10-24). `eval_store.py recall` on `data/index/openqa` (8,715 questions, 274,212
     chunks): the model's query at loop 1 recall@5 0.004 against bge 0.829 (z -203), loops 2 and 3
     0.008 / 0.007, every source alike. The IR expert's query was trained by the selection loss
     over the handful of chunks visible to a document (chunk AUROC 0.78 there) and has never
     competed against a store; as a retriever it is at chance.
-  - **A7, unreadable.** `pathway`: generated EM 0.000 with the model's query (abstains on 97%),
+  - **A7 pathway half and A4 edit, unreadable** (recorded as "A7" until 2026-10-24; both taken
+    before the 2026-10-24 packer fix, re-read pending). `pathway`: generated EM 0.000 with the model's query (abstains on 97%),
     0.026 with the oracle buffer (abstains on 88%), 0.022 with bge's buffer; the gate fails
     (z -12.5) against an oracle ceiling of 2.6% exact match, so the read is about a 99M model
     generating open-domain answers, not the pathway. `edit`: 0 of 2,000 answered correctly
     before the edit, so the flip rate has no denominator.
-  - **A3, likelihood holds, behaviour unreadable.** `eval_abstention.py --evidence-port` on
+  - **A3, likelihood holds, behaviour unreadable** (the generation half taken before the
+    2026-10-24 packer fix, re-read pending). `eval_abstention.py --evidence-port` on
     SQuAD v2 dev (2,000 questions): answer-span CE with the real target 2.13 under gold, 6.11
     under distractors, 5.87 with nothing attached (gold against none +3.75 nats). Generated:
     the model abstains on 95.6% of answerable questions under gold (EM 0.010), 99.5% under
@@ -716,8 +752,9 @@ splits). Nothing in the spec changed.
   - **The ladder at the final saves, in one line each**: copy holds; A1(b) control half holds,
     arm P half fails on the held-out form at tier 100 by z 3.2 at a 4x to 47x reduction; 1-hop
     gate holds (0.85); L1 "falsified" (Delta +0.002 +- 0.005, nothing composes); A2 and A5
-    hold; A3 holds in likelihood and is unreadable in generation; A4 fails; A7 unreadable; A6
-    holds. The decision table's rows are the user's.
+    hold; A3 holds in likelihood and is unreadable in generation; A7's recall half fails; A7's
+    pathway half and A4 unreadable; A6 holds. The decision table's rows were the user's (decided
+    2026-10-17).
   - **The chain continuation, 2026-10-17** ([chain_continuation_pilot.md](../measurements/chain_continuation_pilot.md),
     `ckpts/evidence_pilot_chains/`, reads `ckpts/inject/pilot_ch_{TAG}_chains_*`): arm P's
     final save for one epoch of `chains_train` alone (102.66M tokens, lr 3e-4, batch 4 x 2 after
@@ -727,5 +764,7 @@ splits). Nothing in the spec changed.
     (chance 0.185), 3-hop 0.17 to 0.21 (0.206), 4-hop 0.20 to 0.22 at depths 1 to 4 (0.210),
     held-out 2-hop 0.19 to 0.21 (0.191), paired kept 3 minus kept 1 +0.004 +- 0.008 (Delta + 2
     sigma 0.020 against 0.05), composed answers 1.93 nats against ln K 1.72. **L1 failed at
-    this shape; the "falsified" row applies** (the user's rule of 2026-10-17). Still to read
-    for the record: the 10M to 90M saves by the chain instrument.
+    this shape; the "falsified" row applies** (the user's rule of 2026-10-17). Every save from
+    10M to the final was read by the chain instrument on 2026-10-19 (the per-save table in its
+    record): 1-hop 0.82 to 0.99, every composition cell at chance at all eleven reads, no
+    transition inside the epoch.

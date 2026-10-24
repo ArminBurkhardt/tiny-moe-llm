@@ -66,7 +66,7 @@ optimization less stable.
 
 Loop 3 contributes nothing measurable in the training log, and on the migrated checkpoints Stage 0
 measures it at 0.021 / 0.008 nats (`sft_final` / `phase2_final`): small, not zero. The learned gain
-on loop 3 is a sixth of loop 1's, but that is **not a second, independent signal** — the migrated
+on loop 3 is a sixth of loop 1's, but that is **not a second, independent signal**: the migrated
 `loop_scale` *is* the deleted halt gate folded in, so the loss and the parameters are reporting the
 same thing.
 
@@ -152,7 +152,7 @@ residual update, `h_{k+1} = h_k + loop_scale[k] * delta_k`, starting from the de
 output is still most of the state at every loop: `‖Δh‖/‖h‖` measures 0.87 / 0.36 / 0.10 on
 `phase2_final`. CrossAttention also already re-reads a per-token embedding (`_moe_ple(input_ids)`)
 on every loop. Re-injecting the decoder output hands later loops the same information they already
-have, while Stage 0's reading was that nothing feeds them anything *new* — which the evidence
+have, while Stage 0's reading was that nothing feeds them anything *new*, which the evidence
 buffer and the loop-conditioned query address directly. Still cheap and zero-init loadable, so it is
 tested rather than argued: NEXT.md Phase 3c. Note that Phase 4 plans to swap `_moe_ple(input_ids)`
 for evidence tokens, removing the one per-loop input re-read the model has today.

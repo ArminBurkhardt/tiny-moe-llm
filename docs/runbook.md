@@ -20,11 +20,11 @@ Four commands, in this order. Only the last one is long-lived.
 | 4 | `python scripts/run_training.py` | ~40 h | yes, restarts itself |
 
 On vast.ai you can paste `scripts/onstart.sh` as the instance's onstart command to survive
-reclaims — it clones, runs setup, and launches the supervisor under `nohup`. It deliberately does
+reclaims: it clones, runs setup, and launches the supervisor under `nohup`. It deliberately does
 **not** run `prepare_data.py`; that has its own multi-hour lifecycle and its own resume state, and
 tangling the two makes both harder to diagnose. Run step 2 by hand first: the hook exits
 immediately (without launching training) if `data/prepared/phase1.idx` is missing, so pasting it
-in before data prep just means it does nothing on the first boot — set it after step 2 completes.
+in before data prep just means it does nothing on the first boot; set it after step 2 completes.
 
 ### 1.1 `scripts/setup.sh`
 
@@ -47,12 +47,12 @@ here only matters if you have not run `prepare_data.py` yet.
 
 Builds `data/prepared/phase1.{bin,idx}` and `phase2.{bin,idx}`. Checkpoints itself every 2000
 documents into `_prepare_state_{phase}.json`; if it dies, re-run the identical command and it
-truncates back to the last confirmed state and continues. Peak disk stays bounded — it holds one
+truncates back to the last confirmed state and continues. Peak disk stays bounded: it holds one
 shard file per source at a time and deletes each after tokenizing.
 
 Peak *RAM* is a separate concern: `load_document_texts` reads a whole shard into a Python
 `list[str]` and the generator holds it for that file's duration, and up to 6 sources are live at
-once in phase 1. Only ever exercised at 50M-token smoke scale — pick an instance with **>=64GB
+once in phase 1. Only ever exercised at 50M-token smoke scale; pick an instance with **>=64GB
 RAM** for the real run.
 
 ### 1.3 The smoke test
@@ -60,16 +60,16 @@ RAM** for the real run.
 Run phase 1 by hand for ~200 steps and check the log line before committing to the real run:
 
 - `MFU:` should be in the region of the Gate 4 extrapolation. **More than ~20% off and you should
-  redo the budget math before starting** — this is the last cheap moment to change `target_tokens`.
+  redo the budget math before starting**: this is the last cheap moment to change `target_tokens`.
 - `Peak Mem:` should leave headroom on an 80GB card. Gate 4 peaked at 25.45GB on a 32GB card; on an
   80GB H100 try `batch_size: 16` / `grad_accumulation_steps: 8` in `config.yaml` (keeps
   tokens-per-optimizer-step, and therefore `total_steps`/warmup/the cosine, identical while roughly
-  doubling GEMM sizes) — the cheapest available MFU win. Revert if peak mem passes ~65GB.
+  doubling GEMM sizes), the cheapest available MFU win. Revert if peak mem passes ~65GB.
 - FP8 should actually be active. **`te.autocast(enabled=True)` raises if the device rejects the
-  recipe — it does not silently fall back.** `log_precision_mode()`'s log line at startup states
+  recipe: it does not silently fall back.** `log_precision_mode()`'s log line at startup states
   the resolved recipe either way, so check that instead of assuming a missing warning means BF16.
-- `IR E/ln32:` is the IR table's retrieval entropy over `ln(width)` — the width of the softmax the
-  module actually takes (`ir_read_top_k` on the two stage path, the table size on the exact one) —
+- `IR E/ln32:` is the IR table's retrieval entropy over `ln(width)`, the width of the softmax the
+  module actually takes (`ir_read_top_k` on the two stage path, the table size on the exact one), 
   one entry per loop, in the same units as [stage0_diagnostics.md](measurements/stage0_diagnostics.md).
   At init it sits at ~1.0 (a uniform read). It falling is the table learning to store something;
   staying pinned at 1.0 is the failure the 16B run had, and is worth catching in the first hour
@@ -111,7 +111,8 @@ cat ckpts/training/status.json        # machine-readable snapshot, rewritten eve
 
 `eta_phase` is time to the end of the current phase; `eta_run` is time to the end of both. Both are
 extrapolated from the throughput of the last log interval only, so they jump around early and after
-a restart. The same figures appear at the end of every log line as `ETA:`.
+a restart. The log line ends with `ETA:`, which is `eta_phase` only; `eta_run` is written to
+`status.json` alone.
 
 Everything is also mirrored to `https://huggingface.co/ikeafisch4/temp-train` at every checkpoint,
 so you can check progress without an ssh session:
@@ -129,11 +130,11 @@ manifest.json
 **Remote retention mirrors local retention.** Every rolling checkpoint `prune_checkpoints` deletes
 locally (§3) is also deleted from `checkpoints/` on the Hub, and `HFSync` squashes the repo's git
 history afterward (throttled to at most once per 30 minutes) so the deleted 2GB blob's storage is
-actually reclaimed rather than just hidden from the current tree — a plain Hub file delete alone
+actually reclaimed rather than just hidden from the current tree: a plain Hub file delete alone
 leaves it referenced by history and still billed. Both the delete and the squash go through the
 same non-fatal retry-and-log path as uploads; a failure never touches the training loop, and a
 failed delete just leaves stale clutter on the Hub rather than a local retention problem. Because
-history gets rewritten, do not expect old commits on `ikeafisch4/temp-train` to stay browsable —
+history gets rewritten, do not expect old commits on `ikeafisch4/temp-train` to stay browsable; 
 this repo is a scratch mirror of local checkpoints, not something meant to be read commit-by-commit.
 
 ---
@@ -148,7 +149,7 @@ filling:
 
 - **A checkpoint is only deleted once it is BOTH outside the keep window (`keep_local_checkpoints`,
   default 2) AND confirmed uploaded.** A checkpoint deleted locally and never uploaded is gone
-  forever; one kept because its upload failed only costs disk. If uploads break, the disk fills —
+  forever; one kept because its upload failed only costs disk. If uploads break, the disk fills:
   loud and fixable, which is the intended failure.
 - **`checkpoint_{phase}_final.pt` is never pruned.** One per phase, written when the phase ends.
 
@@ -163,17 +164,17 @@ is cleaned up.
 | What you want | Do this | Exit code | Supervisor restarts? |
 |---|---|---|---|
 | Stop the whole run, cleanly | `touch ckpts/training/STOP` | 10 | no |
-| Checkpoint right now, keep training | `kill -USR1 <pid>` | — | n/a |
+| Checkpoint right now, keep training | `kill -USR1 <pid>` | - | n/a |
 | Stop this process, expect a restart | `kill <pid>` (SIGTERM) | 20 | yes |
 | Stop from an attached terminal | Ctrl-C | 10 | no |
 
-The STOP sentinel is the one to use remotely — it needs no ssh session and no process lookup, just
+The STOP sentinel is the one to use remotely: it needs no ssh session and no process lookup, just
 a file. Both the sentinel and the signal flags are read at the log cadence (~3s), then a 2GB
 `torch.save` has to finish. **Measured end to end on a 5090: 23 seconds** from `touch` to the
 supervisor exiting 10. Budget for that, not for instant.
 
 A stale `STOP` file is deleted at startup, so a relaunch is never stopped by the previous run's
-sentinel. To stop the supervisor *and* the current phase, create the sentinel and let it exit —
+sentinel. To stop the supervisor *and* the current phase, create the sentinel and let it exit;
 killing the supervisor alone leaves `pretrain.py` running.
 
 **Exit codes**, shared between `pretrain.py` and the supervisor:
@@ -183,7 +184,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 | 0 | phase finished (target reached or data exhausted) | next phase |
 | 10 | you asked it to stop | stops |
 | 20 | preempted / SIGTERM | relaunches |
-| 30 | **resume verification failed** | stops — see §6 |
+| 30 | **resume verification failed** | stops, see §6 |
 
 ---
 
@@ -200,7 +201,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 | `skipping already-complete phase(s) on disk: phase1` | A reclaimed instance came back and `onstart.sh` started a brand new `run_training.py`. `resume_phase_index` (`modules/runtime/checkpoints.py`) checked `ckpts/training` before looping and found phase 1 already finished, so it starts straight at phase 2 instead of re-entering phase 1 and overwriting `checkpoint_phase1_final.pt` with phase-2 weights. |
 | ETA swinging wildly in the first few minutes after a restart | It extrapolates from one log interval. It settles. |
 | `mean loops` below `n_loops` | `loop_count_sampling` runs 30% of steps at a reduced depth on purpose. Log steps are pinned to full depth. |
-| `loop_scale` far below `1/sqrt(n_loops)` at step 0 | Expected on a checkpoint from `scripts/migrate_phase0.py` — the deleted halt gate's measured per-loop mean was folded into it. Not a collapsed loop. |
+| `loop_scale` far below `1/sqrt(n_loops)` at step 0 | Expected on a checkpoint from `scripts/migrate_phase0.py`: the deleted halt gate's measured per-loop mean was folded into it. Not a collapsed loop. |
 
 ---
 
@@ -208,12 +209,12 @@ killing the supervisor alone leaves `pretrain.py` running.
 
 | Symptom | Almost certainly | Do this |
 |---|---|---|
-| **Exit code 30**, `resume verification failed` | The process resumed materially behind what `run_state.json` recorded — the wrong checkpoint loaded, or the state was lost. | **Do not just restart.** Look at `ckpts/training/` and `run_state.json` and work out which checkpoint is real. Restarting blindly retrains ground already covered, at full cost. |
+| **Exit code 30**, `resume verification failed` | The process resumed materially behind what `run_state.json` recorded: the wrong checkpoint loaded, or the state was lost. | **Do not just restart.** Look at `ckpts/training/` and `run_state.json` and work out which checkpoint is real. Restarting blindly retrains ground already covered, at full cost. |
 | Disk filling up | Uploads are failing, so retention refuses to delete. | Check the log for `upload of ... failed after 3 attempts`. Usually a token/network problem. Fix it; uploads resume at the next checkpoint. |
 | `keeping N checkpoint(s) past the retention window because their upload has not succeeded` | Same as above, caught earlier. | Same. |
 | Loss is `nan` | Almost always precision. | Re-run without `USE_FP8=1`. The dry run asserts a finite loss at startup, so a `nan` appearing later is a training-dynamics problem, not a config one. |
-| Training "succeeded" in minutes having done nothing | A phase-2 run whose document offset was not reset. | This is the bug `resolve_resume_scope` exists to prevent — check the checkpoint's `phase` field. |
-| `upload queue full; dropping ...` | Uploads are slower than checkpointing. | Only rolling checkpoints are ever dropped, and a dropped one stays on disk un-pruned. If it persists, the box's uplink cannot keep up with a 2GB/30min cadence — raise `checkpoint_every_tokens`. |
+| Training "succeeded" in minutes having done nothing | A phase-2 run whose document offset was not reset. | This is the bug `resolve_resume_scope` exists to prevent; check the checkpoint's `phase` field. |
+| `upload queue full; dropping ...` | Uploads are slower than checkpointing. | Only rolling checkpoints are ever dropped, and a dropped one stays on disk un-pruned. If it persists, the box's uplink cannot keep up with a 2GB/30min cadence; raise `checkpoint_every_tokens`. |
 | Supervisor gave up: `restarted N times in 600s` | A crash loop, not a preemption. | Read the last child traceback in the log. The flap limit exists so a crash loop does not silently bill you for hours. |
 | `setup: FATAL: no HF token, but config.yaml's hf_upload_repo resolves to ...` | `huggingface.key`/`$HF_TOKEN` missing or empty, and `config.yaml` has uploads enabled. `setup.sh` now exits non-zero here rather than only warning, so `onstart.sh` (which runs under `set -euo pipefail`) never launches training with a token that would 401 every upload for 40 hours. | Set `$HF_TOKEN` (a vast.ai **instance env var** survives a reclaim; `huggingface.key` alone does not, since it's gitignored and a fresh clone won't have it) or pass `--hf-token hf_xxx`. Or set `hf_upload_repo: ""` to run local-only on purpose. |
 
@@ -221,7 +222,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 
 ## 7. Recovering after the instance is reclaimed
 
-If `onstart.sh` is configured, nothing — the box comes back, clones, sets up, and the supervisor
+If `onstart.sh` is configured, nothing: the box comes back, clones, sets up, and the supervisor
 resumes from the newest valid checkpoint.
 
 By hand:
@@ -275,7 +276,7 @@ data/prepared/{phase1,phase2}.{bin,idx}   from prepare_data.py
 huggingface.key                           your token, mode 600, gitignored
 ```
 
-All of `ckpts/` and `data/prepared/` are gitignored, as is every `*.json` — `run_state.json` and
+All of `ckpts/` and `data/prepared/` are gitignored, as is every `*.json`: `run_state.json` and
 `status.json` are runtime state, not tracked files.
 
 ---
@@ -284,19 +285,19 @@ All of `ckpts/` and `data/prepared/` are gitignored, as is every `*.json` — `r
 
 SFT is written for the local dev GPU, but it runs unattended on vast.ai. It is a *different shape*
 of job from pretraining: ~300M tokens x 2 epochs, so **1-3 hours, not 40**, and there is no
-supervisor because there are no phases — only epochs, and the epoch is in the checkpoint.
+supervisor because there are no phases: only epochs, and the epoch is in the checkpoint.
 
 **Rent on-demand, not interruptible.** The interruptible discount is worth ~EUR 1-3 on a run this
 short, against a real chance of babysitting restarts. `sft.py` does honour the same stop contract
 as pretraining (SIGTERM → checkpoint + exit 20, `ckpts/sft/STOP` → exit 10, SIGUSR1 → checkpoint and
 keep going), so if you do take an interruptible box, wrap it: `until python scripts/sft.py
---upload-repo ikeafisch4/temp-train; do sleep 10; done` — exit 10 and 0 both stop the loop, exit 20
+--upload-repo ikeafisch4/temp-train; do sleep 10; done`: exit 10 and 0 both stop the loop, exit 20
 relaunches and resumes from the newest loadable checkpoint in `ckpts/sft`.
 
 ### 10.1 On the same instance that just finished pretraining (preferred)
 
 The tokenizer, `manifest.json` and the final checkpoint are all already on disk, and
-`checkpoint_phase2_final.pt` is right there — no downloads.
+`checkpoint_phase2_final.pt` is right there: no downloads.
 
 ```bash
 # stop the onstart hook from relaunching the supervisor on the next boot (clear it in the vast
@@ -330,7 +331,7 @@ holdout list rather than doing that silently; `--ignore-holdout` overrides, but 
 | | why |
 |---|---|
 | **`--upload-repo <repo>`** | `sft.hf_upload_repo` is `""` (uploads off) because SFT is a local run. On a rented box that means the checkpoints die with the instance. This is the one you must not forget. |
-| **`unset USE_FP8`** | `onstart.sh` exports `USE_FP8=1`, and `sft.py` imports the same recipe resolution from `pretrain.py`, so it would inherit FP8. At `lr=3e-5` the FP8 GEMM noise is large relative to the update — the same margin argument that forces fp32 masters for every parameter (see `build_sft_param_groups`). The run is short enough that the throughput does not matter. |
+| **`unset USE_FP8`** | `onstart.sh` exports `USE_FP8=1`, and `sft.py` imports the same recipe resolution from `pretrain.py`, so it would inherit FP8. At `lr=3e-5` the FP8 GEMM noise is large relative to the update, the same margin argument that forces fp32 masters for every parameter (see `build_sft_param_groups`). The run is short enough that the throughput does not matter. |
 | **`sft.batch_size: 16`, `grad_accumulation_steps: 2`** | 4 x 8 is sized for a 32GB 5090. On an 80GB H100 this keeps tokens/step at 131k and is far faster. Both are in `config.yaml`'s `sft:` block. |
 | `--target-tokens` | 300M is the default corpus size. Raising it costs prep time and disk, not much else. |
 
@@ -362,25 +363,25 @@ no network), generates an answer for every question, and prints three blocks:
 
 | block | the number that matters |
 |---|---|
-| generated answers | **abstention precision and recall** — the acceptance pair. Read `false abstention rate` next to them: a model that refuses everything scores recall 1.0 and looks fine on precision alone. That is not hypothetical: the 16B-token run refused **78.4% of answerable questions** (see [CONCLUSION.md](CONCLUSION.md)). |
+| generated answers | **abstention precision and recall**: the acceptance pair. Read `false abstention rate` next to them: a model that refuses everything scores recall 1.0 and looks fine on precision alone. That is not hypothetical: the 16B-token run refused **78.4% of answerable questions** (see [CONCLUSION.md](CONCLUSION.md)). |
 | answer quality | EM/token-F1 on the answerable half. Low here with a high abstention rate is the degenerate solution. |
 | calibration | answer-level ECE/AUROC for `p_max`, then the teacher-forced token-level pass with the pretrained checkpoint beside it and an explicit PASS/FAIL on **`ECE(p_max)` change vs pretrained**. |
 
 Three things to expect rather than panic about. First, **the run is slow**: there is no KV cache, so
 every decode step re-runs the whole prefix. The full ~11.9k-question split at `--batch-size 16` is
-tens of minutes on the dev GPU — use `--max-examples 2000` for a first look (it is a seeded
+tens of minutes on the dev GPU: use `--max-examples 2000` for a first look (it is a seeded
 subsample, so two capped runs are comparable to each other). Raise `--batch-size` on a bigger card.
 
 Second, **hold `--batch-size` and `--max-examples` fixed across any two runs you compare.** The
 padding is genuinely invisible to the model (`tests/test_pad_isolation.py` asserts the decoder is
 bit-identical under a changed pad region), but the MoE's grouped GEMM tiles by the batch's
-per-expert row counts, so batch composition shifts bf16 accumulation order by ~0.5–1% of
-hidden-state magnitude. Deterministic, not random — the same command twice gives the same answer —
+per-expert row counts, so batch composition shifts bf16 accumulation order by ~0.5 to 1% of
+hidden-state magnitude. Deterministic, not random (the same command twice gives the same answer),
 but a different `--batch-size` is a different measurement.
 
 Third, **the baseline comparison is asymmetric on purpose**: the pretrained checkpoint never saw
 the chat control tokens, so it is out of distribution on these inputs and its ECE is a conservative
-bar. The script prints this with the verdict — a PASS is weak evidence, a FAIL is strong.
+bar. The script prints this with the verdict: a PASS is weak evidence, a FAIL is strong.
 
 Note the token-level number can pass while the behavioural one fails, and that is exactly what
 happened on the real run: teacher-forced ECE read 0.026 against the pretrained baseline's 0.049 (a
@@ -390,7 +391,7 @@ answer-level decision was right. Read the generated-answers block first.
 
 ## 11. The abstention repair pass ([NEXT.md](plans/NEXT.md) Phase 2)
 
-Runs **locally on the 5090, in BF16** — do not set `USE_FP8`. It is the same script and the same
+Runs **locally on the 5090, in BF16**; do not set `USE_FP8`. It is the same script and the same
 objective as §10 with a repaired corpus, three config numbers and per-conversation loss weighting;
 everything in §10.4 and §10.5 applies unchanged.
 
@@ -411,13 +412,13 @@ python scripts/eval_abstention.py -c ckpts/repair/checkpoint_repair_final.pt \
   is what makes the two numbers comparable.
 - Prep prints **`unanswerable share of QA conversations`** at the end. That is the knob's actual
   effect; `--squad-unanswerable-fraction` scales one source and the corpus-wide share is what
-  NEXT.md's 10–15% target means. Rebuild with a higher fraction if it comes out low and abstention
+  NEXT.md's 10 to 15% target means. Rebuild with a higher fraction if it comes out low and abstention
   recall collapses.
 - Checkpoints land in `ckpts/repair/` under phase `repair`, on the same rolling/final naming and the
   same stop contract. `eval_abstention.py`'s default `--checkpoint` still searches `ckpts/sft`, so
   pass `-c` explicitly here.
 
-## 12. The IR sharpening and evidence finetunes ([NEXT.md](plans/NEXT.md) Phases 3–4)
+## 12. The IR sharpening and evidence finetunes ([NEXT.md](plans/NEXT.md) Phases 3 to 4)
 
 Same script, same objective, same stop contract, same rules as §11 (local, BF16, seed with `-c`,
 fixed eval flags). Two things are new and both are instrumented for the same reason: a
@@ -451,7 +452,7 @@ python scripts/eval_benchmarks.py -c ckpts/evidence/checkpoint_evidence_final.pt
 - **Kill a run the moment its own instrumentation says it cannot pass.** `|g_proj|rms` (`--ir`),
   `|inject|rms`, `|shared_evidence.o_proj|rms` (`--evidence`) are the zero-init tensors; one that
   has stopped climbing by the first checkpoint is the answer, and the remaining hour only buys a
-  control at matched tokens — worth having sometimes, worth saying out loud either way.
+  control at matched tokens: worth having sometimes, worth saying out loud either way.
 - **The `--evidence` early kill is the fixed-target `[eval fixed]` line**, over `evidence_fixed`
   with the real answer as the target under every condition; gain = CE(none) - CE(cond), positive
   means the evidence helped. At the first fixed-target eval past `kill_tokens` (10M) the run saves
@@ -469,11 +470,11 @@ python scripts/eval_benchmarks.py -c ckpts/evidence/checkpoint_evidence_final.pt
   and the same flags; without `-c` the yaml builds a model without the port and the strict load
   fails. Add `eval fixed|KILL|kill check|device not ready` to the watch filter and tee the watched
   output to a gitignored log.
-- **Throughput is the first thing to read.** 4 × 4096 stays resident on the 5090 (~21–27GB peak);
-  8 × 4096 spills into shared system memory at a ~3–4x throughput cost and does not OOM. Do not
+- **Throughput is the first thing to read.** 4 × 4096 stays resident on the 5090 (~21 to 27GB peak);
+  8 × 4096 spills into shared system memory at a ~3 to 4x throughput cost and does not OOM. Do not
   wait out a slow run; fix the batch.
 - `IR cluster refresh at …` lines report candidate recall@32; below 0.9 the centroid stage is
-  dropping entries the read wanted — raise `ir_probe_clusters` before blaming the anneal.
+  dropping entries the read wanted: raise `ir_probe_clusters` before blaming the anneal.
 - The `--evidence-port` eval prints two teacher-forced numbers per condition. **G3 is the
   answer-span CE with the real answer as the target under every condition** (the "gold vs none,
   answer-span CE gap" block at the end), not the condition-target CE, which compares "say the

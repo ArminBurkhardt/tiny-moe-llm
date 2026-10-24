@@ -2,8 +2,8 @@
 
 Every loop currently reads only the residual stream, which by loop 3 is the dense decoder's output
 plus two of the block's own updates. The diagnostics said the later loops behave like that is the
-problem — `cos(q2, q3) = 0.977`, 60% of a token's expert selections repeated from the previous
-loop, `cos(Δ3, Δ2) = 0.685` — and every published looped transformer hands the block's input back
+problem (`cos(q2, q3) = 0.977`, 60% of a token's expert selections repeated from the previous
+loop, `cos(Δ3, Δ2) = 0.685`), and every published looped transformer hands the block's input back
 to each iteration in some form. Arm D adds that: a zero-init `768 x 768` `inject`, so every loop's
 router and experts read `hidden_states + inject(e)` where `e` is what the decoder handed over. The
 residual update is untouched, so the injection reaches a readout only through what the experts
@@ -38,7 +38,7 @@ which is why the run continued past the first checkpoint.
 
 **Closing it bought nothing.** The gain delta moved from 11% of its bar to 9% of it, while both
 repetition measures moved monotonically the *wrong* way. The injection makes consecutive loops
-slightly **more** alike, not less — the opposite of the mechanism's purpose, at both readings and
+slightly **more** alike, not less, the opposite of the mechanism's purpose, at both readings and
 on both transitions.
 
 ## 2. The mechanism stopped growing
@@ -50,7 +50,7 @@ on both transitions.
 | `\|inject\|rms` | 2.56e-04 | 2.37e-03 | 3.27e-03 | 3.83e-03 | 4.18e-03 | 4.17e-03 | 4.19e-03 |
 
 Flat from 78M onward. It plateaued at 4.2e-3, which is essentially where `g_proj` plateaued in the
-same runs (4.6e-3 at 208M) — two tensors, different jobs, same ceiling, both at `fresh_lr` against
+same runs (4.6e-3 at 208M): two tensors, different jobs, same ceiling, both at `fresh_lr` against
 the same trunk. The remaining 85M tokens would have trained a flat tensor toward a number 11x short
 of its gate, so they were not spent.
 
@@ -64,17 +64,17 @@ cheapest published fix for exactly this symptom and it does not transfer to this
 Two things keep this from being a verdict on the recurrence itself:
 
 - **The loop-conditioned mechanism the model already has does work.** Zeroing `loop_router_bias` at
-  eval costs 0.0018 nats and raises consecutive-loop expert overlap by 0.017–0.029 — a 1,120
+  eval costs 0.0018 nats and raises consecutive-loop expert overlap by 0.017 to 0.029: a 1,120
   parameter zero-init tensor moving the quantity arm D's 0.59M could not. Whatever is wrong is not
   that per-loop conditioning is inert here.
 - **The depth is doing something.** Out to 8 loops each transition still moves the hidden state
-  (‖Δh‖/‖h‖ ≈ 0.09–0.12) and flips ~5% of top-1 predictions, and the oracle keeps finding tokens
-  that only a deeper loop gets right (first-correct still adds 0.3–0.5% per loop at depth 8). The
+  (‖Δh‖/‖h‖ ≈ 0.09 to 0.12) and flips ~5% of top-1 predictions, and the oracle keeps finding tokens
+  that only a deeper loop gets right (first-correct still adds 0.3 to 0.5% per loop at depth 8). The
   loops compute; they also break as much as they fix (`regressed` climbs 0.026 → 0.057), which is
   what keeps net top-1 flat after loop 3.
 
 So the failure is retention and control, not access. That is not something another zero-init tensor
-on this trunk is going to fix, and this is the second arm to establish the same shape of result —
+on this trunk is going to fix, and this is the second arm to establish the same shape of result:
 the remaining candidates (a coda block trained from scratch, the loop-conditioned evidence query)
 are architecture changes that belong in a from-scratch comparison rather than a graft onto a
 converged checkpoint.
@@ -82,7 +82,7 @@ converged checkpoint.
 ## 4. Provenance
 
 `scripts/migrate_loop_inject.py` produced the seed from
-`checkpoint_phase2_final_phase0_irc.pt` — the same seed arm C started from, differing in exactly
+`checkpoint_phase2_final_phase0_irc.pt`, the same seed arm C started from, differing in exactly
 one tensor, verified by state-dict comparison (added `moe.inject.weight` at RMS 0, nothing else
 added, dropped or changed). Zero-init neutrality is asserted bit-identical in
 `tests/test_loop_inject.py`, along with the injection reaching loops past the first.

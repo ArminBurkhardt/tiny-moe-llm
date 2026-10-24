@@ -10,34 +10,37 @@ information-retrieval table is a lookup rather than a matmul.
 
 One 16B-token run exists, pretrained on a rented H100 and fine-tuned locally, then carried through
 a sequence of measured finetunes. [docs/CONCLUSION.md](docs/CONCLUSION.md) is the write-up of the
-pretraining run and [docs/measurements/](docs/measurements/) holds every gate since — read them
+pretraining run and [docs/measurements/](docs/measurements/) holds every gate since; read them
 before believing anything in this list. The plan is [docs/plans/NEXT.md](docs/plans/NEXT.md); its
 "Now" section is what happens next.
 
 The following techniques were used/implemented:
 
-- **Dense Gemma4-style blocks** — GQA, RoPE, RMSNorm, per-layer embeddings (PLE)
-- **Looped MoE** — one MoE block applied for `n_loops` iterations, rerouting tokens each pass
+- **Dense Gemma4-style blocks**: GQA, RoPE, RMSNorm, per-layer embeddings (PLE)
+- **Looped MoE**: one MoE block applied for `n_loops` iterations, rerouting tokens each pass
   (LoopLM-style recurrence), with routing conditioned on the loop index so consecutive loops do not
   all pick the same experts
-- **Heterogeneous experts** — self-attention, cross-attention, information-retrieval and MLP
+- **Heterogeneous experts**: self-attention, cross-attention, information-retrieval and MLP
   experts share one router, plus always-on shared MLP/attention experts outside the router pool
-- **Evidence port** — retrieved chunks are encoded by the model's own dense decoder and read at
-  every loop by an always-on cross-attention *reader*, while the IR expert acts as a *selector*
-  scoring the chunks' external embeddings under the same softmax as its learned table. With no
-  evidence attached the forward is bit-identical to the model without the port
-- **Per-loop CE supervision** — every loop's readout is supervised, not just the last, so an
+- **Evidence port**: retrieved chunks are encoded by the model's own dense decoder and read at
+  every loop by an always-on *reader*, while the IR expert acts as a *selector* scoring the chunks'
+  external embeddings under the same softmax as its learned table. The measured reader (since
+  2026-10-03, and the pilot's) is the key/value reader: the evidence becomes leading keys and values
+  of the shared self-attention in every loop, read under one softmax with the document's own keys.
+  The original cross-attention reader stays loadable. With no evidence attached the forward is
+  bit-identical to the model without the port
+- **Per-loop CE supervision**: every loop's readout is supervised, not just the last, so an
   early-exit policy has something to exit *to*
-- **Stochastic loop depth** — a fraction of steps train at a reduced depth, making the loop count a
+- **Stochastic loop depth**: a fraction of steps train at a reduced depth, making the loop count a
   real runtime choice at inference
-- **Parameter-free convergence exit** — inference stops looping once the last position's readout
+- **Parameter-free convergence exit**: inference stops looping once the last position's readout
   stops moving. No learned gate, no loss term, nothing that can saturate
-- **Multi-token prediction (MTP)** — auxiliary heads predict several future tokens per step, reused
+- **Multi-token prediction (MTP)**: auxiliary heads predict several future tokens per step, reused
   at inference as self-speculative drafting
-- **KV-cached decoding** — one cache slot per decoder layer and per (loop, attention expert) pair
-- **Document packing** — multiple documents per sequence with block-diagonal causal attention via
+- **KV-cached decoding**: one cache slot per decoder layer and per (loop, attention expert) pair
+- **Document packing**: multiple documents per sequence with block-diagonal causal attention via
   flash-attn varlen
-- **Low-precision training** — optional FP8 / NVFP4 via NVIDIA Transformer Engine
+- **Low-precision training**: optional FP8 / NVFP4 via NVIDIA Transformer Engine
 
 There is no identity expert. There is also no longer a learned halt head or correctness head: both
 were tried, both failed structurally rather than by mistuning, and both were removed. See
@@ -45,7 +48,7 @@ were tried, both failed structurally rather than by mistuning, and both were rem
 the measurements that decided it.
 
 <details>
-<summary><b>Model flow</b> — one pass, end to end</summary>
+<summary><b>Model flow</b>: one pass, end to end</summary>
 
 383M total, 224M active per token, ~502M forward FLOP/token at `seq_len=4096`, plus ~118M FLOP per
 *evidence* token when a buffer is attached (the decoder run once over the evidence).
@@ -58,13 +61,13 @@ tokens [B,S] = 4×4096, document-packed (uint16)          evidence [B,S_ev] (opt
 embed_tokens (65536 × 768) + per-layer embeddings (32/layer)   same table, same decoder ─┐
         │                                                                                │
         ▼                                                                                │
-┌─ DENSE DECODER — Gemma4-style, 8 layers, runs ONCE ──────┐                             │
+┌─ DENSE DECODER: Gemma4-style, 8 layers, runs ONCE ───────┐                             │
 │  GQA (12 heads, head_dim 64) + RoPE + RMSNorm(TE)        │   evidence states [B,S_ev,768] ◄┘
 │  SwiGLU MLP (2304) · layer_scalar gain per layer         │   (encoded once, reused every loop)
 └──────────────────────────────────────────────────────────┘        │
         │  h [B,S,768], RMS ≈ 1                                     │
         ▼                                                           │
-╔═ MoE BLOCK — ONE module, applied n_loops = 3 times ═══════════════╪═══════╗
+╔═ MoE BLOCK: ONE module, applied n_loops = 3 times ════════════════╪═══════╗
 ║                                                                   │       ║
 ║  router: 35 experts, top_k = 2                                    │       ║
 ║    + loop_router_bias(sinusoidal loop index)                      │       ║
@@ -91,16 +94,17 @@ MTP heads (+2 tokens) ──► chunked checkpointed CE on the final loop
 ```
 
 Depth is recurrence, not parameters: the MoE block's weights appear once in the parameter count and
-run three times. The non-MLP experts run for every token regardless of routing — attention has to
-see the whole sequence — so the top-k mask only scales their output; sparsity buys compute for the
-32 MLP experts alone. Everything on the evidence side is absent when no buffer is attached, and the
-reader's output projection is zero-initialized, so a freshly ported checkpoint scores identically to
-its source with or without a corpus.
+run three times. The non-MLP experts run for every token regardless of routing (attention has to
+see the whole sequence), so the top-k mask only scales their output; sparsity buys compute for the
+32 MLP experts alone. Everything on the evidence side is absent when no buffer is attached, so a
+ported checkpoint scores identically to its source without a corpus. The diagram shows the cross
+reader, whose output projection is zero-initialized, so a fresh cross port is neutral with a corpus
+too; the key/value reader (evidence as leading keys of `shared_attn`) shares the softmax and is not.
 
 </details>
 
 <details>
-<summary><b>The information-retrieval expert</b> — selector over a learned table and an external store</summary>
+<summary><b>The information-retrieval expert</b>: selector over a learned table and an external store</summary>
 
 ```
 h ─► RMSNorm ─► down_proj 768→384 ─► + loop_query_bias(k) ─► F.normalize ─► query
@@ -127,9 +131,9 @@ so candidate scoring is one `bmm` with no ragged gather and no host sync.
 ([ir_sharpening.md](docs/measurements/ir_sharpening.md),
 [ir_scale_fix.md](docs/measurements/ir_scale_fix.md)): a table trained on the trunk's own corpus can
 only offer content the trunk already holds, so nothing pays for opening the valve. Its size is
-frozen out of the real run spec. The external store is the opposite case — a gold passage carries
+frozen out of the real run spec. The external store is the opposite case: a gold passage carries
 content the model provably lacks, worth **+3.23 nats** in context
-([evidence_ceiling.md](docs/measurements/evidence_ceiling.md)) — and the same module reads it under
+([evidence_ceiling.md](docs/measurements/evidence_ceiling.md)), and the same module reads it under
 the same softmax, so "how much of the read went external" is a measurable groundedness signal.
 
 The expert's original output stage, an inner attention over every position's own read, averaged a
@@ -140,7 +144,7 @@ loadable for the A/B.
 </details>
 
 <details>
-<summary><b>Inference</b> — caching, drafting, evidence, and the depth policy</summary>
+<summary><b>Inference</b>: caching, drafting, evidence, and the depth policy</summary>
 
 `scripts/inference.py` is the reference path and `scripts/gradio_app.py` imports `stream_generate`
 from it, so the CLI and the UI cannot drift.
@@ -150,17 +154,19 @@ from it, so the CLI and the UI cannot drift.
 | *(default)* | KV-cached decode. Exact, not approximate: every attention call is causal, so a past token's output at a given depth never changes when later tokens are appended |
 | `--no-kv-cache` | the slow full-prefix reference path |
 | `--evidence FILE` | attach a buffer (JSON list of chunks, or one chunk per line) through the port for the whole session. Needs a checkpoint carrying the port |
-| `--num-mtp-tokens N` | self-speculative drafting off the same step's final hidden state, greedily accepted with **no** rejection sampling — trades quality for forward passes. Default 0 |
+| `--num-mtp-tokens N` | self-speculative drafting off the same step's final hidden state, greedily accepted with **no** rejection sampling; this trades quality for forward passes. Default 0 |
 | `--converge-tol T` | the convergence exit (below). Forces the KV cache **off** |
 | `-n / --temperature / -p` | length, sampling temperature, prompt |
 
 **The KV cache** holds one slot per dense decoder layer, plus one per `(loop, non-MLP expert)` pair
-*and* per `(loop, shared_attn)` — the MoE block is the same weights re-applied over an evolving
+*and* per `(loop, shared_attn)`: the MoE block is the same weights re-applied over an evolving
 hidden state, not three independent layers, so each loop needs its own cache. Single-sequence only.
-The evidence reader has no cache slot: it recomputes its cross attention over the fixed evidence
+The cross evidence reader has no cache slot: it recomputes its cross attention over the fixed evidence
 states every step, which is correct but slower, and under caching its per-step shape differs, so
 greedy decodes with evidence can diverge from the uncached path after a few tokens (reduction
-order, not RNG). Use `--no-kv-cache` when exact reproducibility with evidence matters.
+order, not RNG). Use `--no-kv-cache` when exact reproducibility with evidence matters. With the
+key/value reader and evidence attached, `inference.py` turns the cache off itself (the evidence
+sits inside `shared_attn`, which then has no cacheable slot).
 
 **The depth policy is parameter-free.** After each loop the model reads out the **last position
 only** and stops when the top-1 token is unchanged *and* its log-probability moved by less than
@@ -168,7 +174,7 @@ only** and stops when the top-1 token is unchanged *and* its log-probability mov
 
 - It reads the **readout**, not `‖Δh‖`. `loop_scale` still injects a sizeable hidden delta on the
   last loop while the prediction is already stationary, so a hidden-state criterion never fires.
-- It is asserted **inference-only** — a short `hidden_states_all` would silently break per-loop CE.
+- It is asserted **inference-only**: a short `hidden_states_all` would silently break per-loop CE.
 - It is asserted **mutually exclusive with the KV cache**: an exited loop appends no K/V for that
   token, so a later full-depth step would attend over a cache with a hole in it. Filling those
   cheaply is real plumbing through every attention expert, and is unimplemented.
@@ -176,7 +182,7 @@ only** and stops when the top-1 token is unchanged *and* its log-probability mov
 Pick the threshold from `scripts/eval_calibration.py`'s per-transition table. Measured on the 16B
 checkpoints: loop 1→2 top-1 agreement ~0.82 with mean `|Δ log p|` ~0.21, loop 2→3 ~0.94 / ~0.07.
 
-Streaming re-decodes the full generated id sequence each step and yields only the new suffix — a
+Streaming re-decodes the full generated id sequence each step and yields only the new suffix: a
 lone step's tokens can decode differently out of context, because of subword and space merges.
 
 </details>
@@ -201,15 +207,16 @@ lone step's tokens can decode differently out of context, because of subword and
 
 **Everything runs under WSL, from the repo root, after `source env_init`.** The dev box is Windows;
 CUDA, flash-attn and Transformer Engine all live in the WSL Ubuntu install. `env_init` is
-gitignored — it sets `CUDA_HOME`, the library paths, `PYTORCH_CUDA_ALLOC_CONF`, and activates
+gitignored: it sets `CUDA_HOME`, the library paths, `PYTORCH_CUDA_ALLOC_CONF`, and activates
 `venv/`. From PowerShell that is:
 
 ```powershell
 wsl bash -lc "cd /mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm && source env_init && python scripts/inference.py --help"
 ```
 
-Nothing works without it, and nothing works from a different working directory either — `config.py`
-opens `config.yaml` by relative path. The rented box is the one exception: `scripts/setup.sh`
+Nothing works without it, and nothing works from a different working directory either: `config.py`
+opens `config.yaml` (or the file `TINY_LLM_CONFIG` names, such as `config_micro.yaml` or
+`config_pilot.yaml`) by relative path. The rented box is the one exception: `scripts/setup.sh`
 installs into the NGC image's system python and there is no `env_init` to source there.
 
 ## Quick start
@@ -232,9 +239,9 @@ python scripts/pretrain.py --phase phase1
 ```
 
 On a local box you can skip `setup.sh` and use `pip install -r requirements.txt`, but Transformer
-Engine and flash-attn need CUDA builds matched to your GPU — see the
+Engine and flash-attn need CUDA builds matched to your GPU; see the
 [TE installation guide](https://github.com/NVIDIA/TransformerEngine#installation). flash-attn is
-optional (attention falls back to a slower SDPA path); **Transformer Engine is not** — nothing
+optional (attention falls back to a slower SDPA path); **Transformer Engine is not**: nothing
 under `modules/model/` imports without it.
 
 Inference against a checkpoint:
@@ -267,7 +274,7 @@ python scripts/eval_abstention.py -c CKPT --evidence-port --evidence-condition g
 
 Checkpoints written before the halt and correctness heads were removed do not load: they carry two
 tensors the model no longer has, and a `loop_scale` that was learned underneath a per-token gate.
-Fold and strip them first — the script measures the gate on real data rather than assuming it:
+Fold and strip them first: the script measures the gate on real data rather than assuming it:
 
 ```bash
 python scripts/migrate_phase0.py -c ckpts/trained/checkpoint_sft_final.pt
@@ -278,7 +285,7 @@ behaviourally identical to the original: final-loop CE moved 3.7564 → 3.7604 a
 0.3628 on a fixed held-out slice. The later migrations (`migrate_ir_reshape.py`,
 `migrate_loop_inject.py`, `migrate_evidence_port.py`) follow the same rule: every added tensor is
 zero- or identity-initialized so the migrated checkpoint scores identically to its source, and the
-checkpoint — never `config.yaml` — decides which of these a model carries when it is loaded.
+checkpoint, never `config.yaml`, decides which of these a model carries when it is loaded.
 
 ## Repository layout
 
@@ -372,14 +379,14 @@ Borrows heavily from [Gemma4](https://huggingface.co/google/gemma-4-31b-it).
   of [docs/review_2026-09-18.md](docs/review_2026-09-18.md) (RETRO, Fusion-in-Decoder, Memory
   Layers at Scale, LMLM, and others)
 
-**Datasets** — pretraining
+**Datasets**: pretraining
 - [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) / [DCLM](https://huggingface.co/datasets/mlfoundations/dclm-baseline-1.0) / [FinePDFs-Edu](https://huggingface.co/datasets/HuggingFaceFW/finepdfs)
 - [Stack-Edu (Common Pile)](https://huggingface.co/datasets/common-pile/stackv2_edu_filtered)
 - [Nemotron-CC-Math-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1) (gated)
 - [Wikipedia](https://huggingface.co/datasets/wikimedia/wikipedia)
 - [SmolTalk2](https://huggingface.co/datasets/HuggingFaceTB/smoltalk2) (phase 2)
 
-**Datasets** — post-training and evidence
+**Datasets**: post-training and evidence
 - [SQuAD v2](https://huggingface.co/datasets/rajpurkar/squad_v2), [HotpotQA](https://huggingface.co/datasets/hotpotqa/hotpot_qa)
   (distractor setting), [GSM8K](https://huggingface.co/datasets/openai/gsm8k)
 - [bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5) as the external chunk embedder
@@ -393,7 +400,7 @@ Borrows heavily from [Gemma4](https://huggingface.co/google/gemma-4-31b-it).
 - Token counts may be slightly inflated during training (on the order of tens of tokens per batch).
 - The tokenizer is a 65536-token prune of DeepSeek-V4-Pro's, so the corpus fits in `uint16`. It
   lives at [ikeafisch4/DeepSeek-V4-Pro-tokenizer-65536](https://huggingface.co/ikeafisch4/DeepSeek-V4-Pro-tokenizer-65536)
-  and `scripts/fetch_tokenizer.py` pulls it — `ckpts/` is gitignored, so a fresh clone has none.
+  and `scripts/fetch_tokenizer.py` pulls it; `ckpts/` is gitignored, so a fresh clone has none.
 - `pad_token_id == eos_token_id` and id 0 is BOS, which is why the embedding table has no
   `padding_idx` (setting one froze BOS at zero).
 - The corpus under `data/prepared/` on the dev box is an outdated local stand-in, not the corpus the

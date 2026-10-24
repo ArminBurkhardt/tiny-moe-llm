@@ -1,8 +1,8 @@
-# Phase 0 — heads out: the migration record (2026-08-19)
+# Phase 0, heads out: the migration record (2026-08-19)
 
 The head-removal phase of [NEXT.md](../plans/NEXT.md). Both learned heads (correctness, halt)
-failed for structural reasons, not tuning ones — the analysis is in
-[CONCLUSION.md](../CONCLUSION.md) — so Phase 0 was a subtraction: delete `correct_proj`, delete
+failed for structural reasons, not tuning ones (the analysis is in
+[CONCLUSION.md](../CONCLUSION.md)), so Phase 0 was a subtraction: delete `correct_proj`, delete
 `halt_proj` and the whole ponder subsystem, and fold the halt gate's measured effect into
 `loop_scale` so the checkpoint keeps working.
 
@@ -18,14 +18,14 @@ rather than taking a constant, because the planning guess was wrong:
 
 The single logged `p_halt` scalar was a mean over all three loops and hid a strong decreasing
 trend, so a flat fold would have left loop 1 ~25% too weak and loop 3 ~2.6x too strong. The gate is
-stable across corpora within a checkpoint (~5%) but differs a lot between checkpoints — hence
-"measure it, per checkpoint". Its per-token std is small (≈0.03–0.06), which is what makes folding
+stable across corpora within a checkpoint (~5%) but differs a lot between checkpoints, hence
+"measure it, per checkpoint". Its per-token std is small (≈0.03 to 0.06), which is what makes folding
 to a mean legitimate at all.
 
 ## Gate P0
 
 Re-run `eval_abstention.py` / `eval_calibration.py` on the folded checkpoint; loss and top-1 must
-be within noise of the pre-removal numbers — the phase is meant to change nothing behaviorally.
+be within noise of the pre-removal numbers; the phase is meant to change nothing behaviorally.
 
 **Passed on both checkpoints** (local `phase1` slice, 654k tokens, identical settings
 before/after):
@@ -58,7 +58,7 @@ Measured for picking `converge_tol` (`eval_calibration.py` prints these):
 | transition | top-1 agreement | mean `\|Δ log p_top\|` |
 |---|---|---|
 | loop 1 → 2 | 0.808 | 0.232 |
-| loop 2 → 3 | 0.925–0.944 | 0.067–0.091 |
+| loop 2 → 3 | 0.925 to 0.944 | 0.067 to 0.091 |
 
-A migrated checkpoint drops its optimizer/scheduler state — it is a finetune **seed**, not a
+A migrated checkpoint drops its optimizer/scheduler state: it is a finetune **seed**, not a
 resume point, and `utils.load_checkpoint` says so by name if you try.

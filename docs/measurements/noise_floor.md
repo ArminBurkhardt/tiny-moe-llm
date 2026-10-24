@@ -1,4 +1,4 @@
-# Noise floor — eval sampling spread on the abstention metrics (2026-08-23)
+# Noise floor: eval sampling spread on the abstention metrics (2026-08-23)
 
 Gates need honest thresholds more than they need ambition. From here on "must not regress" means
 "within the documented noise" and "must improve" means "by ≥3σ", so the noise has to be a measured
@@ -22,7 +22,7 @@ python scripts/eval_abstention.py -c $CKPT --max-examples 2000 --batch-size 16 -
   --example-offset 2000
 ```
 
-The offset counts questions that survived rendering and the 1,024-token prompt cap, not raw rows —
+The offset counts questions that survived rendering and the 1,024-token prompt cap, not raw rows:
 an offset over raw rows would land somewhere else in the sequence the un-offset run collects, and
 the two slices would then not be disjoint in the way the number claims.
 
@@ -33,9 +33,9 @@ refactor left the default path bit-for-bit unchanged.
 
 ## The two slices
 
-| | questions 0–2,000 | questions 2,000–4,000 | spread (σ) |
+| | questions 0 to 2,000 | questions 2,000 to 4,000 | spread (σ) |
 |---|---|---|---|
-| unanswerable / answerable | 1,013 / 987 | 999 / 1,001 | — |
+| unanswerable / answerable | 1,013 / 987 | 999 / 1,001 | - |
 | **false abstention rate (answerable)** | **0.1611** | **0.1568** | **0.0043 (0.0030)** |
 | abstention precision | 0.5782 | 0.5757 | 0.0025 (0.0018) |
 | abstention recall | 0.2152 | 0.2132 | 0.0020 (0.0014) |
@@ -48,14 +48,14 @@ refactor left the default path bit-for-bit unchanged.
 | ECE(`p_max`) | 0.4994 | 0.5077 | 0.0083 (0.0059) |
 | AUROC(`p_max` → answer correct) | 0.6595 | 0.6437 | 0.0158 (0.0112) |
 | AUROC(`1 - p_max` → unanswerable) | 0.4775 | 0.5062 | 0.0287 (0.0203) |
-| abstentions made / correct | 377 / 218 | 370 / 213 | — |
-| distinct completions | 1,263 | 1,279 | — |
-| most common completion | `"The passage doesn't say."`, 274 | `"The passage doesn't say."`, 273 | — |
+| abstentions made / correct | 377 / 218 | 370 / 213 | - |
+| distinct completions | 1,263 | 1,279 | - |
+| most common completion | `"The passage doesn't say."`, 274 | `"The passage doesn't say."`, 273 | - |
 
 "spread" is the absolute difference between the two readings; the figure in brackets is that
 difference read as a standard deviation (`|a - b| / sqrt(2)`, the unbiased σ estimate from a pair).
-**Two samples is a weak estimator of σ** — the 95% interval on a σ from n=2 spans roughly 0.45x to
-16x the point estimate — so these are order-of-magnitude floors, and the sensible way to use them is
+**Two samples is a weak estimator of σ** (the 95% interval on a σ from n=2 spans roughly 0.45x to
+16x the point estimate), so these are order-of-magnitude floors, and the sensible way to use them is
 the operating-point column below rather than the raw number.
 
 ## What it says
@@ -67,13 +67,13 @@ the operating-point column below rather than the raw number.
   0.578 over 377 abstentions is ±0.025 binomial, and the measured slice-to-slice spread of 0.0025
   sits an order of magnitude *inside* it, which is the expected outcome for two samples out of one
   population. The practical floor to gate against is therefore the **binomial** error on the count,
-  not this spread — for precision on ~370 abstentions that is **±0.026**, and a "3σ improvement"
+  not this spread: for precision on ~370 abstentions that is **±0.026**, and a "3σ improvement"
   means clearing 0.578 by about **0.08**.
-- **EM on the answerable half moves 0.0152** — 1.5 points, the widest of the behavioural metrics.
+- **EM on the answerable half moves 0.0152**, 1.5 points, the widest of the behavioural metrics.
   It is a mean over ~1,000 questions of a quantity whose per-question variance is far higher than a
   0/1 abstention decision (a near-miss span scores 0), so a 1-point EM change between two runs is
   not a result.
-- **AUROC(`1 - p_max` → unanswerable) moves 0.0287, from 0.4775 to 0.5062** — across chance. That
+- **AUROC(`1 - p_max` → unanswerable) moves 0.0287, from 0.4775 to 0.5062**, across chance. That
   is the most important line here. The "below chance on three checkpoints running" reading in
   [abstention_repair.md](abstention_repair.md) survives as "not above chance", but the *sign* of
   that signal is not stable across a 2,000-question slice, so no argument should rest on it being
@@ -93,7 +93,7 @@ the operating-point column below rather than the raw number.
 | AUROC (either) | ±0.030 | measured slice spread |
 | mean `p_max` | ±0.002 | measured slice spread |
 
-Where the binomial error and the measured spread disagree, the table takes the larger — the spread
+Where the binomial error and the measured spread disagree, the table takes the larger: the spread
 is estimated from two samples and can only be trusted as a lower bound, while the binomial error is
 exact for the count it describes.
 

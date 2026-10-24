@@ -34,7 +34,7 @@ normalization (imported from `eval_abstention.py`, so both evals normalize ident
 **Frozen flags:** `--batch-size 32 --max-context 1024 --gen-limit 1000 --seed 1234`, peers in fp32
 with TF32 matmuls, this model in bf16. Multiple choice runs the full split; the three generative
 tasks are capped at 1,000 questions by a seeded shuffle-then-truncate, so every model sees the same
-subsample. Batch size is part of the measurement — the MoE's grouped GEMM tiles by the batch's
+subsample. Batch size is part of the measurement: the MoE's grouped GEMM tiles by the batch's
 per-expert row counts.
 
 Prompt formats are the EleutherAI harness's, task by task, which is what makes the validation below
@@ -68,7 +68,7 @@ The published file carries no HellaSwag, OpenBookQA or BoolQ entry, so those thr
 anchor. Two of them corroborate anyway: gpt2-medium comes out at HellaSwag acc 0.3327 / acc_norm
 0.3926 and BoolQ acc 0.5875, which is where that model is generally reported. OpenBookQA is the one
 task with no independent confirmation at all, and it is also the smallest split (500 questions,
-±1.8 points of binomial error) — treat a movement there with more suspicion than the others.
+±1.8 points of binomial error); treat a movement there with more suspicion than the others.
 
 ### Two conventions the first attempt got wrong
 
@@ -88,7 +88,7 @@ Neither would have been visible without a published number to check against.
 ## The frozen peer numbers
 
 Peers are measured **once** and reused via `--compare`; each run is written to
-`docs/measurements/benchmarks/peer.<name>.json` (untracked — `.gitignore` swallows `*.json` — so
+`docs/measurements/benchmarks/peer.<name>.json` (untracked: `.gitignore` swallows `*.json`, so
 regenerate with `--peer all --json-out docs/measurements/benchmarks/peer.json`).
 
 | task | metric | chance | gpt2-medium | pythia-410m | smollm2-360m | qwen2.5-0.5b |
@@ -117,17 +117,17 @@ regenerate with `--peer all --json-out docs/measurements/benchmarks/peer.json`).
 
 "headroom over chance" is `(score − chance) / (1 − chance)`, the share of the *available* range
 above guessing that the model covered. At this size several tasks sit within noise of chance, where
-a raw accuracy column reads like a real number and a headroom column reads like the 0 it is —
+a raw accuracy column reads like a real number and a headroom column reads like the 0 it is:
 ARC-Challenge at 0.25 and MMLU at 0.23 are two models scoring nothing, not two models scoring 24%.
 
 Three readings worth keeping:
 
 - **The token axis is visible and it is not a straight line.** gpt2-medium at ~10B and pythia-410m
-  at 300B are 1.5 headroom points apart across nine tasks — a 30x data increase buying almost
-  nothing on this suite — while SmolLM2-360M at 4T is 14 points clear of both at *fewer* parameters
+  at 300B are 1.5 headroom points apart across nine tasks (a 30x data increase buying almost
+  nothing on this suite), while SmolLM2-360M at 4T is 14 points clear of both at *fewer* parameters
   than Pythia. That gap is data curation, not scale: FineWeb-Edu/DCLM against the Pile.
 - **MMLU separates knowledge from everything else.** Three of the four peers are at chance
-  (0.229–0.263). Qwen2.5-0.5B at 0.477 is the only model in the class that has the knowledge, and
+  (0.229 to 0.263). Qwen2.5-0.5B at 0.477 is the only model in the class that has the knowledge, and
   it took 18T tokens. This is the "did knowledge arrive" axis for the real run, and it is honest
   about how expensive arriving is.
 - **SmolLM2-360M's TriviaQA 0.219 is the number the evidence thesis is aimed at.** Closed-book
@@ -137,7 +137,7 @@ Three readings worth keeping:
 Two cross-checks on the peer numbers themselves: Qwen2.5-0.5B's MMLU 0.477 matches Qwen's published
 47.5 for the base model, and SmolLM2-360M's ARC average of 0.532 matches the 53.0 on its card. Its
 card's HellaSwag 54.5 against our 56.2 and its MMLU 35.8 against our 26.3 are format differences,
-not disagreements — the card uses lighteval with a cloze MMLU, this suite uses the harness's
+not disagreements: the card uses lighteval with a cloze MMLU, this suite uses the harness's
 lettered-option MMLU.
 
 ## Shakedown of the local model path
@@ -145,7 +145,7 @@ lettered-option MMLU.
 One checkpoint through all thirteen tasks, to prove the local scoring and generation paths work end
 to end rather than only on the four tasks the smoke tests covered. `checkpoint_repair_final.pt` (the
 0.55 repair finetune), raw completion format, same flags. **This is not the three-checkpoint
-snapshot** — that is still to be recorded — but the numbers are real and reported here so they are
+snapshot** (that is still to be recorded), but the numbers are real and reported here so they are
 not measured twice.
 
 | task | metric | this model | headroom | gpt2-medium | pythia-410m | smollm2-360m | qwen2.5-0.5b |
@@ -158,22 +158,22 @@ not measured twice.
 | openbookqa | acc_norm | 0.2740 | +0.032 | 0.3020 | 0.2940 | 0.3820 | 0.3520 |
 | sciq | acc | 0.6560 | +0.541 | 0.7690 | 0.8120 | 0.9120 | 0.9310 |
 | boolq | acc | 0.4190 | −0.162 | 0.5875 | 0.6012 | 0.6205 | 0.6177 |
-| lambada_openai | acc | 0.1989 | — | 0.4304 | 0.5164 | 0.5376 | 0.5255 |
+| lambada_openai | acc | 0.1989 | - | 0.4304 | 0.5164 | 0.5376 | 0.5255 |
 | mmlu | acc | 0.2285 | −0.029 | 0.2293 | 0.2322 | 0.2631 | 0.4771 |
-| triviaqa | EM | 0.0140 | — | 0.0300 | 0.0210 | 0.2190 | 0.0660 |
-| nq_open | EM | 0.0020 | — | 0.0070 | 0.0000 | 0.0520 | 0.0260 |
-| gsm8k | EM | 0.0090 | — | 0.0180 | 0.0180 | 0.0430 | 0.3710 |
+| triviaqa | EM | 0.0140 | - | 0.0300 | 0.0210 | 0.2190 | 0.0660 |
+| nq_open | EM | 0.0020 | - | 0.0070 | 0.0000 | 0.0520 | 0.0260 |
+| gsm8k | EM | 0.0090 | - | 0.0180 | 0.0180 | 0.0430 | 0.3710 |
 | **mean MC headroom** | | **+0.084** | | +0.193 | +0.208 | +0.345 | +0.335 |
 
 The harness works on this model: every task ran, `n` matches the peers' exactly, and the shape of
-the result is what a 16B-token model should look like — real signal on SciQ (+0.54 headroom),
+the result is what a 16B-token model should look like: real signal on SciQ (+0.54 headroom),
 ARC-Easy and PIQA, at chance on ARC-Challenge and MMLU. It sits below gpt2-medium overall, which is
 the honest starting position and the reason the plan's second claim is "on-trend for its token
 budget" rather than "competitive".
 
 **BoolQ at 0.4190 is below chance and is the one number here that is a finding rather than a floor.**
 A two-option task can only land there by systematically preferring one option, and `acc_norm` on the
-same scores reads 0.5920 — so the model prefers `" no"` on log-probability while byte normalization
+same scores reads 0.5920, so the model prefers `" no"` on log-probability while byte normalization
 (`" no"` is shorter than `" yes"`) flips most of it back. Worth revisiting once the trunk moves; it
 is the kind of yes/no answer-policy bias that average CE cannot see, which is the entire argument
 for having this suite.
@@ -197,8 +197,8 @@ Neither directory is tracked (`data/benchmarks` was added to `.gitignore`; `ckpt
 
 ## Cost
 
-Six to nine minutes per peer for the whole suite on the 5090 — 148k scored continuations plus 3,000
-generations — at 5.7–10.7 GB peak.
+Six to nine minutes per peer for the whole suite on the 5090 (148k scored continuations plus 3,000
+generations), at 5.7 to 10.7 GB peak.
 
 The first implementation took ~25 minutes for HellaSwag alone at 16% GPU utilization. Two changes
 fixed it, both worth remembering for anything else that scores this many short sequences:

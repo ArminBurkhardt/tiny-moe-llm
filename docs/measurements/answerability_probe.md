@@ -3,7 +3,7 @@
 Two checkpoints of abstention work established what the *policy* cannot do: tell an answerable
 question from an unanswerable one. The corpus ratio slides the operating point along a fixed curve
 (precision read at ~0.578 six times while everything else moved), and `p_max` carries no usable
-discrimination — AUROC 0.462–0.478 across three checkpoints, with a sign that is not even stable
+discrimination: AUROC 0.462 to 0.478 across three checkpoints, with a sign that is not even stable
 across a 2,000-question slice. What that record never said is **why**, and the two possible reasons
 put the burden in completely different places:
 
@@ -35,7 +35,7 @@ Defaults throughout: 10,000 `squad_v2/train` questions to fit (2,000 of them hel
 L2 penalty), the standard 2,000-question `squad_v2/validation` slice to read, `--batch-size 16`,
 `--max-prompt-tokens 1024`, seed 1234. The rendering path is `eval_abstention.build_records` by
 import, so the prompts are byte-identical to the ones every abstention number in this project is
-measured on and the eval slice is *the same slice* — same seeded shuffle, same 1,013/987 split.
+measured on and the eval slice is *the same slice*: same seeded shuffle, same 1,013/987 split.
 
 Features are read at the **last prompt position**: the state the model would decode its first answer
 token from, not an average over the passage. Three sets, fitted separately so the answer is
@@ -45,7 +45,7 @@ attributable:
 |---|---|
 | `scalars` | `p_max`, predictive entropy, top-1/top-2 log-probability margin |
 | `hidden` | the final loop's post-norm hidden state, 768-d |
-| `hidden+scalars` | both — the plan's stated feature set |
+| `hidden+scalars` | both: the plan's stated feature set |
 
 Positive class is **unanswerable**, matching the direction `eval_abstention.py` reports
 `AUROC(1 - p_max → unanswerable)` in. The L2 strength is chosen on the held-out train questions and
@@ -67,7 +67,7 @@ AUROC on the standard slice, all three checkpoints:
 Three readings, in order of how much they change the plan.
 
 **1. The signal exists, it is weak, and it is a property of the pretrained trunk.** 0.5804 / 0.5850
-/ 0.5839 — the three checkpoints agree to within **0.005**, an order of magnitude inside the ±0.030
+/ 0.5839: the three checkpoints agree to within **0.005**, an order of magnitude inside the ±0.030
 slice noise on an AUROC ([noise_floor.md](noise_floor.md)). A 709M-token SFT and a 49M-token
 abstention repair, between them, moved this number by nothing. Whatever answerability information a
 linear read can extract was already there when pretraining ended, and neither finetune added to it
@@ -79,15 +79,15 @@ representation**, not changing it. The two observations are consistent by constr
 they say the data lever is exhausted for the same reason in both cases.
 
 **2. `p_max` and its friends carry nothing, confirmed a fourth time.** Every unfitted scalar lands
-in 0.454–0.548 — straddling chance, with no consistent sign across checkpoints. The fitted `scalars`
-probe does no better (0.476–0.540): three free numbers, three orders of magnitude of regularization
+in 0.454 to 0.548, straddling chance, with no consistent sign across checkpoints. The fitted `scalars`
+probe does no better (0.476 to 0.540): three free numbers, three orders of magnitude of regularization
 searched, and it still cannot separate the classes. This is now measured on four checkpoints by two
 different methods and should not be re-litigated.
 
 **3. Neither of the plan's branches fires cleanly, and 0.58 is the honest answer.** The plan wrote
 ≈0.5 → "not in the representation" and ≥0.7 → "a readout problem". The measurement landed between
 them: the hidden state beats the *best* free scalar on its own checkpoint by 0.032 (pretrained),
-0.051 (SFT) and 0.060 (repair) — every one of them outside the ±0.030 noise, and the strongest
+0.051 (SFT) and 0.060 (repair): every one of them outside the ±0.030 noise, and the strongest
 comparison is on the shipped checkpoint. The signal is real and the policy is not using it. But 0.58
 is nowhere near a discriminator anything could ship on alone.
 
@@ -114,20 +114,20 @@ questions:
 | 0.05 | 0.7700 | 0.0760 | 0.0233 |
 
 **At matched recall (0.209 vs the policy's 0.215) the probe is 0.13 more precise and abstains
-falsely at half the rate** — 5x the ±0.026 binomial floor on precision and well past the ±0.012 on
+falsely at half the rate**: 5x the ±0.026 binomial floor on precision and well past the ±0.012 on
 false abstention. So the trunk's weak signal is not merely above chance, it is *better ordered than
 the shipped policy's own decisions* at the operating point that policy sits on.
 
 Three things keep that from being a result to ship on:
 
 - **It is not the same decision.** The policy emits an answer; the probe only decides whether to
-  abstain. A deployed combination — abstain when the probe fires, otherwise emit the model's answer
-  with its own abstentions suppressed — is a different mechanism whose answerable-half EM is not
+  abstain. A deployed combination (abstain when the probe fires, otherwise emit the model's answer
+  with its own abstentions suppressed) is a different mechanism whose answerable-half EM is not
   measured here. That combination is a Phase 6 question, not a Phase 1b finding.
 - **The curve is still not bent where it matters.** G7 wants precision ≥ 0.65 *at recall ≥ 0.5*.
-  The probe's precision at recall 0.55 is 0.557, barely over the slice's 0.507 base rate — a model
+  The probe's precision at recall 0.55 is 0.557, barely over the slice's 0.507 base rate: a model
   that flagged half the questions at random would score close to it. Everything it buys, it buys by
-  abstaining less, which is sliding along a curve again — a better curve than the policy's, but the
+  abstaining less, which is sliding along a curve again: a better curve than the policy's, but the
   same shape.
 - **It is fitted per task.** 10,000 in-domain questions with labels produced this; nothing says it
   transfers off SQuAD, and the abstention claim is not a SQuAD claim.
@@ -136,7 +136,7 @@ Three things keep that from being a result to ship on:
 
 - **The probe is fitted on data the checkpoints trained on.** `prepare_sft_data.py` builds the SFT
   and repair corpora from `squad_v2/train`, so these questions are not novel to the model. That
-  cannot leak into the reported AUROC — it is read on held-out validation questions — but it does
+  cannot leak into the reported AUROC (it is read on held-out validation questions), but it does
   mean the fit set is a distribution the model has seen, which flatters the fit half of the ladder
   and makes the low slice number the more robust of the two.
 - **`1 - p_max` reads 0.5016 here against 0.4775 in [noise_floor.md](noise_floor.md), and they are
@@ -148,7 +148,7 @@ Three things keep that from being a result to ship on:
   finetune moved, and Phase 4's job is to add information rather than to decode harder.
 - **Batch size is part of the measurement.** `ParallelSparseMoELayer` tiles its grouped GEMM by
   per-expert row counts computed over every token in the batch, padding included, so features
-  measured at a different `--batch-size` differ at the ~0.5–1% level.
+  measured at a different `--batch-size` differ at the ~0.5 to 1% level.
 
 ## What this decides
 
@@ -156,11 +156,11 @@ Three things keep that from being a result to ship on:
 currently have, because three checkpoints' worth of finetuning demonstrably did not put any there.
 Gate G3b stands as written.
 
-**G3b's reference number changes, and it should.** "Beat `p_max`'s 0.462–0.478" was never a
-demanding bar — `p_max` is at chance. The honest bar is that the external-vs-parametric mass
+**G3b's reference number changes, and it should.** "Beat `p_max`'s 0.462 to 0.478" was never a
+demanding bar: `p_max` is at chance. The honest bar is that the external-vs-parametric mass
 signal must beat **0.584**, what a free linear read of the *existing* trunk already gives, before
 "the evidence pathway supplies discrimination" means anything. G3b's stated 0.65 threshold clears
-that by 0.066, so the gate's number needs no change — only its comparison, which is now a real
+that by 0.066, so the gate's number needs no change, only its comparison, which is now a real
 baseline rather than a chance-level one.
 
 **Phase 6 has something small and real to amplify.** The preference pass is no longer being asked to
