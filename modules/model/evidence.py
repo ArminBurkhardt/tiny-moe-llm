@@ -134,6 +134,9 @@ def evidence_cu_seqlens(segment_ids: torch.Tensor, num_segments: int) -> tuple[t
 
     Requires the evidence tokens to be laid out sorted by segment over the flattened ``B * S_ev``
     axis, which is what the dataset writes (row major, and within a row in conversation order).
+    Checked with an assert whenever gradients are disabled (evals and inference, where every packer
+    bug so far has lived and a host sync costs nothing that matters); the training forward skips
+    the check, which would sync every step.
 
     Args:
         segment_ids: ``[B, S_ev]``, each entry the index of the query segment that token serves.
@@ -144,6 +147,9 @@ def evidence_cu_seqlens(segment_ids: torch.Tensor, num_segments: int) -> tuple[t
         maximum would cost a host sync every step, same trade as the query side's.
     """
     flat = segment_ids.reshape(-1)
+    if not torch.is_grad_enabled():
+        # a host assert, not torch._assert_async: a device side assert presents as a silent hang
+        assert bool((flat[1:] >= flat[:-1]).all()), "evidence tokens must be sorted by segment"
     counts = torch.zeros(num_segments, dtype=torch.long, device=flat.device)
     counts.scatter_add_(0, flat, torch.ones_like(flat))
     cu = torch.zeros(num_segments + 1, dtype=torch.int32, device=flat.device)

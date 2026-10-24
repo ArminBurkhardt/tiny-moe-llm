@@ -41,7 +41,23 @@ import torch
 from modules.model.moe import is_fresh_loop_param
 from modules.model.transformer import TinyMoETransformer
 from config import ModelConfig
-from utils import BASE_DIR, BF16, logger, model_params_for_state_dict
+from utils import BALANCE_KEYS, BASE_DIR, BF16, logger, model_params_for_state_dict
+
+
+def stray_added_keys(added):
+    """The added state keys that are neither the head's nor the tolerated balance bias.
+
+    The balance bias is the one tensor besides the head a source may lack: a checkpoint saved
+    before it existed was the unbiased router, which is the buffer's zero init.
+
+    Args:
+        added: state keys the migrated model has and the source does not.
+
+    Returns:
+        The keys that would load as an unexplained init, in input order.
+    """
+    return [k for k in added
+            if not k.startswith("groundedness_head.") and not k.endswith(BALANCE_KEYS)]
 
 
 def main():
@@ -96,7 +112,7 @@ def main():
         )
     # every added tensor must belong to the head. Anything else absent would load as its random
     # init and train as if it were the source's, which is the silent failure strict loading prevents
-    stray = [k for k in added if not k.startswith("groundedness_head.")]
+    stray = stray_added_keys(added)
     if stray:
         raise SystemExit(f"these added tensors are not part of the head: {stray}")
     if not added:
@@ -116,7 +132,7 @@ def main():
                if name.startswith("groundedness_head."))
 
     payload["model_state_dict"] = model.state_dict()
-    for key in ("optimizer_state_dict", "scheduler_state_dict"):
+    for key in ("optimizer_state_dict", "scheduler_state_dict", "fp32_masters"):
         payload.pop(key, None)
     payload["groundedness_head_migration"] = {
         "source": os.path.basename(src),

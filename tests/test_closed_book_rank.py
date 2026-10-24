@@ -19,7 +19,14 @@
    has delta 0, a scorer that binds names to values has a large delta;
 10. ``compare`` on three files prints the verdict;
 11. ``--n-loops`` reaches the model forward through ``TinyEvidenceBackend.score`` (a CPU stub model),
-    and the range check rejects 0 and anything past the depth.
+    and the range check rejects 0 and anything past the depth;
+12. the person-clustered sigma: items equal within a person give about sqrt(m) times the item
+    sigma (m items per person), independent items give the two within 20%, and every table dict
+    carries ``n_persons``, ``sigma_clustered`` and ``z_clustered``;
+13. ``compare --class`` keeps one attribute class in every block, ``all`` keeps everything;
+14. the paired prior-controlled ``delta`` block reads a binding difference the raw block misses
+    and ignores a prior shift the raw block reads, with item and clustered sigma and z;
+15. the existing printed lines and dict keys keep their exact format, order and values.
 
 GPU free; check 11 imports the model modules (no CUDA initialised) but loads no model.
 """
@@ -412,6 +419,153 @@ def main():
             continue
         raise AssertionError(f"n_loops {bad} accepted at depth 3")
     print("11. n_loops reaches the forward, range check rejects 0 and past depth    PASS")
+
+    # 12. the person-clustered bootstrap
+    from scripts.closed_book_rank import (
+        cluster_bootstrap_sigma, filter_class, paired_delta_compare, person_key, print_summary,
+    )
+    n_persons, m = 400, 5
+    labels = np.repeat(np.arange(n_persons), m)
+    per_person = np.random.RandomState(12).rand(n_persons)
+    tied = per_person[labels]
+    item_s = bootstrap_sigma(tied, 1000, 0)
+    cluster_s = cluster_bootstrap_sigma(tied, labels, 1000, 0)
+    ratio = cluster_s / item_s
+    assert abs(ratio - math.sqrt(m)) / math.sqrt(m) < 0.15, (ratio, math.sqrt(m))
+    loose = np.random.RandomState(13).rand(n_persons * m)
+    ratio_loose = cluster_bootstrap_sigma(loose, labels, 1000, 0) / bootstrap_sigma(loose, 1000, 0)
+    assert abs(ratio_loose - 1.0) < 0.2, ratio_loose
+    assert cluster_bootstrap_sigma([0.3], [0], 100) == 0.0
+    assert cluster_bootstrap_sigma(tied, labels, 300, 4) == cluster_bootstrap_sigma(tied, labels, 300, 4)
+    # one person per item reads like the item bootstrap
+    ratio_one = cluster_bootstrap_sigma(loose, np.arange(loose.size), 1000, 0) / bootstrap_sigma(loose, 1000, 0)
+    assert abs(ratio_one - 1.0) < 0.1, ratio_one
+    assert person_key({"item_id": "17:birth_city:indist|prior"}) == "17"
+    assert person_key({"item_id": "x", "person_id": 4}) == "4" and person_key({"item_id": "i9"}) == "i9"
+
+    def bio_results(n_people, real_of, prior_of, seed, forms=("indist", "heldout"), tier="100"):
+        """Annotated results with controls; ``real_of(person, rng)`` and ``prior_of`` give norm_ranks."""
+        rng = np.random.RandomState(seed)
+        out = []
+        for p in range(n_people):
+            for attribute in bio.ATTRIBUTES:
+                for form in forms:
+                    item_id = f"{p}:{attribute}:{form}"
+                    for rid, nr in ((item_id, real_of(p, rng)), (item_id + "|prior", prior_of(p, rng))):
+                        nr = float(np.clip(nr, 0.0, 1.0))
+                        out.append({"item_id": rid, "tier": tier, "group": attribute, "n": 100,
+                                    "rank": 1 + nr * 99, "norm_rank": nr, "top1": False,
+                                    "gold_logprob": 0.0, "norm_rank_bytes": nr,
+                                    "cls": bio.attribute_class(attribute), "form": form, "person_id": p})
+        return out
+
+    # a person is stored or not: all their items move together, so the clustered sigma is wider
+    stored = np.random.RandomState(21).rand(300) < 0.3
+    corr = bio_results(300, lambda p, r: (0.1 if stored[p] else 0.5) + 0.02 * r.randn(),
+                       lambda p, r: 0.5 + 0.02 * r.randn(), 22)
+    d = prior_deltas([r for r in corr if r["form"] == "indist"], by=("tier",), n_boot=500)["100"]
+    assert d["n"] == 1500 and d["n_persons"] == 300 and d["sigma_clustered"] > 1.8 * d["delta_sigma"], d
+    s = summarize(real_only(corr), by=("tier",), n_boot=200)["all"]
+    assert {"n_persons", "sigma_clustered", "z_clustered"} <= set(s) and s["n_persons"] == 300
+    assert abs(s["z_clustered"] - (0.5 - s["norm_rank"]) / s["sigma_clustered"]) < 1e-9
+    print(f"12. clustered sigma: tied {ratio:.2f}x (sqrt m {math.sqrt(m):.2f}), independent "
+          f"{ratio_loose:.2f}x, stored persons {d['sigma_clustered'] / d['delta_sigma']:.2f}x   PASS")
+
+    # 13. the class filter, and 14. the paired delta block
+    tmp = tempfile.mkdtemp(prefix="rank_")
+    try:
+        # a: binds names (real 0.3, prior 0.5); b: same real ranks, its prior moved to 0.3 (no binding)
+        run_a = bio_results(200, lambda p, r: 0.3 + 0.05 * r.randn(), lambda p, r: 0.5 + 0.05 * r.randn(), 31)
+        run_b = [dict(x) for x in run_a]
+        prior_rng = np.random.RandomState(32)
+        for x in run_b:
+            if x["item_id"].endswith("|prior"):
+                x["norm_rank"] = float(np.clip(0.3 + 0.05 * prior_rng.randn(), 0.0, 1.0))
+        raw = paired_compare(real_only(run_a), real_only(run_b), n_boot=200)["all"]
+        assert raw["diff_norm_rank"] == 0.0 and raw["z"] == 0.0 and raw["z_clustered"] == 0.0, raw
+        dd = paired_delta_compare(run_a, run_b, by=("tier",), n_boot=200)
+        assert abs(dd["all"]["diff_delta"] - 0.2) < 0.02 and dd["all"]["z"] > 20 and dd["all"]["z_clustered"] > 20
+        assert dd["all"]["n"] == 200 * 5 * 2 and dd["all"]["n_persons"] == 200
+        assert abs(dd["all"]["delta_a"] - 0.2) < 0.02 and abs(dd["all"]["delta_b"]) < 0.02
+        assert paired_delta_compare(real_only(run_a), real_only(run_b)) == {}
+        assert len(filter_class(run_a, "entity")) == 200 * 3 * 2 * 2 and filter_class(run_a, "all") is run_a
+        assert {r["group"] for r in filter_class(run_a, "date")} == {"birth_date"}
+
+        paths = []
+        for name, results in (("a", run_a), ("b", run_b)):
+            path = os.path.join(tmp, f"{name}.json")
+            with open(path, "w") as f:
+                json.dump({"flags": {"checkpoint": name}, "results": results, "summary": {}}, f)
+            paths.append(path)
+        texts = {}
+        for cls in ("all", "entity"):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                run_compare(Namespace(files=paths, by="form,tier", n_boot=50, cls=cls))
+            texts[cls] = buffer.getvalue()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            run_compare(Namespace(files=paths, by="form,tier", n_boot=50))
+        assert buffer.getvalue() == texts["all"], "a Namespace without cls is not the default"
+        assert "class filter" not in texts["all"] and "class filter: entity" in texts["entity"]
+        for cls, n_all in (("all", 2000), ("entity", 1200)):
+            lines = texts[cls].splitlines()
+            raw_all = [l for l in lines if l.startswith("  all ") and " diff " in l and "persons" not in l
+                       and " delta " not in l]
+            assert len(raw_all) == 1 and f"n {n_all:>6}" in raw_all[0], raw_all
+            at = lines.index(raw_all[0])
+            assert lines[at + 1].startswith("  note: the all row pools"), lines[at + 1]
+            assert any(l.startswith("  heldout|100 ") and "c sigma" in l for l in lines)
+            start = lines.index(next(l for l in lines if l.startswith("=== paired prior-controlled delta")))
+            block = lines[start:]
+            assert block[1] == "a minus b (delta)"
+            delta_all = next(l for l in block if l.startswith("  all "))
+            assert f"n {n_all:>6}" in delta_all and " c z " in delta_all and " z " in delta_all
+            assert block[block.index(delta_all) + 1].startswith("  note: the all row pools")
+            assert "entity" in texts[cls] and (("\ndate " in texts[cls]) == (cls == "all"))
+        print("13. compare --class keeps one class in every block, all keeps every class PASS")
+        print(f"14. delta block: raw diff 0 under a prior shift, delta diff "
+              f"{dd['all']['diff_delta']:.3f} z {dd['all']['z']:.0f} (clustered "
+              f"{dd['all']['z_clustered']:.0f})         PASS")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 15. the existing lines, keys and numbers: formats spelled out as they were before the clustered output
+    fixture = bio_results(60, lambda p, r: 0.4 + 0.1 * r.randn(), lambda p, r: 0.5 + 0.1 * r.randn(), 41,
+                          forms=("indist",))
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        out = print_summary("fixture", fixture, n_boot=100)
+    lines = buffer.getvalue().splitlines()
+    assert lines[0] == "" and lines[1] == "=== fixture ==="
+    assert lines[2] == (f"{'class':<8} {'tier':>5} {'n':>6} {'norm_rank':>10} {'sigma':>7} {'ref z0.5':>9} "
+                        f"{'top1':>7} {'chance':>7} {'prior':>7} {'delta':>7} {'d sigma':>8} {'d z':>6}"), lines[2]
+    s, dt = out["entity"]["100"], out["prior"]["by_tier"]["entity"]["100"]
+    assert list(s)[:9] == ["n", "norm_rank", "norm_rank_sigma", "norm_rank_bytes", "top1", "top1_sigma",
+                           "chance_norm_rank", "chance_top1", "z_vs_chance"], list(s)
+    assert list(dt)[:6] == ["n", "norm_rank", "norm_rank_prior", "delta", "delta_sigma", "z_delta"], list(dt)
+    entity_rows = real_only([r for r in fixture if r["cls"] == "entity"])
+    nr = np.array([r["norm_rank"] for r in sorted(entity_rows, key=lambda r: r["item_id"])])
+    assert s["norm_rank_sigma"] == bootstrap_sigma(nr, 100, 0) and s["n"] == 180
+    expected = (f"{'entity':<8} {'100':>5} {s['n']:>6} {s['norm_rank']:>10.4f} {s['norm_rank_sigma']:>7.4f} "
+                f"{s['z_vs_chance']:>9.1f} {s['top1']:>7.3f} {s['chance_top1']:>7.3f} "
+                f"{dt['norm_rank_prior']:>7.4f} {dt['delta']:>7.4f} {dt['delta_sigma']:>8.4f} {dt['z_delta']:>6.1f}")
+    assert lines[3] == expected, (lines[3], expected)
+    assert lines[5].startswith("date ") and lines[9] == ("prior control, per tier and attribute (delta = prior - "
+                                                         "real, positive means the name helps)")
+    assert lines[10] == (f"{'group':<12} {'tier':>5} {'n':>6} {'norm_rank':>10} {'prior':>7} {'delta':>7} "
+                         f"{'d sigma':>8} {'d z':>6}"), lines[10]
+    clustered_at = lines.index("clustered by person (bootstrap over persons with all their items; same "
+                               "resamples and seed)")
+    assert clustered_at == 16, clustered_at                      # every old line comes first, in order
+    reals = sorted(real_only(fixture), key=lambda r: r["item_id"])
+    noisy = [dict(r, norm_rank=r["norm_rank"] * 0.9) for r in reals]
+    shift = paired_compare(reals, noisy, n_boot=100)["all"]
+    assert list(shift)[:4] == ["n", "diff_norm_rank", "sigma", "z"]
+    item_diffs = [a["norm_rank"] - b["norm_rank"] for a, b in zip(reals, noisy)]
+    assert shift["sigma"] == bootstrap_sigma(item_diffs, 100, 0) and shift["n"] == 300
+    assert shift["diff_norm_rank"] == float(np.mean(item_diffs))
+    print("15. existing lines, keys, order and numbers unchanged                    PASS")
     print("all closed-book rank checks passed")
 
 

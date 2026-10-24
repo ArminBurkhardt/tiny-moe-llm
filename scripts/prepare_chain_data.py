@@ -211,6 +211,10 @@ def log_report(split: str, report: dict) -> None:
     for hops, base in report["shortcuts"].items():
         logger.info(f"{split}: {hops}-hop shortcut baselines " +
                     ", ".join(f"{k} {v:.3f}" for k, v in base.items()))
+        if hops >= 2:
+            logger.info(f"{split}: {hops}-hop penultimate_fed {base['penultimate_fed']:.3f} against "
+                        f"random {base['random']:.3f} is a known bias of the distractor recipe and "
+                        f"the line an above chance latent read has to beat")
     for comp, n in report["by_composition"].most_common():
         logger.info(f"{split}: composition {comp}: {n}")
 
@@ -250,6 +254,9 @@ def main():
     embedder = ChunkEmbedder(device=args.device, cache_size=20_000)
     seen, held_out = chains.split_compositions(args.seed)
     logger.info(f"held out 2-hop compositions: {sorted(held_out)}")
+    logger.info(f"note: the held out set is {len(held_out)} pairs with first relations "
+                f"{sorted({c[0] for c in held_out})}; kept as drawn, since a redraw changes the "
+                f"splits the pilot arms were read on")
     for name in names:
         split = f"{args.prefix}_{name}"
         count = args.train_questions if name == "train" else args.val_questions

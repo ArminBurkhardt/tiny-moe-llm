@@ -100,7 +100,7 @@ def main():
     payload["model_state_dict"] = model.state_dict()
     # a new tensor shifts every later param group's index, so the saved moments no longer describe
     # the parameters they would be paired with. Same contract as the other two migrations.
-    for key in ("optimizer_state_dict", "scheduler_state_dict"):
+    for key in ("optimizer_state_dict", "scheduler_state_dict", "fp32_masters"):
         payload.pop(key, None)
     payload["loop_inject_migration"] = {
         "source": os.path.basename(src),

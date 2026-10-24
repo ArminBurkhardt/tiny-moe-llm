@@ -238,7 +238,7 @@ def main():
     payload["model_state_dict"] = model.state_dict()
     # AdamW's moments are indexed by param-group position and these tensors changed shape, so the
     # old state cannot be paired back up. Same contract as the Phase 0 migration: a finetune seed.
-    for key in ("optimizer_state_dict", "scheduler_state_dict"):
+    for key in ("optimizer_state_dict", "scheduler_state_dict", "fp32_masters"):
         payload.pop(key, None)
     payload["ir_reshape"] = {
         "source": os.path.basename(src),

@@ -136,6 +136,12 @@ EVIDENCE_CEILING_NATS = 3.2306
 GRAD_PROBE_STEPS = (10, 100)
 GRAD_PROBE_SUFFIXES = ("key_adapter.weight", "value_adapter.weight", "down_proj.weight",
                        "loop_query_bias.weight")
+# every checkpoint carries each parameter's fp32 master under "fp32_masters" (about 4 bytes per
+# parameter on disk: 0.4 GB at 99M), so a resume continues the masters instead of reseeding them
+# from bf16. Off writes checkpoints exactly as before; a resume then reseeds as it always did
+SAVE_FP32_MASTERS = True
+# the data fields a checkpoint records, compared on resume (see split_changes)
+DATA_KEYS = ("data_dir", "train_split", "val_split")
 
 
 def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True):
@@ -213,9 +219,10 @@ def build_sft_param_groups(model: TinyMoETransformer, weight_decay: float, fresh
     Cost at 332M params: ~4.0GB of optimizer state (1.3GB masters + 2.7GB fp32 Adam moments, since
     ``torch.zeros_like(p)`` gives a master's moments fp32 where a bf16 parameter's would be bf16)
     against ~1.4GB for the pretraining arrangement -- ~2.6GB more, which a 32GB local card running
-    a halved SFT batch has to spare. Note the masters are NOT checkpointed: a resume reseeds them
-    from the bf16 weights, so sub-ulp progress accumulated since the last save is discarded. That
-    is inherent -- the saved model is bf16 either way -- and bounded by one checkpoint interval.
+    a halved SFT batch has to spare. The masters are checkpointed under ``fp32_masters`` while
+    ``SAVE_FP32_MASTERS`` is on, and a resume restores them (``restore_fp32_masters``); a
+    checkpoint without them reseeds the masters from the bf16 weights, which discards up to half
+    an ulp of sub-ulp progress per weight at every relaunch.
 
     Args:
         model: the (already bf16) model.
@@ -450,9 +457,214 @@ def pull_from_hub(repo_id: str, filename: str, dest_dir: str, token: str = None)
     return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, token=token)
 
 
+def next_grid_point(tokens: int, every: int) -> int:
+    """The first multiple of ``every`` strictly above ``tokens``.
+
+    The save and eval cadence after a resume: a relaunch at 300.4M with a 25M cadence saves next
+    at 325M, not at 325.4M, so stops and relaunches do not shift the grid. At ``tokens = 0`` (a
+    fresh run) it equals ``tokens + every``, the old form.
+
+    Args:
+        tokens: tokens trained in this run so far.
+        every: the cadence in tokens; a cadence of zero or below keeps the old ``tokens + every``.
+
+    Returns:
+        The token count at which the next save (or eval) is due.
+    """
+    if every <= 0:
+        return tokens + every
+    return (tokens // every + 1) * every
+
+
+def split_changes(saved: dict, current: dict, base_dir: str = BASE_DIR) -> list:
+    """The data fields a resume would change, as ``(name, saved value, current value)`` triples.
+
+    A field the checkpoint does not record (every checkpoint written before the fields existed)
+    is never a change. ``data_dir`` is compared as a path resolved against ``base_dir``, so a
+    relative and an absolute spelling of one directory agree.
+
+    Args:
+        saved: the checkpoint's ``sft`` fields (``data_dir``, ``train_split``, ``val_split``).
+        current: this launch's effective values, after any command line override.
+        base_dir: the root a relative ``data_dir`` resolves against.
+
+    Returns:
+        The differing fields, empty when the launch matches the checkpoint.
+    """
+    changes = []
+    for key in DATA_KEYS:
+        old = saved.get(key)
+        if old is None:
+            continue
+        new = current.get(key)
+        if key == "data_dir":
+            same = (new is not None and os.path.normpath(os.path.join(base_dir, old))
+                    == os.path.normpath(os.path.join(base_dir, new)))
+        else:
+            same = old == new
+        if not same:
+            changes.append((key, old, new))
+    return changes
+
+
+def check_split_switch(saved: dict, current: dict, allow_switch: bool,
+                       base_dir: str = BASE_DIR) -> list:
+    """Refuse a resume on other data than the checkpoint's unless the switch is asked for.
+
+    The pilot launchers default to the warm-up split, so a relaunch after the switch that forgets
+    the split would otherwise resume silently on the warm-up data.
+
+    Args:
+        saved: the checkpoint's ``sft`` fields.
+        current: this launch's effective ``data_dir``, ``train_split`` and ``val_split``.
+        allow_switch: ``--switch-split`` was passed.
+        base_dir: the root a relative ``data_dir`` resolves against.
+
+    Returns:
+        The changes (see ``split_changes``), when there are none or the switch is allowed.
+
+    Raises:
+        SystemExit: the data differ and the switch was not asked for.
+    """
+    changes = split_changes(saved, current, base_dir)
+    if changes and not allow_switch:
+        listed = "; ".join(f"{key}: checkpoint {old!r}, this launch {new!r}"
+                           for key, old, new in changes)
+        raise SystemExit(
+            f"this launch resumes on other data than the checkpoint was trained on ({listed}). "
+            f"Relaunch with the checkpoint's values, or pass --switch-split to change the data "
+            f"on purpose."
+        )
+    return changes
+
+
+def stop_needs_save(optimizer_steps: int, steps_at_last_save, slack_steps: int) -> bool:
+    """Whether a stop request should write a checkpoint before exiting.
+
+    ``False`` when the last save is within ``slack_steps`` optimizer steps: the stop is polled at
+    the log cadence only, so a STOP dropped right after a save (``stop_after_save.sh``) is seen
+    up to one log interval later, and a second file a few steps past the first is a near
+    duplicate. The save on disk is then the resume point and the steps since it are retrained.
+
+    Args:
+        optimizer_steps: optimizer steps taken so far (the scheduler's ``last_epoch``).
+        steps_at_last_save: the same count at the last save or at the resumed checkpoint, or
+            ``None`` when this process has neither (a fresh run always saves).
+        slack_steps: optimizer steps in one log interval.
+
+    Returns:
+        True when the stop must save.
+    """
+    if steps_at_last_save is None:
+        return True
+    return optimizer_steps - steps_at_last_save > slack_steps
+
+
+def fp32_master_state(named_masters) -> dict:
+    """The fp32 masters as a CPU dict keyed like the model's state dict.
+
+    Args:
+        named_masters: ``[(name, bf16_param, fp32_master)]``.
+
+    Returns:
+        ``{name: fp32 CPU tensor}``, copies that a later step cannot change.
+    """
+    return {name: master.detach().to(device="cpu", dtype=torch.float32, copy=True)
+            for name, _, master in named_masters}
+
+
+def restore_fp32_masters(named_masters, saved) -> str:
+    """Set the masters from a checkpoint's ``fp32_masters``, or reseed them from bf16.
+
+    The saved values are copied into the existing master tensors in place, so the optimizer's
+    param groups and its state (both keyed by those tensor objects) stay valid. The saved masters
+    are used only when every master has an entry of its shape and each rounds to the bf16
+    parameter just loaded (which is what the last step left behind); anything else reseeds all
+    masters from the bf16 weights, which is what every resume did before the masters were saved.
+
+    Args:
+        named_masters: ``[(name, bf16_param, fp32_master)]``, the bf16 weights already loaded.
+        saved: the checkpoint's ``fp32_masters`` dict, or None.
+
+    Returns:
+        A short description of the path taken, for the log.
+    """
+    reason = None
+    if saved is None:
+        reason = "the checkpoint carries none"
+    else:
+        for name, param, master in named_masters:
+            value = saved.get(name)
+            if value is None or tuple(value.shape) != tuple(master.shape):
+                reason = f"{name} is missing or has another shape"
+                break
+            if not torch.equal(value.to(device=param.device, dtype=param.dtype), param.detach()):
+                reason = f"{name} does not round to the loaded bf16 weight"
+                break
+    with torch.no_grad():
+        if reason is None:
+            for name, _, master in named_masters:
+                master.copy_(saved[name].to(device=master.device, dtype=master.dtype))
+            return f"restored {len(named_masters)} fp32 masters from the checkpoint"
+        for _, param, master in named_masters:
+            master.copy_(param.detach().float())
+    return f"reseeded the fp32 masters from bf16 ({reason})"
+
+
+def restore_rng_states(loop_rng: random.Random, sft_extra: dict) -> list:
+    """Restore the depth sampling RNG and the CUDA RNG when the checkpoint recorded them.
+
+    Args:
+        loop_rng: the trainer's depth sampling RNG, seeded from the config.
+        sft_extra: the checkpoint's ``sft`` fields.
+
+    Returns:
+        The names of the states restored; empty for a checkpoint that recorded neither.
+    """
+    restored = []
+    state = sft_extra.get("loop_rng_state")
+    if state is not None:
+        version, internal, gauss_next = state
+        loop_rng.setstate((version, tuple(internal), gauss_next))
+        restored.append("loop_rng")
+    cuda_state = sft_extra.get("cuda_rng_state")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(cuda_state.cpu())
+        restored.append("cuda")
+    return restored
+
+
+def run_already_complete(checkpoint_dir: str, phase: str) -> bool:
+    """True when the run in ``checkpoint_dir`` finished: its newest checkpoint is the final one
+    and ``run_state.json`` names it.
+
+    The final checkpoint is written only at the end of the last epoch, and ``run_state.json``
+    records the basename of every save, so the pair marks completion. A relaunch would otherwise
+    resume from the final checkpoint and overwrite it.
+
+    Args:
+        checkpoint_dir: the run directory.
+        phase: the profile's phase label.
+
+    Returns:
+        Whether the run is complete.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return False
+    names = [n for n in os.listdir(checkpoint_dir)
+             if n.startswith(ckpt_lib.CKPT_PREFIX) and n.endswith(".pt")]
+    if not names:
+        return False
+    newest = max(names, key=lambda n: os.path.getmtime(os.path.join(checkpoint_dir, n)))
+    if newest != ckpt_lib.final_name(phase):
+        return False
+    state = ckpt_lib.read_run_state(os.path.join(checkpoint_dir, "run_state.json"))
+    return bool(state) and state.get("phase") == phase and state.get("checkpoint") == newest
+
+
 def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token_count,
                         start_token_count, global_offset, losses, seed, phase=SFT_PHASE,
-                        kill_checked=False):
+                        kill_checked=False, sft_fields=None, fp32_masters=None):
     """Write an SFT checkpoint atomically.
 
     Deliberately its own function rather than an extension of ``utils.save_checkpoint``: SFT needs
@@ -464,6 +676,11 @@ def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token
 
     The payload is a strict **superset** of what ``utils.load_checkpoint`` expects, so
     ``scripts/inference.py`` and ``scripts/eval_calibration.py`` read an SFT checkpoint unchanged.
+
+    Args:
+        sft_fields: extra entries of the ``sft`` dict (the data the run trains on and the RNG
+            states), read back with ``.get`` so older checkpoints load without them.
+        fp32_masters: ``fp32_master_state``'s dict, stored as ``fp32_masters`` when given.
     """
     payload = {
         "model_state_dict": model.state_dict(),
@@ -478,8 +695,10 @@ def save_sft_checkpoint(model, optimizer, scheduler, path, *, epoch, step, token
         # SFT-only extras, ignored by utils.load_checkpoint's .get()-based reader
         # kill_checked: the one automatic kill decision was taken, so a resume must not take it again
         "sft": {"start_token_count": start_token_count, "seed": seed,
-                "kill_checked": kill_checked},
+                "kill_checked": kill_checked, **(sft_fields or {})},
     }
+    if fp32_masters is not None:
+        payload["fp32_masters"] = fp32_masters
     # write-then-rename, same reasoning as utils.save_checkpoint: a crash mid-write must not leave
     # a truncated .pt that is also the newest file by mtime, i.e. the one a resume would pick
     tmp_path = path + ".tmp"
@@ -518,6 +737,12 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
     sft_extra = checkpoint.get("sft", {}) or {}
     logger.info(f"Checkpoint loaded from {path}")
     return {
+        # read with .get: every checkpoint before these fields existed resumes as before
+        "data": {key: sft_extra[key] for key in DATA_KEYS if sft_extra.get(key) is not None},
+        "rng": {key: sft_extra[key] for key in ("loop_rng_state", "cuda_rng_state")
+                if sft_extra.get(key) is not None},
+        "fp32_masters": checkpoint.get("fp32_masters"),
+        "optimizer_steps": int(getattr(scheduler, "last_epoch", 0)),
         "epoch": checkpoint.get("epoch", 0),
         "step": checkpoint.get("dataset_idx", 0),
         "token_count": checkpoint.get("token_count", 0),
@@ -988,8 +1213,8 @@ def sft(args):
     else:
         cfg, phase, checkpoint_dir = SFTConfig, SFT_PHASE, SFT_CHECKPOINT_DIR
     # a subclass rather than a mutation, so every other attribute keeps inheriting and the config
-    # class other code imports is untouched. Not saved in the checkpoint: a resumed run is
-    # relaunched with the same flags, like --reader-no-rotary
+    # class other code imports is untouched. The effective values are saved in the checkpoint and
+    # a resume on other ones is refused without --switch-split, so relaunch with the same flags
     overrides = {name: value for name, value in (
         ("data_dir", getattr(args, "data_dir", None)),
         ("train_split", getattr(args, "train_split", None)),
@@ -1012,6 +1237,15 @@ def sft(args):
     # its own seed -- the resume path only checks the phase label, which is the same for both
     if args.run_name:
         checkpoint_dir = f"{checkpoint_dir}_{args.run_name}"
+    if run_already_complete(checkpoint_dir, phase):
+        logger.warning(
+            f"run already complete: {ckpt_lib.final_name(phase)} is the newest checkpoint in "
+            f"{checkpoint_dir} and run_state.json names it; nothing to train and exiting 0. A "
+            f"longer run on the same data needs a new run directory seeded from it with -c (and "
+            f"--switch-split if the split changes); a raised epoch count or token target on this "
+            f"directory is not picked up."
+        )
+        return EXIT_OK
 
     data_dir = os.path.join(BASE_DIR, cfg.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
@@ -1143,6 +1377,10 @@ def sft(args):
     start_epoch, step_offset, start_doc_idx = 0, 0, 0
     losses, resumed, resumed_kill_checked = [], False, False
     start_token_count, token_count = 0, 0
+    # what this launch trains on, after the command line overrides; saved in every checkpoint
+    data_fields = {"data_dir": cfg.data_dir, "train_split": cfg.train_split,
+                   "val_split": cfg.val_split}
+    resumed_masters, resumed_rng, steps_at_last_save = None, {}, None
 
     found = ckpt_lib.find_resume_checkpoint(
         checkpoint_dir,
@@ -1166,6 +1404,24 @@ def sft(args):
                 f"{cfg.seed}. The document order (and therefore the resume position) is a "
                 f"function of the seed -- restore the old seed or start a fresh run directory."
             )
+        if not state["data"]:
+            logger.info(
+                f"the checkpoint does not record its data (written before the field existed); "
+                f"resuming on {data_fields}"
+            )
+        else:
+            changes = check_split_switch(state["data"], data_fields,
+                                         getattr(args, "switch_split", False))
+            if changes:
+                logger.warning(
+                    "--switch-split: resuming on other data than the checkpoint's: "
+                    + "; ".join(f"{key} {old!r} -> {new!r}" for key, old, new in changes)
+                    + ". The document position carries over unchanged."
+                )
+            elif getattr(args, "switch_split", False):
+                logger.info("--switch-split passed but the data match the checkpoint's")
+        resumed_masters, resumed_rng = state.pop("fp32_masters"), state["rng"]
+        steps_at_last_save = state["optimizer_steps"]
         model._token_tracker.num_tokens = token_count
         resumed = True
         logger.info(
@@ -1200,12 +1456,18 @@ def sft(args):
         model._token_tracker.num_tokens = token_count
 
     # the masters were cloned from the random init at optimizer-construction time, before either
-    # branch above loaded weights into the model -- reseed them or the first step would undo the
-    # entire pretrained state. Adam's moments came back by param-group position on a resume, which
-    # this copy does not disturb.
-    with torch.no_grad():
-        for bf16_param, master in master_pairs:
-            master.data.copy_(bf16_param.data.float())
+    # branch above loaded weights into the model -- set them or the first step would undo the
+    # entire pretrained state. A resume restores the saved masters when the checkpoint has them,
+    # else reseeds from bf16 like a fresh run. Adam's moments came back by param-group position on
+    # a resume, which an in place copy does not disturb.
+    named_masters = [(names[id(param)], param, master) for param, master in master_pairs]
+    if resumed:
+        logger.info(restore_fp32_masters(named_masters, resumed_masters))
+    else:
+        with torch.no_grad():
+            for bf16_param, master in master_pairs:
+                master.data.copy_(bf16_param.data.float())
+    resumed_masters = None
 
     if frozen_gate is not None:
         gate_value = float(frozen_gate.detach().float().item())
@@ -1268,6 +1530,10 @@ def sft(args):
 
     full_n_loops = ModelConfig.Params["n_loops"]
     loop_rng = random.Random(cfg.seed)
+    if resumed:
+        restored = restore_rng_states(loop_rng, resumed_rng)
+        logger.info(f"RNG states restored: {restored}" if restored else
+                    "the checkpoint records no RNG state; depth sampling restarts from the seed")
     worker_state = torch.full((max(NUM_DATA_WORKERS, 1),), -1, dtype=torch.long, device=device)
 
     def snapshot_global_offset(fallback):
@@ -1283,15 +1549,21 @@ def sft(args):
     target_tokens = None  # filled in after the first log interval, once tokens/row is known
 
     def save_and_sync(epoch, step, loss_value, tokens, final=False):
+        nonlocal steps_at_last_save
         name = (ckpt_lib.final_name(phase) if final
                 else ckpt_lib.rolling_name(phase, tokens - start_token_count, loss_value))
         path = os.path.join(checkpoint_dir, name)
+        sft_fields = dict(data_fields)
+        sft_fields["loop_rng_state"] = loop_rng.getstate()
+        sft_fields["cuda_rng_state"] = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
         save_sft_checkpoint(
             unwrapped_model, optimizer, scheduler, path,
             epoch=epoch, step=step, token_count=tokens, start_token_count=start_token_count,
             global_offset=snapshot_global_offset(start_doc_idx), losses=losses,
-            seed=cfg.seed, phase=phase, kill_checked=kill_checked,
+            seed=cfg.seed, phase=phase, kill_checked=kill_checked, sft_fields=sft_fields,
+            fp32_masters=fp32_master_state(named_masters) if SAVE_FP32_MASTERS else None,
         )
+        steps_at_last_save = int(scheduler.last_epoch)
         ckpt_lib.write_run_state(run_state_path, phase, tokens, name)
         try:
             save_loss_graph(losses, loss_png)
@@ -1448,8 +1720,11 @@ def sft(args):
         )
 
     sft_tokens = token_count - start_token_count
-    next_checkpoint = sft_tokens + cfg.checkpoint_every_tokens
-    next_eval = sft_tokens + cfg.eval_every_tokens
+    # on the fixed grid, so a stop and relaunch does not shift every later save and eval
+    next_checkpoint = next_grid_point(sft_tokens, cfg.checkpoint_every_tokens)
+    next_eval = next_grid_point(sft_tokens, cfg.eval_every_tokens)
+    # a stop polled within one log interval of the last save exits on that save
+    stop_slack_steps = math.ceil(LOG_INTERVAL / max(cfg.grad_accumulation_steps, 1))
     # the IR and evidence profiles' extra schedule (the temperature anneal is --ir only, the refresh
     # is whichever profile's config sets cluster_refresh_tokens). Both are driven from the log block,
     # which already syncs the token counter -- neither adds a host sync of its own, and LOG_INTERVAL
@@ -1794,8 +2069,16 @@ def sft(args):
                 # inside vast's SIGTERM grace period
                 control.poll()
                 if control.stop_requested:
-                    logger.info(f"Stopping: {control.reason}. Saving checkpoint...")
-                    save_and_sync(epoch, step, val_loss, token_count)
+                    if stop_needs_save(int(scheduler.last_epoch), steps_at_last_save,
+                                       stop_slack_steps):
+                        logger.info(f"Stopping: {control.reason}. Saving checkpoint...")
+                        save_and_sync(epoch, step, val_loss, token_count)
+                    else:
+                        logger.info(
+                            f"Stopping: {control.reason}. The last checkpoint is "
+                            f"{int(scheduler.last_epoch) - steps_at_last_save} optimizer step(s) "
+                            f"back, within one log interval: exiting on it without another save"
+                        )
                     exit_code = control.exit_code
                     stop_training = True
                     break
@@ -1876,11 +2159,20 @@ def main():
                              "the first instead of starting from its own seed")
     parser.add_argument("--data-dir", default=None,
                         help="override the profile's data_dir (relative paths resolve against the "
-                             "repo root). Not saved in the checkpoint: pass it on every launch")
+                             "repo root). Saved in the checkpoint and checked on resume: pass it "
+                             "on every launch")
     parser.add_argument("--train-split", default=None,
-                        help="override the profile's train split. Pass it on every launch")
+                        help="override the profile's train split. Saved in the checkpoint and "
+                             "checked on resume: pass it on every launch")
     parser.add_argument("--val-split", default=None,
-                        help="override the profile's validation split. Pass it on every launch")
+                        help="override the profile's validation split. Saved in the checkpoint "
+                             "and checked on resume: pass it on every launch")
+    parser.add_argument("--switch-split", action="store_true",
+                        help="allow a resume on other data than the checkpoint recorded (data_dir, "
+                             "train or val split), e.g. the switch from the warm-up split: "
+                             "SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_X.sh with "
+                             "--switch-split. Without it such a resume is refused; pass it only on "
+                             "the one launch that switches")
     parser.add_argument("--ceiling-json", default=None,
                         help="--evidence only: the in-context ceiling file written by "
                              "scripts/evidence_ceiling_probe.py --fixed-split; each source's gold "

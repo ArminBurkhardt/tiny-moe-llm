@@ -16,7 +16,9 @@ question really differ in evidence alone, so this checks the properties the meas
 5. a question whose evidence overflows is dropped whole from the fixed split;
 6. ``EvidenceDataset`` reads both splits back;
 7. the training path (``build_corpus`` + ``apply_condition`` with a reservoir) is unchanged by the
-   pool parameter: it consumes the same rng draws whether or not the parameter exists.
+   pool parameter: it consumes the same rng draws whether or not the parameter exists;
+8. the training reservoir draw never returns the row's own gold and counts the redraws, and a
+   reservoir without the gold draws and consumes exactly what the text sample did before.
 
 Needs the pruned tokenizer (``utils.TOKENIZER_DIR``); no GPU.
 """
@@ -237,6 +239,31 @@ def main():
             assert with_default == explicit_none
             assert rng_a.random() == rng_b.random()
     print("7. training path: pool=None is the default path                     PASS")
+
+    # 8. the training reservoir draw never returns the row's own gold, counts the redraws, and
+    # draws exactly what the old text sample drew when the reservoir holds no gold
+    row = EvidenceRow(question="q", answer="a", gold=["g1"], near=[])
+    redrawn = []
+    for seed in range(200):
+        reservoir = deque(["g1", "g1"] + [f"r{i}" for i in range(6)])
+        rng = random.Random(seed)
+        chunks, flags, _, _ = apply_condition(row, "distractors", reservoir, rng, 3,
+                                              on_gold_redraw=redrawn.append)
+        assert "g1" not in chunks and len(chunks) == 3 and not any(flags), (seed, chunks)
+        clean = deque([f"r{i}" for i in range(8)])
+        rng_new, rng_old = random.Random(seed), random.Random(seed)
+        clean_hits = []
+        new = apply_condition(row, "distractors", clean, rng_new, 3, on_gold_redraw=clean_hits.append)
+        assert new[0] == rng_old.sample(list(clean), 3) and not clean_hits, seed
+        # the whole call consumes the old sample and the refusal pick, nothing more
+        rng_old_after = random.Random(seed)
+        rng_old_after.sample(list(clean), 3)
+        abstention.pick(abstention.ABSTENTIONS_PASSAGE_TRAIN, rng_old_after)
+        rng_new_after = random.Random(seed)
+        apply_condition(row, "distractors", clean, rng_new_after, 3)
+        assert rng_new_after.random() == rng_old_after.random(), seed
+    assert redrawn and min(redrawn) >= 1
+    print(f"8. training path excludes the row's gold ({sum(redrawn)} draws redrawn)  PASS")
     print("all held-out checks passed")
 
 

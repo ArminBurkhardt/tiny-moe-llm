@@ -6,11 +6,27 @@ label, a share of the target prompt tokens and a pass cap. An input with only ``
 plain slice: it contributes prompt tokens and no evidence. The output is one split the trainer reads
 as it reads any other: ``EvidenceDataset`` when ``{split}.ev`` exists, ``SFTDataset`` otherwise.
 
-Output files (the sidecars ``src``, ``factspan``, ``evhop`` and ``chains.jsonl`` are not merged):
+Output files (the sidecars ``factspan``, ``evhop`` and ``chains.jsonl`` are not merged):
 
     evidence form   bin idx mask ev evidx evchunk evkey evkeyidx evgold cond ans
     --no-evidence   bin idx mask
     always          slice (uint8 per document: the slice index in ``--slice`` order), merge.json
+    all or none     src (uint8 per document, the source index ``prepare_evidence_data`` writes)
+
+``src`` is carried only when every input slice has ``{prefix}.src``, and then copied per document
+unchanged. A merge where some slice lacks it writes no ``src`` at all, because the trainer reads the
+file for every document or not at all, and a filler value for the slices without one would print a
+per source line for a source that was never labelled. Today only the held-out evidence splits (and
+the ``--sources-only`` backfill) write ``src``.
+
+``merge.json`` also reports, per slice and in total, the documents the evidence reader drops as too
+long for a row (``over_evidence_reader_row_limit``): the reader packs a row to ``seq_length - 1``
+positions and a document costs its prompt tokens, one more when it does not start with BOS, plus
+``num_mtp_tokens`` separator slots, so a document whose cost exceeds ``seq_length - 1`` is never
+trained on by an evidence arm (the plain reader keeps it). ``--seq-length``, ``--num-mtp-tokens``
+and ``--bos-id`` set that rule; nothing is dropped by the merge itself. ``md5_mask_by_slice`` is
+the md5 of each slice's ``.mask`` bytes in output order, so a merge that differs from another only
+in the loss mask is caught next to ``md5_by_slice``.
 
 ``evidx`` and ``evkeyidx`` are rebuilt cumulatively; ``evchunk`` is a chunk index within its
 document and is copied unchanged unless ``--max-chunks-per-doc`` drops chunks. A plain slice's
@@ -67,6 +83,7 @@ NONE_CONDITION = CONDITIONS.index("none")
 MAX_CHUNKS_PER_SEGMENT = 256
 PLAIN_SUFFIXES = ("bin", "idx", "mask")
 SIDE_FILES = ("slice", "merge.json")
+SOURCE_FILE = "src"
 
 
 @dataclass
@@ -129,6 +146,10 @@ class SliceSource:
         self.idx = np.fromfile(path("idx"), dtype=np.uint64)
         self.n_docs = len(self.idx) - 1
         assert len(self.bin) == len(self.mask) == int(self.idx[-1]), f"{spec.prefix}: bin, mask, idx disagree"
+        self.has_src = os.path.isfile(path(SOURCE_FILE))
+        if self.has_src:
+            self.src = np.memmap(path(SOURCE_FILE), dtype=np.uint8, mode="r")
+            assert len(self.src) == self.n_docs, f"{spec.prefix}: src disagrees with idx"
         self.has_evidence = os.path.isfile(path("ev"))
         self.has_labels = False
         if self.has_evidence:
@@ -227,7 +248,8 @@ def cap_chunks(gold: np.ndarray, cap: int) -> np.ndarray:
 
 
 def output_paths(out_dir: str, split: str) -> List[str]:
-    return [os.path.join(out_dir, f"{split}.{s}") for s in set(EVIDENCE_SUFFIXES) | set(SIDE_FILES)]
+    suffixes = set(EVIDENCE_SUFFIXES) | set(SIDE_FILES) | {SOURCE_FILE}
+    return [os.path.join(out_dir, f"{split}.{s}") for s in suffixes]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -243,6 +265,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="per slice cap on chunks kept per document (0 = none); gold always kept")
     p.add_argument("--max-evidence-tokens", type=int, default=4608,
                    help="the trainer drops documents above this; only counted in the report")
+    p.add_argument("--seq-length", type=int, default=4096,
+                   help="the trainer's row length; only read for the evidence reader's row limit report")
+    p.add_argument("--num-mtp-tokens", type=int, default=2,
+                   help="separator slots the reader adds per document (mtp_num_extra_tokens); report only")
+    p.add_argument("--bos-id", type=int, default=0,
+                   help="the reader prepends this to a document that does not start with it; report only")
     p.add_argument("--order-from", default=None, metavar="SLICE_FILE",
                    help="reuse the document order of an earlier merge's .slice file instead of "
                         "drawing one; the per slice document counts must match")
@@ -302,6 +330,11 @@ def merge(args: argparse.Namespace) -> dict:
     cond_out = np.full(n_docs, NONE_CONDITION, dtype=np.uint8)
     ans_out = np.ones(n_docs, dtype=np.uint8)
     md5 = [hashlib.md5() for _ in sources]
+    md5_mask = [hashlib.md5() for _ in sources]
+    carry_src = all(src.has_src for src in sources)
+    src_out = np.zeros(n_docs, dtype=np.uint8) if carry_src else None
+    row_limit = args.seq_length - 1
+    over_row = [dict(documents=0, tokens=0) for _ in sources]
     stats = [dict(documents=0, prompt_tokens=0, evidence_tokens=0, chunks=0,
                   over_evidence_cap=0, over_chunk_limit=0) for _ in sources]
     pos = [0] * len(sources)
@@ -315,6 +348,13 @@ def merge(args: argparse.Namespace) -> dict:
         a, b = int(src.idx[d]), int(src.idx[d + 1])
         ids = src.bin[a:b]
         md5[s].update(ids)
+        mask = src.mask[a:b]
+        md5_mask[s].update(mask)
+        if b > a and (b - a) + int(int(ids[0]) != args.bos_id) + args.num_mtp_tokens > row_limit:
+            over_row[s]["documents"] += 1
+            over_row[s]["tokens"] += b - a
+        if carry_src:
+            src_out[n] = src.src[d]
         e_ids = e_chunk = e_keys = e_gold = None
         n_ev = n_chunks = 0
         if src.has_evidence:
@@ -344,7 +384,7 @@ def merge(args: argparse.Namespace) -> dict:
         st["over_evidence_cap"] += int(n_ev > args.max_evidence_tokens)
         st["over_chunk_limit"] += int(n_chunks > MAX_CHUNKS_PER_SEGMENT)
         files["bin"].write(ids)
-        files["mask"].write(src.mask[a:b])
+        files["mask"].write(mask)
         if evidence and n_chunks + n_ev:
             files["ev"].write(e_ids)
             files["evchunk"].write(e_chunk)
@@ -361,6 +401,8 @@ def merge(args: argparse.Namespace) -> dict:
         cond_out.tofile(out("cond"))
         ans_out.tofile(out("ans"))
     order.tofile(out("slice"))
+    if carry_src:
+        src_out.tofile(out(SOURCE_FILE))
 
     for spec, src, st, h in zip(args.slices, sources, stats, md5):
         st.update(label=spec.label, source_documents=src.n_docs, share_target=spec.share,
@@ -377,6 +419,13 @@ def merge(args: argparse.Namespace) -> dict:
         slices=stats, md5_by_slice={st["label"]: st["md5"] for st in stats},
         documents=n_docs, prompt_tokens=tokens, evidence_tokens=ev_tokens, chunks=chunks,
         evidence_ratio=ev_tokens / max(tokens, 1), gap_to_target=args.target_tokens - tokens,
+        md5_mask_by_slice={spec.label: h.hexdigest() for spec, h in zip(args.slices, md5_mask)},
+        over_evidence_reader_row_limit=dict(
+            seq_length=args.seq_length, num_mtp_tokens=args.num_mtp_tokens, bos_id=args.bos_id,
+            row_limit=row_limit, documents=sum(o["documents"] for o in over_row),
+            tokens=sum(o["tokens"] for o in over_row),
+            by_slice={spec.label: o for spec, o in zip(args.slices, over_row)}),
+        src_carried=carry_src,
     )
     with open(out("merge.json"), "w") as f:
         json.dump(result, f, indent=2)
@@ -399,6 +448,14 @@ def report(result: dict, args: argparse.Namespace) -> None:
         f"  total: {result['documents']:,} docs, {result['prompt_tokens']:,} prompt tokens, "
         f"{result['evidence_tokens']:,} evidence tokens, ratio {result['evidence_ratio']:.3f}, "
         f"gap to --target-tokens {result['gap_to_target']:,}")
+    over = result["over_evidence_reader_row_limit"]
+    per_slice = ", ".join(f"{label} {o['documents']:,} docs / {o['tokens']:,} tokens"
+                          for label, o in over["by_slice"].items())
+    lines.append(
+        f"  over the evidence reader's row limit (prompt + BOS if missing + {over['num_mtp_tokens']} "
+        f"MTP slots > {over['row_limit']}, dropped by an evidence arm, kept by the plain reader): "
+        f"{over['documents']:,} docs, {over['tokens']:,} prompt tokens ({per_slice})")
+    lines.append(f"  src carried: {result['src_carried']} (only when every slice has {{prefix}}.src)")
     for p in sorted(output_paths(args.out_dir, args.split)):
         if os.path.exists(p):
             lines.append(f"  {os.path.basename(p)}: {os.path.getsize(p):,} bytes")

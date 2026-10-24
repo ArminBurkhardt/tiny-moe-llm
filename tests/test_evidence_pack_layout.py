@@ -65,4 +65,26 @@ def _check(real, dump, name):
 _check([0, 2, 4, 6, 8], [1, 3, 5, 7, 9], "1. right padded")
 # left padded: dump segment first (0, 2, ...), real last (1, 3, ...)
 _check([1, 3, 5, 7, 9], [0, 2, 4, 6, 8], "2. left padded")
+
+
+def _check_unsorted_refused():
+    # the left padded layout as the packer wrote it before the fix: real tokens before the dump
+    seg = torch.tensor([[1, 1, 0, 0], [3, 3, 2, 2]])
+    with torch.no_grad():
+        try:
+            evidence_cu_seqlens(seg, 4)
+        except AssertionError as e:
+            assert "sorted by segment" in str(e), str(e)
+        else:
+            raise AssertionError("an unsorted evidence axis was accepted under no_grad")
+        cu, _ = evidence_cu_seqlens(torch.tensor([[0, 0, 1, 1], [2, 2, 3, 3]]), 4)
+        assert cu.tolist() == [0, 2, 4, 6, 8], cu.tolist()
+    # with gradients on (the training forward) the check is skipped and nothing syncs: same counts
+    with torch.enable_grad():
+        cu, _ = evidence_cu_seqlens(seg, 4)
+    assert cu.tolist() == [0, 2, 4, 6, 8], cu.tolist()
+    print("3. unsorted evidence axis refused under no_grad, unchecked with grad on  PASS")
+
+
+_check_unsorted_refused()
 print("all evidence pack layout checks passed")

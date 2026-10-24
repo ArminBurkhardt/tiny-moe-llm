@@ -132,7 +132,7 @@ def main():
     reader = sum(p.numel() for name, p in model.named_parameters() if "shared_evidence." in name)
 
     payload["model_state_dict"] = model.state_dict()
-    for key in ("optimizer_state_dict", "scheduler_state_dict"):
+    for key in ("optimizer_state_dict", "scheduler_state_dict", "fp32_masters"):
         payload.pop(key, None)
     payload["evidence_port_migration"] = {
         "source": os.path.basename(src),

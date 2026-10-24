@@ -16,9 +16,12 @@ The distractors are built so a shortcut has nothing to hold on to:
     C   one complete decoy chain of the same relations from a start entity that shares a name part
         with the true start
 
-``shortcut_baselines`` measures five leak detectors on a list of questions, and the test bounds
+``shortcut_baselines`` measures six leak detectors on a list of questions, and the test bounds
 them: a generator whose answer can be picked by frequency or by the question's own subject would
-make every composition reading meaningless.
+make every composition reading meaningless. One of them, ``penultimate_fed``, does sit above chance
+on two or more hops (about 0.256 against 0.185 on 2-hop): the gold, decoy and B-distractor final
+subjects are fed by the second-to-last relation while the A-distractor feeders are drawn from any
+relation into the final domain, so an above-chance latent read has to beat that line, not 1 over K.
 
 The module is pure Python and builds no embedder and no tokenizer. The written bridge helpers
 (``bridge_answer`` and the eval's row bookkeeping) and the statistics helpers at the bottom
@@ -519,15 +522,18 @@ def shortcut_baselines(questions: List[ChainQuestion]) -> Dict[str, float]:
     frequent, ``named_subject`` the object of a chunk whose subject the question names (when it is
     a candidate), ``final_object`` a uniform pick among the objects of final relation chunks,
     ``recurring_subject`` a uniform pick among final relation objects whose subject also occurs in
-    another chunk (gold and decoy bridges do), and ``random`` is the chance line, a uniform pick
-    among the candidates. Ties are scored by their expected value. For two or more hops every
-    picker must sit near ``random``.
+    another chunk (gold and decoy bridges do), ``penultimate_fed`` a uniform pick among the distinct
+    final relation objects whose subject is the object of a chunk of the second-to-last relation
+    (chance on one hop, or when no such object exists), and ``random`` is the chance line, a uniform
+    pick among the candidates. Ties are scored by their expected value. For two or more hops every
+    picker but ``penultimate_fed`` must sit near ``random``; that one reads a known bias of the
+    distractor recipe (the module docstring) and is the line a latent composition read must beat.
 
     Args:
         questions: the questions to score.
     """
     totals = {"frequent": 0.0, "infrequent": 0.0, "named_subject": 0.0, "final_object": 0.0,
-              "recurring_subject": 0.0, "random": 0.0}
+              "recurring_subject": 0.0, "penultimate_fed": 0.0, "random": 0.0}
     for q in questions:
         final = q.composition[-1]
         pool = [o for s, r, o in q.chunk_facts if r == final]
@@ -552,6 +558,16 @@ def shortcut_baselines(questions: List[ChainQuestion]) -> Dict[str, float]:
         low = q.question.lower()
         named = [o for s, _, o in q.chunk_facts if s.lower() in low and o in counts]
         totals["named_subject"] += (float(named[0] == q.answer) if named else 1.0 / len(q.candidates))
+        fed: List[str] = []
+        if len(q.composition) >= 2:
+            fed_subjects = {o for _, r, o in q.chunk_facts if r == q.composition[-2]}
+            for s, r, o in q.chunk_facts:
+                if r == final and s in fed_subjects and o not in fed:
+                    fed.append(o)
+        if fed:
+            totals["penultimate_fed"] += (1.0 / len(fed)) if q.answer in fed else 0.0
+        else:
+            totals["penultimate_fed"] += 1.0 / len(q.candidates)
     n = max(len(questions), 1)
     return {k: v / n for k, v in totals.items()}
 

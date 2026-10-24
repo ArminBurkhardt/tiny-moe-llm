@@ -72,6 +72,17 @@ distractor by five documents costs five copies of its 384 floats. Deduplicating 
 chunk table and a second level of indirection; at ~0.8 KB a copy the duplication is cheaper than the
 machinery, and it keeps a document's evidence contiguous on disk.
 
+Changed 2026-10-24, next build only: a training row's reservoir draw no longer returns the row's
+own gold passage. SQuAD train is ordered by context, so the earlier questions on the same paragraph
+sit in the reservoir, and before this date about 0.3% of ``distractors`` rows carried the gold
+passage under a refusal target. A draw that hits the row's gold is replaced by a second draw from
+the reservoir slots that are neither already drawn nor the row's gold (the held-out path's
+``DistractorPool`` excludes the same set), and the replaced draws are counted per source as
+``gold_redrawn`` in the state and the report. A draw that hits nothing consumes the rng exactly as
+before, so a rebuild stays byte identical up to the first row whose draw hits its own gold and
+differs from there on (the extra draw moves the condition stream). The held-out build is
+untouched: it draws from ``DistractorPool`` and never reaches the reservoir.
+
 ``evgold`` exists because ``apply_condition`` shuffles the gold chunk(s) into the distractors for
 ``mixed``/``many`` and, by design, forgets which one it was -- a selection loss needs the label back,
 and it has to live on the chunk axis because the mix itself is what makes selection a real task.
@@ -648,7 +659,9 @@ class DistractorPool:
 def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: random.Random,
                     num_distractors: int,
                     many_distractors: Tuple[int, int] = (16, 32),
-                    pool: Optional[DistractorPool] = None) -> Tuple[List[str], List[bool], str, bool]:
+                    pool: Optional[DistractorPool] = None,
+                    on_gold_redraw: Optional[Callable[[int], None]] = None,
+                    ) -> Tuple[List[str], List[bool], str, bool]:
     """Turn one row plus a condition into ``(chunk texts, gold flags, target answer, answerable)``.
 
     The abstention targets are the load-bearing part. Under ``distractors`` and ``none`` the answer
@@ -666,6 +679,17 @@ def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: ran
     natively unanswerable SQuAD row takes an abstention target under ``gold`` exactly like it does
     under ``none``, and telling those two apart is the whole job of a groundedness readout. A
     language modeling row is always answerable -- its continuation is its continuation.
+
+    Args:
+        row: the rendered row.
+        condition: one of ``CONDITIONS``.
+        reservoir: recent chunk texts of the row's source, the training build's distractor stream.
+        rng: the condition stream.
+        num_distractors: distractors ``mixed`` and ``distractors`` draw when the row ships fewer.
+        many_distractors: ``(min, max)`` distractor count of ``many``.
+        pool: the held-out build's fixed pool; when given the reservoir is not read.
+        on_gold_redraw: called with the number of reservoir draws that hit the row's own gold and
+            were replaced (training path only, never with 0).
     """
     unanswerable = not row.answer
 
@@ -679,8 +703,20 @@ def apply_condition(row: EvidenceRow, condition: str, reservoir: deque, rng: ran
                 picked.extend(pool.draw(k - len(picked), set(row.gold), picked, rng))
             return picked
         if len(picked) < k and reservoir:
-            extra = rng.sample(list(reservoir), min(k - len(picked), len(reservoir)))
-            picked.extend(extra)
+            slots = list(reservoir)
+            # sampling slot indices draws exactly what sampling the texts drew, so a draw that
+            # misses the row's gold leaves the rng stream as it was before the exclusion existed
+            chosen = rng.sample(range(len(slots)), min(k - len(picked), len(slots)))
+            gold = set(row.gold)
+            hits = sum(slots[i] in gold for i in chosen)
+            chosen = [i for i in chosen if slots[i] not in gold]
+            if hits:
+                taken = set(chosen)
+                rest = [i for i in range(len(slots)) if i not in taken and slots[i] not in gold]
+                chosen.extend(rng.sample(rest, min(hits, len(rest))))
+                if on_gold_redraw is not None:
+                    on_gold_redraw(hits)
+            picked.extend(slots[i] for i in chosen)
         return picked
 
     if condition == "gold":
@@ -876,6 +912,7 @@ def build_corpus(
     # documents is SQuAD v2's natively unanswerable share showing through, which is expected
     state.setdefault("answerable_docs", 0)
     state.setdefault("skipped", {})
+    state.setdefault("gold_redrawn", {})
     for split in (train_split, val_split):
         state["splits"].setdefault(split, {})
     for entry in source_entries:
@@ -886,6 +923,7 @@ def build_corpus(
         state["skipped"].setdefault(
             entry["key"], {"too_long": 0, "unrenderable": 0, "no_evidence": 0, "holdout": 0},
         )
+        state["gold_redrawn"].setdefault(entry["key"], 0)
 
     writers = {s: EvidenceWriter(data_dir, s, state["splits"][s]) for s in (train_split, val_split)}
     split_rng = random.Random(seed)
@@ -1048,6 +1086,10 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
 
     condition = pick_condition(entry["condition_weights"], cond_rng)
 
+    def count_redraws(n: int) -> None:
+        redrawn = state.setdefault("gold_redrawn", {})
+        redrawn[key] = redrawn.get(key, 0) + n
+
     if render == "webtext":
         pieces = split_webtext_document(raw, chunk_rng, chunk_tokens, max_doc_tokens,
                                         held_tokens=webtext_held_tokens)
@@ -1062,7 +1104,7 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
         gold_texts = [template.tokenizer.decode(c, skip_special_tokens=True) for c in held]
         chunk_texts, gold_flags, _, answerable = apply_condition(
             EvidenceRow(gold=gold_texts, lm=True), condition, reservoir, cond_rng, num_distractors,
-            many_distractors=many_distractors,
+            many_distractors=many_distractors, on_gold_redraw=count_redraws,
         )
         reservoir.extend(gold_texts)
         record = {"conversation": None, "ids": ids, "mask": mask, "chunks": chunk_texts,
@@ -1075,6 +1117,7 @@ def _render_row(raw, entry, template, state, reservoir, cond_rng, chunk_rng, *,
             return None
         chunk_texts, gold_flags, answer, answerable = apply_condition(
             row, condition, reservoir, cond_rng, num_distractors, many_distractors=many_distractors,
+            on_gold_redraw=count_redraws,
         )
         reservoir.extend(row.gold)
         reservoir.extend(row.near)
@@ -1739,6 +1782,8 @@ def main():
             f"conversations)"
             + (f", {passes} passes" if passes > 1 else "")
             + f", skipped {final['skipped'][e['key']]}"
+            + f", {final.get('gold_redrawn', {}).get(e['key'], 0):,} distractor draws redrawn "
+              f"off the row's own gold"
         )
         if e["render"] == "messages":
             replay_tokens += s["tokens"]

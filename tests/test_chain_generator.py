@@ -11,6 +11,8 @@ so this checks the properties the measurement leans on:
 4. the leak detectors (most frequent entity, least frequent entity, the object of the named
    subject, any final relation object, a final relation object whose subject recurs) sit within
    0.05 of chance for two or more hops;
+4b. the second-to-last hop picker (``penultimate_fed``, a known bias of the distractor recipe) is
+   reported, sits above chance on 2-hop and 3-hop eval questions and equals chance on one hop;
 5. held out 2-hop compositions never appear in the train split's 2-hop or 3-hop questions, every
    relation still appears in a seen composition, and 4-hop questions exist only in the hop4 split;
 6. ``.evhop`` is nonzero exactly where ``.evgold`` is, with hop h on exactly one chunk per hop, and
@@ -155,6 +157,17 @@ def main():
     assert one["named_subject"] > 0.9, one
     print("4. shortcut baselines vs chance (hops >= 2): " + ", ".join(
         f"{k} {v:.3f}" for k, v in base.items()) + "   PASS")
+
+    # 4b. the second-to-last hop picker is computed and sits above chance on a small eval set
+    eval_qs = pcd.make_split_questions("eval", 0, 42, held, per_hop=300)
+    for hops in (2, 3):
+        b = chains.shortcut_baselines([q for q in eval_qs if q.hops == hops])
+        assert "penultimate_fed" in b and b["penultimate_fed"] > b["random"] + 0.03, (hops, b)
+    b1 = chains.shortcut_baselines([q for q in eval_qs if q.hops == 1])
+    assert abs(b1["penultimate_fed"] - b1["random"]) < 1e-12, b1
+    b2 = chains.shortcut_baselines([q for q in eval_qs if q.hops == 2])
+    print(f"4b. penultimate_fed above chance on 2-hop eval: {b2['penultimate_fed']:.3f} vs random "
+          f"{b2['random']:.3f}, chance on 1-hop   PASS")
 
     # 5. held out compositions and the 4-hop split
     train_qs = draw(3000, 5, held)

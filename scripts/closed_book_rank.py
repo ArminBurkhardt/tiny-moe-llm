@@ -16,6 +16,13 @@ reading is ``delta = norm_rank_prior - norm_rank`` per item, positive when the n
 bootstrap sigma over items paired by id. A tier is "above the prior" when ``delta > 3 sigma`` and
 "at the prior" when ``|delta| <= 3 sigma``. The 0.5 line stays in the summary as a reference only.
 
+One person contributes several items (every attribute, every form) that share exposure and whether
+the person was stored, so the item bootstrap understates sigma. Every sigma therefore has a twin
+that resamples persons with all their items (``sigma_clustered``, ``z_clustered``), printed in extra
+tables after the item tables, which are unchanged. ``compare`` also pairs the prior-controlled
+``delta`` (``paired_delta_compare``), since the raw rank moves with the prior, and ``--class``
+narrows it to one attribute class.
+
 The library half (``RankItem``, ``rank_items``, ``summarize``, ``paired_compare``) takes a duck typed
 backend (``encode_many``, ``score``, ``bos_id``, and ``score_with_evidence`` only when items carry
 evidence), so a test can drive it with a scripted scorer and another script can drive it with its own
@@ -203,6 +210,56 @@ def bootstrap_sigma(values: Sequence[float], n_boot: int = 1000, seed: int = 0) 
     return float(np.concatenate(means).std(ddof=1))
 
 
+def person_key(result: dict) -> str:
+    """The person an item belongs to: ``person_id`` when annotated, else the item id's first field.
+
+    A biography item id is ``{person_id}:{attribute}:{form}`` (a prior control adds ``PRIOR_SUFFIX``),
+    so both routes give the same key; an id without ``:`` is its own person.
+
+    Args:
+        result: one ``rank_items`` result.
+    """
+    if "person_id" in result:
+        return str(result["person_id"])
+    return result["item_id"].removesuffix(PRIOR_SUFFIX).split(":")[0]
+
+
+def cluster_bootstrap_sigma(values: Sequence[float], clusters: Sequence, n_boot: int = 1000,
+                            seed: int = 0) -> float:
+    """Standard deviation of the mean of ``values`` over bootstrap resamples of whole clusters.
+
+    Clusters are drawn with replacement and each drawn cluster brings all of its items, so items
+    that share a person (exposure, stored or not) are not counted as independent. The mean of a
+    resample is its item mean (sum over count), which weighs clusters of unequal size as the item
+    mean does.
+
+    Args:
+        values: one number per item.
+        clusters: one cluster label per item, any hashable printed the same way for equal labels.
+        n_boot: resamples.
+        seed: the resampling seed.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.size < 2:
+        return 0.0
+    _, inverse = np.unique(np.asarray([str(c) for c in clusters]), return_inverse=True)
+    n_clusters = int(inverse.max()) + 1
+    sums = np.bincount(inverse, weights=values, minlength=n_clusters)
+    counts = np.bincount(inverse, minlength=n_clusters).astype(np.float64)
+    rng = np.random.default_rng(seed)
+    means = []
+    block = max(1, min(n_boot, 2_000_000 // n_clusters))
+    for start in range(0, n_boot, block):
+        count = min(block, n_boot - start)
+        draw = rng.integers(0, n_clusters, size=(count, n_clusters))
+        means.append(sums[draw].sum(axis=1) / counts[draw].sum(axis=1))
+    return float(np.concatenate(means).std(ddof=1))
+
+
+def _n_persons(rows: Sequence[dict]) -> int:
+    return len({person_key(r) for r in rows})
+
+
 def _group_key(result: dict, by: Sequence[str]) -> str:
     return "|".join(str(result[k]) for k in by)
 
@@ -223,9 +280,11 @@ def summarize(results: List[dict], *, by: Sequence[str] = ("tier",), n_boot: int
 
     Returns:
         ``{group_key: {"n", "norm_rank", "norm_rank_sigma", "norm_rank_bytes", "top1", "top1_sigma",
-        "chance_norm_rank", "chance_top1", "z_vs_chance"}}`` plus an ``"all"`` entry. ``z_vs_chance``
-        is ``(0.5 - norm_rank) / sigma``, positive when better than 0.5. That line is a reference
-        only; the reading that counts is ``prior_deltas``. Control items (ids ending in
+        "chance_norm_rank", "chance_top1", "z_vs_chance", "n_persons", "sigma_clustered",
+        "z_clustered"}}`` plus an ``"all"`` entry. ``z_vs_chance`` is ``(0.5 - norm_rank) / sigma``,
+        positive when better than 0.5. That line is a reference only; the reading that counts is
+        ``prior_deltas``. ``sigma_clustered`` is the ``norm_rank`` sigma resampling persons
+        (``person_key``) and ``z_clustered`` the reference z on it. Control items (ids ending in
         ``PRIOR_SUFFIX``) must be left out of ``results`` by the caller.
     """
     ordered = sorted(results, key=lambda r: r["item_id"])
@@ -245,6 +304,9 @@ def summarize(results: List[dict], *, by: Sequence[str] = ("tier",), n_boot: int
             "chance_norm_rank": 0.5, "chance_top1": float(np.mean([1.0 / r["n"] for r in rows])),
             "z_vs_chance": _z(0.5 - float(nr.mean()), sigma),
         }
+        sigma_c = cluster_bootstrap_sigma(nr, [person_key(r) for r in rows], n_boot, seed)
+        out[key].update({"n_persons": _n_persons(rows), "sigma_clustered": sigma_c,
+                         "z_clustered": _z(0.5 - float(nr.mean()), sigma_c)})
     return out
 
 
@@ -277,20 +339,25 @@ def prior_deltas(results: List[dict], *, by: Sequence[str] = ("tier",), n_boot: 
         seed: the resampling seed.
 
     Returns:
-        ``{group_key: {"n", "norm_rank", "norm_rank_prior", "delta", "delta_sigma", "z_delta"}}`` plus
-        an ``"all"`` entry; empty when no item has a control. ``delta`` is positive when the name
-        helps and ``delta_sigma`` is the bootstrap sigma of the mean paired difference (a nonzero
-        delta with zero sigma reads as z of plus or minus 1e6).
+        ``{group_key: {"n", "norm_rank", "norm_rank_prior", "delta", "delta_sigma", "z_delta",
+        "n_persons", "sigma_clustered", "z_clustered"}}`` plus an ``"all"`` entry; empty when no item
+        has a control. ``delta`` is positive when the name helps and ``delta_sigma`` is the bootstrap
+        sigma of the mean paired difference (a nonzero delta with zero sigma reads as z of plus or
+        minus 1e6). ``sigma_clustered`` and ``z_clustered`` are the same reading resampling persons.
     """
     by_id = {r["item_id"]: r for r in results}
     groups: Dict[str, List[Tuple[float, float]]] = {"all": []}
+    persons: Dict[str, List[str]] = {"all": []}
     for item_id in sorted(by_id):
         control = by_id.get(item_id + PRIOR_SUFFIX)
         if control is None or is_prior(by_id[item_id]):
             continue
         pair = (by_id[item_id]["norm_rank"], control["norm_rank"])
-        groups.setdefault(_group_key(by_id[item_id], by), []).append(pair)
+        key = _group_key(by_id[item_id], by)
+        groups.setdefault(key, []).append(pair)
         groups["all"].append(pair)
+        persons.setdefault(key, []).append(person_key(by_id[item_id]))
+        persons["all"].append(person_key(by_id[item_id]))
     if not groups["all"]:
         return {}
     out = {}
@@ -302,6 +369,10 @@ def prior_deltas(results: List[dict], *, by: Sequence[str] = ("tier",), n_boot: 
         out[key] = {"n": len(pairs), "norm_rank": float(real.mean()), "norm_rank_prior": float(prior.mean()),
                     "delta": delta, "delta_sigma": sigma,
                     "z_delta": _z(delta, sigma) if sigma > 0 or delta == 0 else math.copysign(1e6, delta)}
+        sigma_c = cluster_bootstrap_sigma(prior - real, persons[key], n_boot, seed)
+        out[key].update({"n_persons": len(set(persons[key])), "sigma_clustered": sigma_c,
+                         "z_clustered": _z(delta, sigma_c) if sigma_c > 0 or delta == 0
+                         else math.copysign(1e6, delta)})
     return out
 
 
@@ -320,21 +391,86 @@ def paired_compare(results_a: List[dict], results_b: List[dict], *, by: Sequence
         seed: the resampling seed.
 
     Returns:
-        ``{group_key: {"n", "diff_norm_rank", "sigma", "z"}}`` plus an ``"all"`` entry.
+        ``{group_key: {"n", "diff_norm_rank", "sigma", "z", "n_persons", "sigma_clustered",
+        "z_clustered"}}`` plus an ``"all"`` entry; the clustered pair resamples persons.
     """
     b_by_id = {r["item_id"]: r for r in results_b}
     ids = sorted(r["item_id"] for r in results_a if r["item_id"] in b_by_id)
     a_by_id = {r["item_id"]: r for r in results_a}
     groups: Dict[str, List[float]] = {"all": []}
+    persons: Dict[str, List[str]] = {"all": []}
     for item_id in ids:
         diff = a_by_id[item_id]["norm_rank"] - b_by_id[item_id]["norm_rank"]
-        groups.setdefault(_group_key(a_by_id[item_id], by), []).append(diff)
+        key = _group_key(a_by_id[item_id], by)
+        groups.setdefault(key, []).append(diff)
         groups["all"].append(diff)
+        persons.setdefault(key, []).append(person_key(a_by_id[item_id]))
+        persons["all"].append(person_key(a_by_id[item_id]))
     out = {}
     for key, diffs in groups.items():
         mean = float(np.mean(diffs)) if diffs else 0.0
         sigma = bootstrap_sigma(diffs, n_boot, seed)
         out[key] = {"n": len(diffs), "diff_norm_rank": mean, "sigma": sigma, "z": _z(mean, sigma)}
+        sigma_c = cluster_bootstrap_sigma(diffs, persons[key], n_boot, seed)
+        out[key].update({"n_persons": len(set(persons[key])), "sigma_clustered": sigma_c,
+                         "z_clustered": _z(mean, sigma_c)})
+    return out
+
+
+def paired_delta_compare(results_a: List[dict], results_b: List[dict], *, by: Sequence[str] = ("tier",),
+                         n_boot: int = 1000, seed: int = 0) -> dict:
+    """Difference of the prior-controlled ``delta`` (a minus b) over the items both runs scored.
+
+    Per item and run ``delta = norm_rank_prior - norm_rank`` as in ``prior_deltas``; the paired
+    difference is ``delta_a - delta_b``, positive when ``a`` binds the name to the value more than
+    ``b`` beyond what each run's fresh-name prior gives. A prior that moves between runs moves the
+    raw ``paired_compare`` reading and leaves this one alone. Only items with a control in both runs
+    count.
+
+    Args:
+        results_a: one run's ``rank_items`` output with its ``|prior`` controls.
+        results_b: another run's, over the same item ids.
+        by: result keys that define a group.
+        n_boot: resamples.
+        seed: the resampling seed.
+
+    Returns:
+        ``{group_key: {"n", "delta_a", "delta_b", "diff_delta", "sigma", "z", "n_persons",
+        "sigma_clustered", "z_clustered"}}`` plus an ``"all"`` entry; empty when no item has a
+        control in both runs.
+    """
+    a_by_id = {r["item_id"]: r for r in results_a}
+    b_by_id = {r["item_id"]: r for r in results_b}
+    groups: Dict[str, List[Tuple[float, float]]] = {"all": []}
+    persons: Dict[str, List[str]] = {"all": []}
+    for item_id in sorted(a_by_id):
+        if is_prior(a_by_id[item_id]) or item_id not in b_by_id:
+            continue
+        control_a = a_by_id.get(item_id + PRIOR_SUFFIX)
+        control_b = b_by_id.get(item_id + PRIOR_SUFFIX)
+        if control_a is None or control_b is None:
+            continue
+        pair = (control_a["norm_rank"] - a_by_id[item_id]["norm_rank"],
+                control_b["norm_rank"] - b_by_id[item_id]["norm_rank"])
+        key = _group_key(a_by_id[item_id], by)
+        groups.setdefault(key, []).append(pair)
+        groups["all"].append(pair)
+        persons.setdefault(key, []).append(person_key(a_by_id[item_id]))
+        persons["all"].append(person_key(a_by_id[item_id]))
+    if not groups["all"]:
+        return {}
+    out = {}
+    for key, pairs in groups.items():
+        delta_a = np.array([p[0] for p in pairs])
+        delta_b = np.array([p[1] for p in pairs])
+        diffs = delta_a - delta_b
+        mean = float(diffs.mean())
+        sigma = bootstrap_sigma(diffs, n_boot, seed)
+        sigma_c = cluster_bootstrap_sigma(diffs, persons[key], n_boot, seed)
+        out[key] = {"n": len(pairs), "delta_a": float(delta_a.mean()), "delta_b": float(delta_b.mean()),
+                    "diff_delta": mean, "sigma": sigma, "z": _z(mean, sigma),
+                    "n_persons": len(set(persons[key])), "sigma_clustered": sigma_c,
+                    "z_clustered": _z(mean, sigma_c)}
     return out
 
 
@@ -624,7 +760,33 @@ def print_summary(title: str, results: List[dict], n_boot: int = 1000) -> dict:
             if rows:
                 print(f"{tier:>5} {len(rows):>6} {np.mean([r['follow'] for r in rows]):>8.3f} "
                       f"{np.mean([r['mr_ll'] for r in rows]):>11.3f}")
+    _print_clustered_summary(out, prior_tier, prior_group, has_prior)
     return out
+
+
+def _print_clustered_summary(out: dict, prior_tier: dict, prior_group: dict, has_prior: bool) -> None:
+    """The person-clustered sigmas and z of every row ``print_summary`` printed, as extra tables."""
+    print("clustered by person (bootstrap over persons with all their items; same resamples and seed)")
+    print(f"{'class':<8} {'tier':>5} {'n':>6} {'persons':>8} {'c sigma':>8} {'c ref z':>8} "
+          f"{'c d sigma':>10} {'c d z':>6}")
+    for cls in ("entity", "date", "noun"):
+        if cls not in out:
+            continue
+        summary, deltas = out[cls], prior_tier.get(cls, {})
+        for tier, s in _tier_rows(summary) + [("all", summary["all"])]:
+            d = deltas.get(tier)
+            tail = f" {d['sigma_clustered']:>10.4f} {d['z_clustered']:>6.1f}" if d else ""
+            print(f"{cls:<8} {tier:>5} {s['n']:>6} {s['n_persons']:>8} {s['sigma_clustered']:>8.4f} "
+                  f"{s['z_clustered']:>8.1f}{tail}")
+    if has_prior:
+        print("clustered by person, prior control per tier and attribute")
+        print(f"{'group':<12} {'tier':>5} {'n':>6} {'persons':>8} {'delta':>7} {'c d sigma':>10} {'c d z':>6}")
+        for cls, table in prior_group.items():
+            for key in sorted(k for k in table if k != "all"):
+                tier, group = key.split("|")
+                d = table[key]
+                print(f"{group:<12} {tier:>5} {d['n']:>6} {d['n_persons']:>8} {d['delta']:>7.4f} "
+                      f"{d['sigma_clustered']:>10.4f} {d['z_clustered']:>6.1f}")
 
 
 def micro_verdict(arms: Dict[str, List[dict]], n_boot: int = 1000) -> Tuple[str, dict]:
@@ -760,6 +922,24 @@ def run_bios(args) -> None:
         logger.info(f"wrote {path}")
 
 
+POOLED_NOTE = ("  note: the all row pools the classes and forms in the files, so a fact read on both forms "
+               "counts once per form (twice); read per form with --by form,tier")
+CLASSES = ("entity", "date", "noun")
+
+
+def filter_class(results: List[dict], cls: str) -> List[dict]:
+    """The results of one attribute class (``all`` keeps every result), prior controls included.
+
+    Args:
+        results: annotated ``rank_items`` output; a result without ``cls`` is classed by its group.
+        cls: ``entity``, ``date``, ``noun`` or ``all``.
+    """
+    assert cls == "all" or cls in CLASSES, cls
+    if cls == "all":
+        return results
+    return [r for r in results if (r["cls"] if "cls" in r else bio.attribute_class(r["group"])) == cls]
+
+
 def run_compare(args) -> None:
     runs = []
     for path in args.files:
@@ -767,6 +947,13 @@ def run_compare(args) -> None:
             runs.append(json.load(f))
     by = tuple(args.by.split(","))
     names = ("full", "masked", "retrieval") if len(runs) == 3 else ("a", "b")
+    cls_filter = getattr(args, "cls", "all")
+    # the verdict reads entities on its own, so it always gets the whole files
+    unfiltered = [run["results"] for run in runs]
+    if cls_filter != "all":
+        print(f"class filter: {cls_filter} items only (every block below)")
+        for run in runs:
+            run["results"] = filter_class(run["results"], cls_filter)
     for name, run in zip(names, runs):
         print_summary(f"{name}: {run['flags'].get('checkpoint', '?')}", run["results"], args.n_boot)
     print("\n=== paired differences (norm_rank, first minus second; negative favours the first) ===")
@@ -778,9 +965,28 @@ def run_compare(args) -> None:
         for key, s in sorted(cmp.items()):
             print(f"  {key:<24} n {s['n']:>6}  diff {s['diff_norm_rank']:>8.4f}  "
                   f"sigma {s['sigma']:.4f}  z {s['z']:>6.1f}")
+            if key == "all":
+                print(POOLED_NOTE)
+        print("  clustered by person (raw norm_rank, same rows)")
+        for key, s in sorted(cmp.items()):
+            print(f"  {key:<24} persons {s['n_persons']:>6}  diff {s['diff_norm_rank']:>8.4f}  "
+                  f"c sigma {s['sigma_clustered']:.4f}  c z {s['z_clustered']:>6.1f}")
+    print("\n=== paired prior-controlled delta (delta = prior - real per item and run; first minus second;"
+          " POSITIVE favours the first: it binds names more) ===")
+    for i, j in pairs:
+        print(f"{names[i]} minus {names[j]} (delta)")
+        cmp = paired_delta_compare(runs[i]["results"], runs[j]["results"], by=by, n_boot=args.n_boot)
+        if not cmp:
+            print("  no item carries a prior control in both files; nothing to pair")
+            continue
+        for key, s in sorted(cmp.items()):
+            print(f"  {key:<24} n {s['n']:>6}  delta {s['delta_a']:>7.4f} {s['delta_b']:>7.4f}  "
+                  f"diff {s['diff_delta']:>8.4f}  sigma {s['sigma']:.4f}  z {s['z']:>6.1f}  "
+                  f"persons {s['n_persons']:>5}  c sigma {s['sigma_clustered']:.4f}  c z {s['z_clustered']:>6.1f}")
+            if key == "all":
+                print(POOLED_NOTE)
     if len(runs) == 3:
-        for form, (line, _) in micro_verdicts(dict(zip(names, (r["results"] for r in runs))),
-                                              args.n_boot).items():
+        for form, (line, _) in micro_verdicts(dict(zip(names, unfiltered)), args.n_boot).items():
             print(f"\nverdict ({form} form): {line}")
 
 
@@ -812,6 +1018,9 @@ def main():
     c.add_argument("files", nargs="+", help="two result files, or three in the order full masked "
                                             "retrieval for the verdict")
     c.add_argument("--by", default="tier", help="comma separated result keys, e.g. tier,group")
+    c.add_argument("--class", dest="cls", choices=("all",) + CLASSES, default="all",
+                   help="read one attribute class only in every block but the three arm verdict "
+                        "(default all: every class)")
     c.add_argument("--n-boot", type=int, default=1000)
 
     args = parser.parse_args()

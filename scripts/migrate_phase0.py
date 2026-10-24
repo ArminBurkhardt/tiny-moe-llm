@@ -217,7 +217,7 @@ def main():
     # the optimizer state is indexed by param-group POSITION, and two tensors just left the model,
     # so every moment after the removed heads would be paired with the wrong parameter on load.
     # A migrated checkpoint is a finetune starting point, not a resume point -- drop it and say so.
-    for key in ("optimizer_state_dict", "scheduler_state_dict"):
+    for key in ("optimizer_state_dict", "scheduler_state_dict", "fp32_masters"):
         payload.pop(key, None)
     payload["phase0_migration"] = {
         "source": os.path.basename(args.checkpoint),

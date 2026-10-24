@@ -17,11 +17,16 @@ labels) merged through ``scripts/merge_evidence_splits.py`` and checked for:
 5. ``--max-chunks-per-doc`` keeps every gold chunk, cuts distractors to the cap, renumbers chunks
    and trims tokens and keys to match;
 6. ``EvidenceDataset`` iterates the merged split and ``SFTDataset`` the plain form (needs the pruned
-   tokenizer, skipped without it).
+   tokenizer, skipped without it);
+7. ``over_evidence_reader_row_limit`` counts exactly the documents whose prompt, plus BOS when
+   missing, plus the MTP slots, exceed ``seq_length - 1``, per slice and in total;
+8. ``md5_mask_by_slice`` is the md5 of each slice's mask bytes in output order and moves only for a
+   slice whose mask changed, with ``md5_by_slice`` unchanged;
+9. ``src`` is carried per document when every slice has it and written nowhere when one lacks it.
 
 GPU free.
 """
-import os, sys, json, shutil, tempfile
+import os, sys, json, shutil, hashlib, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -159,6 +164,13 @@ def expected_selection(slices, target, seed):
         out.append((spec, mes.select_documents(src.lengths, int(spec.share * target), spec.max_passes,
                                                seed, spec.label)))
     return out
+
+
+def copy_split(src_dir, name, dst_dir):
+    os.makedirs(dst_dir, exist_ok=True)
+    for f in os.listdir(src_dir):
+        if f.startswith(name + "."):
+            shutil.copy(os.path.join(src_dir, f), os.path.join(dst_dir, f))
 
 
 def file_bytes(directory, split, suffixes):
@@ -317,7 +329,83 @@ def main():
             assert any("evidence_ids" in b and "chunk_gold" in b for b in batches)
             plain_batches = list(iter(SFTDataset(data_dir=plain_dir, split="m", **kwargs)))
             assert batches and plain_batches
+            assert tokenizer.bos_token_id == mes.build_parser().get_default("bos_id")
             print(f"6. EvidenceDataset ({len(batches)} batches) and SFTDataset ({len(plain_batches)}) read the merge   PASS")
+
+        # 7. the evidence reader's row limit report
+        seq, mtp, bos = 64, 2, 0
+        lens = [61, 62, 61, 60, 63, 20, 59]
+        first = [bos, bos, 7, 7, bos, 7, 9]
+        long_dir = os.path.join(root, "long")
+        os.makedirs(long_dir)
+        ids = np.concatenate([np.r_[f, np.full(n - 1, 11)] for n, f in zip(lens, first)]).astype(np.uint16)
+        ids.tofile(os.path.join(long_dir, "long.bin"))
+        np.ones(len(ids), dtype=np.uint8).tofile(os.path.join(long_dir, "long.mask"))
+        np.concatenate([[0], np.cumsum(lens)]).astype(np.uint64).tofile(os.path.join(long_dir, "long.idx"))
+        over = [n + int(f != bos) + mtp > seq - 1 for n, f in zip(lens, first)]
+        assert over == [False, True, True, False, True, False, False]
+        res7 = run(os.path.join(root, "rowlimit"), "m", 10 ** 6, 7,
+                   [f"long={long_dir}/long:0.5", f"qa={src}/qa:0.5"],
+                   ["--seq-length", "4096", "--num-mtp-tokens", str(mtp), "--bos-id", str(bos)])
+        assert res7["over_evidence_reader_row_limit"]["documents"] == 0
+        res7 = run(os.path.join(root, "rowlimit"), "m", 10 ** 6, 7,
+                   [f"long={long_dir}/long:0.5", f"qa={src}/qa:0.5"],
+                   ["--seq-length", str(seq), "--num-mtp-tokens", str(mtp), "--bos-id", str(bos),
+                    "--overwrite"])
+        rl = res7["over_evidence_reader_row_limit"]
+        qa_over = [int(n) + 1 + mtp > seq - 1 for n in mes.SliceSource(mes.parse_slice(f"qa={src}/qa:1")).lengths]
+        assert rl["row_limit"] == seq - 1 and rl["by_slice"]["qa"]["documents"] == sum(qa_over)
+        assert rl["by_slice"]["long"] == dict(documents=sum(over),
+                                              tokens=sum(n for n, o in zip(lens, over) if o)), rl
+        qa_lens = mes.SliceSource(mes.parse_slice(f"qa={src}/qa:1")).lengths
+        assert rl["documents"] == 3 + sum(qa_over) and 0 < sum(qa_over) < len(qa_over)
+        assert rl["tokens"] == 62 + 61 + 63 + int(qa_lens[np.asarray(qa_over)].sum())
+        on_disk = json.load(open(os.path.join(root, "rowlimit", "m.merge.json")))
+        assert on_disk["over_evidence_reader_row_limit"] == rl
+        assert result["over_evidence_reader_row_limit"]["documents"] == 0
+        print(f"7. evidence reader row limit: {rl['documents']} docs, {rl['tokens']} tokens over   PASS")
+
+        # 8. the mask digest
+        for si, (spec, _) in enumerate(sel):
+            got = b"".join(d["mask"].tobytes() for d, k in zip(docs, slice_ids) if k == si)
+            assert result["md5_mask_by_slice"][spec.label] == hashlib.md5(got).hexdigest(), spec.label
+        masked_src = os.path.join(root, "src_mask")
+        copy_split(src, "qa", masked_src)
+        qa_mask = np.fromfile(os.path.join(masked_src, "qa.mask"), dtype=np.uint8)
+        (1 - qa_mask).astype(np.uint8).tofile(os.path.join(masked_src, "qa.mask"))
+        res8 = run(os.path.join(root, "maskdrift"), "m", target, 7,
+                   [s.replace(f"{src}/qa", f"{masked_src}/qa") for s in slices])
+        assert res8["md5_by_slice"] == result["md5_by_slice"]
+        for label in ("bios", "plain", "nolab"):
+            assert res8["md5_mask_by_slice"][label] == result["md5_mask_by_slice"][label], label
+        assert res8["md5_mask_by_slice"]["qa"] != result["md5_mask_by_slice"]["qa"]
+        print("8. md5_mask_by_slice catches a mask-only drift in its slice alone   PASS")
+
+        # 9. src all or none
+        labelled = os.path.join(root, "src_lab")
+        source_bytes = {}
+        for i, name in enumerate(("bios", "qa", "plain", "nolab")):
+            copy_split(src, name, labelled)
+            n_docs = len(np.fromfile(os.path.join(src, f"{name}.idx"), dtype=np.uint64)) - 1
+            source_bytes[name] = ((np.arange(n_docs) + 3 * i) % 6).astype(np.uint8)
+            source_bytes[name].tofile(os.path.join(labelled, f"{name}.src"))
+        lab_slices = [s.replace(f"{src}/", f"{labelled}/") for s in slices]
+        lab_out = os.path.join(root, "src_out")
+        res9 = run(lab_out, "m", target, 7, lab_slices)
+        assert res9["src_carried"] and not result["src_carried"]
+        merged_src = load(lab_out, "m", "src", np.uint8)
+        assert len(merged_src) == len(slice_ids)
+        counters = [0] * len(sel)
+        for n, s_id in enumerate(slice_ids):
+            spec, picks = sel[s_id]
+            assert merged_src[n] == source_bytes[spec.label][int(picks[counters[s_id]])]
+            counters[s_id] += 1
+        assert file_bytes(lab_out, "m", suffixes) == file_bytes(out, "m", suffixes)
+        os.remove(os.path.join(labelled, "nolab.src"))
+        res9b = run(lab_out, "m", target, 7, lab_slices, ["--overwrite"])
+        assert not res9b["src_carried"] and not os.path.exists(os.path.join(lab_out, "m.src"))
+        assert not os.path.exists(os.path.join(out, "m.src"))
+        print("9. src carried per document when every slice has it, absent otherwise   PASS")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

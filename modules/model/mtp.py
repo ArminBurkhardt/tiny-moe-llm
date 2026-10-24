@@ -91,15 +91,19 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
     gone: it beat ``p_correct`` on ECE and AUROC on the real checkpoint, and ``1 - p_correct``
     scored below chance at flagging unanswerable questions (docs/CONCLUSION.md).
     """
-    valid = labels != -100
-    n_valid = valid.sum()
-    if n_valid == 0:
+    if hidden.size(0) == 0:
         # keep the head in the autograd graph so DDP still sees its grads
         z = lm_head(hidden[:1]).sum() * 0.0
         if collect_metrics:
             zm = z.new_zeros(())
             return z, {"p_max": zm, "top1_acc": zm}
         return z
+
+    valid = labels != -100
+    # clamped instead of branching on a device count (a host sync per call): with no valid label
+    # every chunk's sum is exactly zero, so the clamp turns 0 / 0 into the zero the old early
+    # return gave, and with one or more valid labels it changes nothing
+    n_valid = valid.sum().clamp_min(1)
 
     if weights is None:
         denominator = n_valid
