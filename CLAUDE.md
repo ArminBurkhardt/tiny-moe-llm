@@ -16,8 +16,18 @@ Restructured 2026-10-24 after the repository review.
 
 ### State (2026-10-24)
 
-- **Running:** nothing from this queue; the three re-reads on arm P's final with the fixed packer
-  are done (`ckpts/inject/pilot_p_ladder2_{abstention,store_pathway,store_edit}.*`).
+- **Running:** nothing; the three re-reads on arm P's final with the fixed packer and the bge
+  routed A4 flip read are done
+  (`ckpts/inject/pilot_p_ladder2_{abstention,store_pathway,store_edit,store_edit_bge}.*`).
+- **Decided 2026-10-24 (the user):** R4 (loss placement by coda) is dropped, obsolete on R9: the
+  model composes at 0.997 on held-out compositions once the intermediate entity is written out,
+  so the loop no longer has to compose in silence; the coda stays unbuilt. R6 (the
+  pretraining-text leak probe) is skipped: its mechanism is already read at micro (arm (a) stores
+  plain-text facts under the normal loss, tier 100 `delta` 0.378; arm (b), fact spans masked,
+  stores nothing; arm C repeats arm (a) at pilot shape), so the run spec uses that lever (the
+  spans to keep out of the weights are masked, or plain-text facts are accepted into them) in
+  place of a new arm. A4's flip read gets a bge routed variant (retrieval through the store's bge
+  query keys, the serving configuration, in place of the model's own query, which finds nothing).
 - **Just read:** R9, the written bridge (`docs/measurements/written_bridge_pilot.md`): held-out
   2-hop 0.997 against chance 0.191 at the final (0.982 already at 10M), 3-hop 0.997, read sites
   past the first adding +0.002 +- 0.001, 4-hop at chance because the model writes the two steps it
@@ -26,12 +36,17 @@ Restructured 2026-10-24 after the repository review.
   fix read its buffer shifted. The A3 generation and A7 pathway re-reads on arm P's final: A3 weak
   in generation (EM 0.05, abstention 0.77 under gold; likelihood unchanged), A7 oracle-buffer EM
   0.09 against the model's query at 0.001; the A4 edit flip read still unreadable on the model's
-  query route (1 of 2,000 answered before the edit). Arm E4
+  query route (1 of 2,000 answered before the edit). The A4 flip read on the bge route (2026-10-24,
+  `eval_store.py edit --route bge`, built the same day, the serving configuration; 95 of 2,000
+  answered before the edit, same record): delete flip 0.90 +- 0.035 (n 72, stuck 7) against the bar
+  0.70, so the facts the model answers from live in the store; edit flip 0.13 +- 0.07 (n 23,
+  follow 3, stuck 1), and 0.09 follow with the edited chunk attached directly, a generation
+  weakness on real questions, not a store failure. Arm E4
   (`docs/measurements/expert_count_pilot.md`: the expert count is a cost choice); the repository
   review (`docs/review_2026-10-24.md`).
-- **Next, in order:** the review's held code changes with their tests, one commit; R6's data
-  build, the review's throughput items 1 to 4 first.
-- **Open for the user:** R4's coda corner (recommended dropped on R9's read); the goal's reasoning
+- **Next, in order:** R5 on the chosen shape and the run spec; nothing training. The review's
+  held code changes wait on the GPU (their Open items row).
+- **Open for the user:** the goal's reasoning
   clause reworded on R9 (written tokens); R4b's sublayer half; how the next pilot-shape arm is
   matched after the 4094-token finding; a clean validation slice; the two micro retriever arms;
   6f's abstention reward against the A3 re-read.
@@ -43,17 +58,18 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 | item | status | the read that gates it | waiting on |
 |---|---|---|---|
 | the review's held code changes (bf16 CE accumulation in `mtp.py`; per-segment and log-space selection loss; the `evidence_contrastive_loops` default; an evidence-only groundedness input; the evidence reader's 4094 rule and the row estimator; the evidence-padding chunk boundary; the dense-slot GEMM skip; the frozen-gate skip; the eval-pass rewrite; fp32 selection scores under loss-free) | held | bit-identity tests on the GPU | the GPU |
-| A4 edit, a flip read routed through bge | the re-reads of 2026-10-24 on arm P's final with the fixed packer are done (A3 weak in generation: EM 0.05, abstention 0.77 under gold; A7 oracle route readable, EM 0.09, the model's query 0.001; the A4 flip read still unreadable on the model's query route, 1 of 2,000 answered before the edit); the 2026-10-14 reads predate the packer fix (`af24c70`) and are void | `eval_store.py edit` extended to route through bge, on arm P's final | a build; the user; due before 6f's abstention reward is fixed |
+| A4 edit, a flip read routed through bge | closed: read 2026-10-24 (`scripts/eval_store.py edit --route bge` on arm P's final, retrieval through the store's bge query keys, the serving configuration; `ckpts/inject/pilot_p_ladder2_store_edit_bge.*`; 95 of 2,000 answered before the edit): delete holds (flip 0.90 +- 0.035, n 72, bar 0.70), edit fails on generation (flip 0.13 +- 0.07, n 23; the edited chunk attached directly followed 0.09); the edit half goes to 6f with A3 | none | nothing |
+| R5, the winner, eval only | next, on the chosen shape (the A4 bge read done 2026-10-24) | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | the chosen shape |
 | a clean validation slice (documents neither builder used) | proposed, not built | `eval_exit.py` on the arm P, C and E4 finals | the user (a corpus decision) |
 | a value-to-name closed-book probe | proposed, mode not built | arm P's final | a build |
 | how the next pilot-shape arm is matched | open (arm C alone trained on the 4094-token rows, 50.11M tokens) | none | the user |
-| R4, the coda corner | recommended dropped on R9's final read (2026-10-24: composition lives in written tokens); open | none | the user |
+| R4, the coda corner | closed: dropped 2026-10-24 (the user), obsolete on R9 (composition at 0.997 held out once the intermediate entity is written out); the coda stays unbuilt | none | nothing |
 | R4b, the sublayer half | open; the review recommends a cost choice, no arms | none at pilot scale | the user |
 | two micro retriever arms (the contrastive term at loop 1 with the trunk gradient on; per-segment selection weighting) | proposed | store recall and held-out CE against `w0e3` | the user |
 | two leak candidates (value-first templates; distractor-collision spans) | proposed, builder changes | one micro warm-up arm each | the user |
-| R6, pretraining-text facts | next rung (R9 read 2026-10-24) | closed-book hop-1 and 2-hop accuracy | its data build, the review's throughput items 1 to 4 first |
+| R6, pretraining-text facts | closed: skipped 2026-10-24 (the user); its mechanism is read at micro (arm (a) stores plain-text facts, tier 100 `delta` 0.378; arm (b), spans masked, stores nothing; arm C repeats arm (a) at pilot shape) and the run spec uses that lever | none | nothing |
 | the goal's reasoning clause reworded | open since 2026-10-17; R9 read 2026-10-24: composes in written tokens, not in the loop | none | the user |
-| 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth | the A3 generation re-read (weak, 2026-10-24); decode with evidence through a KV cache | the real run |
+| 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
 | 6a throughput, 6c corpus on the rented cluster, 6d run spec | after every other spec decision (2026-10-21) | none | the rows above |
 
 **The design page moves with the architecture and the plan.** Any change to the architecture (a
@@ -538,7 +554,7 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
      [written_bridge_pilot.md](docs/measurements/written_bridge_pilot.md): passes by a wide margin,
      held-out 2-hop 0.997 against chance 0.191, composition in written tokens, not the loop), whose
      read gates R4's corner arm (R4 staged: arm P the baseline cell, the far corner with the
-     unbuilt coda first, five arms at most; recommended dropped on R9's read, open for the user), then R6; R4b's sublayer half needs the unbuilt
+     unbuilt coda first, five arms at most; recommended dropped on R9's read; dropped 2026-10-24 by the user, obsolete on R9), then R6 (skipped 2026-10-24 by the user); R4b's sublayer half needs the unbuilt
      three-sublayer core, its build open for the user.
   Spec written 2026-10-09 ([PILOT.md](docs/plans/PILOT.md)); build list done 2026-10-10 (its
   "Build" section). Launch: `bash ckpts/inject/launch_pilot_p.sh` (warm-up split; after the switch
@@ -783,7 +799,7 @@ python scripts/prepare_chain_data.py --out-dir data/prepared --prefix chains_bri
 python scripts/eval_chains.py -c CKPT --data-dir data/prepared --splits chains_eval,chains_heldout_tmpl,chains_hop4 --depths 3,4 --sites all --generate-bridge [--bridge-max-tokens 48] --json-out OUT.json
 python scripts/build_store.py --name openqa --sources nq,triviaqa,hotpotqa --max-questions 3000 --chunk-tokens 128 --device cuda --seed 42
 python scripts/build_store.py --edit-from openqa --name openqa_edit --edit-fraction 0.5 --neighbour-cos 0.85 --device cpu --seed 42
-python scripts/eval_store.py recall|pathway|edit -c CKPT --store data/index/openqa [--edit-store data/index/openqa_edit] --buffer 4 --loop 1 --json-out OUT.json
+python scripts/eval_store.py recall|pathway|edit -c CKPT --store data/index/openqa [--edit-store data/index/openqa_edit] --buffer 4 --loop 1 [--route bge] --json-out OUT.json   # edit --route bge: serving time retrieval by the store bge query keys
 TINY_LLM_CONFIG=config_micro.yaml python scripts/probe_query_head.py -c CKPT --store data/index/openqa --batch-size 16 --pool last|mean|meanlast --json-out OUT.json
 TINY_LLM_CONFIG=config_pilot.yaml python scripts/probe_depth_memory.py -c ckpts/inject/seed_pilot_grounded.pt --settings 3:0,5:0,5:2 --json-out OUT.json   # [--batch-size 4]
 python scripts/eval_benchmarks.py -c CKPT --tasks popqa --rank-candidates 20 --json-out OUT.json
@@ -996,7 +1012,8 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   then the row's first segment), with a non-decreasing assert on CPU tensors, because
   `evidence_cu_seqlens` counts tokens per segment. Before that date every left padded decode with
   evidence read its buffer shifted by the dump width, so the A3 generation and A7 pathway (and A4
-  edit) reads before 2026-10-24 are void. `tests/test_evidence_pack_layout.py`.
+  edit) reads before 2026-10-24 are void; all three were re-read on the fixed packer that day, A4
+  on the bge route (`eval_store.py edit --route bge`). `tests/test_evidence_pack_layout.py`.
 - `evidence_selection_loss`: BCE per visible chunk vs gold, renormalized over the token's visible
   chunks, averaged over every (loop, IR expert), weight 0.1. Supervised at the positions that
   produce a supervised token (`labels[:, 1:] != -100` shifted to `:-1`), the positions

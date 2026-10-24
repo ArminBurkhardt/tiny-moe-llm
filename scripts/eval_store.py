@@ -22,6 +22,10 @@ per checkpoint, and ranks a store with it. Three questions, three subcommands:
     ``follow`` (the substitute), ``stuck`` (the original), ``abstained`` or ``other``. A flip is
     ``follow`` for an edit and not ``stuck`` for a delete; the line passes at 0.70 per kind. The
     oracle row attaches the edited gold chunk directly and is a diagnostic, not a gate.
+    ``--route`` picks who retrieves the buffer: ``model`` (the default) uses the model's query at
+    ``--loop`` against the adapted index; ``bge`` uses the question's bge query key from the
+    original store against the raw bge keys of each store, as serving does, and ``--loop`` then
+    plays no part. The model generates the answers through the port either way.
 
 The query is read with ``evidence=None``: the first retrieval of a session happens before any
 evidence is in the state. Scoring is exact brute force over the index. A model with no port
@@ -32,7 +36,7 @@ python scripts/eval_store.py recall -c CKPT --store data/index/openqa --k 1,2,5,
 python scripts/eval_store.py pathway -c CKPT --store data/index/openqa --buffer 4 --loop 1 \\
   --max-questions 2000 --batch-size 16 --max-new-tokens 32 --json-out out.json
 python scripts/eval_store.py edit -c CKPT --store data/index/openqa --edit-store data/index/openqa_edit \\
-  --buffer 4 --loop 1 --json-out out.json
+  --buffer 4 --loop 1 [--route model|bge] --json-out out.json
 python scripts/eval_store.py recall --bge-only --store data/index/openqa
 ```
 """
@@ -428,6 +432,39 @@ def sample_questions(store: Store, per_source: Optional[int], seed: int) -> List
     return sorted(chosen)
 
 
+def edit_queries(route: str, store: Store, qids: Sequence[str],
+                 model_queries: Optional[np.ndarray] = None) -> np.ndarray:
+    """The retrieval query per sampled question for the edit read, in ``qids`` order.
+
+    Args:
+        route: ``"model"`` returns ``model_queries`` unchanged; ``"bge"`` returns the questions'
+            bge query keys from ``store``, looked up by qid in ``questions.jsonl`` order.
+        store: the original store, whose ``query_keys`` the bge route reads.
+        qids: question ids of the sampled questions, in the order the rows are wanted.
+        model_queries: ``[len(qids), D]`` model queries; required for the model route.
+
+    Returns:
+        float32 ``[len(qids), D]`` for the bge route, ``model_queries`` itself for the model route.
+
+    Raises:
+        SystemExit: on an unknown route, a missing input, or a qid absent from ``store``.
+    """
+    if route == "model":
+        if model_queries is None:
+            raise SystemExit("the model route needs the model's queries")
+        return model_queries
+    if route != "bge":
+        raise SystemExit(f"unknown route {route!r}")
+    if store.query_keys is None:
+        raise SystemExit(f"{store.root} has no query_keys_bge.npy, the bge route cannot run")
+    row_of = {q["qid"]: i for i, q in enumerate(store.questions)}
+    missing = [qid for qid in qids if qid not in row_of]
+    if missing:
+        raise SystemExit(f"{len(missing)} qids are not in {store.root}, first {missing[0]!r}")
+    rows = np.array([row_of[qid] for qid in qids], dtype=np.int64)
+    return store.query_keys[rows].astype(np.float32)
+
+
 def headline_loop(args, model) -> int:
     """Zero-based index of the loop the headline numbers are read at, from ``--loop`` (one-based).
 
@@ -576,8 +613,13 @@ def cmd_pathway(args) -> dict:
 def cmd_edit(args) -> dict:
     """Score the same questions on the original and the edit store and classify each answer change.
 
+    Under ``--route bge`` the buffers are retrieved by the bge query keys of the original store
+    against the raw bge keys of the original store (before) and of the edit store (after), with no
+    model forward for the query; ``--loop`` is then not read and ``loop`` is recorded as None.
+
     Args:
-        args: parsed arguments (``store``, ``edit_store``, ``checkpoint``, ``loop``, ``max_questions``, ``seed``).
+        args: parsed arguments (``store``, ``edit_store``, ``checkpoint``, ``loop``, ``route``,
+            ``max_questions``, ``seed``).
 
     Returns:
         The summary dict that is also printed and optionally written as JSON.
@@ -595,22 +637,30 @@ def cmd_edit(args) -> dict:
         random.Random(args.seed).shuffle(edits)
         edits = edits[:args.max_questions]
 
+    route = args.route
     model, tokenizer, template = load_eval_model(args)
-    loop = headline_loop(args, model)
     questions = [by_qid[e["qid"]] for e in edits]
     prompts = [question_prompt(template, q["question"]) for q in questions]
-    queries = extract_queries(model, prompts, pad_id=tokenizer.pad_token_id, device=args.device,
-                              batch_size=args.batch_size)[(0, loop)]
+    if route == "model":
+        loop = headline_loop(args, model)
+        model_queries = extract_queries(model, prompts, pad_id=tokenizer.pad_token_id, device=args.device,
+                                        batch_size=args.batch_size)[(0, loop)]
+        before_index = adapted_index(model, original.keys, 0, args.device)
+    else:
+        model_queries = None
+        before_index = original.keys.astype(np.float32)
+    queries = edit_queries(route, original, [e["qid"] for e in edits], model_queries)
 
-    top = topk_ids(queries, adapted_index(model, original.keys, 0, args.device), args.buffer, args.device)
+    top = topk_ids(queries, before_index, args.buffer, args.device)
     rows = [evidence_row(tokenizer, original, ids) for ids in top]
     before = generate_answers(model, tokenizer, template, prompts, rows, args)
     correct = [i for i, (q, a) in enumerate(zip(questions, before)) if exact_match(a, q["answers"])]
     logger.info(f"[edit] {len(correct):,}/{len(edits):,} answered correctly on the original store")
 
     sub_prompts = [prompts[i] for i in correct]
-    top_after = topk_ids(queries[correct], adapted_index(model, edited.keys, 0, args.device),
-                         args.buffer, args.device)
+    after_index = (adapted_index(model, edited.keys, 0, args.device) if route == "model"
+                   else edited.keys.astype(np.float32))
+    top_after = topk_ids(queries[correct], after_index, args.buffer, args.device)
     after = generate_answers(model, tokenizer, template, sub_prompts,
                              [evidence_row(tokenizer, edited, ids) for ids in top_after], args)
     labels, per_item = [], []
@@ -631,11 +681,13 @@ def cmd_edit(args) -> dict:
                                                 exact_match))
                          for i, a in zip(oracle_idx, oracle_answers)]
 
-    result = {"store": args.store, "edit_store": args.edit_store, "buffer": args.buffer, "loop": args.loop,
+    result = {"store": args.store, "edit_store": args.edit_store, "buffer": args.buffer, "route": route,
+              "loop": args.loop if route == "model" else None,
               "n_edits": len(edits), "n_correct_before": len(correct),
               "flip": flip_rates(labels), "oracle_edit": flip_rates(oracle_labels)["edit"],
               "items": per_item, "n_questions_in_edit_store": len(edit_questions)}
-    print(f"\nstore edit: {len(correct):,} of {len(edits):,} questions answered correctly before the edit")
+    print(f"\nstore edit, route {route}: {len(correct):,} of {len(edits):,} questions answered correctly "
+          f"before the edit")
     for kind, row in result["flip"].items():
         print(f"  {kind:<7} n {row['n']:5d}  counts {row['counts']}  flip {row['flip_rate']:.3f} "
               f"+/- {row['sigma']:.3f}  (bar {FLIP_BAR:.2f}): {'PASS' if row['pass'] else 'FAIL'}")
@@ -656,6 +708,8 @@ def main():
     parser.add_argument("--gate-k", type=int, default=5)
     parser.add_argument("--buffer", type=int, default=4)
     parser.add_argument("--loop", type=int, default=1, help="1-based loop whose query retrieves")
+    parser.add_argument("--route", choices=("model", "bge"), default="model",
+                        help="edit: who retrieves the buffer, the model's query or the store's bge query keys")
     parser.add_argument("--max-questions", type=int, default=2000, help="per source, seeded")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -670,6 +724,10 @@ def main():
         raise SystemExit("--bge-only only applies to recall")
     if args.mode == "edit" and not args.edit_store:
         raise SystemExit("edit needs --edit-store")
+    if args.route == "bge" and args.mode == "recall":
+        raise SystemExit("--route bge does not apply to recall, which reports the bge row already")
+    if args.route == "bge" and args.mode == "pathway":
+        logger.info("[pathway] --route ignored: pathway reports the model and the bge arms side by side")
 
     result = {"recall": cmd_recall, "pathway": cmd_pathway, "edit": cmd_edit}[args.mode](args)
     if args.json_out:

@@ -88,8 +88,9 @@ evidence in the batch.
   of the time). The 10M to final reads below are the re-reads on the fixed packer.
 - Re-reads on arm P's final with the fixed packer, 2026-10-24: `bash
   ckpts/inject/ladder_pilot_redo.sh`, outputs
-  `ckpts/inject/pilot_p_ladder2_{abstention,store_pathway}.*`, and the A4 edit read
-  (`eval_store.py edit`, `ckpts/inject/pilot_p_ladder2_store_edit.*`).
+  `ckpts/inject/pilot_p_ladder2_{abstention,store_pathway}.*`, the A4 edit read
+  (`eval_store.py edit`, `ckpts/inject/pilot_p_ladder2_store_edit.*`) and its bge routed variant
+  (`eval_store.py edit --route bge`, `ckpts/inject/pilot_p_ladder2_store_edit_bge.*`).
 
 | re-read on arm P's final (fixed packer) | 2026-10-14 read (void) | re-read 2026-10-24 |
 |---|---|---|
@@ -103,6 +104,7 @@ evidence in the batch.
 | A7 pathway EM, model query / bge / oracle buffer (n 6,000) | 0.000 / 0.022 / 0.026 (oracle abstain 0.883) | 0.001 / 0.044 / 0.088 (abstain 0.948 / 0.584 / 0.610) |
 | A7 pathway, first per-source block (HotpotQA, n 2,000), oracle EM | 0.036 | 0.189 (F1 0.253, abstain 0.169) |
 | A4 edit flip rate (model query route) | 0 of 2,000 answered before the edit | 1 of 2,000 answered before the edit: edit n 1, flip 0.000; delete n 0; the edited gold chunk attached directly followed (n 1) |
+| A4 edit flip rate (bge route, the serving configuration) | not run | 95 of 2,000 answered before the edit. Delete: n 72, abstained 48, other 17, stuck 7, flip 0.903 +- 0.035 against the bar 0.70, PASS. Edit: n 23, follow 3, other 19, stuck 1, flip 0.130 +- 0.070, FAIL; the edited gold chunk attached directly: n 23, follow 2, other 20, stuck 1, follow 0.087 |
 
 The likelihood numbers are identical to the old read, which confirms that only the generation path
 changed. A3 in generation is readable now but weak: under gold the model still abstains on 77% of
@@ -111,7 +113,29 @@ pathway gate (pathway EM against oracle EM) still fails, 0.001 against 0.088 (z 
 the model's own query finds nothing (A7's recall half, recall@5 0.004). The oracle route is
 readable now (EM 0.09), but the A4 flip read runs on the model's own retrieval route, which finds
 nothing, so it stays unreadable (one item answered before the edit); a flip read routed through
-bge would need `eval_store.py edit` extended.
+bge needed `eval_store.py edit` extended, which was built and read the same day (next paragraph).
+
+The bge routed flip read (A4), 2026-10-24. `scripts/eval_store.py edit --route bge` retrieves the
+"before" and "after" buffers by the question's bge query key against the original store's and the
+edit store's raw bge keys, the serving configuration, while the model still generates with the
+port attached; the default route is unchanged (`tests/test_eval_store_route.py`; a detached Sonnet
+review found no bugs). Command: `TINY_LLM_CONFIG=config_pilot.yaml python scripts/eval_store.py
+edit -c ckpts/evidence_pilot_p/checkpoint_evidence_final.pt --store data/index/openqa --edit-store
+data/index/openqa_edit --buffer 4 --route bge --json-out
+ckpts/inject/pilot_p_ladder2_store_edit_bge.json`, log `pilot_p_ladder2_store_edit_bge.log`. On
+this route 95 of 2,000 sampled edits were answered correctly before the edit (the model route read
+1 of 2,000 the same day). When the fact leaves the store (delete edits, the gold chunk removed),
+the answer leaves with it: the model abstains or answers something else and does not fall back to
+a memorized answer (stuck 7 of 72), so on the serving route the facts it answers from do live in
+the store. When the fact is rewritten (edit edits, the gold chunk carrying a substitute answer),
+the model neither keeps the old answer (stuck 1 of 23) nor copies the new one (follow 3 of 23) but
+answers something else, and the same holds with the edited chunk handed to it directly (follow
+0.09). Following an edited real-text chunk is therefore a generation weakness of arm P on real
+questions (exact match 0.05 under gold on SQuAD, the A3 re-read above), not a store failure; on the
+synthetic biographies the same model follows a swapped card 100% of the time. The edit half rests
+on 23 items. Verdict: A4's delete half holds on the serving route, the edit half fails on
+generation quality; both halves were unreadable before the decode fix of the same day and on the
+model's own query route, which finds nothing.
 
 ## The trainer's series (held-out `chains_bridge_val`, 25 batches, 44,673 supervised tokens)
 

@@ -28,7 +28,9 @@ ceiling), A6 holds (within noise of the control), A3 holds in likelihood (+3.75 
 none, the swapped answer wins) and is unreadable in generation (96% abstention under gold), A7's
 recall half fails (the model's query at recall@5 0.004 against bge 0.829), A7's pathway half (oracle
 EM 2.6%) and the A4 edit unreadable (the generation, pathway and edit reads were taken before the
-2026-10-24 packer fix, re-read pending);
+2026-10-24 packer fix; re-read the same day on the fixed packer: A3 weak in generation, EM 0.05
+and 77% abstention under gold; A7 oracle EM 0.09; A4 on the bge route delete 0.90 PASS, edit 0.13
+FAIL on generation, the read table rows);
 the exit and depth reads repeat the micro shape on both arms. Decided 2026-10-17 (the user, after
 the research round in [review_2026-10-16.md](../review_2026-10-16.md)): A1(b) passes with the
 leak recorded as known and the criterion amended to the paired reading (the read table above); L1
@@ -246,7 +248,7 @@ Gate names as NEXT.md. Every closed-book read at full depth. `closed_book_rank.p
 | L1 | `eval_chains.py`, `chains_heldout_tmpl` 2-hop, D 3, kept 1, 2, 3 | Delta = kept 3 minus kept 1 at least 0.05 and at least 3 sigma | once the 1-hop gate holds, and final | falsified: Delta + 2 sigma under 0.05 with the 1-hop gate passed; inconclusive: the gate failed, or Delta between the two |
 | A2, A5 | `[eval fixed]` on `evidence_fixed`; `--ceiling-json` from `evidence_ceiling_probe.py --fixed-split evidence_fixed` on arm P's final checkpoint | gold gain at least half that ceiling, distractors gain at least 0; chunk AUROC per loop at least 0.59; grounded AUROC at least 0.674 | every 25M in the trainer; final verdict | the port does not recover evidence on held-out QA |
 | A3 | `eval_abstention.py --evidence-port --evidence-condition gold,counterfactual,distractors,none --json-out`; the swapped bios read for the injected facts | memorization ratio at most 0.05, follow at least 0.9 per stratum, ratio-binned or baseline-paired | swapped bios at every save; `eval_abstention.py` at final | weights override a chunk. The generation half of the 2026-10-14 read (abstention, EM, follow rate, `mr_gen`) is void (a decode bug in the eval packer, fixed 2026-10-24, [written_bridge_pilot.md](../measurements/written_bridge_pilot.md)); the likelihood half (`mr_ll`, answer CE) is right padded and unaffected. Generation re-read 2026-10-24 after the decode fix: A3 weak in generation (EM 0.05, abstention 0.77 under gold), likelihood identical to the old read |
-| A4, A7 | `eval_store.py recall\|pathway\|edit`, `data/index/openqa`, `openqa_edit` | flip rate at least 70%; model-query recall@k at least bge-query recall@k; pathway EM against oracle-buffer EM | final | store edits do not reach the answer; the query loses to bge. Labels: the edit flip rate is A4, recall@k and pathway EM are A7. The pathway and edit reads of 2026-10-14 are void (a decode bug in the eval packer, fixed 2026-10-24, [written_bridge_pilot.md](../measurements/written_bridge_pilot.md)); `recall` is unaffected. Generation re-read 2026-10-24 after the decode fix: A7 oracle EM 0.09 (the model's query 0.001, the pathway gate still failing at z -23.7): the oracle route readable now, the A4 flip read still unreadable on the model's query route (1 of 2,000 answered before the edit); a flip read routed through bge would need the eval extended |
+| A4, A7 | `eval_store.py recall\|pathway\|edit`, `data/index/openqa`, `openqa_edit` | flip rate at least 70%; model-query recall@k at least bge-query recall@k; pathway EM against oracle-buffer EM | final | store edits do not reach the answer; the query loses to bge. Labels: the edit flip rate is A4, recall@k and pathway EM are A7. The pathway and edit reads of 2026-10-14 are void (a decode bug in the eval packer, fixed 2026-10-24, [written_bridge_pilot.md](../measurements/written_bridge_pilot.md)); `recall` is unaffected. Generation re-read 2026-10-24 after the decode fix: A7 oracle EM 0.09 (the model's query 0.001, the pathway gate still failing at z -23.7): the oracle route readable now, the A4 flip read still unreadable on the model's query route (1 of 2,000 answered before the edit). A4 read 2026-10-24 on the bge route (`eval_store.py edit --route bge`, the serving configuration, `ckpts/inject/pilot_p_ladder2_store_edit_bge.*`; 95 of 2,000 answered before the edit): delete flip 0.90 +- 0.035 (n 72, stuck 7), PASS; edit flip 0.13 +- 0.07 (n 23, follow 3, stuck 1; the edited chunk attached directly followed 0.09), FAIL on generation quality, not on the store (the model answers something else rather than keeping the old answer) |
 | A6 | `eval_benchmarks.py`, both arms, against `docs/measurements/benchmark_snapshot.md` | arm P within noise of arm C | final | the pathway costs language |
 
 **A1(b) detail.** Tier 1000 is read alongside; the leak is known from R0b (0.085 at micro, z 6.4)
@@ -724,14 +726,15 @@ splits). Nothing in the spec changed.
     0.008 / 0.007, every source alike. The IR expert's query was trained by the selection loss
     over the handful of chunks visible to a document (chunk AUROC 0.78 there) and has never
     competed against a store; as a retriever it is at chance.
-  - **A7 pathway half and A4 edit, unreadable** (recorded as "A7" until 2026-10-24; both taken
-    before the 2026-10-24 packer fix, re-read pending). `pathway`: generated EM 0.000 with the model's query (abstains on 97%),
+  - **A7 pathway half and A4 edit, unreadable as read** (recorded as "A7" until 2026-10-24; both
+    taken before the 2026-10-24 packer fix; re-read the same day: A7 oracle EM 0.09, A4 on the bge
+    route delete 0.90 PASS and edit 0.13 FAIL on generation, the read table). `pathway`: generated EM 0.000 with the model's query (abstains on 97%),
     0.026 with the oracle buffer (abstains on 88%), 0.022 with bge's buffer; the gate fails
     (z -12.5) against an oracle ceiling of 2.6% exact match, so the read is about a 99M model
     generating open-domain answers, not the pathway. `edit`: 0 of 2,000 answered correctly
     before the edit, so the flip rate has no denominator.
-  - **A3, likelihood holds, behaviour unreadable** (the generation half taken before the
-    2026-10-24 packer fix, re-read pending). `eval_abstention.py --evidence-port` on
+  - **A3, likelihood holds, behaviour unreadable as read** (the generation half taken before the
+    2026-10-24 packer fix; re-read the same day: EM 0.05 and 77% abstention under gold, weak). `eval_abstention.py --evidence-port` on
     SQuAD v2 dev (2,000 questions): answer-span CE with the real target 2.13 under gold, 6.11
     under distractors, 5.87 with nothing attached (gold against none +3.75 nats). Generated:
     the model abstains on 95.6% of answerable questions under gold (EM 0.010), 99.5% under
@@ -752,8 +755,9 @@ splits). Nothing in the spec changed.
   - **The ladder at the final saves, in one line each**: copy holds; A1(b) control half holds,
     arm P half fails on the held-out form at tier 100 by z 3.2 at a 4x to 47x reduction; 1-hop
     gate holds (0.85); L1 "falsified" (Delta +0.002 +- 0.005, nothing composes); A2 and A5
-    hold; A3 holds in likelihood and is unreadable in generation; A7's recall half fails; A7's
-    pathway half and A4 unreadable; A6 holds. The decision table's rows were the user's (decided
+    hold; A3 holds in likelihood and is unreadable in generation (re-read 2026-10-24: weak); A7's
+    recall half fails; A7's pathway half and A4 unreadable (re-read 2026-10-24: A4 delete holds on
+    the bge route, edit fails on generation); A6 holds. The decision table's rows were the user's (decided
     2026-10-17).
   - **The chain continuation, 2026-10-17** ([chain_continuation_pilot.md](../measurements/chain_continuation_pilot.md),
     `ckpts/evidence_pilot_chains/`, reads `ckpts/inject/pilot_ch_{TAG}_chains_*`): arm P's
