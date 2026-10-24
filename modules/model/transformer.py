@@ -15,6 +15,10 @@ from utils import logger
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
 from transformer_engine.pytorch import checkpoint
 
+# evidence padding is cut into segments of this many tokens in the encoder; 0 restores the old
+# single causal segment per row (kept reachable for the equivalence test)
+EVIDENCE_PAD_SEGMENT = 128
+
 
 class TokenTracker():
     """Counts trained tokens without forcing a host sync on every forward.
@@ -400,7 +404,15 @@ class TinyMoETransformer(nn.Module):
         hidden_states = decoder.embed_tokens(evidence_ids) * (decoder.hidden_size ** 0.5)
         hidden_states = decoder.dropout(hidden_states)
 
-        chunk_cu_seqlens, chunk_max_seqlen = cu_seqlens_from_doc_ids(evidence_chunk_ids)
+        seg_ids = evidence_chunk_ids
+        if EVIDENCE_PAD_SEGMENT > 0:
+            # padding tokens (negative chunk id) are read by no query segment; cutting the padded
+            # tail into short segments keeps the encoder from running quadratic attention over it
+            # (one segment per token costs more in the varlen kernel than it saves)
+            pad = evidence_chunk_ids < 0
+            block = -1 - (torch.arange(S_ev, device=evidence_chunk_ids.device) // EVIDENCE_PAD_SEGMENT)
+            seg_ids = torch.where(pad, block.expand(B, S_ev).to(evidence_chunk_ids.dtype), evidence_chunk_ids)
+        chunk_cu_seqlens, chunk_max_seqlen = cu_seqlens_from_doc_ids(seg_ids)
         position_embeddings = decoder.rotary_emb.gather(position_ids, hidden_states.dtype)
 
         if decoder.ple is not None:
@@ -480,12 +492,13 @@ class TinyMoETransformer(nn.Module):
         position_ids = chunk_position_ids(evidence_chunk_ids)
         states = self._encode_evidence(evidence_ids, evidence_chunk_ids, position_ids)
         cu_seqlens, max_seqlen = evidence_cu_seqlens(evidence_segment_ids, num_segments)
-        cos, sin = self.moe.rotary_emb.gather(position_ids, states.dtype)
+        # only the cross reader reads these; the key/value reader builds its own prefix rotation
+        position_embeddings = None if self.moe.reader_kv else self.moe.rotary_emb.gather(position_ids, states.dtype)
         return EvidenceBatch(
             states=states,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            position_embeddings=(cos, sin),
+            position_embeddings=position_embeddings,
             chunk_ids=evidence_chunk_ids,
             chunk_keys=chunk_keys,
             chunk_segments=chunk_segments,
@@ -530,6 +543,10 @@ class TinyMoETransformer(nn.Module):
         if (self.groundedness_head is None or reader is None or visible is None
                 or chunk_gold is None or answerable is None):
             return None
+        if self.moe.reader_kv:
+            # the key/value reader's output is shared_attn's whole output, live from step 0: without
+            # the detach the label could be read off the prompt context through the trunk's attention
+            reader = reader.detach()
         logits = self.groundedness_head(reader).reshape(-1)                      # [B * S]
         gold_present = visible.to(logits.dtype) @ chunk_gold.to(logits.dtype)    # [B * S]
         return groundedness_loss(
@@ -681,8 +698,11 @@ class TinyMoETransformer(nn.Module):
             exit_check = None if converge_tol is None else self._convergence_exit(converge_tol, min_loops)
             x = self.gemma_decoder(input_ids, cu_seqlens, max_seqlen, kv_cache=decoder_cache, position_offset=position_offset).last_hidden_state
             _, aux_loss, hidden_states_all = self.moe(x, other=self._moe_ple(input_ids), cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_loss=True, n_loops=n_loops, kv_cache=moe_cache, position_offset=position_offset, exit_check=exit_check, evidence=evidence, token_mask=token_mask, reader_sites_kept=reader_sites_kept, detach_loops=detach_loops)
-            x_all = self.norm(hidden_states_all)
-            x = x_all[-1]
+            if return_hidden:
+                x_all = self.norm(hidden_states_all)
+                x = x_all[-1]
+            else:
+                x = self.norm(hidden_states_all[-1])
             extra_token_outputs = None if skip_mtp else self._mtp_forward(x, use_checkpointing=False)
             x = x_all if return_hidden else self.lm_head(x)
 

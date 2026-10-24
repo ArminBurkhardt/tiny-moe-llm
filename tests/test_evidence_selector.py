@@ -515,6 +515,88 @@ def test_within_buffer_auroc():
     print("23. the within-buffer chunk AUROC reads 0.5 for a uniform selector              PASS")
 
 
+def _old_selection_loss(external_weights, visible, chunk_gold, eps=1e-6):
+    import torch.nn.functional as F
+    visible_f = visible.to(external_weights.dtype)
+    weights = external_weights * visible_f
+    denom = weights.sum(dim=-1)
+    p = weights / denom.clamp_min(eps).unsqueeze(-1)
+    target = chunk_gold.to(external_weights.dtype).unsqueeze(0).expand_as(p)
+    per_chunk = F.binary_cross_entropy(p.clamp(eps, 1.0 - eps), target, reduction="none") * visible_f
+    per_token = per_chunk.sum(dim=-1) / visible_f.sum(dim=-1).clamp_min(1.0)
+    row_mask = (denom > eps).to(per_token.dtype)
+    return (per_token * row_mask).sum() / row_mask.sum().clamp_min(eps)
+
+
+def test_selection_log_space():
+    torch.manual_seed(0)
+    # a confidently wrong row: gold share 2e-9 of the visible mass, old clamp gave it no gradient
+    w = torch.tensor([[2e-9, 0.5, 0.25]], device=DEVICE, requires_grad=True)
+    vis = torch.ones(1, 3, dtype=torch.bool, device=DEVICE)
+    gold = torch.tensor([1.0, 0.0, 0.0], device=DEVICE)
+    old_w = w.detach().clone().requires_grad_(True)
+    _old_selection_loss(old_w, vis, gold).backward()
+    assert abs(old_w.grad[0, 0].item()) < 10.0, f"the old form was expected to clip the gold gradient: {old_w.grad}"
+    evidence_selection_loss(w, vis, gold).backward()
+    assert w.grad[0, 0].item() < -1e6 and torch.isfinite(w.grad).all(), f"no gradient on the gold chunk: {w.grad}"
+    # one visible chunk: nothing to rank, excluded, exact zero with a live graph
+    w1 = torch.rand(2, 3, device=DEVICE, requires_grad=True)
+    vis1 = torch.zeros(2, 3, dtype=torch.bool, device=DEVICE)
+    vis1[:, 0] = True
+    l1 = evidence_selection_loss(w1, vis1, gold)
+    assert torch.equal(l1, torch.zeros_like(l1)) and l1.requires_grad
+    l1.backward()
+    # nothing visible: exact zero
+    l0 = evidence_selection_loss(w1.detach().requires_grad_(True), torch.zeros_like(vis1), gold)
+    assert torch.equal(l0, torch.zeros_like(l0))
+    # a non gold chunk taking all the mass stays finite
+    wp = torch.tensor([[1.0, 0.0, 0.0]], device=DEVICE, requires_grad=True)
+    lp = evidence_selection_loss(wp, vis, torch.tensor([0.0, 1.0, 0.0], device=DEVICE))
+    lp.backward()
+    assert torch.isfinite(lp) and torch.isfinite(wp.grad).all()
+    # value against the old form on a random fixture
+    wr = torch.rand(64, 6, device=DEVICE)
+    visr = torch.rand(64, 6, device=DEVICE) > 0.3
+    visr[:, :2] = True
+    goldr = (torch.rand(6, device=DEVICE) > 0.6).float()
+    new_v = evidence_selection_loss(wr, visr, goldr).item()
+    old_v = _old_selection_loss(wr, visr, goldr).item()
+    print(f"   random fixture: new {new_v:.6f} old {old_v:.6f} (rows with >= 2 visible chunks only differ in the mask)")
+    assert abs(new_v - old_v) < 0.05
+    print("24. selection loss in log space: gradient on a confidently wrong row, exact zeros  PASS")
+
+
+def test_selection_segment_weighting():
+    torch.manual_seed(1)
+    M = 4
+    gold = torch.tensor([1.0, 0.0, 0.0, 0.0], device=DEVICE)
+    vis_row = torch.ones(M, dtype=torch.bool, device=DEVICE)
+    # equal length segments: both modes agree
+    T = 8
+    w = torch.rand(T, M, device=DEVICE)
+    vis = vis_row.expand(T, M)
+    seg = torch.tensor([0] * 4 + [1] * 4, device=DEVICE)
+    tok = evidence_selection_loss(w, vis, gold)
+    sgm = evidence_selection_loss(w, vis, gold, segment_ids=seg, num_segments=2)
+    assert torch.allclose(tok, sgm, atol=1e-6), f"{tok} vs {sgm}"
+    # one long and one short segment: the segment mode is the mean of the two segment means
+    T = 12
+    w = torch.rand(T, M, device=DEVICE)
+    vis = vis_row.expand(T, M)
+    seg = torch.tensor([0] * 10 + [1] * 2, device=DEVICE)
+    per_a = evidence_selection_loss(w[:10], vis[:10], gold)
+    per_b = evidence_selection_loss(w[10:], vis[10:], gold)
+    sgm = evidence_selection_loss(w, vis, gold, segment_ids=seg, num_segments=2)
+    assert torch.allclose(sgm, 0.5 * (per_a + per_b), atol=1e-6), f"{sgm} vs {0.5 * (per_a + per_b)}"
+    tok = evidence_selection_loss(w, vis, gold)
+    assert not torch.allclose(tok, sgm, atol=1e-4), "token mode should weigh the long segment more"
+    # an unsupervised segment does not dilute the mean
+    sup = torch.tensor([1.0] * 10 + [0.0] * 2, device=DEVICE)
+    only = evidence_selection_loss(w, vis, gold, supervised=sup, segment_ids=seg, num_segments=2)
+    assert torch.allclose(only, per_a, atol=1e-6)
+    print("25. segment weighting agrees on equal segments and weighs long and short equally  PASS")
+
+
 def main():
     test_direct_read()
     test_selection_loss()
@@ -527,6 +609,8 @@ def main():
     test_groundedness_wiring()
     test_supervised_positions()
     test_within_buffer_auroc()
+    test_selection_log_space()
+    test_selection_segment_weighting()
 
 
 if __name__ == "__main__":

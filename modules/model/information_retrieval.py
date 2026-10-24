@@ -124,6 +124,8 @@ def evidence_selection_loss(
     chunk_gold: torch.Tensor,
     supervised: torch.Tensor = None,
     eps: float = 1e-6,
+    segment_ids: torch.Tensor = None,
+    num_segments: int = 0,
 ) -> torch.Tensor:
     """BCE between the selector's own per chunk read share and the corpus's gold flag.
 
@@ -146,6 +148,12 @@ def evidence_selection_loss(
         supervised: optional ``[T]`` bool/float mask restricting the loss to specific query
             positions (e.g. ``labels != -100``); every position counts when omitted.
         eps: numerical floor for the renormalizing division and the row mask.
+        segment_ids: optional ``[T]`` long, the query segment (packed document) of each position.
+            When given, each segment's valid positions are averaged first and the segments are then
+            averaged, so a long document and a short question weigh the same; omitted is the mean
+            over every valid position.
+        num_segments: the number of segments ``segment_ids`` indexes into (a shape, never read
+            back from the device); required with ``segment_ids``.
 
     Returns:
         Scalar loss. BCE, not InfoNCE: a document's evidence buffer can hold zero gold chunks (a
@@ -162,6 +170,9 @@ def evidence_selection_loss(
         Dividing it out asks only "of the mass that DID go external, did it land on the gold chunk"
         -- pure ranking, with no incentive to push the overall split itself up or down.
 
+        Computed in log space with no clamp on the renormalized share, so a gold chunk whose share
+        is under 1e-6 still gets a gradient; rows with fewer than two visible chunks are excluded.
+
         Numerically safe by construction rather than by a branch: with nothing visible or nothing
         supervised, every row of ``per_token * row_mask`` is exactly zero and the division is by a
         clamped, non-zero constant, so the result is a genuine zero tensor with a live graph back to
@@ -170,17 +181,37 @@ def evidence_selection_loss(
     visible_f = visible.to(external_weights.dtype)
     weights = external_weights * visible_f
     denom = weights.sum(dim=-1)
-    p = weights / denom.clamp_min(eps).unsqueeze(-1)
+    n_visible = visible_f.sum(dim=-1)
+    tiny = torch.finfo(weights.dtype).tiny
+
+    # BCE of the renormalized share in log space: log p from the log of the weights, log(1 - p)
+    # from log1p with the argument kept off 1 by a where (not a clamp on p, which would zero the
+    # gradient of a confidently wrong ranking). The inner where keeps the unused branch finite.
+    log_p = torch.log(weights.clamp_min(tiny)) - torch.log(denom.clamp_min(tiny)).unsqueeze(-1)
+    p = log_p.exp()
+    floor = 1e-7
+    ok = (1.0 - p) > floor
+    log_1mp = torch.where(ok, torch.log1p(-torch.where(ok, p, torch.zeros_like(p))), math.log(floor))
 
     target = chunk_gold.to(external_weights.dtype).unsqueeze(0).expand_as(p)
-    per_chunk = F.binary_cross_entropy(p.clamp(eps, 1.0 - eps), target, reduction="none") * visible_f
-    per_token = per_chunk.sum(dim=-1) / visible_f.sum(dim=-1).clamp_min(1.0)
+    per_chunk = -(target * log_p + (1.0 - target) * log_1mp) * visible_f
+    per_token = per_chunk.sum(dim=-1) / n_visible.clamp_min(1.0)
 
-    row_mask = (denom > eps).to(per_token.dtype)
+    # a row with one visible chunk has nothing to rank
+    row_mask = ((denom > eps) & (n_visible >= 2.0)).to(per_token.dtype)
     if supervised is not None:
         row_mask = row_mask * supervised.to(per_token.dtype)
-    total = row_mask.sum().clamp_min(eps)
-    return (per_token * row_mask).sum() / total
+    if segment_ids is None:
+        total = row_mask.sum().clamp_min(eps)
+        return (per_token * row_mask).sum() / total
+
+    # each query segment's valid positions are averaged first, then the segments with any
+    seg_count = torch.zeros(num_segments, dtype=per_token.dtype, device=per_token.device)
+    seg_count = seg_count.index_add(0, segment_ids, row_mask)
+    seg_sum = torch.zeros_like(seg_count).index_add(0, segment_ids, per_token * row_mask)
+    seg_mean = seg_sum / seg_count.clamp_min(1.0)
+    has = (seg_count > 0).to(per_token.dtype)
+    return seg_mean.sum() / has.sum().clamp_min(eps)
 
 
 def evidence_contrastive_loss(

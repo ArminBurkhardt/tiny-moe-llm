@@ -268,11 +268,23 @@ def train_step(
                     "checkpointing recomputes under no_grad -- it would train nothing. Turn "
                     "checkpointing off for the evidence profile, or make the term part of the forward."
                 )
+                segment_ids, num_segments = None, 0
+                if TrainingConfig.evidence_selection_weighting == "segment":
+                    assert cu_seqlens is not None, "segment weighting needs the packed cu_seqlens"
+                    # segment of each flat position from cu_seqlens: a device search, shapes only
+                    num_segments = cu_seqlens.numel() - 1
+                    segment_ids = torch.searchsorted(
+                        cu_seqlens.to(torch.long),
+                        torch.arange(input_ids.numel(), device=cu_seqlens.device),
+                        right=True,
+                    ) - 1
                 selection_loss = unwrapped.moe.evidence_selection_term(
                     evidence.chunk_gold,
                     # the query positions that produce a supervised token: the state one before an
                     # answer token is the one reading the evidence while that token is predicted
                     supervised=predicting_positions(labels).reshape(-1),
+                    segment_ids=segment_ids,
+                    num_segments=num_segments,
                 )
                 if selection_loss is not None:
                     loss = loss + TrainingConfig.evidence_selection_weight * selection_loss

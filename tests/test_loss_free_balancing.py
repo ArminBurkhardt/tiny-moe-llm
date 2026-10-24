@@ -131,6 +131,32 @@ def main():
     shadow, _, _ = fresh.moe._balance_state(dev)
     assert shadow.dtype == torch.float32 and torch.allclose(shadow[0, first], torch.tensor(0.25, device=dev))
     print("4. state dict round trip, absent buffer loads unbiased, fp32 shadow            PASS")
+
+    # 5. the selection scores are formed in fp32
+    model.eval()
+    with torch.no_grad():
+        moe.balance_bias.zero_()
+        big = torch.randn(8, 512, P["hidden_size"], device=dev, dtype=torch.bfloat16)
+        probs = F.softmax((moe.router(big) + moe.loop_bias(0)) / moe.temperature, dim=-1)
+        old_idx = torch.topk(probs + moe.balance_bias[0].to(probs.dtype), moe.top_k, dim=-1).indices
+        w, idx, _ = moe.route(big, temperature=moe.temperature, loop_idx=0)
+        assert idx[..., 0].numel() >= 1000 and torch.equal(idx, old_idx), "zero bias moved the selection"
+        g = probs.gather(-1, old_idx)
+        assert torch.equal(w, g / g.sum(-1, keepdim=True)), "zero bias moved the weights"
+        # ties: coarse probabilities so most rows hold repeated values, bf16 topk against fp32 topk
+        tied = (probs.float() * 8).round().div(8).to(torch.bfloat16)
+        assert torch.equal(torch.topk(tied, moe.top_k, dim=-1).indices,
+                           torch.topk(tied.float(), moe.top_k, dim=-1).indices), "ties broke differently in fp32"
+        # a bias of a few tenths: the picks follow the fp32 sum, which the bf16 sum gets wrong
+        moe.balance_bias[0, first:] = torch.linspace(0.30, 0.31, E - first, device=dev).to(torch.bfloat16)
+        _, idx_b, _ = moe.route(big, temperature=moe.temperature, loop_idx=0)
+        bias32 = moe.balance_bias[0].float()
+        ref = torch.topk(probs.float() + bias32, moe.top_k, dim=-1).indices
+        coarse = torch.topk(probs + moe.balance_bias[0], moe.top_k, dim=-1).indices
+        assert torch.equal(idx_b, ref), "selection is not the fp32 sum"
+        print(f"   bf16 sum picks differ from fp32 on {(coarse != ref).any(-1).float().mean().item():.3f} of tokens")
+        moe.balance_bias.zero_()
+    print("5. selection scores in fp32: zero bias identical (with ties), a large bias exact  PASS")
     print("all loss free balancing checks passed")
 
 

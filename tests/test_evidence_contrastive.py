@@ -312,5 +312,31 @@ def model_checks(tau):
     print(f"11. detach_loops=2: both terms read the live pass only ({t_scaled.item():.4f} against {live_ref.item():.4f}) PASS")
 
 
+def config_checks():
+    import subprocess, tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = "from config import TrainingConfig as T; print(T.evidence_contrastive_loops)"
+
+    def read(yaml_text):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, dir=root) as f:
+            f.write(yaml_text)
+        try:
+            env = dict(os.environ, TINY_LLM_CONFIG=f.name)
+            done = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True)
+        finally:
+            os.unlink(f.name)
+        assert done.returncode == 0, done.stderr
+        return done.stdout.strip().splitlines()[-1]
+
+    base = open(os.path.join(root, "config.yaml")).read()
+    lines = [ln for ln in base.splitlines() if not ln.lstrip().startswith("evidence_contrastive_loops:")]
+    assert read(chr(10).join(lines)) == "[0]", "the fallback is not [0]"
+    nulled = [ln.split(":")[0] + ": null" if ln.lstrip().startswith("evidence_contrastive_loops:") else ln
+              for ln in base.splitlines()]
+    assert read(chr(10).join(nulled)) == "None", "null is no longer accepted"
+    print("12. evidence_contrastive_loops falls back to [0] and still accepts null  PASS")
+
+
 if __name__ == "__main__":
     main()
+    config_checks()

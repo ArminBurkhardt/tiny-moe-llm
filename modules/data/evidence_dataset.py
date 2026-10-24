@@ -203,6 +203,16 @@ class EvidenceDataset(SFTDataset):
             f"{n_chunks:,} chunks"
         )
 
+        # a document the row limit rules out is dropped silently by the packer; naming the size of
+        # that loss in a run's first lines is what lets a builder cap that disagrees with it show up
+        doc_lengths = np.diff(np.fromfile(self.idx_path, dtype=np.uint64)).astype(np.int64)
+        over = (doc_lengths > 0) & (doc_lengths + self.num_mtp_tokens > self.max_length - 1)
+        logger.info(
+            f"EvidenceDataset[{split}]: {int(over.sum()):,} documents, "
+            f"{int(doc_lengths[over].sum()):,} tokens over the evidence reader's row limit "
+            f"({self.max_length - 1} with {self.num_mtp_tokens} pads) will be skipped"
+        )
+
     def _batch_iterator(self) -> Iterator[dict]:
         bin_mmap = np.memmap(self.bin_path, dtype=np.uint16, mode="r")
         idx_mmap = np.memmap(self.idx_path, dtype=np.uint64, mode="r")
@@ -244,6 +254,8 @@ class EvidenceDataset(SFTDataset):
                    "conditions": [], "answerable": [], "sources": []}
         committed_position = first - num_workers
         skipped_too_long = 0
+        skipped_rowlimit = skipped_rowlimit_tokens = 0
+        skipped_evcap = skipped_evcap_tokens = 0
         # how full the rows actually come out. A row costs a full width forward whatever fraction of
         # it is real, so an unbalanced evidence cap is invisible in the loss and shows up only as
         # throughput -- which reads like a slow GPU rather than a corpus that is 96% padding. This
@@ -365,6 +377,12 @@ class EvidenceDataset(SFTDataset):
             block_len = len(tokens) + self.num_mtp_tokens
             if block_len > usable or len(ev_tokens) > self.max_evidence_tokens:
                 skipped_too_long += 1
+                if block_len > usable:
+                    skipped_rowlimit += 1
+                    skipped_rowlimit_tokens += len(tokens)
+                else:
+                    skipped_evcap += 1
+                    skipped_evcap_tokens += len(tokens)
                 continue
 
             row_ev = sum(len(e["ids"]) for e in current["evidence"])
@@ -420,6 +438,11 @@ class EvidenceDataset(SFTDataset):
             logger.warning(
                 f"[worker {worker_id}] skipped {skipped_too_long} conversation(s) over "
                 f"max_length={self.max_length} or max_evidence_tokens={self.max_evidence_tokens}"
+            )
+            logger.warning(
+                f"[worker {worker_id}] skipped tokens: {skipped_rowlimit_tokens:,} in "
+                f"{skipped_rowlimit} over the row limit ({usable} with {self.num_mtp_tokens} pads), "
+                f"{skipped_evcap_tokens:,} in {skipped_evcap} over the evidence cap"
             )
 
 

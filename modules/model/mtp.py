@@ -106,7 +106,7 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
     n_valid = valid.sum().clamp_min(1)
 
     if weights is None:
-        denominator = n_valid
+        denominator = n_valid.float()
     else:
         # masked by `valid` rather than trusting the caller's zeros, so a weight left on an ignored
         # position can't inflate the denominator. clamped because a division by an all-zero weight
@@ -119,14 +119,15 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
         logits = unpad(lm_head(pad_for_low_fp(h)), h0)
         if w is None:
             # sum, not mean: divided by the global denominator below
-            ce = F.cross_entropy(logits, l, ignore_index=-100, reduction="sum")
+            # per token losses summed in fp32: a bf16 sum over 8192 tokens sits on a 1/64 nat grid
+            ce = F.cross_entropy(logits, l, ignore_index=-100, reduction="none").float().sum()
         else:
             # reduction="none" already returns 0 at ignore_index positions, so the dot product
             # needs no extra masking. the [chunk] fp32 vector is negligible next to the logits.
             ce = (F.cross_entropy(logits, l, ignore_index=-100, reduction="none") * w).sum()
         if not collect_metrics:
             return ce
-        valid_chunk = (l != -100).to(logits.dtype)
+        valid_chunk = (l != -100).float()
         with torch.no_grad():
             max_logit, argmax = logits.max(-1)
             # p_max == softmax(logits).max() == 1 / sum_j exp(l_j - l_max). computed this
@@ -138,13 +139,13 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
                 (1.0 / (logits - max_logit.unsqueeze(-1)).exp().sum(-1, dtype=torch.float32))
                 * valid_chunk
             ).sum()
-            top1_sum = ((argmax == l).to(logits.dtype) * valid_chunk).sum()
+            top1_sum = ((argmax == l).float() * valid_chunk).sum()
         return ce, p_max_sum, top1_sum
 
-    loss_sum = hidden.new_zeros(())
+    loss_sum = torch.zeros((), device=hidden.device, dtype=torch.float32)
     if collect_metrics:
-        p_max_sum = hidden.new_zeros(())
-        top1_sum = hidden.new_zeros(())
+        p_max_sum = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        top1_sum = torch.zeros((), device=hidden.device, dtype=torch.float32)
     T = hidden.size(0)
     for start in range(0, T, chunk_size):
         # the weights chunk is appended only when there is one: passing None through
@@ -167,7 +168,7 @@ def _chunked_linear_ce(lm_head: nn.Module, hidden: torch.Tensor, labels: torch.T
 
     if collect_metrics:
         # note the two denominators: the loss is weighted (if asked), the metrics never are
-        return loss_sum / denominator, {"p_max": p_max_sum / n_valid, "top1_acc": top1_sum / n_valid}
+        return loss_sum / denominator, {"p_max": p_max_sum / n_valid.float(), "top1_acc": top1_sum / n_valid.float()}
     return loss_sum / denominator
 
 

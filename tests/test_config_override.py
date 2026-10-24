@@ -76,7 +76,7 @@ def main():
     assert micro["groundedness_weight"] == 0.0 and micro["target_tokens"] == 300_000_000
     assert micro["evidence_contrastive_weight"] == 0.0
     assert micro["evidence_contrastive_temperature"] == 0.07
-    assert micro["evidence_contrastive_loops"] is None
+    assert micro["evidence_contrastive_loops"] == [0]
     assert micro["evidence_contrastive_trunk_grad"] == 1.0
     assert micro["optimizer"] == "adamw"
     assert micro["moe_balancing"] == "aux" and micro["moe_balance_bias_rate"] == 0.001
@@ -113,7 +113,7 @@ def main():
     assert default["evidence"]["batch"] == raw["evidence"]["batch_size"]
     assert default["evidence_contrastive_weight"] == raw["training"]["evidence_contrastive_weight"]
     assert default["evidence_contrastive_temperature"] == raw["training"]["evidence_contrastive_temperature"]
-    assert default["evidence_contrastive_loops"] is raw["training"]["evidence_contrastive_loops"] is None
+    assert default["evidence_contrastive_loops"] == raw["training"]["evidence_contrastive_loops"] == [0]
     assert default["evidence_contrastive_trunk_grad"] == raw["training"]["evidence_contrastive_trunk_grad"] == 1.0
     assert default["optimizer"] == raw["training"]["optimizer"] == "adamw"
     assert default["moe_balancing"] == raw["training"]["moe_balancing"] == "aux"

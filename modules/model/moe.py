@@ -10,7 +10,7 @@ from transformer_engine.pytorch import checkpoint
 
 from modules.model.router import Router, compute_aux_loss
 from modules.model.gemma4 import GemmaRMSNorm as RMSNorm
-from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention
+from modules.model.experts import CrossAttention, InformationRetrievalExpert, SelfAttention, grouped_mlp_forward
 from modules.model.information_retrieval import (
     RetrievalEntropyTracking, evidence_contrastive_loss, evidence_selection_loss,
 )
@@ -44,44 +44,23 @@ class ParallelSparseMoELayer(nn.Module):
 
         self.activation = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor) -> torch.Tensor:
-        # x: [batch_size, seq_len, hidden_size]
-        # topk_weights, topk_indices: [batch_size, seq_len, top_k]
-        # non MLP (null) slots arrive as index 0 with weight 0 => contribute nothing after scaling
-        B, S, H = x.shape
-        top_k = topk_indices.shape[-1]
-        x_flat = x.reshape(-1, H)                       # [T, H]
-        T = x_flat.shape[0]
+    def forward(self, x: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor,
+                null_mask: torch.Tensor = None) -> torch.Tensor:
+        """Dispatch each token to its routed MLP experts through the grouped GEMM.
 
-        idx = topk_indices.reshape(-1)                  # [N] expert id per (token, slot), N = T*top_k
-        wgt = topk_weights.reshape(-1)                  # [N] routing weight per slot
-        tok = torch.arange(T, device=x.device).repeat_interleave(top_k)  # [N] owning token per slot
+        Args:
+            x: ``[B, S, H]`` layer input.
+            topk_weights: ``[B, S, top_k]`` routing weights, zero on the dense (non MLP) slots.
+            topk_indices: ``[B, S, top_k]`` local MLP expert ids, zero on the dense slots.
+            null_mask: ``[B, S, top_k]`` bool, True on the dense slots. Since 2026-10-24 those
+                picks are sorted after the real experts and sliced off before the GEMM instead of
+                running through expert 0 at weight zero; without the mask a pick is null when its
+                weight is exactly zero.
 
-        # sort assignments so each experts rows are contiguous (required by GroupedLinear)
-        # stable=True for determinism across checkpoint recompute pass
-        order = torch.argsort(idx, stable=True)         # [N]
-        idx_sorted = idx[order]
-        tok_sorted = tok[order]
-        wgt_sorted = wgt[order]
-        x_sorted = x_flat.index_select(0, tok_sorted)   # [N, H] each slot sees its (unscaled) token
-
-        # per expert group sizes
-        m_splits = torch.bincount(idx_sorted, minlength=self.num_experts).tolist() # host sync :(
-
-        # run the experts in BF16: NVFP4 requires each GEMMs row count (a dynamic per expert group size here) to be divisible by 16, which cant be guaranteed
-        # => sparsity more important
-        with te.autocast(enabled=False):
-            gate_up = self.gate_up(x_sorted, m_splits)  # [N, 2*intermediate]
-            gate, up = gate_up.chunk(2, dim=-1)
-            act = self.activation(gate) * up            # [N, intermediate]
-            out_sorted = self.down(act, m_splits)       # [N, H]
-
-        # scale each expert output by its routing weight (null slots => *0), then scatter back
-        out_sorted = out_sorted * wgt_sorted.unsqueeze(-1)
-        combined = torch.zeros(T, H, device=x.device, dtype=out_sorted.dtype)
-        combined.index_add_(0, tok_sorted, out_sorted)
-
-        return combined.view(B, S, H)
+        Returns:
+            ``[B, S, H]`` weighted expert output, exactly zero on the dense slots.
+        """
+        return grouped_mlp_forward(self, x, topk_weights, topk_indices, null_mask=null_mask)
 
 
 class SharedMLP(nn.Module):
@@ -626,7 +605,10 @@ class LoopMixtureOfExperts(nn.Module):
         # themselves. A zero bias is an exact no-op (adding zero is exact, and the gathered values
         # are the topk values), so a run without balancing routes as it always did.
         bias_row = min(int(loop_idx), self.balance_bias.size(0) - 1)
-        selection_scores = expert_scores + self.balance_bias[bias_row].to(expert_scores.dtype)
+        # formed in fp32: a bf16 sum of a bias of a few tenths is coarser than many probability
+        # gaps and topk then breaks the ties toward low indices. with a zero bias the fp32 cast of
+        # the bf16 scores is exact and order preserving, so the picked indices are unchanged
+        selection_scores = expert_scores.float() + self.balance_bias[bias_row].float()
         topk_indices = torch.topk(selection_scores, self.top_k, dim=-1).indices   # [batch_size, seq_len, top_k]
         topk_scores = expert_scores.gather(-1, topk_indices)                       # [batch_size, seq_len, top_k]
         load_balancing_loss = compute_aux_loss(topk_indices, expert_scores, self.num_experts, token_mask=token_mask)
@@ -640,6 +622,25 @@ class LoopMixtureOfExperts(nn.Module):
         self.expert_tracker.update(topk_indices, topk_scores, expert_scores)
 
         return topk_scores, topk_indices, load_balancing_loss
+
+    def _evidence_gate_is_identity(self) -> bool:
+        """True when the chunk gate is exactly 1.0 and cannot change: the scale is frozen at zero.
+
+        A trainable scale can leave zero at any step, so only ``requires_grad`` False qualifies. The
+        zero test reads the device once and is cached against the parameter's in-place version
+        counter, so a steady-state call is a Python comparison with no device sync; any in-place
+        write to the scale (``zero_``, ``fill_``, ``load_state_dict``) bumps the counter and
+        refreshes the cache on the next call.
+        """
+        scale = getattr(self, "evidence_gate_scale", None)
+        if scale is None or scale.requires_grad:
+            return False
+        key = (scale._version, scale.data_ptr(), scale.dtype)
+        cached = getattr(self, "_gate_identity_cache", None)
+        if cached is None or cached[0] != key:
+            cached = (key, bool(scale.detach().float().item() == 0.0))
+            self._gate_identity_cache = cached
+        return cached[1]
 
     def _selector_chunk_mass(self, memory) -> torch.Tensor:
         """this loop's selector chunk scores, ``[M]``, averaged over however many IR experts exist.
@@ -695,7 +696,7 @@ class LoopMixtureOfExperts(nn.Module):
             # the key/value reader: the evidence joins shared_attn's own keys. Same gate as the
             # cross reader below (this loop's selector chunk mass, exactly 1.0 at a zero scale),
             # applied per token after shared_attn's norm
-            chunk_mass = self._selector_chunk_mass(memory) if memory is not None else None
+            chunk_mass = self._selector_chunk_mass(memory) if memory is not None and not self._evidence_gate_is_identity() else None
             token_gate = None
             if chunk_mass is not None:
                 gate = 1.0 + self.evidence_gate_scale * torch.sigmoid(chunk_mass)
@@ -726,7 +727,7 @@ class LoopMixtureOfExperts(nn.Module):
             # None when there is nothing to gate by: no IR expert in the pool, or this batch's
             # memory carried no external store at all -- both leave the reader untouched, which is
             # every configuration this repo has trained before this gate existed.
-            chunk_mass = self._selector_chunk_mass(memory) if memory is not None else None
+            chunk_mass = self._selector_chunk_mass(memory) if memory is not None and not self._evidence_gate_is_identity() else None
             if chunk_mass is not None:
                 gate = 1.0 + self.evidence_gate_scale * torch.sigmoid(chunk_mass)
                 reader_evidence = apply_chunk_gate(evidence, gate)
@@ -776,7 +777,8 @@ class LoopMixtureOfExperts(nn.Module):
         parallel_output = self.parallel_experts(
             step_input,
             mlp_scores,
-            mlp_indices
+            mlp_indices,
+            null_mask=~mlp_mask,
         )
         output = output + parallel_output
 
@@ -1101,7 +1103,10 @@ class LoopMixtureOfExperts(nn.Module):
             for m in self.ir_modules if m.num_clusters > 0
         ]
 
-    def evidence_selection_term(self, chunk_gold: torch.Tensor, supervised: torch.Tensor = None):
+    def evidence_selection_term(
+        self, chunk_gold: torch.Tensor, supervised: torch.Tensor = None,
+        segment_ids: torch.Tensor = None, num_segments: int = 0,
+    ):
         """Supervised selection loss over the read the forward pass just did. Scalar, or None.
 
         The selector's only other gradient toward RELEVANCE is the reader's per chunk gate, which
@@ -1127,6 +1132,8 @@ class LoopMixtureOfExperts(nn.Module):
                 ``EvidenceBatch.chunk_keys``/``chunk_segments``.
             supervised: optional ``[B * S]`` mask restricting the loss to supervised query
                 positions (``(labels != -100).reshape(-1)``).
+            segment_ids: optional ``[B * S]`` long segment id per position, with ``num_segments``;
+                averages each segment first (see ``evidence_selection_loss``).
 
         Returns:
             Scalar loss, or None when this forward carried no external store to select over (no
@@ -1137,7 +1144,10 @@ class LoopMixtureOfExperts(nn.Module):
         if visible is None or chunk_gold is None:
             return None
         terms = [
-            evidence_selection_loss(weights, visible, chunk_gold, supervised=supervised)
+            evidence_selection_loss(
+                weights, visible, chunk_gold, supervised=supervised,
+                segment_ids=segment_ids, num_segments=num_segments,
+            )
             for module in self.ir_modules
             for loop, weights in module.memory_weights_by_loop.items()
             if weights is not None and loop >= self.last_detach_loops

@@ -157,6 +157,12 @@ MANIFEST_PATH = os.path.join(BASE_DIR, "manifest.json")
 
 EMBED_DIM = 384          # bge-small-en-v1.5, which is also ir_dim -- see the adapters in moe.py
 CONDITIONS = ("gold", "mixed", "many", "distractors", "none")
+# the evidence reader packs to one position under the row and appends num_mtp_tokens pads to each
+# document, so a document fits only up to seq_length - num_mtp_tokens - 1 = 4096 - 2 - 1. The
+# held-out builds keep the old cap: live arms read them and they must stay byte identical.
+MAX_DOC_TOKENS_TRAIN = 4093
+MAX_DOC_TOKENS_HELDOUT = 4094
+
 # the index into this tuple is the byte a document's `.src` entry holds. Append only: a reorder
 # would silently relabel every split that already carries the sidecar
 SOURCE_KEYS = ("squad_v2", "hotpot_qa", "webtext", "smoltalk2", "ultrachat", "no_robots")
@@ -860,7 +866,7 @@ def build_corpus(
     embedder: ChunkEmbedder,
     data_dir: str,
     state_path: str,
-    max_doc_tokens: int = 4094,
+    max_doc_tokens: int = MAX_DOC_TOKENS_TRAIN,
     max_evidence_tokens: int = 1536,
     num_distractors: int = 3,
     many_distractors: Tuple[int, int] = (16, 32),
@@ -1628,7 +1634,9 @@ def main():
     parser.add_argument("--target-tokens", type=int, default=150_000_000,
                         help="PROMPT tokens across both splits; evidence tokens are reported "
                              "separately (see the module docstring)")
-    parser.add_argument("--max-doc-tokens", type=int, default=4094)
+    parser.add_argument("--max-doc-tokens", type=int, default=None,
+                        help=f"prompt token cap per row. Default {MAX_DOC_TOKENS_TRAIN} for the "
+                             f"training corpus, {MAX_DOC_TOKENS_HELDOUT} under --heldout")
     parser.add_argument("--max-evidence-tokens", type=int, default=1536)
     parser.add_argument("--num-distractors", type=int, default=3)
     parser.add_argument("--many-distractors", type=int, nargs=2, default=[16, 32],
@@ -1676,6 +1684,13 @@ def main():
     args = parser.parse_args()
     if args.sources_only and not args.heldout:
         raise SystemExit("--sources-only is a mode of --heldout")
+
+    if args.max_doc_tokens is None:
+        args.max_doc_tokens = MAX_DOC_TOKENS_HELDOUT if args.heldout else MAX_DOC_TOKENS_TRAIN
+    logger.info(
+        f"max_doc_tokens {args.max_doc_tokens} (training default {MAX_DOC_TOKENS_TRAIN} = "
+        f"4096 - 2 mtp pads - 1; heldout default {MAX_DOC_TOKENS_HELDOUT})"
+    )
 
     os.makedirs(args.data_dir, exist_ok=True)
     if args.heldout:

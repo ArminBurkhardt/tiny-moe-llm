@@ -94,6 +94,7 @@ training:
                                  # enough to rank the chunks, small enough that it cannot outrun the
                                  # language objective the port is supposed to be serving. 0.0
                                  # disables it, which is the run without a trained selector.
+  evidence_selection_weighting: token # token = mean over supervised positions; segment = each query segment averaged first, then segments
   evidence_contrastive_weight: 0.0 # coefficient on the retriever's in-batch InfoNCE (the selector's
                                    # query at each answer-start position against every chunk in
                                    # the batch, the other documents' chunks as negatives; see
@@ -102,7 +103,7 @@ training:
                                    # selector trained on it alone retrieves nothing from a store.
                                    # 0.0 is the objective of every run before 2026-10-17.
   evidence_contrastive_temperature: 0.07 # the fixed softmax temperature on the cosine for that term
-  evidence_contrastive_loops: null # zero-based loops the term averages over; null is every loop; only loop 0 runs at every sampled depth
+  evidence_contrastive_loops: [0] # zero-based loops the term averages over; [0] since 2026-10-24 (past loop 0 the query position has already read the evidence, so InfoNCE there can match chunk content it read; the store eval reads loop 0); null is every loop; only loop 0 runs at every sampled depth
   evidence_contrastive_trunk_grad: 1.0 # share of the term's gradient reaching the trunk via the query; 0.0 trains the query head alone
   groundedness_weight: 0.1 # coefficient on the groundedness readout's BCE (evidence.py's
                            # GroundednessHead, label "a gold chunk is present AND the row is

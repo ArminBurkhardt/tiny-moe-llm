@@ -20,7 +20,9 @@ properties the experiment leans on:
    embedder's key;
 8. with a placeholder rate, a build next to the first leaves buffers, gold flags, keys, swaps and
    the mask on value tokens unchanged; renamed documents carry the same placeholder in the document,
-   the gold card and (distinct ones) the distractor cards.
+   the gold card and (distinct ones) the distractor cards;
+9. ``mask_first_name_mention`` and ``support_gold_only`` change ``.mask`` of the retrieval arm and
+   nothing else: the first name run alone is zeroed, gold-less documents lose every value span.
 
 GPU free. Needs the pruned tokenizer (``utils.TOKENIZER_DIR``).
 """
@@ -362,6 +364,73 @@ def main():
         assert p50["arms"]["retrieval"]["anonymized_docs"] == entry["anonymized_docs"]
         print(f"8. placeholders with the gold card: {with_ph} documents renamed, {without_ph} not, buffers "
               f"and flags identical to the base build, cards renamed with distinct placeholders   PASS")
+        # 9. the two mask flags change .mask only
+        flagged = {}
+        for tag, flags in (("m1", dict(mask_first_name_mention=True)), ("g1", dict(support_gold_only=True))):
+            flagged[tag] = build_injection(out, tokenizer, FakeEmbedder(), **dict(
+                common, arms=("retrieval",), suffix=tag, **flags))
+        base_name = "inject_retrieval_train"
+        for tag in flagged:
+            other = split_name("retrieval", tag)
+            for suffix in ("bin", "idx", "factspan", "ev", "evidx", "evchunk", "evkey", "evkeyidx",
+                           "evgold", "cond", "ans"):
+                assert file_hash(os.path.join(out, f"{base_name}.{suffix}")) ==                     file_hash(os.path.join(out, f"{other}.{suffix}")), (tag, suffix)
+        assert file_hash(os.path.join(out, f"{base_name}.mask")) !=             file_hash(os.path.join(out, f"{split_name('retrieval', 'm1')}.mask"))
+        m1_docs = read_evidence(out, split_name("retrieval", "m1"))
+        g1_docs = read_evidence(out, split_name("retrieval", "g1"))
+
+        def name_runs(doc):
+            runs, start = [], None
+            for t in range(len(doc["codes"]) + 1):
+                is_name = t < len(doc["codes"]) and int(doc["codes"][t]) in (6, 7)
+                if is_name and start is None:
+                    start = t
+                if not is_name and start is not None:
+                    runs.append(slice(start, t))
+                    start = None
+            return runs
+
+        first_tokens = bio_docs = multi = 0
+        for base, new in zip(retrieval, m1_docs):
+            runs = name_runs(base)
+            if not runs:
+                assert base["mask"].tolist() == new["mask"].tolist()
+                continue
+            bio_docs += 1
+            multi += int(len(runs) > 1)
+            expected = base["mask"].copy()
+            expected[runs[0]] = 0
+            assert new["mask"].tolist() == expected.tolist()
+            zero_names = [r for r in runs if (new["mask"][r] == 0).all()]
+            assert zero_names == [runs[0]] and all(new["mask"][r].all() for r in runs[1:])
+            first_tokens += runs[0].stop - runs[0].start
+        assert bio_docs == 35 and multi > 0
+        assert flagged["m1"]["arms"]["retrieval"]["first_name_tokens_masked"] == first_tokens > 0
+        assert metrics["arms"]["retrieval"]["first_name_tokens_masked"] == 0
+        goldless_values = 0
+        for base, new in zip(retrieval, g1_docs):
+            if not value_runs(base):
+                assert base["mask"].tolist() == new["mask"].tolist()
+                continue
+            if any(base["gold"]):
+                assert base["mask"].tolist() == new["mask"].tolist()
+                continue
+            for _, tokens in value_runs(new):
+                assert not new["mask"][tokens].any()
+                goldless_values += 1
+            expected = np.ones(len(base["ids"]), dtype=np.uint8)
+            expected[0] = 0
+            for _, tokens in value_runs(base):
+                expected[tokens] = 0
+            assert new["mask"].tolist() == expected.tolist()
+        assert goldless_values > 0
+        g1 = flagged["g1"]["arms"]["retrieval"]
+        assert g1["support_gold_only"] and g1["swapped_spans"] == entry["swapped_spans"]
+        assert g1["anonymized_docs"] == entry["anonymized_docs"]
+        assert g1["value_collision_share_of_spans"] == entry["value_collision_share_of_spans"]
+        assert g1["supported_span_share"] <= entry["supported_span_share"]
+        print(f"9. mask flags: .mask only; {first_tokens} first name tokens zeroed in {bio_docs} documents, "
+              f"{goldless_values} gold-less value spans all 0, gold documents unchanged   PASS")
         print("all injection corpus checks passed")
     finally:
         shutil.rmtree(root, ignore_errors=True)

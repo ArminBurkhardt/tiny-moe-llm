@@ -293,7 +293,9 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
 
     Args:
         idx_path: ``{split}.idx``, uint64 document-end offsets with a leading 0.
-        max_length: row length.
+        max_length: row length. The evidence reader (``evidx_path`` given) packs to ``max_length - 1``
+            and skips a conversation with ``len + num_mtp_tokens`` over that; the SFT reader packs
+            to ``max_length`` and skips one over it. Both rules are replayed here.
         num_mtp_tokens: separator slots appended after each conversation.
         split_documents: True for the pretraining ``Dataset``, which DOES split a document across
             rows and therefore drops nothing and wastes only the separator slots. That reader also
@@ -317,9 +319,14 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
         Estimated number of packed rows for one epoch.
     """
     offsets = np.fromfile(idx_path, dtype=np.uint64)
-    lengths = np.diff(offsets).astype(np.int64) + num_mtp_tokens
+    doc_lengths = np.diff(offsets).astype(np.int64)
+    lengths = doc_lengths + num_mtp_tokens
     if split_documents:
         return max(1, int(lengths.sum() // max_length) + 1)
+
+    # the evidence reader packs to one position under the row, so a row ends with a pad segment;
+    # the SFT reader packs to the full row. lengths assume the BOS the builders always write
+    row_limit = max_length - 1 if evidx_path else max_length
 
     ev_lengths = np.zeros_like(lengths)
     if evidx_path and max_evidence_tokens:
@@ -331,7 +338,9 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
     if order is not None:
         lengths, ev_lengths = lengths[order], ev_lengths[order]
 
-    keep = lengths <= max_length
+    keep = lengths <= row_limit
+    # both readers skip empty documents
+    keep &= (doc_lengths[order] if order is not None else doc_lengths) > 0
     if max_evidence_tokens:
         keep &= ev_lengths <= max_evidence_tokens
 
@@ -344,7 +353,7 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
         shard_ev = ev_lengths[shard::num_workers][shard_keep].tolist()
         used, used_ev, open_row = 0, 0, False
         for length, ev in zip(shard_len, shard_ev):
-            if open_row and (used + length > max_length
+            if open_row and (used + length > row_limit
                              or (max_evidence_tokens and used_ev + ev > max_evidence_tokens)):
                 rows += 1
                 used, used_ev = 0, 0

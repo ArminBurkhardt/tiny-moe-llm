@@ -245,3 +245,58 @@ class InformationRetrievalExpert(nn.Module):
         rows = scale_gradient(rows, trunk_grad)
         return self.ir_module.unit_query(self.down_proj(self.norm(rows)), loop_idx)
 
+
+def grouped_mlp_forward(layer, x: torch.Tensor, topk_weights: torch.Tensor, topk_indices: torch.Tensor,
+                        null_mask: torch.Tensor = None) -> torch.Tensor:
+    """Sparse MLP dispatch of ``ParallelSparseMoELayer`` that never runs the null picks.
+
+    Picks of a dense (attention or IR) slot arrive as ``(index 0, weight 0)``. They sort after every
+    real expert, are counted in the same ``bincount`` host sync, and are sliced off before the
+    grouped GEMM, so MLP expert 0 only sees its own rows. Their output is exactly zero, as the weight
+    multiply made it before.
+
+    Args:
+        layer: the ``ParallelSparseMoELayer`` owning ``gate_up``, ``down``, ``activation`` and
+            ``num_experts``.
+        x: ``[B, S, H]`` layer input.
+        topk_weights: ``[B, S, top_k]`` routing weights, zero on dense slots.
+        topk_indices: ``[B, S, top_k]`` local MLP expert ids, zero on dense slots.
+        null_mask: optional ``[B, S, top_k]`` bool, True on dense slots. Defaults to
+            ``topk_weights == 0``, which also drops a real pick whose weight underflowed to zero.
+
+    Returns:
+        ``[B, S, H]`` weighted expert output.
+    """
+    B, S, H = x.shape
+    top_k = topk_indices.shape[-1]
+    x_flat = x.reshape(-1, H)
+    T = x_flat.shape[0]
+    num_experts = layer.num_experts
+
+    idx = topk_indices.reshape(-1)
+    wgt = topk_weights.reshape(-1)
+    null = (wgt == 0) if null_mask is None else null_mask.reshape(-1)
+    key = torch.where(null, torch.full_like(idx, num_experts), idx)
+    tok = torch.arange(T, device=x.device).repeat_interleave(top_k)
+
+    order = torch.argsort(key, stable=True)
+    key_sorted = key[order]
+    counts = torch.bincount(key_sorted, minlength=num_experts + 1).tolist()  # the one host sync
+    m_splits = counts[:num_experts]
+    n_real = sum(m_splits)
+    if n_real == 0:
+        return torch.zeros(B, S, H, device=x.device, dtype=x.dtype)
+
+    order_real = order[:n_real]
+    tok_sorted = tok[order_real]
+    wgt_sorted = wgt[order_real]
+    x_sorted = x_flat.index_select(0, tok_sorted)
+
+    with te.autocast(enabled=False):
+        gate, up = layer.gate_up(x_sorted, m_splits).chunk(2, dim=-1)
+        out_sorted = layer.down(layer.activation(gate) * up, m_splits)
+
+    out_sorted = out_sorted * wgt_sorted.unsqueeze(-1)
+    combined = torch.zeros(T, H, device=x.device, dtype=out_sorted.dtype)
+    combined.index_add_(0, tok_sorted, out_sorted)
+    return combined.view(B, S, H)

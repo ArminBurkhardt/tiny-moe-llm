@@ -46,6 +46,18 @@ Per bio document in the ``retrieval`` arm, in this order:
    The draws come from their own stream, so the buffer, the gold flag and the swaps equal those of a
    build at rate 0.
 6. **Mask.** 1 on language tokens and supported spans (swapped included), 0 on unsupported spans.
+7. **First name mention** (``--mask-first-name-mention``, added 2026-10-24, default off). In every
+   document of the retrieval arm the tokens of the first name mention (the first run of ``.factspan``
+   6 or 7) get mask 0; later mentions keep 1. A template that puts the value before the subject
+   ("{v} is the hometown of {s}.") otherwise supervises the name from the value alone when it opens
+   the biography, which trains value to name recall in the weights, a direction the closed book
+   read cannot see. Only ``.mask`` changes. Example suffix: ``--suffix s15a50m1``.
+8. **Support from the gold card only** (``--support-gold-only``, added 2026-10-24, default off). Rule 2
+   counts a value that collides with a distractor card's value as supported, so a gold-less document
+   still supervises the real name with the real value. Under the flag support is counted from the
+   gold card alone: in a gold-less document every value span has mask 0 and ``supported`` is False
+   (collisions are still reported). Swaps need the gold card, so nothing else moves. Only ``.mask``
+   changes. Example suffix: ``--suffix s15a50g1``.
 
 ``.factspan`` is one uint8 per ``.bin`` token: 0 none, 1 to 5 the attribute (index in ``ATTRIBUTES``
 plus one), 6 a name mention, 7 a placeholder. It is for evals and build metrics; no trainer reads it.
@@ -278,15 +290,19 @@ class RetrievalBuilder:
         placeholder_rate: chance a document with the gold card renames every card and the document.
         distractors: distractor cards beside the gold (one more without it).
         neighbors: how many nearest same-tier people the near distractors are drawn from.
+        mask_first_name_mention: zero the mask on the first name mention of every document.
+        support_gold_only: count a value as supported by the gold card only, not by a collision.
     """
 
     def __init__(self, people: List[bio.Person], pools: Dict[str, List[str]], keys: np.ndarray,
                  tokenizer, seed: int, swap_rate: float, anon_rate: float, gold_drop_rate: float,
-                 distractors: int, neighbors: int = 8, *, placeholder_rate: float = 0.0):
+                 distractors: int, neighbors: int = 8, *, placeholder_rate: float = 0.0,
+                 mask_first_name_mention: bool = False, support_gold_only: bool = False):
         self.people, self.pools, self.keys = people, pools, np.asarray(keys, dtype=np.float32)
         self.tokenizer, self.seed = tokenizer, seed
         self.swap_rate, self.anon_rate, self.gold_drop_rate = swap_rate, anon_rate, gold_drop_rate
         self.placeholder_rate = placeholder_rate
+        self.mask_first_name_mention, self.support_gold_only = mask_first_name_mention, support_gold_only
         self.distractors = distractors
         self.card_ids = [np.asarray(x, dtype=np.uint16) for x in
                          tokenizer([p.store_chunk for p in people], add_special_tokens=False)["input_ids"]]
@@ -304,7 +320,7 @@ class RetrievalBuilder:
             "docs": 0, "gold_in_buffer": 0, "spans": 0, "spans_supported": 0, "span_tokens": 0,
             "span_tokens_supported": 0, "swapped_spans": 0, "anonymized_docs": 0,
             "placeholder_docs": 0, "collision_spans": 0, "spans_in_goldless_docs": 0, "goldless_docs": 0,
-            "ev_tokens_max": 0,
+            "ev_tokens_max": 0, "first_name_tokens_masked": 0,
         }
 
     def _buffer(self, person: bio.Person, rng: random.Random, gold: bool) -> List[int]:
@@ -339,7 +355,7 @@ class RetrievalBuilder:
                 value = person.attributes[attribute]
                 by_gold = gold
                 by_other = any(value in texts[c] for c in cards if c != pid)
-                supported[attribute] = by_gold or by_other
+                supported[attribute] = by_gold or (by_other and not self.support_gold_only)
                 collided[attribute] = (not by_gold) and by_other
             overrides = {}
             if gold:
@@ -403,6 +419,19 @@ class RetrievalBuilder:
             is_value = (codes >= 1) & (codes <= 5)
             token_mask = np.ones(len(ids), dtype=np.uint8)
             token_mask[is_value & ~supported_by_code[codes]] = 0
+            if self.mask_first_name_mention:
+                name_at = np.flatnonzero((codes == CODE_NAME) | (codes == CODE_PLACEHOLDER))
+                if len(name_at):
+                    # the first run: consecutive positions from the first name token
+                    run_end = name_at[0] + 1
+                    while run_end < len(codes) and codes[run_end] in (CODE_NAME, CODE_PLACEHOLDER):
+                        run_end += 1
+                    token_mask[name_at[0]:run_end] = 0
+                    s_first = int(run_end - name_at[0])
+                else:
+                    s_first = 0
+            else:
+                s_first = 0
             full_ids = np.concatenate(([bos], ids, [eos])).astype(np.uint16)
             full_mask = np.concatenate(([0], token_mask, [1])).astype(np.uint8)
             full_codes = np.concatenate(([0], codes, [0])).astype(np.uint8)
@@ -423,6 +452,7 @@ class RetrievalBuilder:
             s = self.stats
             n_spans = len(bio.ATTRIBUTES)
             s["docs"] += 1
+            s["first_name_tokens_masked"] += s_first
             s["gold_in_buffer"] += int(spec["gold"])
             s["spans"] += n_spans
             s["spans_supported"] += sum(spec["supported"].values())
@@ -452,7 +482,8 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
                     swap_rate: float = 0.15, anon_rate: float = 0.5, placeholder_rate: float = 0.0,
                     gold_drop_rate: float = 0.2, distractors: int = 3, seed: int = 42, arms: Sequence[str] = ARMS,
                     suffix: str = "", val_fraction: float = 0.005, store_dir: Optional[str] = None,
-                    overwrite: bool = False, block: int = 4096) -> dict:
+                    overwrite: bool = False, block: int = 4096,
+                    mask_first_name_mention: bool = False, support_gold_only: bool = False) -> dict:
     """Write the arm splits, the shared validation split, the facts, the pools and the store.
 
     Free of the Hub, so a test can drive it with a fake embedder and a small synthetic filler.
@@ -479,6 +510,8 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         store_dir: the biography store directory, or None to skip it.
         overwrite: replace existing splits of these arms (and the shared files).
         block: documents rendered and written together.
+        mask_first_name_mention: see the module docstring, rule 7; retrieval arm, ``.mask`` only.
+        support_gold_only: see the module docstring, rule 8; retrieval arm, ``.mask`` only.
 
     Returns:
         The build metrics, also merged into ``inject_build.json`` in ``out_dir``.
@@ -567,7 +600,9 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
     builder = None
     if "retrieval" in arms:
         builder = RetrievalBuilder(people, pools, keys, tokenizer, seed, swap_rate, anon_rate,
-                                   gold_drop_rate, distractors, placeholder_rate=placeholder_rate)
+                                   gold_drop_rate, distractors, placeholder_rate=placeholder_rate,
+                                   mask_first_name_mention=mask_first_name_mention,
+                                   support_gold_only=support_gold_only)
 
     def window_doc(row) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         source, start, length = (int(v) for v in row)
@@ -651,6 +686,9 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
             entry.update({
                 "swap_rate": swap_rate, "anon_rate": anon_rate, "placeholder_rate": placeholder_rate,
                 "gold_drop_rate": gold_drop_rate, "distractors": distractors,
+                "mask_first_name_mention": mask_first_name_mention,
+                "support_gold_only": support_gold_only,
+                "first_name_tokens_masked": s["first_name_tokens_masked"],
                 "gold_in_buffer_share": s["gold_in_buffer"] / max(1, s["docs"]),
                 "supported_span_share": s["spans_supported"] / max(1, s["spans"]),
                 "supported_fact_token_share": s["span_tokens_supported"] / max(1, s["span_tokens"]),
@@ -698,6 +736,9 @@ def log_report(metrics: dict) -> None:
                 f"({e['value_collision_share_of_goldless_spans']:.2%} of gold-less spans), "
                 f"evidence ratio {e['evidence_to_prompt_ratio']:.2f}"
             )
+            logger.info(f"  mask first name mention {e.get('mask_first_name_mention', False)} "
+                        f"({e.get('first_name_tokens_masked', 0):,} tokens zeroed), support gold only "
+                        f"{e.get('support_gold_only', False)}")
 
 
 def parse_tiers(text: str) -> Dict[int, int]:
@@ -723,6 +764,11 @@ def main():
     parser.add_argument("--anon-rate", type=float, default=0.5)
     parser.add_argument("--placeholder-rate", type=float, default=0.0)
     parser.add_argument("--gold-drop-rate", type=float, default=0.2)
+    parser.add_argument("--mask-first-name-mention", action="store_true",
+                        help="retrieval arm: mask 0 on the first name mention of every document")
+    parser.add_argument("--support-gold-only", action="store_true",
+                        help="retrieval arm: a value is supported by the gold card only, so gold-less "
+                             "documents supervise no value span")
     parser.add_argument("--distractors", type=int, default=3)
     parser.add_argument("--persons-per-tier", default="1000:100,100:500,10:1000,1:2000",
                         help="tier:people pairs")
@@ -751,6 +797,7 @@ def main():
         filler=filler, target_tokens=args.target_tokens, seq_length=args.seq_length,
         swap_rate=args.swap_rate, anon_rate=args.anon_rate,
         placeholder_rate=args.placeholder_rate, gold_drop_rate=args.gold_drop_rate,
+        mask_first_name_mention=args.mask_first_name_mention, support_gold_only=args.support_gold_only,
         distractors=args.distractors, seed=args.seed, arms=arms, suffix=args.suffix,
         val_fraction=args.val_fraction, store_dir=args.store_dir, overwrite=args.overwrite,
     )

@@ -66,6 +66,13 @@ class TrainingConfig:
     assert evidence_selection_weight >= 0.0, (
         f"evidence_selection_weight ({evidence_selection_weight}) must be >= 0"
     )
+    # how the selection term averages: "token" is the mean over every supervised predicting
+    # position in the batch (every run before 2026-10-24), "segment" averages each query segment
+    # first so a long biography and a short chain question weigh the same
+    evidence_selection_weighting = str(Config["training"].get("evidence_selection_weighting", "token"))
+    assert evidence_selection_weighting in ("token", "segment"), (
+        f"evidence_selection_weighting ({evidence_selection_weighting}) must be token or segment"
+    )
     # the groundedness readout's coefficient, here for the same reason
     groundedness_weight = float(Config["training"].get("groundedness_weight", 0.0))
     assert groundedness_weight >= 0.0, (
@@ -89,9 +96,12 @@ class TrainingConfig:
     # 2026-10-21), and the share of its gradient that reaches the trunk through the query's input
     # state (1.0 is the objective before 2026-10-21; 0.0 trains the query head alone). The store
     # recall eval reads the first loop's query with no evidence read yet, so [0] trains that query.
+    # Default [0] since 2026-10-24: past the first pass the IR query position has already read the
+    # evidence through the key/value reader, so in-batch InfoNCE there can be solved by matching
+    # the chunk content the position read. null (every loop) is still accepted for recorded arms.
     # Loop 0 is the only pass every sampled depth runs; a list without it drops the term on the
     # steps whose depth skipped every listed loop.
-    _contrastive_loops = Config["training"].get("evidence_contrastive_loops", None)
+    _contrastive_loops = Config["training"].get("evidence_contrastive_loops", [0])
     evidence_contrastive_loops = (
         None if _contrastive_loops is None else [int(loop) for loop in _contrastive_loops]
     )
