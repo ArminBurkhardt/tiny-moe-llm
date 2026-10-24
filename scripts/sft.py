@@ -547,6 +547,28 @@ def check_split_switch(saved: dict, current: dict, allow_switch: bool,
     return changes
 
 
+def select_epoch(dataloader, dataset, epoch: int) -> None:
+    """Point the next pass over ``dataloader`` at ``epoch``'s document permutation.
+
+    accelerate's prepared loader calls ``set_epoch(self.iteration)`` on its dataset at the start
+    of every pass, and ``iteration`` counts the passes of this process from zero, so setting the
+    epoch on the dataset alone is overridden on a resume past epoch 0: the rest of that epoch
+    read epoch 0's order again and the pass after it epoch 1's. Setting it through the loader
+    keeps its counter and the dataset in step. A fresh run is unchanged (the counter and the
+    epoch agree on every pass), and a loader without ``set_epoch`` falls back to the dataset's.
+
+    Args:
+        dataloader: the loader the epoch loop iterates, prepared by accelerate or plain.
+        dataset: the dataset behind it; the LM reader has no ``set_epoch`` and reads in on-disk
+            order.
+        epoch: the epoch whose permutation the next pass uses.
+    """
+    if hasattr(dataloader, "set_epoch"):
+        dataloader.set_epoch(epoch)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+
+
 def stop_needs_save(optimizer_steps: int, steps_at_last_save, slack_steps: int) -> bool:
     """Whether a stop request should write a checkpoint before exiting.
 
@@ -1786,8 +1808,7 @@ def sft(args):
             resume_epoch = resumed and epoch == start_epoch
             # the LM reader has no per-epoch permutation to set: it reads in on-disk order, which
             # is where the corpus builder already put the source mix
-            if hasattr(train_dataset, "set_epoch"):
-                train_dataset.set_epoch(epoch)
+            select_epoch(dataloader, train_dataset, epoch)
             train_dataset.start_doc_idx = start_doc_idx if resume_epoch else 0
             if not resume_epoch:
                 worker_state.fill_(-1)

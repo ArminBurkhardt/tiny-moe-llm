@@ -15,6 +15,11 @@
    payload written before them loads with empty fields.
 7. **A finished run is recognised**: the final checkpoint is the newest and ``run_state.json``
    names it.
+8. **The epoch loop selects the permutation through the prepared loader**: accelerate's loader
+   sets its dataset's epoch from its own pass counter at the start of every pass, which starts
+   at zero in a new process, so a resume past epoch 0 that set the epoch on the dataset alone
+   trained on epoch 0's order again; ``select_epoch`` keeps the two in step and a fresh run's
+   passes read epochs 0, 1, 2 as before.
 
 GPU free, but ``scripts/sft.py`` imports Transformer Engine, so run it in WSL after env_init.
 """
@@ -26,12 +31,15 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+from accelerate import Accelerator
 from torch import nn, optim
+from torch.utils.data import DataLoader, IterableDataset
 
 from modules.runtime import checkpoints as ckpt_lib
 from scripts.sft import (EVIDENCE_PHASE, check_split_switch, fp32_master_state, load_sft_checkpoint,
                          next_grid_point, restore_fp32_masters, restore_rng_states,
-                         run_already_complete, save_sft_checkpoint, split_changes, stop_needs_save)
+                         run_already_complete, save_sft_checkpoint, select_epoch, split_changes,
+                         stop_needs_save)
 
 
 def test_grid():
@@ -208,6 +216,47 @@ def test_run_complete():
     print("7. a finished run is recognised by its final checkpoint and run_state.json   PASS")
 
 
+class _EpochDataset(IterableDataset):
+    """Records the epoch each pass ran under, as the SFT datasets' permutation would."""
+
+    def __init__(self):
+        self.epoch = 0
+        self.seen = []
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        self.seen.append(self.epoch)
+        yield torch.zeros(1)
+
+
+def test_epoch_select():
+    dataset = _EpochDataset()
+    loader = Accelerator(cpu=True).prepare(DataLoader(dataset, batch_size=None, num_workers=0))
+    # a fresh run: the loop's epochs and the loader's pass counter agree
+    for epoch in range(3):
+        select_epoch(loader, dataset, epoch)
+        list(loader)
+    assert dataset.seen == [0, 1, 2], dataset.seen
+    # a resume at epoch 1 in a new process: the loader's counter starts at zero again
+    dataset = _EpochDataset()
+    loader = Accelerator(cpu=True).prepare(DataLoader(dataset, batch_size=None, num_workers=0))
+    for epoch in range(1, 3):
+        select_epoch(loader, dataset, epoch)
+        list(loader)
+    assert dataset.seen == [1, 2], dataset.seen
+    # a plain loader has no set_epoch of its own: the dataset's is used
+    dataset = _EpochDataset()
+    plain = DataLoader(dataset, batch_size=None, num_workers=0)
+    select_epoch(plain, dataset, 2)
+    list(plain)
+    assert dataset.seen == [2], dataset.seen
+    # a dataset without set_epoch (the LM reader) is left alone
+    select_epoch(loader, object(), 1)
+    print("8. the epoch permutation is selected through the prepared loader on a resume   PASS")
+
+
 def main():
     test_grid()
     test_split_switch()
@@ -216,6 +265,7 @@ def main():
     test_rng_roundtrip()
     test_payload_roundtrip()
     test_run_complete()
+    test_epoch_select()
     print("all sft resume state checks passed")
 
 

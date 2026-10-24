@@ -281,6 +281,13 @@ unless `--switch-split` is passed.
   restored from `fp32_masters` when every master is present with its shape and rounds to the
   just-loaded BF16 weight; otherwise (an older checkpoint, or pretraining) they are reseeded from
   the BF16 weights, and the sub-ulp progress since the last save is lost, bounded by one interval.
+- The epoch loop selects the document permutation through the prepared loader
+  (`sft.select_epoch`, since 2026-10-24): accelerate's `DataLoaderShard.__iter__` calls its
+  dataset's `set_epoch` with its own pass counter at the start of every pass, and that counter
+  starts at zero in a new process, so a resume past epoch 0 that only set the epoch on the dataset
+  read epoch 0's permutation again (and the pass after it epoch 1's). Setting the epoch through
+  the loader keeps the counter and the dataset in step; a fresh run's order is unchanged, the LM
+  reader (no permutation) is untouched, and the validation sets are not prepared by accelerate.
 
 ## Stopping
 
