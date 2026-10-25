@@ -42,7 +42,7 @@ an abrupt flip) is what the per-10M saves were read for.
 | 100M | 23,860 | 0.202 | 0.912 | 0.311 |
 | final | 24,439 | 0.201 | 0.913 | 0.311 |
 
-A smooth decay with no break: the CE falls 0.135 nats over the pass while top-1 per token moves
+A smooth decay with no break: the CE falls 0.135 nats over the pass (0.114 from step 0, 0.135 from the 10M peak) while top-1 per token moves
 0.906 to 0.913, which is the model growing more confident on the tokens it already had right. On
 the training rows the per-loop CE is flat across passes in most windows (pass 3 led in a run of
 five windows around steps 10k to 13k and fell back), the loop scales go [1.289, 0.566, 0.258] to

@@ -693,6 +693,39 @@ def cell_stats(correct: Sequence[bool], chances: Sequence[float]) -> dict:
             "null_sigma": null_sigma, "z_vs_chance": (acc - chance) / null_sigma if null_sigma > 0 else float("nan")}
 
 
+def question_from_meta(meta: dict) -> Optional[ChainQuestion]:
+    """The leak detectors' view of one question, rebuilt from an eval sidecar line.
+
+    ``shortcut_baselines`` reads only the question text, answer, composition, candidates and
+    ``chunk_facts``; the rest of the dataclass is left empty. A sidecar written before the eval
+    splits carried ``chunk_facts`` has none, and the function returns None.
+
+    Args:
+        meta: one parsed line of ``{split}.chains.jsonl``.
+    """
+    if "chunk_facts" not in meta:
+        return None
+    return ChainQuestion(
+        question=meta["question"], answer=meta["answer"], answer_type=meta.get("answer_type", ""),
+        hops=meta["hops"], composition=tuple(meta["composition"]), chunks=[], chunk_hop=[],
+        chunk_kind=meta.get("chunk_kind", []), candidates=list(meta["candidates"]),
+        entities=list(meta.get("entities", [])), chunk_facts=[tuple(f) for f in meta["chunk_facts"]],
+    )
+
+
+def z_vs_line(acc: float, line: float, n: int) -> float:
+    """z of an accuracy against a reference line with the null sigma ``sqrt(line (1 - line) / n)``.
+
+    Args:
+        acc: observed accuracy.
+        line: the reference accuracy, 1 / K or a shortcut baseline.
+        n: questions in the cell.
+    """
+    if n == 0 or not 0.0 < line < 1.0:
+        return float("nan")
+    return (acc - line) / math.sqrt(line * (1.0 - line) / n)
+
+
 def validity_report(cells: Sequence[dict], readable_z: float = 3.0) -> dict:
     """The verdict on the instrument from a flat list of grid cells.
 

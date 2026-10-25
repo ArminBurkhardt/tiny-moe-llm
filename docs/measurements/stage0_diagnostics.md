@@ -33,6 +33,8 @@ actually needs to be observable during the Phase 3 run.
 
 ## Readings
 
+Raw outputs: `stage0_phase2_final.txt` and `stage0_sft_final.txt` in this directory (the `eval_stage0.py` runs on the phase 2 final and the SFT final).
+
 **1 + 2: the table stores nothing, and the read is a constant.** Entropy is 99.5% of `ln 8192` on
 every loop of both checkpoints, and the top 32 of 8192 entries carry 0.7% of the mass against a
 uniform 0.39%. Zeroing the read costs 0.0004 nats; replacing it with its own batch mean costs

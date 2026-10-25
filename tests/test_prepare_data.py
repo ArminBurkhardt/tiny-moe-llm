@@ -179,9 +179,56 @@ def test_holdout_hashes_recorded_for_designated_source():
     shutil.rmtree(d)
 
 
+def test_shard_seed_is_pure_across_processes():
+    import subprocess
+    code = ("import sys; sys.path.insert(0, %r); "
+            "from scripts.prepare_data import shard_shuffle_seed; "
+            "print(shard_shuffle_seed(42, 'data/train-00001-of-00099.parquet'))"
+            % os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    outs = []
+    for hs in ("1", "2", "random"):
+        env = dict(os.environ, PYTHONHASHSEED=hs)
+        r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        outs.append(r.stdout.strip().splitlines()[-1])
+    assert len(set(outs)) == 1, f"shard seed depends on the process hash salt: {outs}"
+    from scripts.prepare_data import shard_shuffle_seed
+    assert shard_shuffle_seed(42, "a") != shard_shuffle_seed(42, "b")
+    assert shard_shuffle_seed(42, "a") != shard_shuffle_seed(43, "a")
+    print(f"[ok] shard shuffle seed {outs[0]} identical across PYTHONHASHSEED 1, 2, random")
+
+
+def test_manifest_key_required_for_ir():
+    import argparse
+    from scripts.prepare_data import check_manifest_key
+    def parse(phases, key):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--phases", nargs="+", default=["phase1", "phase2"])
+        parser.add_argument("--manifest-key", default=None)
+        argv = ["--phases"] + phases + (["--manifest-key", key] if key else [])
+        args = parser.parse_args(argv)
+        check_manifest_key(parser, args)
+        return args
+    try:
+        parse(["ir"], None)
+        raise AssertionError("ir without --manifest-key must be refused")
+    except SystemExit as e:
+        assert e.code == 2
+    try:
+        parse(["phase1", "ir"], None)
+        raise AssertionError("ir among phases without --manifest-key must be refused")
+    except SystemExit:
+        pass
+    assert parse(["ir"], "ir_prep").manifest_key == "ir_prep"
+    assert parse(["phase1", "phase2"], None).manifest_key == "data_prep"
+    print("[ok] --manifest-key required with ir, default kept otherwise")
+
+
 if __name__ == "__main__":
     test_mix_ratio_and_bin_idx_consistency()
     test_interrupt_and_resume_no_gap_no_repeat()
     test_truncate_to_state_drops_uncommitted_tail()
     test_holdout_hashes_recorded_for_designated_source()
+    test_shard_seed_is_pure_across_processes()
+    test_manifest_key_required_for_ir()
     print("\nPREPARE_DATA CHECKS PASSED")

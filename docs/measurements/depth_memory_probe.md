@@ -4,8 +4,8 @@ Rung R1b asks whether one training step at depth 5 fits the 5090 at the pilot's 
 without the detached prefix the blueprint's depth schedule assumes, against depth 3 (the pilot's
 own depth). Answer: it fits. Depth 5 with full gradient does not fit at the pilot's batch 8 x
 4096 (about 31 GB allocated by extrapolation, the card holds 32 GB physical) but fits at batch 4
-x 4096 (17.3 GB), so batch 4 with 2 accumulation steps keeps the tokens per update at about
-1.27x the step time per token of depth 3. The detached prefix fits easily (21.5 GB at batch 8,
+x 4096 (17.3 GB), so batch 4 with 2 accumulation steps keeps the tokens per update the same, at
+about 1.27x the step time per token of depth 3 (config `config_pilot.yaml`). The detached prefix fits easily (21.5 GB at batch 8,
 under depth 3) but as built it cuts the prelude decoder off from the language loss.
 
 ## Build

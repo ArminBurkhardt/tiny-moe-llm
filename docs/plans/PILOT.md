@@ -8,8 +8,8 @@ term at 0.25 under loss-free balancing, stopped at 87M on the language bar on 20
 ([infonce_micro.md](../measurements/infonce_micro.md)); arm E4, 4 routed experts under loss-free
 balancing, complete at 858.40M and read 2026-10-24 ([expert_count_pilot.md](../measurements/expert_count_pilot.md)).
 The written-bridge arm (R9, from arm P's final, `ckpts/evidence_pilot_bridge`) trained to its end
-on 2026-10-24 (66.35M tokens) with its final read running; its 30M read meets R9's bar (NEXT.md
-"Now"). The repository review of 2026-10-24 ([review_2026-10-24.md](../review_2026-10-24.md))
+on 2026-10-24 (66.35M tokens); its final read is done (held-out 2-hop 0.997, 2026-10-24; NEXT.md
+"Now"). R5, the A-gate ladder on the bridge final, was read 2026-10-25, and the real run spec was decided 2026-10-25 ([RUN2.md](RUN2.md)). The repository review of 2026-10-24 ([review_2026-10-24.md](../review_2026-10-24.md))
 adds two corpus caveats (Limitations) and a packer bug under the A3 generation, A7 pathway and
 A4 edit reads (the read table and the Run section). Gate labels follow NEXT.md's table since
 2026-10-24: the store recall read is A7's recall half, the oracle-buffer EM read A7's pathway

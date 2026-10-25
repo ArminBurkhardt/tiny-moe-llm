@@ -356,7 +356,7 @@ router's alone; the fixed aux arm is the first balanced aux run, and it is worse
 on every bar and than the unbalanced arm (a) on loss and storage (arm (a)'s load is not in its
 log).
 
-Decision pending (the user): loss-free balancing into the real-run spec (the record's
+Decided 2026-10-21 (the user): loss-free balancing into the real-run spec (the record's
 recommendation), or aux stays. No pilot-shape arm is needed for the loss bar; the one open
 question for the real run is the bias rate at 8 experts and seq 4096, which a pilot-shape arm P
 under loss-free would read if the user wants it.

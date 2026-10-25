@@ -20,7 +20,10 @@ Two sidecars ride along, both eval-only (no trainer reads them):
                           gold chunk at hop h
     {split}.chains.jsonl  one line per document: qid, question, answer, answer_type, hops,
                           composition, held_out, candidates, chunk_kind, entities (and bridge,
-                          the intermediates e1..e(k-1), under ``--bridge``)
+                          the intermediates e1..e(k-1), under ``--bridge``; and, on the eval splits
+                          only, chunk_facts, the [subject, relation, object] of every chunk, which
+                          ``eval_chains.py`` reads for the shortcut baselines; a sidecar without it
+                          stays readable and gets no baseline)
 
 ``--bridge`` writes the written bridge form: the assistant turn names the chain's intermediate
 entities before the answer (``chains.bridge_answer``); the questions, chunks and sidecars are the
@@ -115,7 +118,8 @@ def conversation(q: chains.ChainQuestion, bridge: bool = False) -> List[dict]:
 
 
 def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion], template: ChatTemplate,
-                embedder, held_out: Set[Tuple[str, ...]], batch: int = 1000, bridge: bool = False) -> dict:
+                embedder, held_out: Set[Tuple[str, ...]], batch: int = 1000, bridge: bool = False,
+                facts: bool = False) -> dict:
     """Write one split and return its build report.
 
     Args:
@@ -128,6 +132,9 @@ def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion]
         batch: questions encoded and embedded per call.
         bridge: the assistant turn is the written bridge and the metadata carries ``bridge``, the
             intermediate entities e1..e(k-1).
+        facts: the metadata also carries ``chunk_facts``, the ``[subject, relation, object]`` of every
+            chunk, which ``eval_chains.py`` needs for the shortcut baselines. Only the eval splits
+            set it; the training and validation sidecars stay as they were.
     """
     state: dict = {}
     writer = EvidenceWriter(data_dir, split, state)
@@ -167,6 +174,8 @@ def build_split(data_dir: str, split: str, questions: List[chains.ChainQuestion]
                 }
                 if bridge:
                     meta["bridge"] = q.entities[1:-1]
+                if facts:
+                    meta["chunk_facts"] = [list(f) for f in q.chunk_facts]
                 meta_file.write((json.dumps(meta) + "\n").encode("utf-8"))
                 report["questions"] += 1
                 report["prompt_tokens"] += len(ids)
@@ -262,7 +271,7 @@ def main():
         count = args.train_questions if name == "train" else args.val_questions
         questions = make_split_questions(name, count, args.seed, held_out, args.eval_questions_per_hop)
         log_report(split, build_split(args.out_dir, split, questions, template, embedder, held_out,
-                                      bridge=args.bridge))
+                                      bridge=args.bridge, facts=name not in ("train", "val")))
 
 
 if __name__ == "__main__":

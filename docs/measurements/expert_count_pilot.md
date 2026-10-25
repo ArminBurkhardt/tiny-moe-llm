@@ -19,7 +19,7 @@ on the prior-controlled `delta`).
 - `bash ckpts/inject/launch_pilot_e4.sh`, config `ckpts/inject/config_pilot_e4.yaml`
   (`config_pilot.yaml` with `num_mlp_experts: 4`, top 2 as before, and `moe_balancing:
   loss_free`), seed `ckpts/inject/seed_pilot_e4_grounded.pt` (`init_scratch_seed.py` seed 0, then
-  `migrate_groundedness_head.py`): 89.6M total, 84.9M active, against arm P's 99.1M / 84.9M, so
+  `migrate_groundedness_head.py`): 89.6M total, 84.9M active, against arm P's 99.1M / 84.9M (the probe's counts; the trainer printed 88.9M / 84.2M for E4 and 98.4M / 84.2M for arm P), so
   the same active compute and FLOP per token.
 - Arm P's recipe: the copy-first warm-up on `pilot_warm_train` to the 300M save, the switch read,
   then `SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_e4.sh` to the epoch's end. Launched
@@ -89,6 +89,8 @@ E4 is above arm P at every read, by 0.001 to 0.019: over 0.013 at 25M (0.019) an
 four experts are probably a little worse on language, by about half the pilot's noise and with
 no growth over the epoch. Arm P's eval at about 628M is missing from its log (a stop window).
 
+Token alignment: E4's evals after 450M sit 2.7 to 4.1M tokens before arm P's nearest, about 0.002 to 0.003 nats of the gap at arm P's slope there, so the raw gaps of 0.005 to 0.012 read about 0.003 to 0.010; still above at every read, under the noise of 0.013.
+
 ## The switch read at 300M (`pilot_e4_300M_*`)
 
 - Copying: gold card top-1 1.000 at every tier in distribution; held out 0.966 / 0.961 / 0.967 /
@@ -153,7 +155,7 @@ arm with fewer parameters stores the frequent facts no more and probably less; m
 | `chains_heldout_tmpl` depth 3, 2-hop (0.191) | 0.184 | 0.184 | 0.195 | 0.192 | at chance |
 | `chains_hop4` depth 4, 4-hop (0.210) | 0.208 | 0.194 | 0.197 | 0.197 | at chance |
 
-The 1-hop gate holds (0.875, 3 points over arm P's 0.848, about 2.5 sigma unpaired at n 2,000, one
+The 1-hop gate holds (0.875, 3 points over arm P's 0.848, about 1.7 sigma unpaired at n 1,000, since the chain read has 1,000 questions per hop and the 2,000 in the heading is per split; one
 seed each) and
 every composition cell is at chance, so L1 fails on this arm as on arm P.
 

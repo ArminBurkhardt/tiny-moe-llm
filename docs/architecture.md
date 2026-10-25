@@ -95,8 +95,12 @@ state dict):
 - **The selector** is the IR expert: the external chunk vectors (bge-small, 384-d) enter its softmax
   through square orthogonal adapters and a learned per-source scale, so the fraction of read mass
   that went external is a groundedness signal computed for every token. The selector's per-chunk
-  mass gates the reader's evidence states through a zero-init scalar, which is what ties the two
-  halves together.
+  mass can gate the reader's evidence states through a zero-init scalar, which was meant to tie the
+  two halves together; in every config that scalar is frozen at 0 (`freeze_evidence_gate`, `config.py`),
+  so the gate is exactly 1 and, since 2026-10-24, skipped in the forward. The evidence encoder cuts
+  its padding into 128-token segments (`transformer.EVIDENCE_PAD_SEGMENT`) before the encoder's
+  `cu_seqlens`, so a row's trailing pad run is not one long causal segment (real-token states and
+  logits are bit-identical). The training CE, top-1 and `p_max` sums accumulate in fp32.
 
 **With no evidence attached the forward is bit-identical to the model without the port**, asserted
 in `tests/test_evidence_port.py`. That property is what lets one checkpoint serve both modes and

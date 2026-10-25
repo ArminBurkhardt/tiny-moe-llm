@@ -133,7 +133,7 @@ answers something else, and the same holds with the edited chunk handed to it di
 0.09). Following an edited real-text chunk is therefore a generation weakness of arm P on real
 questions (exact match 0.05 under gold on SQuAD, the A3 re-read above), not a store failure; on the
 synthetic biographies the same model follows a swapped card 100% of the time. The edit half rests
-on 23 items. Verdict: A4's delete half holds on the serving route, the edit half fails on
+on 23 items. Chunk-order caveat: store chunks are 128 tokens, best first, while training used whole passages with the gold shuffled; under the prefix rotation best-first puts the top chunk farthest from the query. The size of this effect is unmeasured; a shuffled re-read is running 2026-10-25. The same caveat applies to the A7 pathway read. Verdict: A4's delete half holds on the serving route, the edit half fails on
 generation quality; both halves were unreadable before the decode fix of the same day and on the
 model's own query route, which finds nothing.
 
@@ -204,8 +204,8 @@ With no read site kept every cell is at chance at every save (final 0.136 / 0.19
 - **`instrument valid: no` is stale in this mode.** The line and its FAIL rows are the plain
   mode's check that a cell with fewer read sites than hops sits at chance. With the hops written
   that premise no longer holds (a later decode step reads again), so the line does not apply here
-  and is not a failure; the bridge eval suppresses the verdict lines in this mode since the
-  repository review of 2026-10-24.
+  and is not a failure; their suppression in this mode is held, not landed (`scripts/eval_chains.py`
+  is unchanged since `fee6a5c`).
 
 ## Against arm P's latent read
 
@@ -228,7 +228,7 @@ What it decides, and what stays open:
 - 6f's reasoning form is written tokens; the loop keeps lookup and copying, as computation per
   token.
 - R4's corner arm (loss placement through the coda) is no longer needed for the real run and is
-  recommended dropped. Open for the user, not decided.
+  recommended dropped. Dropped 2026-10-24 (the user), obsolete on this read.
 - The real run's training mix needs multi-hop rows at the depth wanted at serving: the written
   depth does not generalize past the trained one (4-hop at chance with two written steps).
 - Not measured: transfer to real questions (A3 in generation, now readable and weak on arm P;
@@ -245,7 +245,8 @@ What it decides, and what stays open:
 - Saves `ckpts/evidence_pilot_bridge/` (10M to 60M, final).
 - Re-reads on arm P's final: `ckpts/inject/ladder_pilot_redo.sh`,
   `ckpts/inject/pilot_p_ladder2_{abstention,store_pathway}.{json,log}` (read 2026-10-24),
-  `ckpts/inject/pilot_p_ladder2_store_edit.{json,log}` (read 2026-10-24).
+  `ckpts/inject/pilot_p_ladder2_store_edit.{json,log}` (read 2026-10-24),
+  `ckpts/inject/pilot_p_ladder2_store_edit_bge.{json,log}` (the bge routed flip read, 2026-10-24).
 
 ## Later: the A-gate ladder on this checkpoint (2026-10-25)
 

@@ -254,6 +254,39 @@ def main():
     assert refused, "a prior control was built for an open-book reading"
     print("7. bio items: candidates, sha1 seeds, major pool, swapped and prompt      PASS")
 
+    # 7b. distractor cards beside the gold, by the builder's rule
+    from scripts.closed_book_rank import near_neighbours, draw_distractors
+    key_rng = np.random.RandomState(3)
+    fake_keys = key_rng.randn(len(people), 384).astype(np.float32)
+    fake_keys /= np.linalg.norm(fake_keys, axis=1, keepdims=True)
+    near = near_neighbours(people, fake_keys)
+    for pid, pool in near.items():
+        assert all(people[o].tier == people[pid].tier and o != pid for o in pool)
+
+    def card_rows(person, text, cards=None):
+        if cards is None:
+            return {"cards": [person.person_id], "gold_pos": 0}
+        return {"cards": [c[0].person_id for c in cards],
+                "gold_pos": [c[0].person_id for c in cards].index(person.person_id)}
+
+    for mode in ("gold", "swapped"):
+        base, _ = make_bio_items(people, pools, forms=["indist"], evidence=mode, card_evidence=card_rows)
+        assert all(i.evidence["cards"] == [int(i.item_id.split(":")[0])] for i in base)
+        with_d, _ = make_bio_items(people, pools, forms=["indist"], evidence=mode, card_evidence=card_rows,
+                                   distractors=3, all_people=people, near=near)
+        again, _ = make_bio_items(people, pools, forms=["indist"], evidence=mode, card_evidence=card_rows,
+                                  distractors=3, all_people=people, near=near)
+        assert [i.evidence for i in with_d] == [i.evidence for i in again]
+        assert [i.candidates for i in with_d] == [i.candidates for i in base]
+        for i in with_d:
+            pid = int(i.item_id.split(":")[0])
+            cards = i.evidence["cards"]
+            assert len(cards) == 4 and len(set(cards)) == 4 and cards.count(pid) == 1
+        assert len({i.evidence["gold_pos"] for i in with_d}) > 1, "the gold is always in one slot"
+    drawn = draw_distractors(0, len(people), near, 3, random.Random(0))
+    assert len(drawn) == 3 and 0 not in drawn and len(set(drawn)) == 3
+    print("7b. distractors: K 0 as before, K 3 gives 4 cards, gold position varies     PASS")
+
     # 8. the three arm verdict, read against the paired prior control
     def synthetic(mean_by_tier, seed, prior_by_tier=None, n_per_tier=300, form="indist"):
         rng = np.random.RandomState(seed)

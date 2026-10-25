@@ -50,7 +50,9 @@ Only the MLP experts are dispatched sparsely.
    experts; the weights are gathered from the **unbiased** `expert_scores` at those indices and
    renormalized to sum to 1. `balance_bias` is the loss-free balancing buffer (below); at zero, which
    is every checkpoint before 2026-10-19 and every run under `moe_balancing: aux`, the selection is
-   exactly the old router's.
+   exactly the old router's. Under loss-free balancing the selection scores (the
+   probabilities plus `balance_bias`) are formed in fp32 for the topk; a zero bias is bit-identical,
+   and at bias 0.30 the bf16 sum picked differently on 2% of tokens.
 5. **Load-balancing aux loss** is computed from the same softmax and the same top-k indices:
    `num_experts * Σ f_i * P_i` (hard token fraction `f_i` times mean soft prob `P_i`), minimized at a
    uniform distribution. It is computed in every mode but added to the objective only under
@@ -165,11 +167,14 @@ shrinkage does not stunt a later re-read. Its `o_proj` is zero-init, which makes
 reader neutral even with evidence attached; that neutrality argument holds for the cross reader
 only.
 
-**The chunk gate** is shared by both: the evidence states are multiplied per chunk by
+**The chunk gate** is shared by both in the code: the evidence states are multiplied per chunk by
 `1 + evidence_gate_scale * sigmoid(chunk mass)`, where the chunk mass is this loop's selector mean
 external weight on that chunk over the document's own tokens. A zero-init scale makes the gate
 *exactly* 1, and a nonzero one gives the selector a dense, always-on gradient through the reader.
-All of these tensors are in `is_fresh_loop_param` and train at the from-scratch rate under
+In every config the scale is frozen at exactly 0 (`freeze_evidence_gate`, `config.py`), so the
+gate is the identity and, since 2026-10-24, it is skipped under both readers: no selector mass,
+scatter or multiply by ones per loop (the zero test is cached against the scale's `_version`, no
+per-step sync; `tests/test_evidence_gate_skip.py`). All of these tensors are in `is_fresh_loop_param` and train at the from-scratch rate under
 `sft.py --evidence`.
 
 `information_retrieval.evidence_selection_loss` (BCE between the per-chunk external share and the
@@ -177,7 +182,10 @@ gold flag) is the selector's supervised half, reached through
 `LoopMixtureOfExperts.evidence_selection_term`: it reads each IR module's `last_memory_weights`
 (the per-chunk breakdown before the sum-and-detach) against the mask the recurrence built once in
 `last_memory_visible`, averages over every loop and IR expert, and `train_step` adds it at
-`TrainingConfig.evidence_selection_weight`. Uniform loop weights, not `loop_ce_weights`' ascending
+`TrainingConfig.evidence_selection_weight`. Since 2026-10-24 the BCE is in log space with no clamp on
+the renormalized share, rows with fewer than two visible chunks are excluded, and
+`evidence_selection_weighting` (`token`, default; `segment`, each query segment averaged first from
+`cu_seqlens`; passed through `evidence_selection_term(segment_ids=, num_segments=)`) sets the average. Uniform loop weights, not `loop_ce_weights`' ascending
 ones: a relevant chunk is relevant at every depth. `None` whenever the batch had no external
 store or the corpus no gold flag, which is every profile but `--evidence`.
 
@@ -193,7 +201,8 @@ whole output, the attention that did the read) at the last prompt token of each 
 
 Under the cross reader its weight gradient is **exactly zero until the reader's `o_proj` leaves
 zero**, because the head reads a zero vector until then and only its bias can move (the key/value
-reader's output is never zero, so this does not apply there). So an early falling `grounded:` is the
+reader's output is never zero, so this does not apply there). Since 2026-10-24 the head's input is
+detached under the key/value reader: the head still learns, no trunk parameter gets a gradient from it. So an early falling `grounded:` is the
 base rate being learned; the held-out AUROC in the `[eval]` line is what says otherwise.
 
 ## Depth policy
@@ -239,7 +248,7 @@ from-scratch test in [NEXT.md](plans/NEXT.md) 7c.
 
 ## Confidence signal
 
-`p_max = softmax(logits).max()` is the confidence signal everywhere: training logs, `sft.py`'s
+`p_max = softmax(logits).max()` (its sum, like the CE and top-1 sums, accumulates in fp32 since 2026-10-24; the evidence encoder's padding is cut into 128-token `EVIDENCE_PAD_SEGMENT` segments) is the confidence signal everywhere: training logs, `sft.py`'s
 validation pass, `eval_calibration.py`, `eval_abstention.py`. Computed as `1 / Σ_j exp(l_j - l_max)`
 to avoid two ~2GB fp32 transients per chunk. It carries no answerability signal (AUROC at or below
 chance on every checkpoint); a linear probe of the final loop's last-position hidden state reads
@@ -255,7 +264,11 @@ keeps it from collapsing the same way.
 
 1. Flatten `(token, slot)` assignments, **sort by expert id** (`stable=True`, for deterministic
    checkpoint recompute).
-2. `bincount(...).tolist()` gives per-expert group sizes, the one accepted host sync per loop.
+2. `bincount(...).tolist()` gives per-expert group sizes, the one accepted host sync per loop. Since
+   2026-10-24 the layer delegates to `experts.grouped_mlp_forward` with `null_mask=~mlp_mask`: the
+   dense-slot picks (`(index 0, weight 0)`) sort after the real experts, are counted in the same
+   `bincount().tolist()` sync and sliced off before the grouped GEMM (exact zeros as before; outputs
+   differ only by bf16 summation order; `tests/test_efficiency_2026_10_24.py`).
 3. One variable-sized grouped GEMM per expert via TE `GroupedLinear` (fused gate+up, then down).
 4. Scale each output by its routing weight (non-MLP slots carry weight 0), `index_add_` back.
 

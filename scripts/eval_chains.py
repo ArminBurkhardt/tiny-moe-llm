@@ -35,7 +35,16 @@ prefix is off the trained distribution, so such rows are excluded from accuracy 
 table gives the marker rate, the hit rate per intermediate hop, the accuracy among marker rows
 only, and the accuracy among questions with every intermediate written against the rest. The
 candidate tail carries the closing "." token here, so ``gold_nll`` and ``ce_per_token`` are not
-comparable to a plain run; ``ln_k`` is.
+comparable to a plain run; ``ln_k`` is. In this mode ``acc`` in the grid and the log counts every
+row, marker or not; quote ``acc_marker``. The latent read's sub-hop rule and instrument verdict are
+not printed (the JSON ``validity`` carries ``mode: bridge, valid: null``), and the kept 3 minus
+kept 1 line is labelled bridge-internal.
+
+Every cell also reads against the shortcut line: ``chains.shortcut_baselines`` over the cell's
+questions, rebuilt from the eval sidecar's ``chunk_facts``. ``penultimate_fed`` (about 0.256
+against 1 / K 0.185 on 2-hop) is what a picker that never composes scores, so ``z_vs_shortcut``,
+not ``z_vs_chance``, is the z a composition claim has to clear. A sidecar without ``chunk_facts``
+(built before 2026-10-25) prints n/a.
 
 Usage:
 
@@ -101,6 +110,23 @@ class ChainSplit:
                 taken[m["hops"]] += 1
                 out.append(i)
         return out
+
+
+def split_shortcuts(split: ChainSplit, indices: Sequence[int]) -> Dict[int, Optional[Dict[str, float]]]:
+    """The shortcut baselines per hop count over the selected questions.
+
+    The cell's questions are the same at every depth and kept count, so this runs once per split.
+    A hop count with any question lacking ``chunk_facts`` in the sidecar maps to None.
+
+    Args:
+        split: the split read.
+        indices: the selected question indices, as ``ChainSplit.select`` returns.
+    """
+    by_hops: Dict[int, list] = defaultdict(list)
+    for i in indices:
+        by_hops[split.meta[i]["hops"]].append(chains.question_from_meta(split.meta[i]))
+    return {h: (None if any(q is None for q in qs) else chains.shortcut_baselines(qs))
+            for h, qs in sorted(by_hops.items())}
 
 
 def encode_items(split: ChainSplit, indices: Sequence[int], tokenizer, template: ChatTemplate) -> List[dict]:
@@ -195,8 +221,8 @@ def generate_bridges(model, tokenizer, items: List[dict], *, depth: int, kept: O
 
     Batched over questions and left padded, with no KV cache (the reader has no cache slot), the
     way ``eval_abstention.generate_batch`` decodes: the pad run is each row's first segment and
-    takes the shared evidence width, the real run its last, and the evidence batch is rebuilt every
-    step against that step's ``cu_seqlens``. A row stops at EOS or once its decoded text contains
+    takes the shared evidence width, the real run its last, and the evidence batch is built once
+    per batch of questions (the segment layout does not change as the real runs grow). A row stops at EOS or once its decoded text contains
     ``chains.BRIDGE_ANSWER_MARKER``; a stopped row emits pad inside its own segment so the batch
     stays rectangular.
 
@@ -228,11 +254,15 @@ def generate_bridges(model, tokenizer, items: List[dict], *, depth: int, kept: O
         generated: List[List[int]] = [[] for _ in chunk]
         finished = [False] * b
         rows = [it["evidence"] for it in chunk]
+        evidence = None
         for _ in range(max_new_tokens):
             cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(doc)
-            seg = _segment_ids(cu_seqlens, b, doc.shape[1], device)
-            evidence = _pack_evidence_batch(model, seg[:, -1], seg[:, 0], rows,
-                                            num_segments=int(cu_seqlens.numel() - 1), device=device)
+            if evidence is None:
+                # the segment layout (one pad run, one real run per row) never changes while the
+                # real runs grow, so the evidence batch of step 0 is every step's
+                seg = _segment_ids(cu_seqlens, b, doc.shape[1], device)
+                evidence = _pack_evidence_batch(model, seg[:, -1], seg[:, 0], rows,
+                                                num_segments=int(cu_seqlens.numel() - 1), device=device)
             res = model(
                 input_ids=ids, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, return_hidden=True,
                 skip_mtp=True, evidence=evidence, n_loops=depth, reader_sites_kept=kept,
@@ -482,29 +512,61 @@ def paired_delta_by_hops(by_kept: Dict[int, List[dict]]) -> Dict[int, dict]:
 
 
 ACC_WIDTH = 29
+SHORTCUT_WIDTH = 17
 NLL_WIDTH = 34
 
 
-def accuracy_table(by_kept: Dict[int, Dict[int, dict]]) -> List[str]:
+def accuracy_table(by_kept: Dict[int, Dict[int, dict]], mark_subhop: bool = True) -> List[str]:
     """Header and one row per kept count; a two character marker column precedes each cell.
+
+    Cells that carry the shortcut line (``shortcut`` and ``z_vs_shortcut``, from ``shortcut_stats``)
+    get two more columns, the line and the z against it.
 
     Args:
         by_kept: grid cells of one split and depth, ``by_kept[kept][hops]``.
+        mark_subhop: put ``*`` on cells with fewer kept sites than hops (the latent read's rule; off
+            for the written bridge read, which that rule does not describe).
     """
     hops_seen = sorted({h for k in by_kept.values() for h in k})
-    lines = ["kept  " + "".join(f"{f'hops {h}':>{ACC_WIDTH + 2}}" for h in hops_seen)]
+    with_line = any("shortcut" in s for k in by_kept.values() for s in k.values())
+    width = ACC_WIDTH + (SHORTCUT_WIDTH if with_line else 0)
+    lines = ["kept  " + "".join(f"{f'hops {h}':>{width + 2}}" for h in hops_seen)]
     for kept, by_hops in by_kept.items():
         line = f"{kept:>4}  "
         for h in hops_seen:
             s = by_hops.get(h)
             if s is None:
-                line += " " * (ACC_WIDTH + 2)
+                line += " " * (width + 2)
                 continue
-            mark = "*" if kept < h else " "
+            mark = "*" if mark_subhop and kept < h else " "
             body = f"{s['acc']:.3f}+-{s['sigma']:.3f} | {s['chance']:.3f} | {s['z_vs_chance']:+6.1f}"
-            line += f" {mark}{body:>{ACC_WIDTH}}"
+            if with_line:
+                if s.get("shortcut") is None:
+                    body += " | " + "n/a".rjust(SHORTCUT_WIDTH - 3)
+                else:
+                    body += f" | {s['shortcut']:.3f} | {s['z_vs_shortcut']:+6.1f}"
+            line += f" {mark}{body:>{width}}"
         lines.append(line)
     return lines
+
+
+def shortcut_stats(correct: Sequence[bool], baselines: Optional[Dict[str, float]]) -> dict:
+    """The shortcut line of one cell and the z of its accuracy against it.
+
+    The line is ``penultimate_fed``, the picker that never composes and sits above 1 / K on two or
+    more hops (on one hop it equals chance). Cells without baselines (a sidecar written before the
+    eval splits carried ``chunk_facts``) get ``shortcut`` None.
+
+    Args:
+        correct: per question, whether the prediction was the answer.
+        baselines: ``chains.shortcut_baselines`` of the cell's questions, or None.
+    """
+    if baselines is None:
+        return {"shortcut": None, "z_vs_shortcut": float("nan"), "shortcut_baselines": None}
+    n = len(correct)
+    acc = sum(1 for c in correct if c) / n if n else float("nan")
+    line = baselines["penultimate_fed"]
+    return {"shortcut": line, "z_vs_shortcut": chains.z_vs_line(acc, line, n), "shortcut_baselines": baselines}
 
 
 def nll_table(by_kept: Dict[int, Dict[int, dict]]) -> List[str]:
@@ -560,10 +622,20 @@ def main():
     cells: List[dict] = []
     ce_by_split: Dict[str, dict] = {}
     records: Dict[str, dict] = {}
+    shortcut_lines: Dict[str, dict] = {}
     for split_name in [s.strip() for s in args.splits.split(",") if s.strip()]:
         split = ChainSplit(args.data_dir, split_name)
-        items = encode_items(split, split.select(args.max_questions), tokenizer, template)
+        selected = split.select(args.max_questions)
+        items = encode_items(split, selected, tokenizer, template)
         logger.info(f"{split_name}: {len(items)} questions")
+        shortcuts = split_shortcuts(split, selected)
+        shortcut_lines[split_name] = {h: b for h, b in shortcuts.items()}
+        for h, b in shortcuts.items():
+            if b is None:
+                logger.info(f"{split_name}: {h}-hop shortcut baselines n/a (the sidecar has no chunk_facts)")
+            else:
+                logger.info(f"{split_name}: {h}-hop shortcut baselines " +
+                            ", ".join(f"{k} {v:.3f}" for k, v in b.items()))
         grid[split_name], ce_by_split[split_name], records[split_name] = {}, {}, {}
         for depth in depths:
             if split_name == args.splits.split(",")[0].strip() and depth == depths[0]:
@@ -599,27 +671,53 @@ def main():
                     extras = cell_extras(cell_records)
                     if args.generate_bridge:
                         extras.update(bridge_stats(cell_records))
-                    grid[split_name][depth][kept][hops] = dict(stats, **extras)
+                    line = shortcut_stats(cell["correct"], shortcut_lines[split_name].get(hops))
+                    grid[split_name][depth][kept][hops] = dict(stats, **extras, **line)
                     ce_by_split[split_name][depth][kept][hops] = answer_ce(cell)
                     cells.append(dict(stats, split=split_name, depth=depth, hops=hops, kept=kept))
-                    logger.info(f"{split_name} D={depth} kept={kept} hops={hops}: acc {stats['acc']:.3f} "
-                                f"chance {stats['chance']:.3f} z {stats['z_vs_chance']:+.1f} n {stats['n']}")
+                    shortcut_text = ("" if line["shortcut"] is None else
+                                     f" shortcut {line['shortcut']:.3f} z {line['z_vs_shortcut']:+.1f}")
+                    if args.generate_bridge:
+                        acc_text = (f"acc_all_rows {stats['acc']:.3f} acc_marker {extras['acc_marker']:.3f} "
+                                    f"(n_marker {extras['n_marker']})")
+                    else:
+                        acc_text = f"acc {stats['acc']:.3f}"
+                    logger.info(f"{split_name} D={depth} kept={kept} hops={hops}: {acc_text} "
+                                f"chance {stats['chance']:.3f} z {stats['z_vs_chance']:+.1f}{shortcut_text} "
+                                f"n {stats['n']}")
 
     verdict = chains.validity_report(cells)
     print("\n=== chain composition by read sites ===")
     for split_name, by_depth in grid.items():
         for depth, by_kept in by_depth.items():
-            print(f"\n{split_name}  depth {depth}   (acc +- sigma | chance | z vs chance)")
-            for line in accuracy_table(by_kept):
+            if args.generate_bridge:
+                head = "acc over all rows, marker or not, +- sigma | chance | z vs chance"
+            else:
+                head = "acc +- sigma | chance | z vs chance"
+            if any("shortcut" in s for bk in by_kept.values() for s in bk.values()):
+                head += " | shortcut line (penultimate_fed) | z vs shortcut"
+            print(f"\n{split_name}  depth {depth}   ({head})")
+            for line in accuracy_table(by_kept, mark_subhop=not args.generate_bridge):
                 print(line)
-    print("\n(* marks a cell with fewer kept sites than hops: it must sit at chance)")
-    print(f"sub-hop cells outside 3 sigma of chance: {len(verdict['failing'])}")
-    for c in verdict["failing"]:
-        print(f"  FAIL {c['split']} D={c['depth']} hops={c['hops']} kept={c['kept']}: "
-              f"acc {c['acc']:.3f} chance {c['chance']:.3f}")
-    if not verdict["readable"]:
-        print(f"1-hop curve not readable: {len(verdict['unreadable'])} cells under 3 sigma above chance")
-    print(f"instrument valid: {'yes' if verdict['valid'] else 'no'}")
+    if args.generate_bridge:
+        print("\nbridge mode: acc above counts rows without the answer marker; quote acc_marker from the "
+              "written bridge table below.")
+        print("the latent read's sub-hop verdict and instrument validity do not describe a written "
+              "bridge and are not printed (validity mode bridge, valid null in the JSON).")
+    else:
+        print("\n(* marks a cell with fewer kept sites than hops: it must sit at chance)")
+        print(f"sub-hop cells outside 3 sigma of chance: {len(verdict['failing'])}")
+        for c in verdict["failing"]:
+            print(f"  FAIL {c['split']} D={c['depth']} hops={c['hops']} kept={c['kept']}: "
+                  f"acc {c['acc']:.3f} chance {c['chance']:.3f}")
+        if not verdict["readable"]:
+            print(f"1-hop curve not readable: {len(verdict['unreadable'])} cells under 3 sigma above chance")
+        print(f"instrument valid: {'yes' if verdict['valid'] else 'no'}")
+    print("\nshortcut line per split and hop (penultimate_fed; chance is 1/K):")
+    for split_name, by_hops in shortcut_lines.items():
+        for h, b in by_hops.items():
+            print(f"  {split_name} hops {h}: " + ("n/a (no chunk_facts in the sidecar)" if b is None else
+                  f"penultimate_fed {b['penultimate_fed']:.3f} against random {b['random']:.3f}"))
 
     print("\n=== gold NLL per answer / mean ln K | CE per token | NLL at the divergent token ===")
     for split_name, by_depth in grid.items():
@@ -663,7 +761,8 @@ def main():
         for name, split_name in (("held out", "chains_heldout_tmpl"), ("seen", "chains_eval")):
             pd = readings["paired_delta"].get(split_name, {}).get("3", {}).get("2")
             if pd:
-                print(f"  paired Delta acc (kept {pd['kept_hi']} minus kept {pd['kept_lo']}), {name}: "
+                label = "bridge-internal " if args.generate_bridge else ""
+                print(f"  {label}paired Delta acc (kept {pd['kept_hi']} minus kept {pd['kept_lo']}), {name}: "
                       f"{pd['delta']:+.3f} +- {pd['sigma']:.3f} (n {pd['n']})")
         readings["heldout_vs_seen_depth3"] = {
             str(k): {"held_out": held[k].get(2), "seen": seen.get(k, {}).get(2)} for k in sorted(held)}
@@ -675,8 +774,14 @@ def main():
                      if args.generate_bridge or k not in ("generate_bridge", "bridge_max_tokens")},
             "grid": {s: {str(d): {str(k): {str(h): v for h, v in bh.items()} for k, bh in bk.items()}
                          for d, bk in bd.items()} for s, bd in grid.items()},
-            "validity": {"valid": verdict["valid"], "readable": verdict["readable"],
-                         "failing": verdict["failing"], "unreadable": verdict["unreadable"]},
+            "validity": ({"mode": "bridge", "valid": None, "readable": None, "failing": [],
+                          "unreadable": [], "note": "the latent read's sub-hop rule does not apply to "
+                          "the written bridge read"}
+                         if args.generate_bridge else
+                         {"mode": "latent", "valid": verdict["valid"], "readable": verdict["readable"],
+                          "failing": verdict["failing"], "unreadable": verdict["unreadable"]}),
+            "shortcut_baselines": {s: {str(h): b for h, b in by_hops.items()}
+                                   for s, by_hops in shortcut_lines.items()},
             "records": {s: {str(d): {str(k): recs for k, recs in bk.items()} for d, bk in bd.items()}
                         for s, bd in records.items()},
             "readings": readings,

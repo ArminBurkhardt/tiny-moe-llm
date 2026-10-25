@@ -195,7 +195,7 @@ Gold top-1 is the entity class; the swapped follow rate is all classes, as in th
 - What writes the tier 1000 level: the prior drifting and the input path, untested by a lever.
 - The value-to-name closed-book probe (the Open items row) is still not built; m1 masks the
   route without measuring the direction itself.
-- `--support-gold-only` as a real-run data lever: open for the user.
+- `--support-gold-only` as a real-run data lever: decided 2026-10-25, carried into the real corpus builder behind a flag (RUN2.md row 3).
 
 ## The same-code twin `cfb` (2026-10-25, evening)
 
@@ -203,7 +203,7 @@ The two leak arms were paired above against the recorded warm-up arm, which ran 
 2026-10-05, so a flag effect and a code effect were not separable in that compare, nor in the
 copying at the switch or in the filler CE gap. `cfb` reruns the recorded warm-up arm's exact
 recipe on the flagless splits (`inject_retrieval_s100a50_train`, then `inject_retrieval_train`)
-on the code in the tree, as the twin both leak arms are read against.
+on the code in the tree, as the twin both leak arms are read against. The cosine's planned steps rule the estimator out as the cause of the 0.022 filler CE gap: about 11,907 for the recorded warm-up arm and about 11,911 for `cfb`, `m1` and `g1`.
 
 - Launcher `bash ckpts/inject/launch_leak_arm.sh cfb` (the `cfb` case added the same day),
   launched 16:49 detached. Warm-up to the 100M save, STOP dropped on it, exit 10 at 17:19 on that
@@ -268,8 +268,7 @@ distribution (-0.037, z -2.5) and its prior moves with it. No cell beyond z 1.8 
    change: paired against the recorded arm the same cell moves -0.009 (z -1.8), inside noise.
    Tier 1000 (0.070, z 5.0 in distribution; 0.038, z 3.5 held out) is the known residual.
 
-Open for the user: accept the thin tier 100 margin as the recipe's known state at micro, or read a
-second seed of `cfb` before the real-run spec leans on the tier 100 half of the rule.
+Decided 2026-10-25 (the user, RUN2.md row 9): the thin tier 100 margin is accepted as the recipe's known state at micro on one seed; no second seed of `cfb`.
 
 ## Raw files
 

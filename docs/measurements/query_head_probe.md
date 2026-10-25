@@ -1,5 +1,7 @@
 # Query head probe (2026-10-21): does the trunk's state carry the question for search
 
+Run under `TINY_LLM_CONFIG=config_micro.yaml` (`scripts/probe_query_head.py`).
+
 Arm PI was stopped at 87M on the language bar: the retriever's InfoNCE term, with its gradient
 into the trunk, cost 0.30 nats of held-out CE at pilot size and bought no search. Before a
 cheaper arm, this probe asks whether the state the search head reads already carries the
@@ -105,7 +107,7 @@ Recall of the gold chunk at loop 1, held-out folds, 8,715 questions over 274,212
   it sees the same states the probe's heads see. A working tower would be a small bge-style
   encoder over the prompt text, a retriever beside the model rather than the trunk searching.
   Decided 2026-10-21 (the user): the tower is held, bge keys the store and embeds the question
-  at serving, A4 stays untested, and the model's own retrieval is revisited at the real run's
+  at serving, A7's recall half stays untested, and the model's own retrieval is revisited at the real run's
   size (the two keys stay as the knob).
 - Not tested: a larger model (the cap may lift with width), later loops (loop 1 is the pass the
   store read uses), and heads wider than one hidden layer.

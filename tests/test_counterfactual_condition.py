@@ -38,7 +38,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FROZEN = ("load_model", "generate_batch", "_pack_evidence_batch", "teacher_forced_calibration",
           "normalize_answer", "exact_match", "token_f1", "abstention_scores", "load_squad_split",
           "squad_references")
-BASELINE_COMMIT = "d3a0fde"
+# moved from d3a0fde to af24c70 on 2026-10-25: the packer fix of 2026-10-24 changed
+# _pack_evidence_batch on purpose (sorted layout under left padding), so the old pin could never
+# match again; af24c70 is the newest commit at which every function above matches the tree
+BASELINE_COMMIT = "af24c70"
 
 
 class FakeEmbedder:

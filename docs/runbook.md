@@ -88,7 +88,7 @@ relaunching through preemptions. This is the only thing you leave running.
 ## 2. Watching it
 
 ```bash
-tail -f ckpts/training/train.log      # the log the supervisor writes
+tail -f ckpts/training/train.log      # written by onstart.sh only; launched by hand, read the supervisor's own output
 cat ckpts/training/status.json        # machine-readable snapshot, rewritten every ~3s
 ```
 
@@ -98,8 +98,8 @@ cat ckpts/training/status.json        # machine-readable snapshot, rewritten eve
 {
   "phase": "phase1",
   "tokens": 12400000000,
-  "phase_target": 25415000000,
-  "run_target": 29900000000,
+  "phase_target": 13600000000,
+  "run_target": 16000000000,
   "tokens_per_sec": 198000.0,
   "loss": 2.91,
   "eta_phase": "18h 14m",
@@ -141,8 +141,8 @@ this repo is a scratch mirror of local checkpoints, not something meant to be re
 
 ## 3. Checkpoints on disk
 
-`ckpts/training/`, ~2GB each, written every `checkpoint_every_tokens` (400M ≈ 30 min ≈ 75 over the
-run). Naming is token-keyed, not step-keyed: `checkpoint_phase1_tok12400M_loss2.9134.pt`.
+`ckpts/training/`, ~2GB each, written every `checkpoint_every_tokens` (400M ≈ 30 min ≈ 40 over the
+16e9 run). Naming is token-keyed, not step-keyed: `checkpoint_phase1_tok12400M_loss2.9134.pt`.
 
 Two rules worth knowing before you go looking for a file that is gone, or wonder why the disk is
 filling:
@@ -166,7 +166,7 @@ is cleaned up.
 | Stop the whole run, cleanly | `touch ckpts/training/STOP` | 10 | no |
 | Checkpoint right now, keep training | `kill -USR1 <pid>` | - | n/a |
 | Stop this process, expect a restart | `kill <pid>` (SIGTERM) | 20 | yes |
-| Stop from an attached terminal | Ctrl-C | 10 | no |
+| Stop from an attached terminal | Ctrl-C | none: under `run_training.py` the Ctrl-C kills the child without a save (CPython's `subprocess.call` behaviour), so the run loses the tokens since its last checkpoint; `touch ckpts/training/STOP` is the clean path | no |
 
 The STOP sentinel is the one to use remotely: it needs no ssh session and no process lookup, just
 a file. Both the sentinel and the signal flags are read at the log cadence (~3s), then a 2GB
@@ -193,7 +193,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 | You see | What it is |
 |---|---|
 | `checkpoint ... failed to load ... trying the next oldest` | A checkpoint was truncated by a preemption. Working as designed; the run continues from the previous one. |
-| `WARNING: stop requested (signal 15)` | vast reclaimed the instance. The supervisor relaunches. |
+| `Stopping: signal 15. Saving checkpoint...` | vast reclaimed the instance (SIGTERM). The supervisor relaunches. |
 | `phase1 preempted; relaunching in 30s` | Normal for an interruptible instance. Backoff doubles, capped at 300s. |
 | `pruned N uploaded checkpoint(s) past the newest 2` | Retention doing its job. |
 | `phase1 data exhausted at ... saving final checkpoint` | Legitimate end of a phase. Phase 1's corpus is only ~0.3% larger than its token target, so either this or "reached target" can fire first; both save a final checkpoint and exit 0. |
@@ -214,7 +214,7 @@ killing the supervisor alone leaves `pretrain.py` running.
 | `keeping N checkpoint(s) past the retention window because their upload has not succeeded` | Same as above, caught earlier. | Same. |
 | Loss is `nan` | Almost always precision. | Re-run without `USE_FP8=1`. The dry run asserts a finite loss at startup, so a `nan` appearing later is a training-dynamics problem, not a config one. |
 | Training "succeeded" in minutes having done nothing | A phase-2 run whose document offset was not reset. | This is the bug `resolve_resume_scope` exists to prevent; check the checkpoint's `phase` field. |
-| `upload queue full; dropping ...` | Uploads are slower than checkpointing. | Only rolling checkpoints are ever dropped, and a dropped one stays on disk un-pruned. If it persists, the box's uplink cannot keep up with a 2GB/30min cadence; raise `checkpoint_every_tokens`. |
+| `upload queue full; dropping ...` | Uploads are slower than checkpointing. | Only droppable jobs are dropped (rolling checkpoints and deletes, `hf_sync.py`), and a dropped checkpoint stays on disk un-pruned. If it persists, the box's uplink cannot keep up with a 2GB/30min cadence; raise `checkpoint_every_tokens`. |
 | Supervisor gave up: `restarted N times in 600s` | A crash loop, not a preemption. | Read the last child traceback in the log. The flap limit exists so a crash loop does not silently bill you for hours. |
 | `setup: FATAL: no HF token, but config.yaml's hf_upload_repo resolves to ...` | `huggingface.key`/`$HF_TOKEN` missing or empty, and `config.yaml` has uploads enabled. `setup.sh` now exits non-zero here rather than only warning, so `onstart.sh` (which runs under `set -euo pipefail`) never launches training with a token that would 401 every upload for 40 hours. | Set `$HF_TOKEN` (a vast.ai **instance env var** survives a reclaim; `huggingface.key` alone does not, since it's gitignored and a fresh clone won't have it) or pass `--hf-token hf_xxx`. Or set `hf_upload_repo: ""` to run local-only on purpose. |
 
@@ -251,7 +251,7 @@ either the box's data or the real config.
 | | phase 1 | phase 2 |
 |---|---|---|
 | corpus | `phase1.bin` (~25.5B tokens) | `phase2.bin` (~4.5B tokens) |
-| stops at | 25,415,000,000 tokens (85% of `target_tokens`) | 29,900,000,000 (the combined target) |
+| stops at | 13,600,000,000 tokens (85% of `target_tokens` 16e9; `phase1_fraction` 0.85) | 16,000,000,000 (the combined target) |
 | LR | warmup → cosine, still descending | continues the same cosine to its floor |
 
 `target_tokens` is the **combined** budget, and `token_count` carries across the boundary. That is
@@ -290,9 +290,7 @@ supervisor because there are no phases: only epochs, and the epoch is in the che
 **Rent on-demand, not interruptible.** The interruptible discount is worth ~EUR 1-3 on a run this
 short, against a real chance of babysitting restarts. `sft.py` does honour the same stop contract
 as pretraining (SIGTERM → checkpoint + exit 20, `ckpts/sft/STOP` → exit 10, SIGUSR1 → checkpoint and
-keep going), so if you do take an interruptible box, wrap it: `until python scripts/sft.py
---upload-repo ikeafisch4/temp-train; do sleep 10; done`: exit 10 and 0 both stop the loop, exit 20
-relaunches and resumes from the newest loadable checkpoint in `ckpts/sft`.
+keep going), so if you do take an interruptible box, wrap it in a loop that stops on 0, 10 and 30 and relaunches only on the rest: `while true; do python scripts/sft.py --upload-repo ikeafisch4/temp-train; rc=$?; case $rc in 0|10|30) break;; esac; sleep 10; done`. A bare `until ...; do sleep 10; done` repeats on any nonzero exit, so exit 10 (a STOP request) would relaunch, and `sft.py`'s startup `clear_sentinel()` deletes the STOP file, so the stop is lost. Exit 20 relaunches and resumes from the newest loadable checkpoint in `ckpts/sft`; exit 30 (resume verification failed) needs a look first.
 
 ### 10.1 On the same instance that just finished pretraining (preferred)
 
@@ -332,7 +330,7 @@ holdout list rather than doing that silently; `--ignore-holdout` overrides, but 
 |---|---|
 | **`--upload-repo <repo>`** | `sft.hf_upload_repo` is `""` (uploads off) because SFT is a local run. On a rented box that means the checkpoints die with the instance. This is the one you must not forget. |
 | **`unset USE_FP8`** | `onstart.sh` exports `USE_FP8=1`, and `sft.py` imports the same recipe resolution from `pretrain.py`, so it would inherit FP8. At `lr=3e-5` the FP8 GEMM noise is large relative to the update, the same margin argument that forces fp32 masters for every parameter (see `build_sft_param_groups`). The run is short enough that the throughput does not matter. |
-| **`sft.batch_size: 16`, `grad_accumulation_steps: 2`** | 4 x 8 is sized for a 32GB 5090. On an 80GB H100 this keeps tokens/step at 131k and is far faster. Both are in `config.yaml`'s `sft:` block. |
+| **`sft.batch_size: 16`, `grad_accumulation_steps: 2`** | 8 x 4 (batch 8, accumulation 4) is sized for a 32GB 5090. On an 80GB H100 this keeps tokens/step at 131k and is far faster. Both are in `config.yaml`'s `sft:` block. |
 | `--target-tokens` | 300M is the default corpus size. Raising it costs prep time and disk, not much else. |
 
 Everything else carries over unchanged. `ckpts/sft/` is a separate directory from `ckpts/training/`
@@ -443,6 +441,8 @@ python scripts/eval_abstention.py -c ckpts/evidence/checkpoint_evidence_final.pt
 python scripts/eval_benchmarks.py -c ckpts/evidence/checkpoint_evidence_final.pt --compare docs/measurements/benchmarks/*.json
 ```
 
+- **Launch detached; the watch never owns the process** (2026-10-24): a Monitor kills its command when it expires, after 30 minutes at most, and once took a launcher and its trainer down at 74M. Run `setsid nohup bash launcher.sh > launcher.log 2>&1 < /dev/null & disown` and watch with `tail -n 0 -F` on the log, re-armed on every expiry.
+- **A relaunch on another split needs `--switch-split`** (2026-10-24): the checkpoint records its splits and `data_dir`, and a relaunch on a different split is refused without it (the warm-up to main switch). The save and eval grid stays fixed in tokens across relaunches, and a finished run exits 0 instead of resuming from `_final.pt`.
 - **Every training launch runs in the background under a watch** whose filter matches
   `Traceback|Error|Killed|OOM|assert` as well as the progress line. A filter that greps only for
   progress is silent through a crash. And **a failure that prints nothing looks like a slow

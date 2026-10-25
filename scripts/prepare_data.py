@@ -108,6 +108,21 @@ def doc_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
+def shard_shuffle_seed(seed: int, filename: str) -> int:
+    """Per-shard shuffle seed, a pure function of ``(seed, filename)``.
+
+    Args:
+        seed: the build seed.
+        filename: the shard's file name in the source repo.
+
+    Returns:
+        The seed for that shard's document shuffle.
+    """
+    # sha1, not the salted builtin hash(): a resume's row_idx points into this ordering
+    digest = hashlib.sha1(filename.encode("utf-8")).digest()
+    return seed ^ int.from_bytes(digest[:4], "big")
+
+
 # PLAN.md Step 11 mix table. phase1 weights sum to 0.90 as written (see module docstring) --
 # renormalized to 1.0 at run time, ratios among sources preserved.
 SOURCES = [
@@ -224,7 +239,7 @@ def make_hf_generator_factory(spec: SourceSpec, files: list, scratch_dir: str, h
                 )
                 raise RuntimeError(f"failed to download {spec.repo_id}/{filename}{gate_hint}: {e}") from e
 
-            texts = load_document_texts(spec, local_path, seed ^ (hash(filename) & 0xFFFFFFFF))
+            texts = load_document_texts(spec, local_path, shard_shuffle_seed(seed, filename))
             try:
                 os.remove(local_path)
             except OSError:
@@ -427,6 +442,24 @@ def split_train_val(data_dir: str, phase: str, val_tokens: int) -> dict:
     }
 
 
+DEFAULT_MANIFEST_KEY = "data_prep"
+
+
+def check_manifest_key(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Resolve ``--manifest-key``; it is required whenever the ir phase is built.
+
+    Args:
+        parser: the argument parser, used to report the error.
+        args: parsed arguments; ``manifest_key`` is filled with the default when allowed.
+    """
+    if args.manifest_key is None:
+        if "ir" in args.phases:
+            parser.error("--manifest-key is required with --phases ir: the default key "
+                         f"'{DEFAULT_MANIFEST_KEY}' holds the 16B run's realized counts and "
+                         "would be overwritten")
+        args.manifest_key = DEFAULT_MANIFEST_KEY
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build phase1/phase2 bin/idx corpora (PLAN.md Step 11)")
     parser.add_argument("--data-dir", default=os.path.join(BASE_DIR, "data", "prepared"))
@@ -442,7 +475,7 @@ def main():
                              "{phase}_val split (0 = no cut). The finetune profiles want one; the "
                              "pretraining phases do not, since their held-out slice is a "
                              "--start-doc-idx into the same file")
-    parser.add_argument("--manifest-key", default="data_prep",
+    parser.add_argument("--manifest-key", default=None,
                         help="top-level manifest.json key to write under. An auxiliary corpus MUST "
                              "pass its own: the default key holds the 16B run's realized counts and "
                              "smoltalk2_holdout_hashes, which scripts/prepare_sft_data.py reads to "
@@ -452,6 +485,7 @@ def main():
     parser.add_argument("--tokenize-batch", type=int, default=256)
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     args = parser.parse_args()
+    check_manifest_key(parser, args)
 
     os.makedirs(args.data_dir, exist_ok=True)
     scratch_dir = os.path.join(args.data_dir, "_scratch")

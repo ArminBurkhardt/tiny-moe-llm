@@ -12,7 +12,7 @@ matrices alone.
 
 ## The arms
 
-`ckpts/inject/launch_muon.sh`, each from `seed_micro.pt` on the R0b splits, same data order
+`ckpts/inject/launch_muon.sh` (`config_micro_muon.yaml`), each from `seed_micro.pt` on the R0b splits, same data order
 and seed as its AdamW twin:
 
 - `full`: Muon on arm (a) (`inject_full_train`, full CE, no evidence) against
@@ -176,7 +176,7 @@ final is 2.1x it (0.068 against 0.032), 3 to 4x mid-run.
 The three bars of the R7 row, in order:
 
 - **Loss: passes.** Muon's held-out CE is below its twin's at every read on both recipes,
-  0.07 to 0.15 nats, z 16 to 25 paired per token, 2 to 4x the one seed pair's spread.
+  0.07 to 0.15 nats, z 14.9 to 24.9 paired per token, 2 to 4x the one seed pair's spread.
 - **Copying no later: passes.** Both warm-up arms copy between 50M and 100M; the switch
   criterion is met at 100M with gold top-1 0.98 to 0.99 against 0.95 to 0.97, and at the final
   Muon copies the held-out template at 0.90 against 0.60 to 0.74 and follows a swapped
@@ -189,10 +189,10 @@ The three bars of the R7 row, in order:
   the seed spread at tiers 10 and 100 in distribution. Against that, the storage instrument's
   own seed spread at tier 1000 (z 3.6 between two AdamW seeds on arm (a)) is as large as the
   leak difference, so one micro pair cannot separate a 1.6x leak at tier 1000 from the seed;
-  the pilot shape can (arm C against arm P read at z 43 at tier 100).
+  the pilot shape can (arm C against arm P: z 43 is arm C's `delta` against its own prior; the paired `compare` reads z -81 in distribution and -6.4 held out).
 - The attention-logit bound is unread (the sampled read is not built).
 
-**Recommended.** The rung's micro step passes as written and the row's next step is one
+**Recommended at the time (dropped 2026-10-21, the user: Muon is out of the real-run spec and the pilot-shape arm was not run).** The rung's micro step passes as written and the row's next step is one
 Muon arm P at the pilot shape against arm P, about one night, which also times the per-tensor
 Newton-Schulz at that shape. The reason to run it rather than stop here is power: the micro
 leak read is one seed pair at z 2.6 against a seed spread of z 3.6, and the pilot's paired

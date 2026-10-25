@@ -145,7 +145,7 @@ loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-fi
   `loop_ce_weights` truncated and rescaled so the deepest loop run carries weight 1.0; log steps are
   pinned to full depth so every logged number is read at one operating point.
 - `compute_mtp_loss(..., return_metrics=True)` also returns still-on-device `per_loop_ce`, `p_max`,
-  `top1_acc`, computed on the chunks already materialized; only `.item()`-ing them at log cadence
+  `top1_acc`, computed on the chunks already materialized (since 2026-10-24 the unweighted CE, top-1 and `p_max` sums accumulate in fp32, so the logged CE leaves its 1/64-nat grid and `top1_acc` cannot pass 1); only `.item()`-ing them at log cadence
   is a host sync.
 
 - **Selection loss**: `evidence_selection_weight * evidence_selection_term(...)`, the supervised
@@ -154,15 +154,22 @@ loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-fi
   and from any corpus built before the flag. It reads the mass split the forward already produced
   (`LoopMixtureOfExperts.evidence_selection_term`, averaged over every loop and every IR expert),
   so it costs one `[tokens, chunks]` BCE and no second pass, and it asserts gradient checkpointing
-  is off, because a checkpointed segment's stashed weights carry no graph.
+  is off, because a checkpointed segment's stashed weights carry no graph. Since 2026-10-24 the
+  BCE runs in log space with no clamp on the renormalized share (a gold chunk under 1e-6 of the
+  visible mass gets a gradient; the old clamp zeroed it), rows with fewer than two visible chunks
+  are excluded, and `evidence_selection_weighting` (`token` default, the mean over supervised
+  predicting positions; `segment`, each query segment averaged first, then the segments; the real
+  run's default since 2026-10-25) is read at the `pretrain.py` call site.
 
 - **Contrastive loss**: `evidence_contrastive_weight * evidence_contrastive_term(...)`, the
   retriever's in-batch InfoNCE: the selector's unit query at each answer-start position against
   every chunk in the batch, the other documents' chunks as negatives, positives the position's own
   gold chunks, fixed temperature `evidence_contrastive_temperature` (0.07), both directions
   averaged. Weight 0 by default and in every run before 2026-10-17. Two keys added 2026-10-21:
-  `evidence_contrastive_loops` (null is every loop, else the zero-based loops the term averages
-  over; a listed loop a sampled depth skipped drops out, and the term is absent for that step when
+  `evidence_contrastive_loops` (default `[0]` since 2026-10-24: past the first pass the IR query
+  position has read the evidence through the key/value reader, so the term there can be solved by
+  matching what it read; null is still accepted and means every loop; else the zero-based loops the
+  term averages over; a listed loop a sampled depth skipped drops out, and the term is absent for that step when
   every listed loop was skipped) and `evidence_contrastive_trunk_grad` (the share of the term's
   gradient reaching the trunk through the query's hidden state; 1.0 is the old term, 0.0 trains the
   query head alone). Same evidence and gold-flag condition and the same no-checkpointing assert as
@@ -174,7 +181,10 @@ loss = Σ_loops w_loop · CE_loop(next token)          # loop_ce_weights, non-fi
   against the corpus label "a gold chunk is present AND the row is answerable" (`.evgold` and the
   `answerable_ids` from `.ans`). Needs a checkpoint carrying the head
   (`migrate_groundedness_head.py`) and a corpus carrying the label files, so like the selection
-  term it is structurally absent everywhere else. Reads the same stashed forward.
+  term it is structurally absent everywhere else. Reads the same stashed forward. Since 2026-10-24
+  the head's input is detached under the key/value reader (the head still learns; no trunk
+  parameter gets a gradient from it, because there `last_reader_output` is nonzero from step 0 and
+  the loss could otherwise shape the trunk's own attention).
 
 ## The finetune profiles
 

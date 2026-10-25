@@ -99,6 +99,8 @@ headroom over chance):
 | gsm8k | em | 0.00 | 0.0140 | 0.0170 | 0.0010 |
 | mean multiple-choice headroom (9 tasks) | | | +0.0615 | +0.0725 | +0.0191 |
 
+The table lists scores; the three mean rows are normalized headroom, not score minus chance. Restatement of the BoolQ chance (2026-10-25): BoolQ chance was set at 0.50 while the majority class is about 0.62 (arm P 0.4098, control 0.4881, bridge 0.3810 against all-no 0.378), so on the 8-task mean arm P reads +0.0917, the control +0.0845 and the bridge +0.0513 (9-task +0.0615 / +0.0725 / +0.0191); A6's "within noise of the control" holds on both (z about 1.2 and 0.76), the sign of the control's lead flips, and R5's suite gap is about half, not a third; the verdict stands on the other gates.
+
 The cloze and continuation tasks fall furthest: lambada from 0.115 to 0.002, sciq 0.599 to 0.451,
 arc_easy 0.370 to 0.297, piqa 0.575 to 0.527; the task perplexities explode (hellaswag about
 15,700 against 49, boolq about 1.0M against 386). The cells that rose (arc_challenge, openbookqa,

@@ -1,4 +1,4 @@
-# The retriever's in-batch InfoNCE at micro scale (2026-10-17): the A4 fix against its twin
+# The retriever's in-batch InfoNCE at micro scale (2026-10-17): the A7 recall fix against its twin
 
 Built 2026-10-17 (`evidence_contrastive_loss` in `modules/model/information_retrieval.py`,
 `LoopMixtureOfExperts.evidence_contrastive_term`, the trainer gate in `pretrain.train_step`,
@@ -7,7 +7,7 @@ Built 2026-10-17 (`evidence_contrastive_loss` in `modules/model/information_retr
 [review_2026-10-16.md](../review_2026-10-16.md): the selector's unit query at every answer-start
 position against every chunk in the batch (the other documents' chunks as negatives), the
 position's own document's gold chunks as positives (joint mass when several, rows without one
-excluded), both directions averaged, fixed temperature 0.07. The pilot's A4 read motivated it: arm
+excluded), both directions averaged, fixed temperature 0.07. The pilot's A7 recall read motivated it: arm
 P's query at recall@5 0.004 against bge 0.829 over the 274k-chunk `openqa` store, the selector
 having only ever ranked a document's few visible chunks.
 
@@ -50,7 +50,7 @@ twin 0 against 7,227; both FAIL by the gate's bar.
 **Read.** The term moves store recall from zero to small: about 105 questions at k 5 and 305
 at k 20 on the arm against 0 and 9 on the twin, with the in-batch loss at 2.2 nats. In-batch
 separation over about 250 chunks transfers weakly to 274k at this dose (35M tokens, a 35M
-model, the port unread). The direction is the one A4 needs; the magnitude says nothing yet
+model, the port unread). The direction is the one A7's recall half needs; the magnitude says nothing yet
 about the pilot shape. The three-epoch round below reads the same pair at the dose where the
 micro arms start reading the port.
 
@@ -102,7 +102,7 @@ whether the retrieved mass turns into answer gain is unread at micro scale; the 
 reads it. The options put to the user: the term enters the pilot-shape recipe at 0.25 (the
 language cost at that shape then read against the control, as every other term's is), at a
 lower weight (no micro sweep was run; the 0.07 nats are the only cost number), or it stays
-held. Recommended then: enter at 0.25, since it is the only lever that has moved A4 at all and
+held. Recommended then: enter at 0.25, since it is the only lever that has moved A7's recall half at all and
 the cost is small against the pilot's between-arm gap of 0.013 nats only at the pilot's own
 scale. The decision and its pilot-shape read follow.
 
@@ -230,7 +230,7 @@ micro and 0.30 at pilot shape (arm PI). The "train only the search head" directi
 this size. What remains: a separate search tower (a small bge-style encoder over the prompt
 text beside the model, exactly zero language cost, a retriever beside the model rather than the
 trunk searching) or holding. Decided 2026-10-21 (the user): the tower is held, bge keys the
-store and embeds the question at serving, A4 stays untested, and the model's own retrieval is
+store and embeds the question at serving, A7's recall half stays untested, and the model's own retrieval is
 revisited at the real run's size (the two keys stay as the knob).
 
 ## The first pass only arm, the fresh twin and the per-segment selection weighting (2026-10-24 and 2026-10-25)
@@ -340,9 +340,7 @@ pull, through the selection term, toward the long documents (the review measured
 corpus's biographies; this QA slice has none, so here the pull would be toward its longer rows).
 The gap holds at every eval from 60M on and grows (-0.018 / -0.028 / -0.031 / -0.033 at 60M /
 80M / 100M / final, -0.008 at 20M and 40M). One seed, and 0.033 sits at the edge of the micro
-seed spread of about 0.03, so on the QA slice alone it is a direction, not a verdict. The paired per-token read ran 2026-10-25 beside the leak arm on `inject_val` (the filler-only held-out slice; `eval_exit.py --pair` refuses a split with evidence, whose packing differs from the trainer's; 40 batches, 1,104,743 tokens, no evidence attached, `ckpts/inject/exit_seg_e3_vs_w0e3b.{json,log}`): `seg_e3` against the twin per exit 6.1418 against 6.2266, 6.0255 against 6.0875, 6.0189 against 6.0793, a paired difference of 0.085 / 0.062 / 0.060 nats at exits 1 / 2 / 3 with per-token se 0.0084 / 0.0073 / 0.0075 (z +10.0 / +8.5 / +8.1). Twice the one measured seed spread (0.029 on one pair) and consistent with the 0.033 on the QA slice, so the gain is real between these two runs and general to text the arms never trained on; its attribution to the weighting rests on one seed. Whether
-`segment` becomes the recipe default is the user's decision (it would change `config_pilot.yaml`
-and the yamls; nothing recorded is affected, every recorded arm ran under `token`).
+seed spread of about 0.03, so on the QA slice alone it is a direction, not a verdict. The paired per-token read ran 2026-10-25 beside the leak arm on `inject_val` (the filler-only held-out slice; `eval_exit.py --pair` refuses a split with evidence, whose packing differs from the trainer's; 40 batches, 148,450 supervised tokens in 162 clusters (the 1,104,743 is the trainer's eval count), no evidence attached, `ckpts/inject/exit_seg_e3_vs_w0e3b.{json,log}`): `seg_e3` against the twin per exit 6.1418 against 6.2266, 6.0255 against 6.0875, 6.0189 against 6.0793, a paired difference of 0.085 / 0.062 / 0.060 nats at exits 1 / 2 / 3 with per-token se 0.0084 / 0.0073 / 0.0075 (z +10.0 / +8.5 / +8.1). About 1.9x the same instrument's seed spread of 0.032 and consistent with the 0.033 on the QA slice, so the gain is real between these two runs and general to text the arms never trained on; its attribution to the weighting rests on one seed. `segment` was decided 2026-10-25 (the user, RUN2.md row 2) as the real run's default; nothing recorded is affected, every recorded arm ran under `token`.
 
 ## Decision
 
@@ -357,7 +355,7 @@ and the yamls; nothing recorded is affected, every recorded arm ran under `token
   is closed at this size.
 - Decided 2026-10-21 (the user): the separate search tower (a small bge-style encoder over the
   prompt text beside the model) is held, not built; bge keys the store and embeds the question at
-  serving, A4 stays untested, and the model's own retrieval is revisited at the real run's size.
+  serving, A7's recall half stays untested, and the model's own retrieval is revisited at the real run's size.
   `evidence_contrastive_loops` and `evidence_contrastive_trunk_grad` stay in the code as the knob
   for that revisit; the real-run spec carries no retriever term.
 - The first pass only arm, read 2026-10-24 against a fresh twin on the reviewed code: recall@5
@@ -367,6 +365,6 @@ and the yamls; nothing recorded is affected, every recorded arm ran under `token
 - The per-segment selection weighting (`seg_e3`), read 2026-10-25 against the same twin: held-out
   CE 4.3671 against 4.3996 (0.033 better, every condition, the gap growing from 60M on), selection
   equal (0.7503 against 0.7538); the paired per-token read on `inject_val` (2026-10-25) puts the
-  twin 0.060 nats behind at exit 3, z +8.1, twice the one measured seed spread, so the gain is real
-  between these two runs and attributed to the weighting on one seed. Open for the user: whether
-  `segment` becomes the recipe default (every recorded arm ran under `token`).
+  twin 0.060 nats behind at exit 3, z +8.1, about 1.9x the same instrument's seed spread of 0.032, so the gain is real
+  between these two runs and attributed to the weighting on one seed. Decided 2026-10-25 (the user, RUN2.md row 2):
+  `segment` is the real run's default (every recorded arm ran under `token`).

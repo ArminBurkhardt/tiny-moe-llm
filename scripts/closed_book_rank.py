@@ -574,6 +574,52 @@ def _seeded(text: str) -> random.Random:
     return random.Random(int.from_bytes(hashlib.sha1(text.encode("utf-8")).digest()[:8], "big"))
 
 
+def near_neighbours(people: List[bio.Person], keys: np.ndarray, neighbors: int = 8) -> Dict[int, List[int]]:
+    """The builder's near-distractor pools: each person's nearest same-tier people by card key.
+
+    Replicates ``prepare_injection_data.RetrievalBuilder.__init__`` so a read can draw distractors the
+    way the training buffers did.
+
+    Args:
+        people: every person of the facts file; ``person_id`` is the row of ``keys``.
+        keys: ``[N, 384]`` card keys.
+        neighbors: pool size per person.
+    """
+    keys = np.asarray(keys, dtype=np.float32)
+    near: Dict[int, List[int]] = {}
+    for tier in sorted({p.tier for p in people}):
+        members = np.array([p.person_id for p in people if p.tier == tier])
+        if len(members) < 2:
+            continue
+        similarity = keys[members] @ keys[members].T
+        np.fill_diagonal(similarity, -2.0)
+        top = np.argsort(-similarity, axis=1)[:, :neighbors]
+        for row, pid in enumerate(members):
+            near[int(pid)] = [int(members[c]) for c in top[row][:len(members) - 1]]
+    return near
+
+
+def draw_distractors(person_id: int, n_people: int, near: Dict[int, List[int]], k: int,
+                     rng: random.Random) -> List[int]:
+    """``k`` distractor person ids by the builder's rule: half near neighbours, the rest uniform.
+
+    Args:
+        person_id: the gold person, never drawn.
+        n_people: number of people in the split.
+        near: the output of ``near_neighbours``.
+        k: how many distractors.
+        rng: the generator the draws come from.
+    """
+    near_pool = near.get(person_id, [])
+    n_near = min((k + 1) // 2, len(near_pool))
+    chosen = rng.sample(near_pool, n_near) if n_near else []
+    while len(chosen) < k:
+        other = rng.randrange(n_people)
+        if other != person_id and other not in chosen:
+            chosen.append(other)
+    return chosen
+
+
 def select_people(people: List[bio.Person], max_per_tier: int) -> List[bio.Person]:
     """Up to ``max_per_tier`` people of each tier, a fixed sample, in person id order.
 
@@ -592,8 +638,9 @@ def select_people(people: List[bio.Person], max_per_tier: int) -> List[bio.Perso
 
 def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, forms: Sequence[str],
                    n_candidates: int = 100, evidence: str = "none", card_evidence=None,
-                   fresh_names: Optional[bio.FreshNames] = None
-                   ) -> Tuple[List[RankItem], Dict[str, dict]]:
+                   fresh_names: Optional[bio.FreshNames] = None, distractors: int = 0,
+                   all_people: Optional[List[bio.Person]] = None, near: Optional[Dict[int, List[int]]] = None,
+                   seed: int = 42) -> Tuple[List[RankItem], Dict[str, dict]]:
     """Closed-book items for the given people, one per person, attribute and probe form.
 
     The candidates are the gold plus values drawn without replacement from the same pool by a
@@ -615,6 +662,14 @@ def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, for
         fresh_names: when given, every item gets a paired prior control: the same candidates, tier,
             group and context template with the name replaced by ``fresh_names.name(item_id)``, id
             ``item_id + PRIOR_SUFFIX``, placed right after its item. Only for ``evidence="none"``.
+        distractors: for ``"gold"`` and ``"swapped"``, other people's cards attached beside the
+            person's, drawn by the builder's rule and shuffled with it (the training buffers carry
+            the gold card plus three). 0 attaches the card alone, as before. At 1 or more
+            ``card_evidence`` is called ``card_evidence(person, text, cards=[(person, text), ...])``
+            with the shuffled cards and returns the row.
+        all_people: every person of the split (the distractor pool); required when ``distractors > 0``.
+        near: ``near_neighbours(all_people, keys)``; required when ``distractors > 0``.
+        seed: seeds the distractor draws and their order, with the item id.
 
     Returns:
         ``(items, swaps)`` where ``swaps`` maps an item id to ``{"substitute"}`` in swapped mode.
@@ -624,6 +679,18 @@ def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, for
         assert card_evidence is not None, "port evidence modes need card_evidence"
     if evidence != "none":
         assert fresh_names is None, "the prior control is a closed-book reading, evidence must be none"
+    assert distractors == 0 or (evidence in ("gold", "swapped") and all_people is not None
+                                and near is not None), "distractors need port evidence, all_people and near"
+
+    def attach(person, text, item_id):
+        if not distractors:
+            return card_evidence(person, text)
+        drng = _seeded(f"{seed}:{item_id}:distractors")
+        others = draw_distractors(person.person_id, len(all_people), near, distractors, drng)
+        cards = [(person, text)] + [(all_people[o], all_people[o].store_chunk) for o in others]
+        drng.shuffle(cards)
+        return card_evidence(person, text, cards=cards)
+
     items, swaps = [], {}
     for person in people:
         for attribute in bio.ATTRIBUTES:
@@ -641,12 +708,12 @@ def make_bio_items(people: List[bio.Person], pools: Dict[str, List[str]], *, for
                     rest = [v for v in others if v != substitute]
                     picks = [substitute] + rng.sample(rest, min(n_candidates - 2, len(rest)))
                     card = bio.render_store_chunk(person, {attribute: substitute})
-                    row = card_evidence(person, card)
+                    row = attach(person, card, item_id)
                     swaps[item_id] = {"substitute": substitute}
                 else:
                     picks = rng.sample(others, min(n_candidates - 1, len(others)))
                     if evidence == "gold":
-                        row = card_evidence(person, person.store_chunk)
+                        row = attach(person, person.store_chunk, item_id)
                 candidates = picks + [gold]
                 rng.shuffle(candidates)
                 items.append(RankItem(item_id, context, gold, candidates, terminator,
@@ -884,17 +951,33 @@ def run_bios(args) -> None:
         store = load_store(_resolve(args.store))
         assert len(store.chunks) == len(people), "the store and the facts disagree on the people"
 
-        def card_evidence(person, text):
-            ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-            return {"ids": ids, "chunk_ids": [0] * len(ids),
-                    "keys": np.asarray(store.keys[person.person_id:person.person_id + 1], dtype=np.float32)}
+        def card_evidence(person, text, cards=None):
+            if cards is None:
+                ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+                return {"ids": ids, "chunk_ids": [0] * len(ids),
+                        "keys": np.asarray(store.keys[person.person_id:person.person_id + 1], dtype=np.float32)}
+            ids, chunk_ids, rows, gold_pos = [], [], [], 0
+            for slot, (owner, card_text) in enumerate(cards):
+                card_ids = tokenizer(card_text, add_special_tokens=False)["input_ids"]
+                ids.extend(card_ids)
+                chunk_ids.extend([slot] * len(card_ids))
+                rows.append(owner.person_id)
+                if owner.person_id == person.person_id:
+                    gold_pos = slot
+            return {"ids": ids, "chunk_ids": chunk_ids, "gold_pos": gold_pos,
+                    "keys": np.asarray(store.keys[rows], dtype=np.float32)}
 
     fresh_names = bio.FreshNames(people, pools) if args.evidence == "none" else None
+    near = None
+    if args.distractors:
+        assert args.evidence in ("gold", "swapped"), "--distractors needs --evidence gold or swapped"
+        near = near_neighbours(people, store.keys)
     items, swaps = make_bio_items(chosen, pools, forms=forms, n_candidates=args.candidates,
                                   evidence=args.evidence, card_evidence=card_evidence,
-                                  fresh_names=fresh_names)
+                                  fresh_names=fresh_names, distractors=args.distractors,
+                                  all_people=people, near=near, seed=args.seed)
     logger.info(f"{len(items):,} items (prior controls included) from {len(chosen):,} people, forms {forms}, "
-                f"evidence {args.evidence}, {args.candidates} candidates, "
+                f"evidence {args.evidence}, distractors {args.distractors}, {args.candidates} candidates, "
                 f"loops {args.n_loops if args.n_loops is not None else f'{trained_loops} (configured)'}")
 
     model = load_model(_resolve(args.checkpoint), args.device)
@@ -911,14 +994,15 @@ def run_bios(args) -> None:
     for form in forms:
         subset = [r for r in results if r["form"] == form]
         summaries[form] = print_summary(f"{os.path.basename(args.checkpoint)} {form} "
-                                        f"evidence={args.evidence}"
+                                        f"evidence={args.evidence} distractors={args.distractors}"
                                         + (f" loops={args.n_loops}" if args.n_loops is not None else ""),
                                         subset, args.n_boot)
     if args.json_out:
         path = _resolve(args.json_out)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            json.dump({"flags": vars(args), "results": results, "summary": summaries}, f)
+            json.dump({"flags": vars(args), "distractors": args.distractors, "results": results,
+                       "summary": summaries}, f)
         logger.info(f"wrote {path}")
 
 
@@ -1004,6 +1088,10 @@ def main():
     p.add_argument("--form", choices=("indist", "heldout", "both"), default="both")
     p.add_argument("--evidence", choices=("none", "gold", "swapped", "prompt"), default="none",
                    help="prompt puts the card text in the prompt before the probe, no port")
+    p.add_argument("--distractors", type=int, default=0,
+                   help="with --evidence gold or swapped, attach this many other people's cards beside the "
+                        "person's, drawn by the training builder's rule and shuffled with it (0: card alone)")
+    p.add_argument("--seed", type=int, default=42, help="seed of the distractor draws and their order")
     p.add_argument("--n-loops", type=int, default=None,
                    help="run the MoE block this many times and read the last loop run (default: configured depth)")
     p.add_argument("--candidates", type=int, default=100)
