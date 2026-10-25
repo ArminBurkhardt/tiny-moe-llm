@@ -18,7 +18,9 @@ half, the edit flip rate A4. Decided 2026-10-24 (the user): the evidence reader 
 cap a training row at 4093 tokens and the row estimator now replays the reader's rule), and
 `data/prepared_pilot/inject_val_clean` (974 windows, 650,125 tokens, 0.99% verbatim overlap with
 the QA training rows against 13.3% for `inject_val`) exists for the held-out CE re-read of the
-three finals (`ckpts/inject/read_clean_val.sh`, queued).
+three finals (`ckpts/inject/read_clean_val.sh`, queued; read 2026-10-25: arm C's held-out CE edge
+over arm P was contamination, 0.025 at exit 3 on `inject_val` against 0.002 on the clean slice,
+[clean_validation_slice.md](../measurements/clean_validation_slice.md)).
 
 Status 2026-10-11: spec written 2026-10-09, build list done 2026-10-10 (the "Build"
 section), arm P launched 2026-10-10 19:03, switched to the main split at the 300M save the same
@@ -383,12 +385,17 @@ the query training).
   document: about 7.4% of its tokens appear verbatim as supervised text in rows both arms train on
   (two passes) and another 6.7% in the dropped 4094-token rows only arm C trains on. Every held-out
   CE on `inject_val` (the language bar, arm PI's stop, the E4 read, arm C's 0.013 edge) leans
-  toward the arm that saw more of it; the rank reads that decide A1(b) are unaffected. Built
+  toward the arm that saw more of it (read 2026-10-25 on the clean slice below: arm C's edge was
+  this contamination, its exit 3 lead over arm P 0.025 on `inject_val` and 0.002 on
+  `inject_val_clean`, [clean_validation_slice.md](../measurements/clean_validation_slice.md)); the rank reads that decide A1(b) are unaffected. Built
   2026-10-24 for the re-read: `inject_val_clean` (`scripts/prepare_clean_val.py`, 974 windows,
   650,125 tokens, `inject_val`'s windows minus those from the first 80,672 `ir.bin` documents the
   evidence QA builder used; verbatim 64-token overlap with the QA training rows' supervised tokens
   0.99% against 13.3% for `inject_val` under the same check, the 7.4% above a narrower
-  definition); the `eval_exit.py` read of the P, C and E4 finals on both slices is queued.
+  definition); the `eval_exit.py` read of the P, C and E4 finals on both slices is queued. Read
+  2026-10-25: CE at exit 3 on `inject_val_clean` P 3.2669, C 3.2650, E4 3.2740 (on `inject_val`
+  3.4092, 3.3844, 3.4201; 40 batches of 4, not the trainer's): on clean text P and C are equal and
+  E4 is 0.007 behind P; the depth gains repeat (about 0.08 from exit 1 to 3 on every arm).
 - The in-context ceiling for A2 comes from arm P itself, which never sees a QA passage in the prompt
   during training; NEXT.md's absolute bar (1.6 nats, half the 3.23-nat ceiling of the full model) is
   printed beside it.
@@ -685,7 +692,11 @@ splits). Nothing in the spec changed.
 - **Arm C complete: 909.72M tokens, one epoch, 2026-10-14** (`checkpoint_evidence_final.pt`,
   exit 0; paused by the user at 854M on 2026-10-12 and resumed 2026-10-14; the control's epoch
   runs 49M longer than arm P's because the control split has no evidence and so no over-length
-  skips). Final `inject_val` CE 3.2195 (arm P 3.2321, a 0.013 gap, the micro gap was 0.026).
+  skips). Final `inject_val` CE 3.2195 (arm P 3.2321, a 0.013 gap, the micro gap was 0.026;
+  amended 2026-10-25: on a clean validation slice the gap is contamination, the control's exit 3
+  lead 0.025 on `inject_val` against 0.002 on `inject_val_clean`, and the micro gap was the code
+  of that week, since the same warm-up recipe on the reviewed code ends at 3.886 to 3.889 against
+  arm (c)'s 3.8842).
   Trainer's final fixed eval on `evidence_fixed`: answer CE 4.35 under every condition, gain
   0.000, chunk AUROC 0.52, grounded AUROC 0.50: the port is neutral, as a run without evidence
   must leave it. Note the `none` answer CE: 4.35 on the control against 5.86 on arm P, so arm P
@@ -727,7 +738,10 @@ splits). Nothing in the spec changed.
     then +0.0050); the gain 1 to 3 is +0.08 to +0.11 in every confidence decile but the top one
     (+0.05); a confidence exit rule is no better than a fixed-depth mix at the same passes on
     either arm (tau 0.5: 3.428 against 3.415 on arm P); the beta 0.1 optimum is near uniform. The
-    micro read's shape, on both arms: depth pays evenly, the third pass is faint.
+    micro read's shape, on both arms: depth pays evenly, the third pass is faint. Re-read
+    2026-10-25 on the same 40 batches (arm P 3.4898 / 3.4166 / 3.4092, reproduced) and on
+    `inject_val_clean`: arm C's 0.025 lead at exit 3 here is contamination, 0.002 on clean text
+    (P 3.2669, C 3.2650).
   - **Depth reads** (`closed_book_rank.py --n-loops 1 | 2`, with the depth 3 final read): arm C
     entity `delta` at tier 100 in distribution 0.348 / 0.464 / 0.467 by depth (the real name
     first on 27% / 94% / 96% of items), tier 1000 saturated at every depth, held out 0.042 /

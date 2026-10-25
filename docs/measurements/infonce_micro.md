@@ -340,9 +340,7 @@ pull, through the selection term, toward the long documents (the review measured
 corpus's biographies; this QA slice has none, so here the pull would be toward its longer rows).
 The gap holds at every eval from 60M on and grows (-0.018 / -0.028 / -0.031 / -0.033 at 60M /
 80M / 100M / final, -0.008 at 20M and 40M). One seed, and 0.033 sits at the edge of the micro
-seed spread of about 0.03, so it is a direction, not a verdict, until a paired per-token read
-(`eval_exit.py --pair` of the two finals on the same tokens) gives a z; that read takes minutes
-and is recommended before the segment weighting is considered for the real-run recipe. Whether
+seed spread of about 0.03, so on the QA slice alone it is a direction, not a verdict. The paired per-token read ran 2026-10-25 beside the leak arm on `inject_val` (the filler-only held-out slice; `eval_exit.py --pair` refuses a split with evidence, whose packing differs from the trainer's; 40 batches, 1,104,743 tokens, no evidence attached, `ckpts/inject/exit_seg_e3_vs_w0e3b.{json,log}`): `seg_e3` against the twin per exit 6.1418 against 6.2266, 6.0255 against 6.0875, 6.0189 against 6.0793, a paired difference of 0.085 / 0.062 / 0.060 nats at exits 1 / 2 / 3 with per-token se 0.0084 / 0.0073 / 0.0075 (z +10.0 / +8.5 / +8.1). Twice the one measured seed spread (0.029 on one pair) and consistent with the 0.033 on the QA slice, so the gain is real between these two runs and general to text the arms never trained on; its attribution to the weighting rests on one seed. Whether
 `segment` becomes the recipe default is the user's decision (it would change `config_pilot.yaml`
 and the yamls; nothing recorded is affected, every recorded arm ran under `token`).
 
@@ -368,6 +366,7 @@ and the yamls; nothing recorded is affected, every recorded arm ran under `token
   decision of 2026-10-21 is unchanged.
 - The per-segment selection weighting (`seg_e3`), read 2026-10-25 against the same twin: held-out
   CE 4.3671 against 4.3996 (0.033 better, every condition, the gap growing from 60M on), selection
-  equal (0.7503 against 0.7538); one seed at the edge of the seed spread, so a direction until the
-  paired per-token read (`eval_exit.py --pair`, minutes) gives a z. Open for the user: whether
+  equal (0.7503 against 0.7538); the paired per-token read on `inject_val` (2026-10-25) puts the
+  twin 0.060 nats behind at exit 3, z +8.1, twice the one measured seed spread, so the gain is real
+  between these two runs and attributed to the weighting on one seed. Open for the user: whether
   `segment` becomes the recipe default (every recorded arm ran under `token`).
