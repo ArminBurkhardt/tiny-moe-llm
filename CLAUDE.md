@@ -14,16 +14,17 @@ Mirror of the "Now" section of NEXT.md; update both when the next step changes. 
 and the Open items table are the same text in both files; the Record below is terser here.
 Restructured 2026-10-24 after the repository review.
 
-### State (2026-10-24)
+### State (2026-10-25)
 
-- **Ran and read this evening:** two of the three micro retriever arms the review proposed,
-  launched 2026-10-24 about 20:25 in sequence (`bash ckpts/inject/launch_review_arms.sh`, about 40
-  minutes each plus the store recall read, on the code in the tree, three passes over
-  `evidence_nomany_train` from `seed_micro.pt`): `w0e3b`, the `w0e3` recipe rerun on the reviewed
-  code as the twin the other two are read against (`ckpts/inject/config_micro_infonce0_e3.yaml`);
-  `l0e3`, the `w25e3` recipe with the contrastive term on the first pass only and the trunk
-  gradient on (`config_micro_infonce_l0_e3.yaml`). The third, `seg_e3`, the `w0e3` recipe with the
-  selection loss weighted per query segment (`config_micro_segsel_e3.yaml`), runs 2026-10-25. Run
+- **Ran and read 2026-10-24 and 2026-10-25:** the three micro retriever arms the review proposed
+  (`bash ckpts/inject/launch_review_arms.sh`, about 40 minutes each plus the store recall read, on
+  the code in the tree, three passes over `evidence_nomany_train` from `seed_micro.pt`), the first
+  two launched 2026-10-24 about 20:25 in sequence: `w0e3b`, the `w0e3` recipe rerun on the
+  reviewed code as the twin the other two are read against
+  (`ckpts/inject/config_micro_infonce0_e3.yaml`); `l0e3`, the `w25e3` recipe with the contrastive
+  term on the first pass only and the trunk gradient on (`config_micro_infonce_l0_e3.yaml`). The
+  third, `seg_e3`, the `w0e3` recipe with the selection loss weighted per query segment
+  (`evidence_selection_weighting: segment`, `config_micro_segsel_e3.yaml`), ran 2026-10-25. Run
   directories `ckpts/evidence_infonce_{ARM}`, logs `ckpts/inject/infonce_{ARM}.log`, reads
   `ckpts/inject/infonce_{ARM}_store_recall.{json,log}`. **Order changed the same evening:** the
   watch on the launcher expired at 20:58 and took the launcher and the twin (at 74M, last save
@@ -36,10 +37,14 @@ Restructured 2026-10-24 after the repository review.
   first (fresh, 21:02; 104.46M tokens in 39.3 minutes at about 45k tokens per second, exit 0),
   then `w0e3b` resumed at 21:45 from its 50M save under the fix
   (`ckpts/inject/queue_twin_after_l0e3.sh`; its 60M eval reproduced the original run's within
-  0.0001, 4.6262 against 4.6261; 104.56M tokens, exit 0); `seg_e3` runs 2026-10-25 (its yaml
-  parked as `config_micro_segsel_e3.yaml.hold` so the first launcher skipped it; rename it back
-  before `bash ckpts/inject/launch_review_arms.sh seg_e3`), then the leak arms and the clean-slice
-  read. The card pauses around 22:30 on 2026-10-24 (the user).
+  0.0001, 4.6262 against 4.6261; 104.56M tokens, exit 0). The card paused around 22:30 on
+  2026-10-24 (the user). `seg_e3` ran 2026-10-25 (its yaml parked as
+  `config_micro_segsel_e3.yaml.hold` so the first launcher skipped it, renamed back before `bash
+  ckpts/inject/launch_review_arms.sh seg_e3`): launched 10:24 detached under the queue script
+  `ckpts/inject/queue_2026_10_25.sh`, 104.46M tokens in 40.0 minutes, peak 16.6 GB, exit 0, the
+  step 0 eval identical to the twin's (same seed); the user stopped the queue after this arm to
+  pause the card at about 11:05, so its later steps (the leak arms `m1` and `g1`, then
+  `read_clean_val.sh`) did not run and are next.
 - **Decided 2026-10-24 (the user):** R4 (loss placement by coda) is dropped, obsolete on R9: the
   model composes at 0.997 on held-out compositions once the intermediate entity is written out,
   so the loop no longer has to compose in silence; the coda stays unbuilt. R6 (the
@@ -58,8 +63,23 @@ Restructured 2026-10-24 after the repository review.
   builds cap a training row at 4093 tokens). Run order: the three micro retriever arms, then the
   two leak arms, then the clean-slice CE re-read, with R5's eval set between them when the card
   is idle.
-- **Just read:** this evening, two of the three micro retriever arms
-  (`docs/measurements/infonce_micro.md`, the first pass only section): `l0e3`, the contrastive
+- **Just read:** on 2026-10-25, the third micro retriever arm, `seg_e3`
+  (`docs/measurements/infonce_micro.md`, the same section as the other two): the `w0e3` recipe
+  with the selection loss weighted per query segment ends at held-out CE 4.3671 against the fresh
+  twin `w0e3b`'s 4.3996 (0.033 better; the gap -0.008 at 20M and 40M, then -0.018 / -0.028 /
+  -0.031 / -0.033 at 60M / 80M / 100M / final), better in every condition (gold 4.6171 against
+  4.6540, mixed 4.4814 against 4.5230, distractors 3.9025 against 3.9179, none 4.3248 against
+  4.3563), selection equal (the eval's `selection:` 0.7503 against 0.7538, lower is better; token
+  top-1 0.3138 against 0.3070), store recall@5 / @20 at loop 1 0.001 / 0.004 against 0.000 /
+  0.002 (gate z -205.0, failed, as expected with no contrastive term). The weighting costs nothing
+  on selection and the gain reaches the rows with no evidence, so it is a language gain (the token
+  weighting's pull toward the long documents through the selection term is the candidate
+  mechanism; the review measured that pull on the pilot corpus's biographies, which this QA slice
+  does not have). One seed, and 0.033 sits at the edge of the micro seed spread of about 0.03, so
+  it is a direction, not a verdict, until a paired per-token read of the two finals
+  (`eval_exit.py --pair`, minutes) gives a z; that read comes before the segment weighting is
+  considered for the real-run recipe. On the evening of 2026-10-24, the other two micro retriever
+  arms (the first pass only section): `l0e3`, the contrastive
   term on the first pass alone, reaches store recall@5 / @20 at loop 1 of 0.049 / 0.122 against
   the every-loop arm `w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), loops 2 and 3 at 0.010 and
   0.005 at k5, held-out CE 4.4404 against the fresh twin `w0e3b`'s 4.3996 (a cost of 0.041 nats;
@@ -85,10 +105,9 @@ Restructured 2026-10-24 after the repository review.
   attached directly, a generation weakness on real questions, not a store failure. Arm E4
   (`docs/measurements/expert_count_pilot.md`: the expert count is a cost choice); the repository
   review (`docs/review_2026-10-24.md`).
-- **Next, in order:** `seg_e3` on 2026-10-25 (rename
-  `ckpts/inject/config_micro_segsel_e3.yaml.hold` back to `config_micro_segsel_e3.yaml`, then
-  `bash ckpts/inject/launch_review_arms.sh seg_e3`; store recall and held-out CE against the fresh
-  twin `w0e3b`); then the two leak arms (`bash ckpts/inject/launch_leak_arm.sh m1`, then
+- **Next, in order:** optionally, the paired per-token read of `seg_e3` against `w0e3b`
+  (`eval_exit.py --pair` of the two finals on the same tokens, minutes; a z for the 0.033 nats);
+  then the two leak arms (`bash ckpts/inject/launch_leak_arm.sh m1`, then
   `g1`: the copy-first warm-up recipe on the flagged splits, run directories
   `ckpts/evidence_leak_{m1,g1}`, reads `ckpts/inject/rank_leak_{ARM}_{100M,final}_*` and
   `compare_cf_vs_leak_{ARM}.log` against the warm-up arm); then the clean-slice CE re-read (`bash
@@ -96,7 +115,9 @@ Restructured 2026-10-24 after the repository review.
   `inject_val_clean` and `inject_val`); R5's eval set between them when the card is idle; then the
   run spec.
 - **Open for the user:** the goal's reasoning clause reworded on R9 (written tokens); R4b's
-  sublayer half; 6f's abstention reward against the A3 re-read.
+  sublayer half; 6f's abstention reward against the A3 re-read; the selection weighting default
+  (`token` or `segment`; `segment` would change `config_pilot.yaml` and the yamls, every recorded
+  arm ran under `token`).
 
 ### Open items
 
@@ -111,7 +132,7 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 | a value-to-name closed-book probe | proposed, mode not built | arm P's final | a build |
 | R4, the coda corner | closed: dropped 2026-10-24 (the user), obsolete on R9 (composition at 0.997 held out once the intermediate entity is written out); the coda stays unbuilt | none | nothing |
 | R4b, the sublayer half | open; the review recommends a cost choice, no arms | none at pilot scale | the user |
-| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | two read 2026-10-24 (`bash ckpts/inject/launch_review_arms.sh`; `docs/measurements/infonce_micro.md`): the twin `w0e3b` final CE 4.3996, recall@5 0.000; `l0e3` recall@5 / @20 at loop 1 0.049 / 0.122 against `w25e3`'s 0.059 / 0.133 at 0.041 nats against the twin (the every-loop pair 0.074), gate failed, so the cost sits in the trunk's change and the decision of 2026-10-21 stands; `seg_e3` runs 2026-10-25 (rename `config_micro_segsel_e3.yaml.hold` back first) | store recall and held-out CE against `w0e3b` | `seg_e3` |
+| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | all three read, two 2026-10-24 and `seg_e3` 2026-10-25 (`bash ckpts/inject/launch_review_arms.sh`; `docs/measurements/infonce_micro.md`): the twin `w0e3b` final CE 4.3996, recall@5 0.000; `l0e3` recall@5 / @20 at loop 1 0.049 / 0.122 against `w25e3`'s 0.059 / 0.133 at 0.041 nats against the twin (the every-loop pair 0.074), gate failed, so the cost sits in the trunk's change and the decision of 2026-10-21 stands; `seg_e3` (per-segment selection weighting, no contrastive term) held-out CE 4.3671 against the twin's 4.3996 (0.033 better, every condition including no evidence, the gap growing from 60M on), selection equal (0.7503 against 0.7538), recall@5 0.001; one seed at the edge of the seed spread of about 0.03, so a direction until a paired per-token read gives a z | store recall and held-out CE against `w0e3b`; for `seg_e3`, `eval_exit.py --pair` of the two finals | the user (whether `segment` becomes the recipe default); the paired read on `seg_e3` |
 | two leak candidates (value-first templates; distractor-collision spans) | built, queued: builder flags `--mask-first-name-mention` and `--support-gold-only` (`.mask` only), splits `inject_retrieval_s100a50m1_train`, `s100a50g1`, `s15a50m1`, `s15a50g1` built 2026-10-24; arms `bash ckpts/inject/launch_leak_arm.sh m1` and `g1` | closed-book rank at 100M and at the final against the copy-first warm-up arm (`compare_cf_vs_leak_{ARM}.log`) | the retriever arms |
 | R6, pretraining-text facts | closed: skipped 2026-10-24 (the user); its mechanism is read at micro (arm (a) stores plain-text facts, tier 100 `delta` 0.378; arm (b), spans masked, stores nothing; arm C repeats arm (a) at pilot shape) and the run spec uses that lever | none | nothing |
 | the goal's reasoning clause reworded | open since 2026-10-17; R9 read 2026-10-24: composes in written tokens, not in the loop | none | the user |
@@ -600,7 +621,7 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   check (the review's 7.4% was a narrower definition); read by `ckpts/inject/read_clean_val.sh`, not
   yet run. Held: the eval-pass rewrite (deferred to 6a) and the two `eval_chains.py` bridge-mode
   items. Launchers: `ckpts/inject/launch_review_arms.sh [w0e3b|l0e3|seg_e3]` (launched 2026-10-24
-  about 20:25, running) and `ckpts/inject/launch_leak_arm.sh m1|g1` (queued after it).
+  about 20:25; all three read by 2026-10-25, the State block) and `ckpts/inject/launch_leak_arm.sh m1|g1` (queued after it).
 
 - **The former "Next, in order" list, closed 2026-10-24** (items 1 to 4 done or closed, item 5
   moved to the Open items table; the full ladder with its done steps is in NEXT.md):

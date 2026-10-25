@@ -233,13 +233,13 @@ trunk searching) or holding. Decided 2026-10-21 (the user): the tower is held, b
 store and embeds the question at serving, A4 stays untested, and the model's own retrieval is
 revisited at the real run's size (the two keys stay as the knob).
 
-## The first pass only arm and the fresh twin (2026-10-24)
+## The first pass only arm, the fresh twin and the per-segment selection weighting (2026-10-24 and 2026-10-25)
 
-Two of the three micro retriever arms the repository review proposed
+The three micro retriever arms the repository review proposed
 ([review_2026-10-24.md](../review_2026-10-24.md)), on the code in the tree after the review's
 fixes (micro shape, key/value reader, three passes over `evidence_nomany_train` from
 `ckpts/inject/seed_micro.pt`, the same seed and data as the pairs above; launcher
-`ckpts/inject/launch_review_arms.sh`):
+`ckpts/inject/launch_review_arms.sh`), the first two run and read 2026-10-24, the third 2026-10-25:
 
 - `w0e3b`, the fresh twin: the `w0e3` recipe (no contrastive term) rerun on the reviewed code,
   `ckpts/inject/config_micro_infonce0_e3.yaml`, run directory `ckpts/evidence_infonce_w0e3b`, log
@@ -251,9 +251,20 @@ fixes (micro shape, key/value reader, three passes over `evidence_nomany_train` 
   `ckpts/inject/config_micro_infonce_l0_e3.yaml`, run directory `ckpts/evidence_infonce_l0e3`, log
   `ckpts/inject/infonce_l0e3.log`, read `ckpts/inject/infonce_l0e3_store_recall.{json,log}`;
   launched 21:02 fresh, 104.46M tokens in 39.3 minutes at about 45k tokens per second, exit 0.
-- The third arm, `seg_e3` (the `w0e3` recipe with the selection loss weighted per query segment),
-  runs 2026-10-25; its yaml is parked as `ckpts/inject/config_micro_segsel_e3.yaml.hold` (rename it
-  back first).
+- `seg_e3`: the `w0e3` recipe (no contrastive term) with `evidence_selection_weighting: segment`
+  (each query segment's selection loss averaged first, then the segments; the default `token`
+  averages over the supervised predicting positions, which the review found lets the long
+  documents carry the loss: on `pilot_main_train` the documents of 600 tokens or more, mostly
+  biographies, carry 63% of the gold-document supervised positions),
+  `ckpts/inject/config_micro_segsel_e3.yaml` (parked as `config_micro_segsel_e3.yaml.hold` on
+  2026-10-24 so the first launcher skipped it, renamed back), run directory
+  `ckpts/evidence_infonce_seg_e3`, log `ckpts/inject/infonce_seg_e3.log`, read
+  `ckpts/inject/infonce_seg_e3_store_recall.{json,log}`; launched 2026-10-25 10:24 detached (`bash
+  ckpts/inject/launch_review_arms.sh seg_e3` under the queue script
+  `ckpts/inject/queue_2026_10_25.sh`, which the user stopped after this arm to pause the card at
+  about 11:05, so the queue's later steps, the leak arms `m1` and `g1` and `read_clean_val.sh`,
+  did not run), 104.46M tokens in 40.0 minutes, peak 16.6 GB, exit 0; the step 0 eval identical
+  to the twin's (same seed). It is read against `w0e3b` (the same code under `token` weighting).
 
 The twin was interrupted once and resumed twice. The watch that owned the launcher expired at
 20:58 and killed launcher and trainer at 74M (last save 50M); the first detached resume ran
@@ -266,14 +277,14 @@ reproduced the original run's 60M eval within 0.0001 (4.6262 against 4.6261).
 Held-out `[eval]` CE on `evidence_nomany_val` (tokens approximate; `w0e3` and `w25e3` from the
 head-only table above):
 
-| eval | `w0e3b` | `w0e3` | `l0e3` | `w25e3` | `w0e3b` minus `w0e3` | `l0e3` minus `w0e3b` | `w25e3` minus `w0e3` |
-|---|---|---|---|---|---|---|---|
-| about 20M | 5.3049 | 5.3164 | 5.3164 | 5.3707 | -0.012 | +0.012 | +0.054 |
-| about 40M | 4.8834 | 4.8905 | 4.9015 | 4.9452 | -0.007 | +0.018 | +0.055 |
-| about 60M | 4.6261 (resumed 4.6262) | 4.6129 | 4.6511 | 4.6776 | +0.013 | +0.025 | +0.065 |
-| about 80M | 4.4903 | 4.4756 | 4.5251 | 4.5454 | +0.015 | +0.035 | +0.070 |
-| about 100M | 4.4073 | 4.3902 | 4.4477 | 4.4711 | +0.017 | +0.040 | +0.081 |
-| final | 4.3996 | 4.3809 | 4.4404 | 4.4546 | +0.019 | +0.041 | +0.074 |
+| eval | `w0e3b` | `w0e3` | `l0e3` | `seg_e3` | `w25e3` | `w0e3b` minus `w0e3` | `l0e3` minus `w0e3b` | `seg_e3` minus `w0e3b` | `w25e3` minus `w0e3` |
+|---|---|---|---|---|---|---|---|---|---|
+| about 20M | 5.3049 | 5.3164 | 5.3164 | 5.2965 | 5.3707 | -0.012 | +0.012 | -0.008 | +0.054 |
+| about 40M | 4.8834 | 4.8905 | 4.9015 | 4.8752 | 4.9452 | -0.007 | +0.018 | -0.008 | +0.055 |
+| about 60M | 4.6261 (resumed 4.6262) | 4.6129 | 4.6511 | 4.6082 | 4.6776 | +0.013 | +0.025 | -0.018 | +0.065 |
+| about 80M | 4.4903 | 4.4756 | 4.5251 | 4.4625 | 4.5454 | +0.015 | +0.035 | -0.028 | +0.070 |
+| about 100M | 4.4073 | 4.3902 | 4.4477 | 4.3768 | 4.4711 | +0.017 | +0.040 | -0.031 | +0.081 |
+| final | 4.3996 | 4.3809 | 4.4404 | 4.3671 | 4.4546 | +0.019 | +0.041 | -0.033 | +0.074 |
 
 The fresh twin ends 0.019 above the old one, inside the micro seed spread of about 0.03. The
 held-out `contrastive` on `l0e3`: 5.53 at step 0, then 3.79 / 2.89 / 2.23 / 1.96 / 1.84 / 1.84
@@ -287,6 +298,7 @@ chunks; bge 0.829 / 0.897 at k 5 / 20):
 |---|---|---|---|---|---|---|
 | `w0e3b` (fresh twin) | none | | 4.3996 | 0.000 | 0.002 | |
 | `w0e3` (old twin) | none | | 4.3809 | 0.000 | 0.002 | |
+| `seg_e3` (segment weighting) | none | | 4.3671 | 0.001 | 0.004 | |
 | `l0e3` | first pass | 1.0 | 4.4404 | 0.049 | 0.122 | 0.010 / 0.005 |
 | `w25e3` | every loop | 1.0 | 4.4546 | 0.059 | 0.133 | |
 | head-only | first pass | 0.0 | 4.3904 | 0.003 | 0.007 | |
@@ -294,8 +306,8 @@ chunks; bge 0.829 / 0.897 at k 5 / 20):
 `l0e3` in full at loop 1: @1 0.015, @2 0.025, @5 0.049, @10 0.079, @20 0.122; per source at k 5 /
 k 20 HotpotQA 0.095 / 0.232, NQ 0.005 / 0.016, TriviaQA 0.044 / 0.108 (`w25e3` 0.111 / 0.237,
 0.008 / 0.019, 0.055 / 0.133). Loops 2 and 3 read 0.010 and 0.005 at k 5, 0.030 and 0.015 at
-k 20. The gate (recall@5 at loop 1 against bge, paired): `l0e3` z -174.3, `w0e3b` z -205.6;
-both FAIL.
+k 20. The gate (recall@5 at loop 1 against bge, paired): `l0e3` z -174.3, `w0e3b` z -205.6,
+`seg_e3` z -205.0; all three FAIL (the twin and `seg_e3` as expected, with no contrastive term).
 
 **Read.** The term on the first pass alone keeps about five sixths of the every-loop term's small
 recall gain (0.049 against 0.059 at k 5, 0.122 against 0.133 at k 20) at a language cost of 0.041
@@ -303,8 +315,36 @@ nats against the fresh twin (4.4404 against 4.3996), where the recorded every-lo
 0.074. So the language cost sits in the trunk's change and not in the later passes, and the later
 passes, where the term no longer acts, find almost nothing (0.010 and 0.005 at k 5). The gate
 stays failed; the decision of 2026-10-21 (no retriever term in the real-run spec, the model's own
-retrieval revisited at the real run's size) is unchanged. Next: `seg_e3` on 2026-10-25, then the
-two leak arms and the clean-slice CE re-read.
+retrieval revisited at the real run's size) is unchanged. Next then: `seg_e3` on 2026-10-25 (read
+below), then the two leak arms and the clean-slice CE re-read.
+
+**The per-segment selection weighting (`seg_e3`, read 2026-10-25).** Final held-out CE on
+`evidence_nomany_val` by condition against the twin `w0e3b`:
+
+| condition | `seg_e3` | `w0e3b` | `seg_e3` minus `w0e3b` |
+|---|---|---|---|
+| gold | 4.6171 | 4.6540 | -0.037 |
+| mixed | 4.4814 | 4.5230 | -0.042 |
+| distractors | 3.9025 | 3.9179 | -0.015 |
+| none | 4.3248 | 4.3563 | -0.032 |
+| pooled | 4.3671 | 4.3996 | -0.033 |
+
+The eval's `selection:` 0.7503 against 0.7538 (lower is better), token top-1 0.3138 against
+0.3070. Store recall at loop 1 @5 / @20 0.001 / 0.004 against the twin's 0.000 / 0.002, gate
+z -205.0, FAIL, as expected with no contrastive term.
+
+**Read.** The per-segment weighting costs nothing on selection and reads 0.033 nats better on
+held-out language, spread across every condition including the rows with no evidence attached,
+so it is a language gain, not a selector gain. The candidate mechanism is the token weighting's
+pull, through the selection term, toward the long documents (the review measured it on the pilot
+corpus's biographies; this QA slice has none, so here the pull would be toward its longer rows).
+The gap holds at every eval from 60M on and grows (-0.018 / -0.028 / -0.031 / -0.033 at 60M /
+80M / 100M / final, -0.008 at 20M and 40M). One seed, and 0.033 sits at the edge of the micro
+seed spread of about 0.03, so it is a direction, not a verdict, until a paired per-token read
+(`eval_exit.py --pair` of the two finals on the same tokens) gives a z; that read takes minutes
+and is recommended before the segment weighting is considered for the real-run recipe. Whether
+`segment` becomes the recipe default is the user's decision (it would change `config_pilot.yaml`
+and the yamls; nothing recorded is affected, every recorded arm ran under `token`).
 
 ## Decision
 
@@ -326,3 +366,8 @@ two leak arms and the clean-slice CE re-read.
   0.049 against `w25e3`'s 0.059 at 0.041 nats of held-out language against the twin (the
   every-loop pair 0.074); the cost sits in the trunk's change, the gate stays failed, and the
   decision of 2026-10-21 is unchanged.
+- The per-segment selection weighting (`seg_e3`), read 2026-10-25 against the same twin: held-out
+  CE 4.3671 against 4.3996 (0.033 better, every condition, the gap growing from 60M on), selection
+  equal (0.7503 against 0.7538); one seed at the edge of the seed spread, so a direction until the
+  paired per-token read (`eval_exit.py --pair`, minutes) gives a z. Open for the user: whether
+  `segment` becomes the recipe default (every recorded arm ran under `token`).
