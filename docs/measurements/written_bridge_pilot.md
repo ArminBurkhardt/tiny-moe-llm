@@ -246,3 +246,16 @@ What it decides, and what stays open:
 - Re-reads on arm P's final: `ckpts/inject/ladder_pilot_redo.sh`,
   `ckpts/inject/pilot_p_ladder2_{abstention,store_pathway}.{json,log}` (read 2026-10-24),
   `ckpts/inject/pilot_p_ladder2_store_edit.{json,log}` (read 2026-10-24).
+
+## Later: the A-gate ladder on this checkpoint (2026-10-25)
+
+R5 read the full A-gate ladder on the bridge final
+(`ckpts/evidence_pilot_bridge/checkpoint_evidence_final.pt`) against arm P's final:
+[r5_bridge_ladder.md](r5_bridge_ladder.md). The composition verdict above stands, but the chain-only
+SFT left no other gate standing: the closed book reads at chance in every cell (the tier 1000
+residual gone with the weakly stored biographies), held-out copying fell from 0.95 to 0.40 to 0.47,
+SQuAD answering and abstention were replaced by the bridge form or degenerate text (EM 0.000,
+abstention 0.000), the pathway read answers nothing on any route, and the clean-slice CE rose from
+3.267 to 9.062 at exit 3. In the main thread's verdict this checkpoint is a demonstration that
+composition happens in written tokens, not a usable checkpoint; 6f's mix carries the pretraining
+slices beside the bridge rows, and every A gate is read on the shipped checkpoint.

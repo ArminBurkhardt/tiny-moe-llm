@@ -74,8 +74,85 @@ Restructured 2026-10-24 after the repository review.
   builds cap a training row at 4093 tokens). Run order: the three micro retriever arms, then the
   two leak arms, then the clean-slice CE re-read, with R5's eval set between them when the card
   is idle.
-- **Just read:** on the afternoon of 2026-10-25, the two leak candidate arms and the clean-slice
-  CE re-read. The leak arms (`docs/measurements/leak_candidates_micro.md`; the copy-first warm-up
+- **Ran and read this evening:** `cfb`, the recorded warm-up arm's recipe on the flagless splits
+  rerun on the code in the tree (`bash ckpts/inject/launch_leak_arm.sh cfb`, launched 2026-10-25
+  16:49 detached; warm-up exit 10 on the 100M save at 17:19, main 17:26 to 18:25, 299.19M tokens in
+  57.0 minutes, exit 0, reads and compares done 18:36; run directory `ckpts/evidence_leak_cfb`, log
+  `ckpts/inject/leak_cfb.log`, reads `ckpts/inject/rank_leak_cfb_*`, `compare_cf_vs_leak_cfb.log`
+  and the two same-code compares `compare_cfb_vs_leak_{m1,g1}.log`): the same-code twin of `m1` and
+  `g1` for the paired leak compare, and the pin on the filler CE gap between today's arms and the
+  recorded warm-up arm (the fp32 CE accounting explains 0.002 of it). Paired on the same code both
+  leak candidates stay falsified (every cell within z 1.1), `cfb` copies at 0.95 to 0.96 at the
+  switch, so the 0.88 to 0.90 of `m1` and `g1` was the flags, and it ends at filler CE 3.8885, so
+  the 0.022 gap to the recorded arm's 3.9106 is the code since 2026-10-05, not the flags. The
+  recipe itself reads tier 100 at z 2.9 in distribution and 3.7 held out on today's code (the
+  recorded arm 2.6 and 2.0), over 3 sigma held out on all three arms of the matched set, a caveat
+  for the user, not a verdict change.
+- **Decided 2026-10-25 (the user, on `docs/plans/RUN2.md`'s first table, every row on the
+  recommended option):** (0) shape L is the configured `config.yaml` shape, width 768, not the
+  blueprint's 1024; (1) 32 routed experts kept; (2) `evidence_selection_weighting: segment` is the
+  real run's default; (3) `--support-gold-only` is carried into the real corpus builder as a data
+  rule, a build item behind a flag; (4) the goal's reasoning clause is reworded to "facts in the
+  store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation
+  per token", the original "reasoning in the looped trunk" kept on record as the original goal and
+  the aspiration to revisit after the real run (NEXT.md "The goal"); (5) today's one block per
+  pass, the three-sublayer core not built (R4b's sublayer half closed); (6) the token target 280B,
+  the application asking 2.5k H100 hours plus the corpus build line plus a 20% buffer (about
+  3.0k), ceiling 5k; (7) R5 tonight on the local card; (8) a short matched control to 10B tokens,
+  about 30 H100 hours (about 4 hours on an 8-GPU node if DDP scales linearly); (9) the thin tier
+  100 held-out margin at micro accepted as the recipe's known state on one seed, stated in the
+  caveats, no second seed.
+- **Just read:** on the evening of 2026-10-25, R5, the winner's eval set
+  (`docs/measurements/r5_bridge_ladder.md`; the main thread's verdict). Arm P's final already
+  carried the complete ladder (2026-10-14, the decode reads redone on the fixed packer 2026-10-24,
+  the A4 flip on the bge route) and its 4-hop reads at depths 3 and 4 by read sites (at chance at
+  every save); the bridge final carried the 4-hop generate read (0.206 against chance 0.210, two
+  steps written); "HotpotQA bridge by read sites" has no instrument (the bridge decode exists only
+  for the synthetic chains), a build item. New: the A-gate ladder on the written-bridge final
+  (`ckpts/evidence_pilot_bridge/checkpoint_evidence_final.pt`, arm P's final plus 66.35M tokens of
+  chain-only bridge SFT, the form 6f builds on; `bash ckpts/inject/r5_bridge_ladder.sh`, launched
+  18:57 detached, one process per read, complete 19:51, log `ckpts/inject/r5_bridge_ladder.log`,
+  outputs `ckpts/inject/pilot_bridge_ladder_*`). Closed book every cell at chance: entity `delta`
+  at tier 100 / 1000 in distribution 0.004 (z 0.9) / -0.000 (z 0.0), held out 0.000 (z 0.1) / 0.006
+  (z 0.7), against arm P's 0.010 / 0.064 and 0.013 / 0.046 (the tier 1000 residual is gone).
+  Copying halved: gold top-1 0.755 / 0.757 / 0.755 / 0.797 by tier in distribution and 0.40 to 0.47
+  held out (arm P 1.000 and 0.95), swapped followed 0.71 to 0.73 and 0.50 to 0.53 (arm P 1.000 and
+  0.94 to 0.97). The in-context ceiling probe reads answer-span CE 12.33 / 12.41 / 14.14 / 15.41
+  under gold / mixed / distractors / none (arm P 3.49 / 4.10 / 6.20 / 6.05; ceiling 3.08, content
+  1.81), the levels set by the answer format (the model expects "Step 1:" first). A3 in generation:
+  EM 0.000 and F1 0.008 under gold, non-abstain 1.000 under none and distractors, the completions
+  the bridge template filled with degenerate or invented strings ("Step 1: 1: 1: 1:", "Answer: The
+  Basisines."); A7's pathway EM 0.000 on every route (arm P's oracle 0.088); A4 on the bge route
+  has nothing to flip (0 of 2,000 answered before the edit). Clean-slice CE 8.687 / 8.974 / 9.062
+  at exits 1 / 2 / 3, token top-1 0.058, against arm P's 3.348 / 3.274 / 3.267 and 0.42: plain
+  language destroyed and depth now hurts. The 13-task suite: mean multiple-choice headroom over
+  chance +0.019 over 9 tasks against arm P's +0.062 and the control's +0.073 (lambada 0.002 against
+  0.115, sciq 0.451 against 0.599, arc_easy 0.297 against 0.370; gsm8k 0.001 against 0.014; the
+  generations degenerate repeats). Verdict: the chain-only bridge SFT at the chain continuation's
+  recipe is a demonstration that composition happens in written tokens (R9 stands, 0.997 held out),
+  not a usable checkpoint. For the spec: 6f's mix carries the pretraining slices (evidence QA, the
+  abstention rows, the biographies at their tier structure, the plain-answer form) beside the
+  bridge rows at a lower LR than the pilot's continuation, with the A gates and the clean-slice CE
+  read at every 6f save and the kill rule on them; every A gate is taken on the shipped checkpoint,
+  after 6e and 6f; the pilot's tier 1000 residual is a property of the pretrained trunk that a
+  short post-training removes, so the leak reads after post-training are the binding ones; the
+  HotpotQA bridge instrument joins the build list (`docs/plans/RUN2.md`). Earlier the same evening,
+  `cfb`, the same-code twin of the two leak arms (`docs/measurements/leak_candidates_micro.md`, the
+  same-code twin section; the main thread's verdict). Paired prior-controlled `delta`, `cfb` minus the arm, against `m1` held out tier 100
+  +0.005 (z 1.1) and tier 1000 +0.005 (z 0.4), in distribution -0.006 (z -0.7) and -0.003
+  (z -0.2); against `g1` held out +0.001 (z 0.3) and +0.002 (z 0.2), in distribution -0.001
+  (z -0.1) and -0.013 (z -0.7): both candidates falsified on the same code. At 100M every cell
+  inside 3 sigma (largest |z| 1.8) with gold top-1 0.964 / 0.961 / 0.949 / 0.950 in distribution
+  (the recorded arm 0.973 / 0.973 / 0.959 / 0.953), so the slower copying of `m1` and `g1` at the
+  switch was the flags. Final entity `delta` in distribution 0.018 (z 2.9) at tier 100 and 0.070
+  (z 5.0) at tier 1000, held out 0.016 (z 3.7) and 0.038 (z 3.5); copying complete in distribution,
+  held-out swapped following 0.64 to 0.65 (the recorded arm 0.66 to 0.69, `m1` 0.65 to 0.67, `g1`
+  0.78 to 0.80). Filler CE 3.8885 against
+  the recorded arm's 3.9106 and `m1` / `g1` 3.886 / 3.889: the 0.022 gap is the code since
+  2026-10-05, the change not identified. The held-out tier 100 cell is over 3 sigma on all three
+  arms (`m1` 3.1, `g1` 3.3, `cfb` 3.7), by the letter of the R0b rule a fail at tier 100 held out
+  on one seed, stated as a caveat; tier 1000 is the known residual. On the afternoon of
+  2026-10-25, the two leak candidate arms and the clean-slice CE re-read. The leak arms (`docs/measurements/leak_candidates_micro.md`; the copy-first warm-up
   recipe on the flagged splits, read against the recorded warm-up arm): both candidates are
   falsified, no cell near the bar. The paired prior-controlled `delta` at tier 1000, warm-up arm
   minus leak arm (the lever needed z +3, the leak arm binding clearly less), reads for `m1` (the
@@ -118,8 +195,8 @@ Restructured 2026-10-24 after the repository review.
   `ckpts/inject/exit_seg_e3_vs_w0e3b.{json,log}`): the twin 0.085 / 0.062 / 0.060 nats behind at
   exits 1 / 2 / 3, per-token z +10.0 / +8.5 / +8.1, twice the one measured seed spread, so the
   gain is real between these two runs and general to text the arms never trained on; its
-  attribution to the weighting rests on one seed. The segment default is the user's call before
-  the real-run recipe. On the evening of 2026-10-24, the other two micro retriever
+  attribution to the weighting rests on one seed. The segment default was the user's call before
+  the real-run recipe (decided 2026-10-25: `segment`). On the evening of 2026-10-24, the other two micro retriever
   arms (the first pass only section): `l0e3`, the contrastive
   term on the first pass alone, reaches store recall@5 / @20 at loop 1 of 0.049 / 0.122 against
   the every-loop arm `w25e3`'s 0.059 / 0.133 (bge 0.829 / 0.897), loops 2 and 3 at 0.010 and
@@ -146,14 +223,14 @@ Restructured 2026-10-24 after the repository review.
   attached directly, a generation weakness on real questions, not a store failure. Arm E4
   (`docs/measurements/expert_count_pilot.md`: the expert count is a cost choice); the repository
   review (`docs/review_2026-10-24.md`).
-- **Next, in order:** the run spec, with R5's eval set when the card is idle (the day's queue is
-  complete: the three micro retriever arms, the two leak arms and the clean-slice read are all
-  read).
-- **Open for the user:** the goal's reasoning clause reworded on R9 (written tokens); R4b's
-  sublayer half; 6f's abstention reward against the A3 re-read; the selection weighting default
-  (`token` or `segment`; `segment` would change `config_pilot.yaml` and the yamls, every recorded
-  arm ran under `token`); support from the gold card only as a real-run data lever (held-out
-  following 0.67 to 0.79).
+- **Next, in order:** the spec's build list in its order (`docs/plans/RUN2.md`, "Build list
+  before launch"; its item 1, R5, done 2026-10-25): `config_run2.yaml` and its seed with the
+  constructor print; multi-GPU on the evidence trainer; the real corpus builder (with
+  `--support-gold-only` behind a flag and the staircase visibility question); the logging builds;
+  a pilot-shape smoke of the real builder; the control's config and launcher; then 6a; added by
+  R5 for the finals and 6f, not the launch: the HotpotQA bridge instrument (the bridge decode over
+  retrieved real chunks) and the 6f mix builder.
+- **Open for the user:** 6f's abstention reward against the A3 re-read.
 
 ### Open items
 
@@ -163,17 +240,17 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 |---|---|---|---|
 | the review's code changes | landed 2026-10-24 (uncommitted; tests pass on the GPU; a detached Sonnet review found no high or medium issue): fp32 CE, top-1 and `p_max` sums in `mtp.py`; the log-space selection loss with `evidence_selection_weighting` (`token` default, `segment`); `evidence_contrastive_loops` default `[0]`; the groundedness head input detached under the key/value reader; the row estimator replaying each reader's rule and a 4093-token training cap in the evidence builder (the reader itself unchanged by decision); the evidence padding cut into 128-token blocks; the dense-slot GEMM skip; the frozen-gate skip; fp32 selection scores under loss-free. Held: the eval-pass rewrite, deferred to 6a; the `eval_chains.py` bridge-mode items (in `--generate-bridge` the latent verdict lines suppressed and the kept 3 minus kept 1 line labelled bridge-internal; the evidence built once per batch) | none | 6a (the eval pass); a free card for the `eval_chains.py` identity check |
 | A4 edit, a flip read routed through bge | closed: read 2026-10-24 (`scripts/eval_store.py edit --route bge` on arm P's final, retrieval through the store's bge query keys, the serving configuration; `ckpts/inject/pilot_p_ladder2_store_edit_bge.*`; 95 of 2,000 answered before the edit): delete holds (flip 0.90 +- 0.035, n 72, bar 0.70), edit fails on generation (flip 0.13 +- 0.07, n 23; the edited chunk attached directly followed 0.09); the edit half goes to 6f with A3 | none | nothing |
-| R5, the winner, eval only | next, on the chosen shape (the A4 bge read done 2026-10-24); runs when the card is idle (idle since 2026-10-25 16:25, the day's queue complete) | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7 | the chosen shape; an idle card |
+| R5, the winner, eval only | closed: read 2026-10-25 evening (RUN2.md row 7; `docs/measurements/r5_bridge_ladder.md`): arm P's final already carried A1 to A7 and its 4-hop reads by read sites (at chance), the bridge final the 4-hop generate read (0.206 against 0.210); the new read, the A-gate ladder on the bridge final (`ckpts/inject/r5_bridge_ladder.sh`), makes the chain-only bridge SFT a demonstration of written composition, not a usable checkpoint (biographies and the tier 1000 residual erased, copying halved, answering and abstention replaced by the bridge form, clean-slice CE 2.8x, the suite's headroom down to a third), so 6f's mix carries the pretraining slices and every A gate is read on the shipped checkpoint; the HotpotQA bridge by read sites has no instrument, a build item | held-out 4-hop by read sites and at D = 4; HotpotQA bridge by read sites; A1 to A7, done | nothing |
 | a clean validation slice (documents neither builder used) | closed: built 2026-10-24 (`scripts/prepare_clean_val.py`, `data/prepared_pilot/inject_val_clean`, 974 windows, 650,125 tokens; verbatim 64-token overlap with the QA training rows' supervised tokens 0.99% against 13.3% for `inject_val`), read 2026-10-25 (`bash ckpts/inject/read_clean_val.sh`; `docs/measurements/clean_validation_slice.md`): the control's exit 3 lead over arm P is 0.025 on `inject_val` and 0.002 on clean text, so its lower held-out CE was contamination, not language; E4 0.007 behind P; depth gains about 0.08 on every arm | `eval_exit.py` on the arm P, C and E4 finals on both slices, done | nothing |
 | a value-to-name closed-book probe | proposed, mode not built | arm P's final | a build |
 | R4, the coda corner | closed: dropped 2026-10-24 (the user), obsolete on R9 (composition at 0.997 held out once the intermediate entity is written out); the coda stays unbuilt | none | nothing |
-| R4b, the sublayer half | open; the review recommends a cost choice, no arms | none at pilot scale | the user |
-| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | all three read, two 2026-10-24 and `seg_e3` 2026-10-25 (`bash ckpts/inject/launch_review_arms.sh`; `docs/measurements/infonce_micro.md`): the twin `w0e3b` final CE 4.3996, recall@5 0.000; `l0e3` recall@5 / @20 at loop 1 0.049 / 0.122 against `w25e3`'s 0.059 / 0.133 at 0.041 nats against the twin (the every-loop pair 0.074), gate failed, so the cost sits in the trunk's change and the decision of 2026-10-21 stands; `seg_e3` (per-segment selection weighting, no contrastive term) held-out CE 4.3671 against the twin's 4.3996 (0.033 better, every condition including no evidence, the gap growing from 60M on), selection equal (0.7503 against 0.7538), recall@5 0.001; the paired per-token read on `inject_val` (2026-10-25) puts the twin 0.060 nats behind at exit 3, z +8.1, twice the one measured seed spread, so the gain is real between these two runs, attributed to the weighting on one seed | store recall and held-out CE against `w0e3b`; the paired exit read, done | the user (whether `segment` becomes the recipe default) |
-| two leak candidates (value-first templates; distractor-collision spans) | closed: builder flags `--mask-first-name-mention` and `--support-gold-only` (`.mask` only), splits `inject_retrieval_s100a50m1_train`, `s100a50g1`, `s15a50m1`, `s15a50g1` built 2026-10-24; arms `bash ckpts/inject/launch_leak_arm.sh m1` and `g1` run and read 2026-10-25 (`docs/measurements/leak_candidates_micro.md`): both falsified, the paired tier 1000 `delta` against the warm-up arm at z 0.7 / 1.3 (`m1`) and 0.1 / 0.9 (`g1`) by form against the bar z 3, so the residual is neither the first name mention nor the collision spans; side finding: `--support-gold-only` raises held-out following from 0.67 to 0.79 at no cost (open for the user) | closed-book rank at 100M and at the final against the copy-first warm-up arm (`compare_cf_vs_leak_{ARM}.log`), done | nothing |
+| R4b, the sublayer half | closed: decided 2026-10-25 (the user, RUN2.md row 5): today's one block per pass, the three-sublayer core not built, a cost choice like the expert count, no arms | none | nothing |
+| three micro retriever arms (a fresh `w0e3` twin on the reviewed code; the contrastive term on the first pass with the trunk gradient on; per-segment selection weighting) | all three read, two 2026-10-24 and `seg_e3` 2026-10-25 (`bash ckpts/inject/launch_review_arms.sh`; `docs/measurements/infonce_micro.md`): the twin `w0e3b` final CE 4.3996, recall@5 0.000; `l0e3` recall@5 / @20 at loop 1 0.049 / 0.122 against `w25e3`'s 0.059 / 0.133 at 0.041 nats against the twin (the every-loop pair 0.074), gate failed, so the cost sits in the trunk's change and the decision of 2026-10-21 stands; `seg_e3` (per-segment selection weighting, no contrastive term) held-out CE 4.3671 against the twin's 4.3996 (0.033 better, every condition including no evidence, the gap growing from 60M on), selection equal (0.7503 against 0.7538), recall@5 0.001; the paired per-token read on `inject_val` (2026-10-25) puts the twin 0.060 nats behind at exit 3, z +8.1, twice the one measured seed spread, so the gain is real between these two runs, attributed to the weighting on one seed; `segment` decided as the real run's default 2026-10-25 (the user, RUN2.md row 2) | store recall and held-out CE against `w0e3b`; the paired exit read, done | nothing |
+| two leak candidates (value-first templates; distractor-collision spans) | closed: builder flags `--mask-first-name-mention` and `--support-gold-only` (`.mask` only), splits `inject_retrieval_s100a50m1_train`, `s100a50g1`, `s15a50m1`, `s15a50g1` built 2026-10-24; arms `bash ckpts/inject/launch_leak_arm.sh m1` and `g1` run and read 2026-10-25 (`docs/measurements/leak_candidates_micro.md`): both falsified, the paired tier 1000 `delta` against the warm-up arm at z 0.7 / 1.3 (`m1`) and 0.1 / 0.9 (`g1`) by form against the bar z 3, so the residual is neither the first name mention nor the collision spans; side finding: `--support-gold-only` raises held-out following from 0.67 to 0.79 at no cost (decided 2026-10-25: carried into the real corpus builder behind a flag, RUN2.md row 3); the same-code twin `cfb` (`bash ckpts/inject/launch_leak_arm.sh cfb`, the flagless splits on today's code, read 2026-10-25 evening) confirms both falsified (every paired cell within z 1.1), puts the slower copying at the switch (0.88 to 0.90 against `cfb`'s 0.95 to 0.96) on the flags and the 0.022 filler CE gap to the recorded arm on the code, and reads tier 100 at z 2.9 / 3.7 by form (held out over 3 sigma on all three arms; accepted 2026-10-25 as the recipe's known state on one seed, no second seed, RUN2.md row 9) | closed-book rank at 100M and at the final against the copy-first warm-up arm (`compare_cf_vs_leak_{ARM}.log`) and against `cfb` (`compare_cfb_vs_leak_{m1,g1}.log`), done | nothing |
 | R6, pretraining-text facts | closed: skipped 2026-10-24 (the user); its mechanism is read at micro (arm (a) stores plain-text facts, tier 100 `delta` 0.378; arm (b), spans masked, stores nothing; arm C repeats arm (a) at pilot shape) and the run spec uses that lever | none | nothing |
-| the goal's reasoning clause reworded | open since 2026-10-17; R9 read 2026-10-24: composes in written tokens, not in the loop | none | the user |
-| 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
-| 6a throughput, 6c corpus on the rented cluster, 6d run spec | after every other spec decision (2026-10-21); 6a carries the deferred eval-pass rewrite | none | the rows above |
+| the goal's reasoning clause reworded | closed: decided 2026-10-25 (the user, RUN2.md row 4), open since 2026-10-17, on R9 (composes in written tokens, not in the loop): "facts in the store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation per token"; the original "reasoning in the looped trunk" kept as the original goal and the aspiration to revisit after the real run (NEXT.md "The goal") | none | nothing |
+| 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth; its mix carries the pretraining slices beside the bridge rows at a lower LR than the pilot's continuation, the A gates and the clean-slice CE read at every save under a kill rule (R5, 2026-10-25: chain-only bridge SFT lost every other gate) | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
+| 6a throughput, 6c corpus on the rented cluster, 6d run spec | 6d decided 2026-10-25 (the user, every row of `docs/plans/RUN2.md`'s first table on the recommended option; drafted the same evening: recipe by rung, cost table for the application, build list; the draft found the plan's 2.5k-hour figure was for the blueprint width 1024 while `config.yaml` is width 768, the evidence trainer single GPU, the real corpus builder unbuilt with the staircase visibility unresolved under the key/value reader); 6c and the rest of the spec's build list next, in RUN2.md's order; 6a after the spec (2026-10-21), carrying the deferred eval-pass rewrite | none | the build list (R5 read 2026-10-25) |
 
 **The design page moves with the architecture and the plan.** Any change to the architecture (a
 tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
@@ -543,8 +620,10 @@ at evidence ratio 3.26, two passes; record below).
 Intermediate pilot saves deleted
 2026-10-17 (kept: both finals, arm P 300M and 530M, arm C 325M). `stop_after_save.sh ARM
 PATTERN` drops STOP after a matching save; a stop leaves `STOP` to remove before relaunch.
-The plan was rewritten on 2026-09-30 around the goal "facts in the store through the retrieval
-pathway, reasoning in the looped trunk"; the
+The plan was rewritten on 2026-09-30 around the goal, worded since 2026-10-25 "facts in the
+store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation
+per token" (the original, "facts in the store through the retrieval pathway, reasoning in the
+looped trunk", kept as the aspiration to revisit after the real run); the
 design is `docs/evidence_path_design.html`, the findings are `docs/review_2026-09-29.md`, the R0b
 record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
 
@@ -681,6 +760,22 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   control's exit 3 lead over arm P 0.025 on `inject_val` and 0.002 on `inject_val_clean`,
   contamination, not language; E4 0.007 behind P; depth gains about 0.08 on every arm. The day's
   queue complete; next the run spec.
+
+- **2026-10-25 evening: R5, the A-gate ladder on the written-bridge final**
+  (`docs/measurements/r5_bridge_ladder.md`, `ckpts/inject/r5_bridge_ladder.sh`, outputs
+  `ckpts/inject/pilot_bridge_ladder_*`). Arm P's final already carried A1 to A7 and its 4-hop reads
+  (at chance), the bridge final its 4-hop generate read (0.206 against 0.210); the HotpotQA bridge
+  has no instrument. On the bridge final (arm P's final plus 66.35M tokens of chain-only bridge SFT
+  at 3e-4): closed book at chance in every entity cell (tier 1000 -0.000 / 0.006 by form against
+  arm P's 0.064 / 0.046), gold top-1 0.76 to 0.80 in distribution and 0.40 to 0.47 held out,
+  swapped followed 0.71 to 0.73 / 0.50 to 0.53, SQuAD EM 0.000 with no abstention under any
+  condition (bridge template, degenerate or invented strings), pathway EM 0.000 on every route,
+  nothing to flip on the A4 edit, clean-slice CE 9.062 at exit 3 against 3.267 with depth costing
+  0.375 nats, the suite's headroom +0.019 against +0.062. The main thread's verdict: a
+  demonstration of written composition, not a usable checkpoint; 6f's mix carries the pretraining
+  slices beside the bridge rows at a lower LR, the A gates and the clean-slice CE at every 6f save
+  under a kill rule, every A gate on the shipped checkpoint, the leak reads after post-training
+  binding, the HotpotQA bridge instrument and the 6f mix builder in RUN2.md's build list.
 
 - **The former "Next, in order" list, closed 2026-10-24** (items 1 to 4 done or closed, item 5
   moved to the Open items table; the full ladder with its done steps is in NEXT.md):
@@ -971,7 +1066,7 @@ TINY_LLM_CONFIG=config_micro.yaml python scripts/sft.py --evidence --reader-kv -
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --arms retrieval --suffix s100a50 --device cuda   # the copy-first warm-up split
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 0.15 --anon-rate 0.5 --gold-drop-rate 0.2 --placeholder-rate 0.5 --distractors 3 --seed 42 --arms retrieval --suffix s15a50p50 --device cuda   # the placeholder name split
 python scripts/prepare_injection_data.py --out-dir data/prepared_inject --target-tokens 300000000 --filler-phases ir,phase1,phase2 --seq-length 1024 --swap-rate 1.0 --anon-rate 0.5 --gold-drop-rate 0.2 --distractors 3 --seed 42 --arms retrieval --suffix s100a50m1 --mask-first-name-mention --device cuda   # a leak arm's warm-up split; also s15a50m1 at swap 0.15, and --support-gold-only for s100a50g1 and s15a50g1 (all four: bash ckpts/inject/build_leak_arms.sh)
-bash ckpts/inject/launch_leak_arm.sh m1|g1   # the copy-first warm-up recipe on a flag's splits, stop at 100M, read, switch, read the final and compare against the warm-up arm
+bash ckpts/inject/launch_leak_arm.sh m1|g1|cfb   # cfb: the flagless splits, the same-code twin; the copy-first warm-up recipe on a flag's splits, stop at 100M, read, switch, read the final and compare against the warm-up arm
 bash ckpts/inject/launch_review_arms.sh [w0e3b|l0e3|seg_e3]   # the micro retriever arms of the 2026-10-24 review, then store recall at loop 1
 python scripts/prepare_clean_val.py [--check-against PREFIX --check-baseline data/prepared_pilot/inject_val]   # inject_val_clean: inject_val's windows from documents the evidence builder never used
 bash ckpts/inject/read_clean_val.sh   # eval_exit.py on the arm P, C and E4 finals on inject_val_clean and inject_val
