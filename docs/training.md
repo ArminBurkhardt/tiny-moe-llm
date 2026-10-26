@@ -257,7 +257,7 @@ the shuffle seed and `kill_checked`. From 2026-10-24 it also carries the fp32 ma
 (`loop_rng_state`, `cuda_rng_state`) and the data fields (`data_dir`, `train_split`,
 `val_split`) under `sft`. A resume restores what is present; a checkpoint written before then
 carries none of them and loads as before. A resume on other data than the checkpoint's is refused
-unless `--switch-split` is passed.
+unless `--switch-split` is passed. Since 2026-10-26 it also stores `total_steps`, `rows_per_epoch` and `world_size`, and a resume warns when the plan changed.
 
 - **Cadence is in tokens** (`checkpoint_every_tokens`), checked inside the existing log block so it
   costs no extra host sync. `SIGUSR1` forces one immediately.
@@ -266,7 +266,7 @@ unless `--switch-split` is passed.
 - **Naming is token-keyed**: `checkpoint_{phase}_tok{N}M_loss{L}.pt`, plus one
   `checkpoint_{phase}_final.pt` per phase that is never pruned.
 - **Retention** keeps the newest `keep_local_checkpoints` and deletes the rest **only** once their
-  upload is confirmed. Sustained upload failure therefore fills the disk rather than discarding
+  upload is confirmed. On the `sft.py` path, `keep_every_tokens` (0 = off, 2026-10-26) also spares the first save at or past each multiple of it and `*_final.pt`; rank 0 does the deleting. Sustained upload failure therefore fills the disk rather than discarding
   history: the loud, recoverable failure.
 - **Resume picks the newest checkpoint that loads**, not simply the newest file. A corrupt newest
   file is logged and skipped; only if *every* candidate fails does startup raise. "A checkpoint
@@ -275,7 +275,8 @@ unless `--switch-split` is passed.
   size or grad-accumulation change still lands on the right point of the cosine.
 - **`run_state.json`** records `{phase, token_count, checkpoint}` at every save. On startup the
   resumed token count is compared against it, and a gap larger than `2 * checkpoint_every_tokens`
-  aborts with exit 30 rather than silently retraining ground already covered.
+  aborts with exit 30 rather than silently retraining ground already covered. Since 2026-10-26 `sft.py` does the same check (exit 30 on the sft path); before then only the pretrain supervisor did.
+- **The grid snap** (2026-10-26): saves and evals fall on a fixed token grid (`next_grid_point`, in `pretrain.py`), so a resume continues on the same grid instead of one interval after wherever it picked up; `sft.py` always did this on the evidence path, the pretrain resume snaps now too.
 - **Migrated checkpoints are seeds, not resume points.** Every `migrate_*.py` output drops its
   optimizer state (Adam moments are indexed by param-group position and the migration adds or
   removes tensors); `utils.load_checkpoint` names that case when you try. Seeding goes through
@@ -284,9 +285,10 @@ unless `--switch-split` is passed.
   `NEUTRAL_LOOP_KEYS` (the loop-conditioned query biases, the reader's per-loop gain and the chunk
   gate scale, all neutral at init), `READER_MODE_KEYS` (the marker buffers
   `moe.evidence_reader_rotary_off` and `moe.evidence_reader_kv`, which carry no learned value) and
-  `BALANCE_KEYS` (`moe.balance_bias`, zero is the unbiased router). The two resume paths
+  `BALANCE_KEYS` (`moe.balance_bias`, zero is the unbiased router). One drop, not a tolerance, since 2026-10-26: `utils.drop_ir_inner_attn` removes an old checkpoint's IR inner attention keys (`moe.experts.{i}.attn.*` of IR experts, with a warning naming the count), because the model no longer builds that attention under the direct read. The two resume paths
   (`utils.load_checkpoint`, `sft.load_sft_checkpoint`) stay strict on every learned tensor; their
-  one tolerance is `moe.balance_bias` (`utils.with_balance_default`).
+  one tolerance is `moe.balance_bias` (`utils.with_balance_default`), so a run checkpoint written before 2026-10-26 cannot resume under the code that no longer builds the IR inner attention (seeds through `-c` load).
+- **Multi-GPU resume** (2026-10-26): the resume cursor is one scalar, so a resume at another rank count is valid; rank 0 alone writes saves and `run_state.json`. Detail in CLAUDE.md "SFT".
 - The fp32 masters are optimizer shadows built before the resume. On an SFT resume they are
   restored from `fp32_masters` when every master is present with its shape and rounds to the
   just-loaded BF16 weight; otherwise (an older checkpoint, or pretraining) they are reseeded from

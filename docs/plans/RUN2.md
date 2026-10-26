@@ -8,9 +8,15 @@ constructor, the builder or the first hour of the run prints it. Decided items c
 and source; the user's decisions of 2026-10-25 are the first table, and the body, written under
 the options that were then decided, is marked "(decided 2026-10-25)" where it depends on them.
 
+Status 2026-10-26: launch path L1 to L5 built (the launch-path table below): the constructor print
+replaces the estimates in Model and Cost (330.4M total / 171.1M active / 459M FLOP per token, 118.4M
+per evidence token), `config_run2.yaml` and the control, multi-GPU on the evidence trainer, and the
+corpus pipeline on the existing builders ([RUN2_corpus.md](RUN2_corpus.md)). Three corpus
+decisions of the main thread are rows 11 to 13 of the table below.
+
 ## Decisions (the user, 2026-10-25)
 
-Rows 1 to 7 are the main thread's; rows 0, 8 and 9 were raised while drafting. Every row was
+Rows 1 to 7 are the main thread's; rows 0, 8 and 9 were raised while drafting; rows 11 to 13 are 2026-10-26 corpus decisions of the main thread. Every row was
 decided on the option the draft recommended; the consequence column is the draft's, kept.
 
 | # | decision | decided | consequence of each option |
@@ -25,7 +31,10 @@ decided on the option the draft recommended; the consequence column is the draft
 | 7 | R5 (the winner's eval set) | **tonight, on the local card, on arm P's final** (8 experts) and the bridge final, launched by the main thread | tonight: needs no decision beyond the shape, about 2 to 4 hours (estimate from the pilot ladder's 45 minutes for twelve reads plus the chain reads, [pilot]), and its margins enter the gate table before the run. On the cluster: costs H100 hours and lands after the application |
 | 8 | the A1 control at the real run's size | **a short matched control**: no retrieval, the same stream and shape, to 10B tokens, about 30 H100 hours (about 4 hours on an 8-GPU node if DDP scales linearly) | short control: A1(b)'s paired reading (decided 2026-10-17) and A1(a) read at matched 10B; the final saves read against the prior and the 10B level. No control: A1 rests on the pilot's 47x / 4x reduction ([pilot]) and the 16B checkpoint, unmatched. A full-length control doubles the run |
 | 9 | the thin tier 100 margin at micro | **accepted** as the recipe's known state on one seed, stated in the caveats; no second seed of `cfb` | held-out tier 100 at z 3.1 / 3.3 / 3.7 on the three same-recipe arms of 2026-10-25, paired inside noise: `cfb` against the recorded arm z -1.8 (`m1` and `g1` read z -0.9 and -1.5, but they are flagged variants, not same-recipe arms) ([leak]); a second seed says whether the R0b rule's tier 100 half holds on today's code |
-| 10 | staircase visibility in the real corpus builder | **open for the user, blocking the real builder** | the design's staircase (a window sees only the chunks retrieved up to it) has no form under the key/value reader, whose prefix is visible in full to every token of its segment; without a fix a token reads chunks retrieved for later windows (Build list 4). Option A, this draft's recommendation: retrieve once per document from its first 64 tokens and mask that opening's loss (no kernel work). Option B: a windowed prefix mask (kernel work, 6a era) |
+| 10 | staircase visibility in the real corpus builder | **not on the launch path 2026-10-26 (moot without per-window retrieval over plain text; revisit for a later run)**; was open for the user, blocking the real builder | the design's staircase (a window sees only the chunks retrieved up to it) has no form under the key/value reader, whose prefix is visible in full to every token of its segment; without a fix a token reads chunks retrieved for later windows (Build list 4). Option A, this draft's recommendation: retrieve once per document from its first 64 tokens and mask that opening's loss (no kernel work). Option B: a windowed prefix mask (kernel work, 6a era) |
+| 11 | split size and epochs | **93.33B prompt tokens per split, 3 epochs** (280B / 3), decided by the main thread 2026-10-26 as routine | 93.33B x 3: the evidence trainer runs whole epochs (`num_epochs` times the split's rows, it ignores `target_tokens`), so the split must be built at T = 280B / 3 for the run to be 280B. The Corpus section's 100B unique at up to 4 epochs would train 300B at 3 epochs or stop at 2.8 passes only by hand ([RUN2_corpus.md](RUN2_corpus.md) section 1) |
+| 12 | chain share of the split | **0.03** (`--chain-share`), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | 0.03: 3.7 TB peak disk, about 2 days after the filler download, 28.1M plain and 19.5M bridge questions each seen 3 times. RUN2's 0.10: 6.8 TB peak, 3 to 4 days, 93.6M / 65.0M questions; a share with no rung behind it (RUN2_corpus.md section 4) |
+| 13 | chat replay share | **held at the supply limit** (about 0.5B unique non-holdout chat, so the 20% line is unreachable and the share goes to the filler), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | at supply: smoltalk2 binds (phase 2 and ir take 1.5B, the QA replay arm 0.3B), the 18.5 points go to the biography slice. At 20%: needs a chat source that does not exist at this size (RUN2_corpus.md section 1) |
 
 ## Question, and what it decides
 
@@ -73,7 +82,7 @@ the union selection over passes, Muon, any retriever term, a separate search tow
 
 ## Model
 
-`config_run2.yaml` (to build): `config.yaml`'s model block with the pilot's selector table.
+`config_run2.yaml` (built 2026-10-26, with `config_run2_control.yaml`): `config.yaml`'s model block with the pilot's selector table.
 
 | key | value |
 |---|---|
@@ -87,11 +96,20 @@ the union selection over passes, Muon, any retriever term, a separate search tow
 
 | layout | total | active | training state per GPU (16 B per parameter) | per save (14 B) |
 |---|---|---|---|---|
-| `config.yaml` as printed | 383.5M | 224.2M | 6.1 GB | 5.4 GB |
-| 32 experts, 256-entry table (decided 2026-10-25) | about 333M | about 174M | 5.3 GB | 4.7 GB |
+| `config.yaml` as printed (HEAD; 380.2M / 221.0M / 464M after the 2026-10-26 model set) | 383.5M | 224.2M | 6.1 GB | 5.4 GB |
+| 32 experts, 256-entry table (decided 2026-10-25), **printed 2026-10-26** | **330.4M** (estimate was about 333M) | **171.1M** (about 174M) | 5.3 GB | 4.6 GB |
 | 16 experts, 256-entry table | about 249M | about 174M | 4.0 GB | 3.5 GB |
 
-Derivation (estimate): one routed expert is 3 x 768 x 2304 = 5.31M parameters, and 383.5M minus
+**Constructor print, 2026-10-26 (replaces the estimates in this section and in Cost):** the trainer
+on `config_run2.yaml` with the key/value reader prints `params: total=330.4M active=171.1M (excl.
+emb=101.9M) | forward FLOP/token ~= 459M (body 252M + heads 100M + attn 107M @ seq_len=4096)`; the
+evidence encoder is 118.4M FLOP per evidence token over its 8 layers; the token table is 50.3M. The
+drop of the IR expert's inner attention under the direct read (`direct_read`, every config) is why
+the FLOP line fell from the 502M of the earlier estimates to 459M (the older estimates counted a
+dead attention, as the Cost note said). Training state at 330.4M parameters: 5.29 GB per GPU, 4.63
+GB per save.
+
+Derivation (estimate, superseded by the print above): one routed expert is 3 x 768 x 2304 = 5.31M parameters, and 383.5M minus
 224.2M is exactly 30 idle experts, so the 65,536 x 384 key and value tables (50.3M) sit in both
 counts. Training state: bf16 weights and gradients, fp32 masters (every parameter, as `sft.py`),
 fp32 AdamW moments; a save drops the gradients. FLOP per token about 502M as printed plus 118M per
@@ -102,6 +120,13 @@ evidence ([16B]), and the evidence axis adds about 0.61 MiB per evidence token (
 binds.
 
 ## Corpus
+
+**Launch version, 2026-10-26:** the corpus the run trains on is the pilot recipe at scale on the
+existing builders, by `scripts/build_run2_corpus.py` ([RUN2_corpus.md](RUN2_corpus.md)): T = 93.33B
+prompt tokens per split, 3 epochs (rows 11 to 13 of the decisions), four slices (biographies with
+filler 95.4%, QA 1.6% at its supply, plain chains 1.5%, bridge chains 1.5%), chat replay at supply,
+an evidence ratio of about 0.4. The table and bullets below are the design this section was written
+for; the new builder features they need are not on the launch path.
 
 100B unique tokens at up to 4 epochs (decided, [6b]); at 280B the run sees each token about 2.8
 times. Built on the cluster (decided 2026-10-21) by the pilot builder mode at scale ([6c]), which
@@ -242,35 +267,51 @@ column below is the main run's; the leak reads after post-training are the bindi
 ## Cost
 
 Application table (H100 hours). Every line is an estimate until the constructor prints the shape
-and the first hour prints the rate. Rate at the configured shape with evidence: 502M + 118M x 1.55
-= 685M FLOP per token forward (1.55 is 6b's evidence ratio from its 15% QA share; RUN2's own shares give about 1.49, 1.40 main and 2.0 tail, which moves the rate about 1%; the FLOP line counts the dead IR inner attention, so 685M is high by about 28M); at the 16B run's achieved rate (97k tokens per second at 490M,
-[16B]) that is 69k tokens per second, times 0.91 for the evidence path's lower efficiency at pilot
-shape (arm P 42k to 48k against arm C 51k to 59k at 1.11x the FLOP, [pilot]): about 63k, range 60k
-to 70k per H100. The blueprint figure is [6b]'s 30k to 32k.
+and the first hour prints the rate. Rate at the configured shape with evidence, **recomputed 2026-10-26 from the constructor print**
+(459M FLOP per token forward, 118.4M per evidence token): 459M + 118.4M x 1.55 = 643M (1.55 is 6b's
+evidence ratio from its 15% QA share; RUN2's own ratio 1.49 gives 635M). At the 16B run's achieved
+rate (97k tokens per second at 490M FLOP, 11% MFU, [16B]) the same MFU gives 97k x 490 / 643 = 73.9k
+tokens per second, times 0.91 for the evidence path's lower efficiency at pilot shape (arm P 42k to
+48k against arm C 51k to 59k at 1.11x the FLOP, [pilot]): about 67k, range 64k to 75k per H100
+(the earlier 685M line gave 63k, range 60k to 70k: it counted the dead IR inner attention). Hours
+for 280B: 280e9 / 67.3k = 4.16e6 GPU seconds = 1,155 h (1,215 h at 64k, 1,040 h at 75k); for 400B
+1,650 h (1,480 to 1,740). The control without evidence at 459M: 97k x 490 / 459 = 104k per second,
+10e9 / 104k = 27 h. The blueprint figure is [6b]'s 30k to 32k.
+
+**The corpus built for this run has an evidence ratio of about 0.4, not 1.49 to 1.55**
+([RUN2_corpus.md](RUN2_corpus.md) section 6: filler windows carry no evidence under the pilot
+recipe; chains and QA carry nearly all of it): 459M + 118.4M x 0.4 = 506M, 97k x 490 / 506 x 0.91 =
+85k per second and about 910 h for 280B (range 820 to 950). So the lines below, kept at RUN2's own
+ratio, are conservative for the corpus actually built; the first hour of the run prints the real
+rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_evidence_tokens`
+4608, 2026-10-26) read 25.4k to 27.4k tokens per second at 16.5 GB peak, step 0 CE 11.17, step 30
+10.96, a save and exit 10 clean; it is a consumer card at batch 2 and sets no cluster figure.
 
 | line | configured shape (row 0) | blueprint width 1024 ([6b]) | basis |
 |---|---|---|---|
-| main run, 280B tokens, today's MFU | 1,100 to 1,300 | 2,400 to 2,600 | the rates above |
-| main run at the 400B cap instead | 1,600 to 1,900 | 3,500 to 3,700 | the same |
+| main run, 280B tokens, today's MFU | 1,040 to 1,220 (about 910 at the corpus ratio 0.4) | 2,400 to 2,600 | the rates above |
+| main run at the 400B cap instead | 1,480 to 1,740 | 3,500 to 3,700 | the same |
 | main run after G8 (2x) | half of the line | half of the line | [6a] |
-| short control, 10B, no evidence (row 8) | about 30 | about 70 | 97k / about 40k tokens per second ([6b]'s rate without its 1.29 evidence factor) |
+| short control, 10B, no evidence (row 8) | about 27 | about 70 | 97k / about 40k tokens per second ([6b]'s rate without its 1.29 evidence factor) |
 | corpus build, GPU | about 25 to 30 | the same | fact tagger about 15, bge window queries about 5, store embedding and ANN a few ([6c]) |
 | corpus build, CPU | 1 to 2 node days | the same | tokenization of 100B, about 400M ANN queries, near-duplicate filter, store deduplication ([6c]); unmeasured |
 | 6a throughput work | 100 to 150 billed per GPU; about 580 if a full 8-GPU node is held 3 days | the same | profiling and compile on one GPU about 3 days, the FP8 A/B (2 x 2B tokens) about 18, G8 one node hour |
 | eval ladder | 30 to 50 | 40 to 70 | the pilot's read set 26 minutes per save and the ladder 45 minutes ([pilot]), at about 2x the FLOP per token, every 10B plus the finals |
 | 6e context extension and consolidation | 40 to 60 | 80 to 120 | a few B tokens each ([6e]); a context change is also a corpus rebuild (CPU) |
 | 6f | not asked | not asked | the rollout rate is unmeasured ([6f]) |
-| ledger, 280B, before buffer | about 1,350 to 1,650 | about 2,700 to 3,050 | sum (6a per GPU) |
-| **ask (row 6, decided 2026-10-25)** | **2.5k + corpus line + 20%: about 3.0k H100 hours; ceiling 5k** | the same | configured: the ledger is 1.35k to 1.65k and 1.6k to 2.0k with its own 20%, so the ask leaves about 1.0k to 1.4k at 280B, and the 400B cap fits (2.2k to 2.7k with 20%); the 2.5k in the ask is the blueprint-width figure; named contingencies: the 400B cap, a second arm after a failed read, 6a and 6e; blueprint: the ask covers the ledger without its buffer |
+| ledger, 280B, before buffer | about 1,260 to 1,540 | about 2,700 to 3,050 | sum (6a per GPU): 1,040 + 27 + 25 + 100 + 30 + 40 = 1,262 low, 1,220 + 30 + 30 + 150 + 50 + 60 = 1,540 high |
+| **ask (row 6, decided 2026-10-25)** | **2.5k + corpus line + 20%: about 3.0k H100 hours; ceiling 5k** | the same | configured (recomputed 2026-10-26): the ledger is 1.26k to 1.54k and 1.5k to 1.85k with its own 20%, so the ask leaves about 1.2k to 1.5k at 280B, and the 400B cap fits (1.7k to 2.1k, 2.0k to 2.5k with 20%); the 2.5k in the ask is the blueprint-width figure; named contingencies: the 400B cap, a second arm after a failed read, 6a and 6e; blueprint: the ask covers the ledger without its buffer |
 
-- **Wall clock**: on 8 H100s about 6.4 days for 280B at 63k per GPU, 3.2 on 16, assuming linear
-  DDP scaling (unmeasured: the evidence trainer is single GPU today, Build list 3).
-- **Storage**: 4.7 GB per save (configured, 256-entry table: 0.67 GB bf16 weights, 1.33 GB fp32
+- **Wall clock**: on 8 H100s about 6.0 days for 280B at 67k per GPU (280e9 / (8 x 67.3k) = 520k s), 3.0 on 16, assuming linear
+  DDP scaling (unmeasured: the multi-GPU evidence trainer was built 2026-10-26, its 2-GPU against 1-GPU check runs in the cluster's first hour).
+- **Storage**: 4.6 GB per save at the printed 330.4M (earlier estimate 4.7 GB; configured, 256-entry table: 0.67 GB bf16 weights, 1.33 GB fp32
   masters, 2.67 GB fp32 moments; the masters are saved since 2026-10-24, CLAUDE.md "SFT"); 30
-  kept saves about 140 GB; 280 uploads at the 1B cadence about 1.3 TB moved. Corpus in today's
+  kept saves about 140 GB (with `keep_every_tokens` 10B and `keep_local_checkpoints` 2 the trainer keeps the newest two plus one per 10B, so about 30 saves of 4.6 GB at the end of the run is an upper bound); 280 uploads at the 1B cadence about 1.3 TB moved. Corpus in today's
   per-occurrence format about 1.5 TB (200 GB prompt, 310 GB evidence tokens at ratio 1.55 (about 1.49 on RUN2's shares), about
   930 GB of fp16 chunk keys at 768 bytes per 128-token chunk occurrence); about 0.5 TB with chunks
-  referenced by store id (a builder option). All estimates.
+  referenced by store id (a builder option). All estimates. The corpus as the launch pipeline builds
+  it is another size: 3.7 TB peak and 1.9 TB standing at the 3% chain share, the warm and main
+  merges 853 GB each and the control 30 GB ([RUN2_corpus.md](RUN2_corpus.md) section 4).
 
 ## Build list before launch, in order
 
@@ -281,14 +322,14 @@ to 70k per H100. The blueprint figure is [6b]'s 30k to 32k.
    happens in written tokens, not a usable checkpoint (the 6f mix rule in Schedule, the
    post-training reads in Reads and gates). The HotpotQA bridge by read sites has no instrument
    (item 9).
-2. `config_run2.yaml` and its seed; the constructor print (total, active, FLOP per token, per
+2. **Done 2026-10-26 (L4):** `config_run2.yaml`, `config_run2_control.yaml`, the seed `ckpts/inject/seed_run2_grounded.pt` and the constructor print (330.4M / 171.1M / 459M, Model and Cost) are in. Text as written: `config_run2.yaml` and its seed; (launch path, L4) the constructor print (total, active, FLOP per token, per
    evidence token) recorded here, replacing every estimate in Model and Cost. `config.yaml` has the opposite of four values the real run needs, so `config_run2.yaml` must carry these overrides: `weight_decay` 0.1 (`config.yaml` 0.02), `moe_balancing: loss_free` (`config.yaml`: aux), `evidence_selection_weighting: segment` (`config.yaml`: token), `num_ir_entries` 256 (`config.yaml`: 65536).
-3. **Multi-GPU on the evidence trainer.** `sft.py` is single GPU and `EvidenceDataset` has no
+3. **Done 2026-10-26 (L3), the 2-GPU against 1-GPU check pending on the cluster.** **Multi-GPU on the evidence trainer.** (launch path, L3) `sft.py` is single GPU and `EvidenceDataset` has no
    per-rank sharding today (no rank or process index in either): rank sharding, DDP under
    accelerate, the token tracker across ranks, and the supervisor's lifecycle (preemption exit 20,
    upload, retention, `verify_resume`) on the `--evidence` path; a 2-GPU run of 100 steps against
    one GPU.
-4. **The real corpus builder** ([6c]): per-window bge retrieval on natural text, the fact tagger
+4. **The real corpus builder** ([6c]): **Not on the launch path, 2026-10-26: the launch uses the existing builders at scale (L5); the new features here (per-window retrieval over plain text, the fact tagger, the near-duplicate filter, the staircase question) are revisited for a later run.** per-window bge retrieval on natural text, the fact tagger
    and span weights, swaps and the warm-up form, tail anonymization, the near-duplicate filter,
    the store at 0.4B tokens or more, the biographies with tiers counted over the run's epochs,
    `--support-gold-only` (row 3; the QA and natural-text analog, a value supported only by a chunk that also carries its subject, is open: not yet decided in or out of scope), the bridge chains at hops 1 to 4 (`prepare_chain_data.py
@@ -299,71 +340,89 @@ to 70k per H100. The blueprint figure is [6b]'s 30k to 32k.
    windows. Options: retrieve once per document from its first 64 tokens and mask that opening's
    loss (no kernel work; this draft's recommendation), or a windowed prefix mask (kernel work, 6a
    era).
-5. Logging builds: the supported-span share and the MFU line.
-6. A pilot-shape smoke of the real builder, local, one 1B-token arm on the 5090 (about 7 hours,
+5. Logging builds: (moved to during the run 2026-10-26, B2) the supported-span share and the MFU line.
+6. **Done 2026-10-26 (L5):** the smoke at scale 0.0005 ran every stage in 23.7 minutes. A pilot-shape smoke of the real builder, (launch path, L5, under 5 hours local) local, one 1B-token arm on the 5090 (about 7 hours,
    arm P's rate, [pilot]): packing, fill, supported share, copy emergence, the A1(a) direction.
    Raised by this draft; the natural-text retrieval slice is otherwise first read on the cluster.
-7. The control's config and launcher (row 8); the read scripts per save at shape L, timed on the
+7. **Done 2026-10-26 (L4):** `config_run2_control.yaml`, `scripts/launch_run2_control.sh`, `scripts/reads/`. The control's config and launcher (launch path, L4) (row 8); the read scripts per save at shape L, timed on the
    first save.
-8. 6a, after the spec ([6a], decided 2026-10-21): profile, compile, host syncs, the eval-pass
+8. 6a, after the spec (moved to during the run 2026-10-26, optional, none required) ([6a], decided 2026-10-21): profile, compile, host syncs, the eval-pass
    rewrite (deferred to 6a 2026-10-24), FP8 A/B; gate G8.
-9. **The HotpotQA bridge instrument** (L2 and the reasoning row on real questions, raised by R5,
+9. **The HotpotQA bridge instrument** (after the main run 2026-10-26, C1) (L2 and the reasoning row on real questions, raised by R5,
    [r5]): the bridge decode of `eval_chains.py --generate-bridge` over retrieved real chunks
    (HotpotQA bridge questions with the bge buffer attached), scored by read sites. Today the decode
    exists only for the synthetic chain splits. Needed by the finals, not by the launch.
-10. **The 6f mix builder** (raised by R5, [r5]): the bridge rows merged with the pretraining slices
+10. **The 6f mix builder** (after the main run 2026-10-26, C2) (raised by R5, [r5]): the bridge rows merged with the pretraining slices
    (evidence QA with its abstention rows, the biographies at their tier structure, plain-answer
    QA, plain text) through `merge_evidence_splits.py`, extended to `.evhop` and `.factspan` (NEXT.md
    6f), and a 6f launcher that reads the A gates and the clean-slice CE per save with their kill
    rule. Needed by 6f, not by the launch.
 
-## Build plan with estimates, 2026-10-25
+## Build plan with estimates, 2026-10-25, re-cut 2026-10-26 to the launch path
 
-**Hard constraint (the user, 2026-10-25): no local run longer than 5 hours; multi-day runs happen only on the rented cluster.** The pilot-shape smoke of the real builder is therefore cut to 0.5B tokens local (about 3.5 h) or runs on the cluster, and every 6a A/B is a micro arm of about 40 minutes.
+**Hard constraint (the user, 2026-10-25): no local run longer than 5 hours; multi-day runs happen only on the rented cluster.** Every 6a A/B is a micro arm of about 40 minutes and the pilot-shape smoke of the corpus pipeline stays under 5 hours local.
 
-Estimates are build effort for one agent lane, in working days (d) or hours (h). Wall clock is
-shorter where lanes run in parallel. Every efficiency percentage below is an estimate until the
-lane 2 profile of one training step at shape L replaces it. The token target, the hours and the
-ask in Cost do not change on these figures; they move only if 6a's measured rate does.
+**Re-cut 2026-10-26 (the user).** Cluster access starts 2026-10-28, so the launch path is 2 days of build, and anything not required for a successful run leaves it. The earlier multi-week figure summed optional work (6a throughput, the new corpus builder features, the post-run instruments) with the launch path and is withdrawn. The run uses the pilot recipe at scale on the existing builders. Estimates are build effort for one agent lane (h or d); wall clock is shorter where lanes run in parallel. Every efficiency percentage is an estimate; the token target, the hours and the ask in Cost do not change on this re-cut.
 
-| item | what | estimate | gate or A/B | blocked on |
+### A. Launch path, 2 days (2026-10-26 and 2026-10-27), required for a successful run
+
+| item | what | estimate | check | blocked on |
 |---|---|---|---|---|
-| **Lane 1, started 2026-10-25 evening, partly landed, the rest tomorrow (the main thread appends what landed)** | | | | |
-| 1.1 | the review's bug fixes: grid snap in `sft.py` and `pretrain.py`; held-out selection under `segment`; `verify_resume` and exit 30 on the sft path; `total_steps` stored and warned on change; groundedness checkpointing tripwire; sha1 shard seed and a required manifest key in `prepare_data.py`; checkpointed rngs in the evidence builder; the empty-chunk re-check; the dead IR inner attention dropped under `direct_read` with a load tolerance; the FLOP line corrected; the `detach_loops` clamp; the balance shadow keyed on the buffer version; the `ir_dim` assert | about 2 to 3 h | tests; no A/B | nothing |
-| 1.2 | logging builds: span share, MFU line, ev pad share | in the same window | smoke | nothing |
-| 1.3 | eval builds: `closed_book_rank --distractors K`; `eval_chains` shortcut line, the two held bridge-mode items, acc against acc_marker; BoolQ majority chance and the 8-task mean; gsm8k numeric EM; the pad-column assert; `eval_store --chunk-order` | in the same window | tests | nothing |
-| 1.4 | two reads: the copy read with 3 distractors on arm P's final and the warm-up arm's 100M save; A7 pathway and A4 edit with shuffled chunks | about 20 min and about 30 min | reads | the eval builds |
-| 1.5 | the stale test pin and this docs sweep | in the same window | none | nothing |
-| 1.6 | **Status at the 2026-10-25 hand-over (the main thread).** Landed and tested: `prepare_data.py` sha1 shard seed (`shard_shuffle_seed`) and the required `--manifest-key` with `ir` (`tests/test_prepare_data.py`); `closed_book_rank.py --distractors K --seed` (test 7b); `eval_chains.py` evidence built once per batch, the latent verdict lines suppressed in bridge mode with `validity.mode`, `acc_all_rows` beside `acc_marker`, the shortcut line (`chains.question_from_meta`, `z_vs_line`; `prepare_chain_data.py` writes `chunk_facts` into eval sidecars only; `tests/test_eval_chains_shortcut.py`); the docs sweep A to G. Measured shortcut `penultimate_fed` against 1/K: `chains_eval` 0.256 / 0.185 at 2 hops, 0.294 / 0.206 at 3; `chains_heldout_tmpl` 0.257 / 0.191; `chains_hop4` 0.301 / 0.210. In the tree with their reports pending at the hand-over (verify their tests before committing): the model set (`experts.py`, `moe.py`, `transformer.py`, `utils.py`, `migrate_*.py`, `tests/test_ir_inner_attn_drop.py`, `test_loop_machinery.py`, `test_loss_free_balancing.py`) only; the trainer set was restored to HEAD at the hand-over (its fixes 1 to 6 are unlanded; the stale pin in `tests/test_counterfactual_condition.py` landed, `BASELINE_COMMIT` moved to af24c70, test passing). Trainer fix notes: move `next_grid_point` into `pretrain.py` (sft imports pretrain, not the reverse); the resume check uses `ckpt_lib.read_run_state`, `verify_resume` and `EXIT_RESUME_FAILED` from `modules.runtime.control`; the MFU arithmetic factors out of `pretrain.py` about :985-1001; `pin_memory` is moot because accelerate does the device move. Not started: the evidence builder rng checkpointing, the empty-chunk re-check, the `ev pad share` log line, the dtype narrowing, BoolQ majority chance and the 8-task mean, gsm8k numeric EM, the pad-column assert, `eval_store --chunk-order` and the `recall --loop` check, `eval_exit --pair` token check, both reads (1.4), and the copy of the rebuilt eval sidecars: the scratch rebuild sits in the session scratchpad and is lost; rebuild the three eval splits with the CLAUDE.md command into a scratch dir, byte-diff every file but `.chains.jsonl` against `data/prepared`, then copy only the three `.chains.jsonl`. A test file `tests/test_eval_chains_shortcut.py` and `tests/test_ir_inner_attn_drop.py` are new and untracked. | 1 d for the rest | tests, then the two reads | nothing |
-| **Lane 2, next (about 2 d build, 1 d wall clock)** | | | | |
-| 2.1 | `config_run2.yaml`, its seed and the constructor print | 1 h | the print against RUN2 Model | lane 1 |
-| 2.2 | checkpoint shape record: the yaml-only keys (`top_k`, `evidence_encoder`, `max_seq_len`, heads x head_dim, `ir_read_top_k`) saved in the payload and checked on load | 2 h | tests | nothing |
-| 2.3 | multi-GPU on the evidence trainer: per-rank sharding in the datasets, DDP kwargs with `find_unused_parameters`, the token tracker and balance counts all-reduced, kill, STOP and saves decided on rank 0, the eval pass rank-sharded, exit 20 relaunch for `sft.py` in the supervisor | 1 d plus a Sonnet review; 1 h on the rented box for the 2-GPU against 1-GPU 100-step check | 2-GPU against 1-GPU 100-step match | the rented box for the check |
-| 2.4 | the per-save read scripts moved from gitignored `ckpts/inject` into tracked `scripts/reads` | 1 h | none | nothing |
-| 2.5 | the control's config and launcher | 1 h | none | 2.1 |
-| 2.6 | a profile of one training step at shape L on the 5090 at batch 2, to replace every efficiency estimate | 1 h | the profile | 2.1 |
-| **Lane 3, 6a throughput (after lane 2; about 6 to 10 d build)** | each non-bit-identical item gets a micro A/B of 40 min against its twin, the bit-identical ones a smoke | | | |
-| 3.1 | the bit-identical set: the head's chunk-checkpoint skip behind a flag, worker-side `cu_seqlens`, pinned memory, one `tolist` in the log block, fused AdamW | 0.5 d, about 3 to 5% | smoke | lane 2 |
-| 3.2 | pad tokens routed to the null slot | 3 h, 1 to 3% | micro A/B | 3.1 |
-| 3.3 | the flat evidence axis replacing padding to the batch max (the pad share measured first) | 1 to 2 d, 5 to 15% | micro A/B | the pad share read |
-| 3.4 | best-fit packing over a lookahead buffer, the estimator replaying it | 1 to 2 d, 8 to 10% | micro A/B | nothing |
-| 3.5 | the eval-pass rewrite | 0.5 to 1 d, 3 to 6% down to under 1% | identity check | 2.3 (rank sharding) |
-| 3.6 | the fused linear plus cross-entropy head and the subsampled MTP head | 1 to 2 d, 5 to 7% | micro A/B | nothing |
-| 3.7 | `torch.compile` on the decoder, shared MLP and norms, with `S_ev` bucketed | 1 to 2 d, size unknown until the profile | micro A/B | 2.6 |
-| 3.8 | the FP8 A/B (2 x 2B tokens) and the G8 hour | on the cluster | loss within about 1% of BF16; G8 | the cluster |
-| 3.9 | the fully unpadded layout, only if the flat axis and packing fall short | 2 to 4 d | micro A/B | 3.3, 3.4 read |
-| 3.10 | encoder depth (`evidence_encoder` 4 against 8, 27% of step compute against 13%) | not a build: a recipe decision, read on an arm | the user's call | the user |
-| **Lane 4, 6c the real corpus builder (about 4 to 6 d)** | 3 to 5 d build plus the pilot-shape smoke of the builder cut to 0.5B tokens local (about 3.5 h) or run on the cluster; carries `--support-gold-only` behind a flag, checkpointed rngs, the 4093 cap, build metrics, the near-duplicate filter, the biography tiers, the bridge chains, the question generator over store chunks if wanted | 4 to 6 d | the smoke | the staircase visibility decision |
-| **Lane 5, after the main run (about 2.5 d)** | | | | |
-| 5.1 | the HotpotQA bridge instrument | 1 d | none | the run |
-| 5.2 | the 6f mix builder and launcher with the A-gate and clean-CE kill rule | 1 d | none | the run |
-| 5.3 | the value-to-name closed-book probe | 0.5 d | none | the run |
-| **Remaining docs sweep** | the sections A to G of the docs editor's brief of 2026-10-25. A (landed as c79002e): done. B (design html: blueprint labelled, tables, cfb, R4b, plan tile step 11): done. C (Record past-tense sweep, Decisions rows, 6a/6b notes, PILOT status): done except CLAUDE.md Record leftovers not re-checked. D (reference docs for c79002e, configuration, training, architecture, moe, runbook, CLAUDE.md IR and bridge text): done; `modules/data/chains.py` docstring (held-out pairs wording) is code, not done. E (RUN2 numbers, row 10 staircase, caveats, NEXT 6a items): done. F (measurement notes): done. G (CONCLUSION dashes; stage0 orphans referenced from `stage0_diagnostics.md`): done. Open: re-run the CLAUDE.md / NEXT.md State and Open items mirror diff (the check script's end marker for the Open items table needs fixing) | check only | diff empty | nothing |
+| L1 | the model set in the tree verified: the IR inner attention dropped under `direct_read` with its load tolerance, the FLOP line, the `detach_loops` clamp, the balance shadow, the `ir_dim` assert (`experts.py`, `moe.py`, `transformer.py`, `utils.py`, `migrate_*.py`, `tests/test_ir_inner_attn_drop.py`, `test_loop_machinery.py`, `test_loss_free_balancing.py`) | 0.5 h; running 2026-10-26 | tests, a Sonnet review, then commit or restore | nothing |
+| L2 | trainer: grid snap at every save and eval site; resume verification with exit 30 on the sft path; `total_steps` stored and warned on change; the groundedness checkpointing tripwire | 2 h; running 2026-10-26 | tests | nothing |
+| L3 | multi-GPU on the evidence trainer under accelerate: per-rank sharding in `SFTDataset` and `EvidenceDataset`, DDP kwargs with `find_unused_parameters`, the token tracker and the balance counts all-reduced at the log cadence, kill, STOP and the save decided on rank 0 and broadcast, saves and `run_state` written by rank 0 behind a barrier, the eval and fixed-eval passes sharded by rank with reduced sums, the single-process path bit-identical | 1 d plus a Sonnet review; running 2026-10-26 | the single-process path bit-identical in tests; the 2-GPU against 1-GPU 100-step check happens in the cluster's first hour | L2 for the shared trainer lines |
+| L4 | `config_run2.yaml` (`config.yaml` with the decided overrides: `weight_decay` 0.1, `moe_balancing: loss_free`, `evidence_selection_weighting: segment`, `num_ir_entries` 256, the batch and LR from Scope), its seed, the constructor print replacing the estimates in Model and Cost; the control's config and launcher; the per-save read scripts and ladders moved from gitignored `ckpts/inject` into tracked `scripts/reads` | 0.5 d | the print against Model | L1 |
+| L5 | the corpus pipeline for the cluster on the existing builders (`prepare_data.py` for the filler mix, `prepare_injection_data.py` for the biographies and the warm-up split, `prepare_evidence_data.py` for QA, `prepare_chain_data.py` for the chains and the bridge rows, `merge_evidence_splits.py` for the three merges at the shares in Scope with `--support-gold-only` on), as one tracked script with a source list sized to the token target, a dry-run mode on a tiny slice, and a pilot-shape smoke under 5 hours local | 1 d; running 2026-10-26 | the dry run; the smoke's packing, fill, supported share and copy emergence | nothing |
+| L6 | cluster day 1 (2026-10-28): the 2-GPU against 1-GPU check, the corpus build on cluster CPUs, the 10B control (about 4 hours on a node), the main run's warm-up launch; plus (2026-10-26): the HF token with Nemotron access accepted, the user's confirmation of `--chain-share` (rows 12 and 13), and the first cluster job `build_run2_corpus.py --stage filler` | 1 d on the cluster | the 2-GPU match; the control's first reads | L3, L4, L5, the token, the confirmations |
 
-Totals: to launch readiness about 12 to 18 working days of build (lanes 1 to 4: 1 + 2 + 6 to 10
-+ 4 to 6, lane 1 at about 0.4 d), about 8 to 12 days wall clock with two or three lanes in
-parallel, plus 2.5 days of post-run instruments (lane 5). The two user decisions, staircase
-visibility and encoder depth, sit on the critical path of lane 4 and lane 3.
+**L1 to L5 done 2026-10-26** (uncommitted in the tree; the commit line is the main thread's):
+
+- **L1:** the IR expert's inner attention is no longer built when `direct_read` is on (every config); an old checkpoint's `moe.experts.{i}.attn.*` keys of IR experts are dropped on load by `utils.drop_ir_inner_attn` (called from `load_model_state` and the migrate scripts; the strict resume paths stay strict, so a run checkpoint written before today cannot resume, none needs to); `flops_per_token_fwd` no longer counts the IR attention and `evidence_prefix_attn_flops` bills the key/value reader's prefix attention (not wired into a trainer); `detach_loops` clamped to `n_loops - 1` and the sampled depth; the fp32 balance shadow stamped on the buffer's `_version`, `data_ptr` and device; `check_store_embed_dim` asserts `ir_dim == 384` with the port. 24 test files pass; `seed_micro.pt`, the warm-up arm's 100M save and arm P's final load strictly with logits bit-identical to HEAD; a detached Sonnet review found no high or medium issue (two lows folded in). Prints: `config_micro` 34.9M / 31.3M / 61M, `config_pilot` 97.4M / 83.3M / 227M, `config.yaml` 380.2M / 221.0M / 464M.
+- **L2:** grid snap at every save and eval site (`next_grid_point`, now in `pretrain.py`), resume verification with exit 30 on the sft path, `total_steps`, `rows_per_epoch` and `world_size` stored in the checkpoint and warned on change, the groundedness gradient-checkpointing tripwire.
+- **L3:** `sft.py --evidence` multi-GPU, one process per GPU: interleaved per-rank document shares in `SFTDataset`, lockstep loaders, gradients averaged in fp32 buckets by `pretrain.all_reduce_grads` (no DDP wrap: the LM heads run outside the model forward), one float64 all-reduce per log step for counts, stop requests and loss means, balance counts summed, rank 0 alone writes saves behind barriers, sharded evals merged, `keep_every_tokens`. A detached Sonnet review found two high and two medium findings, all folded in. The single-process path is unchanged; the 2-GPU against 1-GPU check cannot be bit-exact and runs in the cluster's first hour.
+- **L4:** `config_run2.yaml`, `config_run2_control.yaml` (differs in split, token budget and warm-up fraction only), the seed, `scripts/launch_run2.sh`, `scripts/launch_run2_control.sh`, `scripts/reads/` (README, `read_run2_save.sh`, `stop_after_save_run2.sh`, verbatim copies of the pilot read scripts), `tests/test_run2_config.py`, `tests/test_run2_launchers.py`. The yaml carries the decided overrides (weight decay 0.1, loss-free, `segment`, 256 entries read exactly, no contrastive term, 32 experts top 2, 3 loops, AdamW, 8 x 2 per GPU, lr 4e-4, warm-up 1000 steps, cosine to 0.1, seq 4096, `max_evidence_tokens` 9216, saves every 1B, evals every 2B (one cadence key exists, RUN2 wanted 1B and 2B), the kill rule, `keep_every_tokens` 10B with 2 kept, `num_epochs` 3); pilot values where this spec was silent. 30-step smoke at shape L on the 5090: 25.4k to 27.4k tokens per second, 16.5 GB peak, step 0 CE 11.17, step 30 10.96, save and exit 10 clean. Print in Model.
+- **L5:** `scripts/build_run2_corpus.py` and `tests/test_build_run2_corpus.py`, the sheet [RUN2_corpus.md](RUN2_corpus.md): stages filler, bios_main, bios_warm, qa, chains_plain, chains_bridge, merge_warm, merge_main, merge_control, heldout_qa, heldout_chains, val_clean, store_openqa, store_edit, each idempotent with a marker, `--dry-run`, `--scale`, `--stage`; T = 93.33B per split, chain share 0.03, per-slice targets bios 89.0B, qa 1.53B, plain chains 1.4B, bridge chains 1.4B, control 10B. The smoke at scale 0.0005 ran every stage in 23.7 minutes with `md5_by_slice` agreeing across the warm and main merges. Not run locally: the filler download and the two store builds. The filler at 88.5B is reachable at 1.00x repeat only with fineweb's prefix widened to all crawls (the builder as coded has one crawl, 14.8B; the driver patches it in memory). Missing builder flags are listed in the sheet (section 5): `--order-from-prefix` so the warm merge need not be built at full size, the hop-weight flag, shard flags.
+
+**Not on the launch path, stated explicitly.** The new builder features of the old item 4 (per-window retrieval over plain text, the fact tagger, the near-duplicate filter, the staircase visibility question) are not built for this run: it uses the pilot recipe at scale. The staircase question is moot without per-window retrieval over plain text; its decisions-table row (row 10) stays, marked "not on the launch path, revisit for a later run".
+
+### B. During the run, on the cluster or beside it (not blocking the launch)
+
+| item | what | estimate |
+|---|---|---|
+| B1 | the checkpoint shape record: the yaml-only keys (`top_k`, `evidence_encoder`, `max_seq_len`, heads x head_dim, `ir_read_top_k`) saved in the payload and checked on load | 2 h |
+| B2 | the logging builds: the supported-span share, the MFU line, the ev pad share | 1 h |
+| B3 | the evidence builder's rng checkpointing and the empty-chunk re-check | 2 h |
+| B4 | the remaining eval items: BoolQ majority chance and the 8-task mean, gsm8k numeric EM, the pad-column assert, `eval_store --chunk-order` and the `recall --loop` check, the `eval_exit --pair` token check | 0.5 d |
+| B5 | the two reads when a card is free: the copy read with 3 distractors on arm P's final and the warm-up arm's 100M save (about 20 min); A7 pathway and A4 edit with shuffled chunks (about 30 min) | 1 h |
+| B6 | the rebuilt chain eval sidecars copied into `data/prepared`: rebuild the three eval splits into a scratch dir, byte-diff every file but `.chains.jsonl` against `data/prepared`, copy only the three `.chains.jsonl` | 1 h |
+| B7 | the value-to-name closed-book probe | 0.5 d |
+| B8 | a profile of one training step at shape L on the 5090 at batch 2, to replace the efficiency estimates (a local run of minutes) | 1 h |
+
+**6a throughput, optional, none required.** Each non-bit-identical item is a 40-minute micro A/B against its twin; every percentage is an estimate until B8.
+
+| item | what | estimate |
+|---|---|---|
+| 3.1 | the bit-identical set: the head's chunk-checkpoint skip behind a flag, worker-side `cu_seqlens`, pinned memory, one `tolist` in the log block, fused AdamW | 0.5 d, about 3 to 5% |
+| 3.2 | pad tokens routed to the null slot | 3 h, 1 to 3% |
+| 3.3 | the flat evidence axis replacing padding to the batch max (the pad share measured first) | 1 to 2 d, 5 to 15% |
+| 3.4 | best-fit packing over a lookahead buffer, the estimator replaying it | 1 to 2 d, 8 to 10% |
+| 3.5 | the eval-pass rewrite | 0.5 to 1 d, 3 to 6% down to under 1% |
+| 3.6 | the fused linear plus cross-entropy head and the subsampled MTP head | 1 to 2 d, 5 to 7% |
+| 3.7 | `torch.compile` on the decoder, shared MLP and norms, with `S_ev` bucketed | 1 to 2 d, size unknown until B8 |
+| 3.8 | the FP8 A/B (2 x 2B tokens) and the G8 hour | on the cluster |
+| 3.9 | the fully unpadded layout, only if the flat axis and packing fall short | 2 to 4 d |
+| 3.10 | encoder depth (`evidence_encoder` 4 against 8, 27% of step compute against 13%): a recipe decision, read on an arm | the user's call |
+
+### C. After the main run
+
+| item | what | estimate |
+|---|---|---|
+| C1 | the HotpotQA bridge instrument (the bridge decode over retrieved real chunks, scored by read sites) | 1 d |
+| C2 | the 6f mix builder and launcher with the A-gate and clean-CE kill rule | 1 d |
+| C3 | 6f itself | its own plan |
+| C4 | the A-gate ladder on the shipped checkpoint | a read |
+
+Totals: the launch path is about 3 days of build across parallel lanes, 2 days wall clock; nothing else gates the launch. Status at the 2026-10-25 hand-over, kept for the record: landed and tested were the `prepare_data.py` sha1 shard seed and required `--manifest-key`, `closed_book_rank.py --distractors K --seed`, the `eval_chains.py` bridge-mode and shortcut items (measured shortcut `penultimate_fed` against 1/K: `chains_eval` 0.256 / 0.185 at 2 hops, 0.294 / 0.206 at 3; `chains_heldout_tmpl` 0.257 / 0.191; `chains_hop4` 0.301 / 0.210) and the docs sweep; the model set was in the tree unverified and the trainer set was restored to HEAD (its fixes are L2).
 
 ## Decision table
 

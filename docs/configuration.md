@@ -38,7 +38,7 @@ key is absent from the yaml ("required" when it has none and a missing key is a 
 | `ir_num_clusters` | 0 | 256 | Centroids for the two stage read. `0` is the exact full-table softmax every pre-reshape checkpoint was trained under. Capacity (`entries / clusters`) must stay `<= ir_dim` for the orthonormal value init |
 | `ir_probe_clusters` | 4 | 8 | Clusters opened for exact scoring per token (4 measured recall@32 straddling the 0.9 bar) |
 | `ir_read_top_k` | 32 | same | Entries the read softmax spans |
-| `ir_direct_read` | true | same | IR output stage: each token's own read through a zero-init `direct_gate` (true), or the original inner attention that prefix-averages reads (false, kept for the A/B). **Inferred from the checkpoint at load time** (from whether a `direct_gate` tensor exists), not from here |
+| `ir_direct_read` | true | same | IR output stage: each token's own read through a zero-init `direct_gate` (true), or the original inner attention that prefix-averages reads (false, kept for the A/B; since 2026-10-26 the inner attention is built only when this is off, and an old checkpoint's IR inner attention keys are dropped on load by `utils.drop_ir_inner_attn`). **Inferred from the checkpoint at load time** (from whether a `direct_gate` tensor exists), not from here |
 | `evidence_encoder` | true | same | How retrieved evidence is embedded: the full dense decoder (`true`), the first N layers (an int), or the raw per-token MoE embedding (`false`, comparison only). No parameters, so it applies to any checkpoint, and it always comes from the yaml |
 | `top_k` | required | 2 | Experts selected per token per loop |
 | `n_loops` | required | 3 | MoE routing iterations |
@@ -140,14 +140,15 @@ they agree.
 | `conversation_loss_weighting` | false | **true** | false | **true**, floored by `loss_weight_floor_tokens: 64` |
 | `checkpoint_every_tokens` / `eval_every_tokens` | 100M (25M) / 25M | 10M / 5M | 50M / 10M | 10M / 2.5M (the save at the 10M decision), plus an eval before step 1 on a fresh start (every profile) |
 | fixed-target pass | - | - | - | `fixed_eval_max_batches` 100 over `evidence_fixed`, token-level (unweighted) answer CE per condition, gain = CE(none) - CE(cond), per-loop selector readings. `kill_tokens` 10M / `kill_min_gain` 0.1: the first eval past 10M with a gold gain or a content gain under 0.1 nats saves and exits 10 (`kill_tokens: 0`, as in `config_micro.yaml` and `config_pilot.yaml`, disables it) |
+| `keep_every_tokens` | 0 (off) | 0 | 0 | 0 (every block inherits `SFTConfig`'s value; `config_run2.yaml` sets 10_000_000_000 with `keep_local_checkpoints` 2). Since 2026-10-26 rank 0 deletes rolling saves outside the newest `keep_local_checkpoints` unless the save is the first at or past a multiple of this many tokens or a `*_final.pt` |
 | `freeze_evidence_gate` | - | - | - | true (config.py:466, every config; the gate is also skipped in the forward since 2026-10-24): `evidence_gate_scale` gets `requires_grad=False` and is zeroed if loaded nonzero (the gate reads a document-mean, so it sees future tokens) |
 | anneal | - | - | `temperature_start` 1.0 to `temperature_end` 0.05 over `temperature_anneal_fraction` 0.7, geometric | - |
 | `cluster_refresh_tokens` / `dead_quantile` | - | - | 20M / 0.02 | 20M / 0.02 (the table still trains, so its centroids still track it) |
 | `max_evidence_tokens` | - | - | - | 14336 (12288), one row's evidence cap. It must be read against the corpus's evidence-to-prompt ratio, not set once: a row needs `ratio x seq_length` of evidence to fill its token budget, and under that the evidence budget closes the row early and the unused prompt slots become padding the body still pays for. The old 12288 was 3x `seq_length` against a 2.93 ratio; the four-pass corpus reads 3.75, where 12288 closed 206 of the first 256 rows for 55% fill. 14336 is 3.5x (the ratio's 15.4k minus a safety margin, since the cap is also the dominant term in peak memory) and measures 64% fill, short of what the ratio predicts because packing is greedy and a row drawing QA conversations closes on evidence early |
 
 Other keys: `weight_decay` (the `sft` block's fallback 0.01; each profile reads its own key and falls back to `SFTConfig.weight_decay`), `seq_length` and `data_dir` (read only from the `sft:` block, 4096 and `data/prepared`; the other profiles inherit them, so no profile can set them), `warmup_fraction` 0.03, `lr_min_factor` 0.05 (cosine floor), `seed` 1234 (the per-epoch
-document permutation, checkpointed; changing it mid-run is a hard error), `eval_max_batches` 40,
-`keep_local_checkpoints` 3. `IRConfig.temperature_scale(progress)` interpolates geometrically:
+document permutation, checkpointed; changing it mid-run is a hard error), `eval_max_batches` 40, `keep_every_tokens` 0 (see the table),
+`keep_local_checkpoints` 3. Under several processes (2026-10-26) `batch_size` is per GPU and the global batch is `batch_size` x processes x `grad_accumulation_steps`; `config_run2.yaml` is written for 8 GPUs (524,288 tokens per update). `IRConfig.temperature_scale(progress)` interpolates geometrically:
 temperature is a divisor, so equal ratios are equal steps in sharpness.
 
 ## Derived / hardcoded values
