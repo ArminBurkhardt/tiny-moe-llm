@@ -157,6 +157,34 @@ def main():
         print(f"   bf16 sum picks differ from fp32 on {(coarse != ref).any(-1).float().mean().item():.3f} of tokens")
         moe.balance_bias.zero_()
     print("5. selection scores in fp32: zero bias identical (with ties), a large bias exact  PASS")
+    # 6. the fp32 shadow follows a later load: a train mode forward builds the shadow, a checkpoint
+    # load then replaces the buffer, and the next update must start from the loaded bias
+    model.train()
+    moe.set_router_noise(0.0)
+    moe.set_balance_tracking(True)
+    with torch.no_grad():
+        moe.balance_bias.zero_()
+        moe.route(x, temperature=moe.temperature, loop_idx=0)
+        moe._balance_state(x.device)[1].zero_()
+        loaded = torch.zeros_like(moe.balance_bias)
+        loaded[0, first:] = torch.linspace(-0.5, 0.5, E - first, device=dev).to(loaded.dtype)
+    donor = {k: v.clone() for k, v in model.state_dict().items()}
+    donor["moe.balance_bias"] = loaded
+    load_model_state(model, donor)
+    with torch.no_grad():
+        moe._balance_state(x.device)[1][0, first:] = torch.arange(E - first, device=dev, dtype=torch.float32)
+        moe.update_balance_bias(0.01)
+    stepped = moe.balance_bias[0, first:].float()
+    assert (stepped - loaded[0, first:].float()).abs().max() <= 0.011, (
+        "the update did not start from the loaded bias: a stale shadow was copied over it"
+    )
+    assert (moe.balance_bias[0, first:].float().abs() > 0.1).any(), "the loaded bias was erased"
+    assert moe._balance_bias_fp32 is not None
+    # and a second update with no outside write stays on the shadow, no rebuild
+    stamp = moe._balance_stamp
+    moe._balance_state(x.device)
+    assert moe._balance_stamp == stamp
+    print("6. the fp32 shadow is rebuilt from a bias loaded after a train forward         PASS")
     print("all loss free balancing checks passed")
 
 

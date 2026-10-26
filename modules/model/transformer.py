@@ -10,6 +10,7 @@ from modules.model.evidence import (
     EvidenceBatch, GroundednessHead, chunk_position_ids, evidence_cu_seqlens, groundedness_loss,
 )
 from modules.model.attention import cu_seqlens_from_doc_ids
+from modules.data.store import EMBED_DIM as STORE_EMBED_DIM
 from utils import logger
 
 # NOTE: use Transformer Engines checkpoint, not torch.utils.checkpoint for FP8/NVFP4
@@ -105,8 +106,22 @@ class TinyMoETransformer(nn.Module):
         groundedness_head: bool = False,
         evidence_reader_rotary: bool = True,
         evidence_reader: str = "cross",
+        check_store_embed_dim: bool = False,
     ):
         super().__init__()
+        # the retrieved chunk keys arrive at the embedder's width, the port's adapters are square at
+        # ir_dim, and the data side hardcodes that width (modules/data/store.py EMBED_DIM and
+        # modules/data/evidence_dataset.py EMBED_DIM, both 384). A model built at another ir_dim
+        # with the port fails only at the first batch with a shape error; this fails at construction.
+        # Off by default because the unit tests drive the port with synthetic keys of any width;
+        # the real configs turn it on through ModelConfig.Params (config.py), which
+        # model_params_for_state_dict copies for every checkpoint load.
+        if check_store_embed_dim and evidence_port:
+            assert ir_dim == STORE_EMBED_DIM, (
+                f"ir_dim={ir_dim} but the evidence store keys are {STORE_EMBED_DIM} wide "
+                f"(EMBED_DIM in modules/data/store.py and modules/data/evidence_dataset.py): "
+                f"the port's adapters are square at ir_dim, so the two must match"
+            )
 
         # how build_evidence embeds retrieved evidence, resolved once here rather than re-branched
         # on every call. True/None -> every decoder layer; an explicit int -> only the first N
@@ -270,8 +285,10 @@ class TinyMoETransformer(nn.Module):
             mtp_lm_head_params, mtp_body_params = 0, 0
         body_params = non_moe_params - lm_head_params - mtp_lm_head_params - mtp_body_params
 
-        # 1 shared_attn + (self + cross) per attn expert + 1 per IR expert, every loop
-        moe_attn_per_loop = 1 + 2 * num_attn_experts + num_ir_experts
+        # 1 shared_attn + (self + cross) per attn expert, every loop, plus one inner attention per IR
+        # expert only on the averaged output stage: under the direct read (every config) the IR
+        # expert has no attention at all
+        moe_attn_per_loop = 1 + 2 * num_attn_experts + (0 if ir_direct_read else num_ir_experts)
         n_attn_layers = num_layers + n_loops * moe_attn_per_loop
 
         # split per-loop from run-once so the trainer can bill the loop count it ACTUALLY ran --
@@ -308,6 +325,18 @@ class TinyMoETransformer(nn.Module):
             encoder_layers_run = min(self.evidence_encoder_layers, num_layers)
         self.evidence_encoder_flops_per_token = 2 * decoder_layer_params * encoder_layers_run
 
+        # key/value reader: the evidence states are leading keys of every query segment's
+        # shared_attn softmax, so each query token also attends over its own segment's E_s evidence
+        # tokens, every loop. Per query token, loop and evidence token of its segment that is the
+        # two matmuls (QK^T and AV) at 2 FLOP per MAC: 4 * hidden_size, with H x head_dim =
+        # hidden_size as in the attention terms above. The prefix is fully visible (no causal
+        # halving), which is why the factor is 4 and not the 2 of the causal terms. Summed over
+        # the configured loops it is the coefficient below; evidence_prefix_attn_flops() applies it
+        # to a batch's real segment lengths. Zero without the key/value reader, and not part of
+        # flops_per_token_fwd, which has no evidence length (same contract as the encoder term).
+        self.prefix_attn_flops_per_loop_per_pair = 4 * hidden_size if self.moe.reader_kv else 0
+        self.prefix_attn_flops_per_pair = n_loops * self.prefix_attn_flops_per_loop_per_pair
+
         # aggregates at the configured loop count, for the log line / anything not tracking depth
         self.body_flops_per_token = self.dense_flops_per_token + n_loops * self.loop_flops_per_token
         self.attn_flops_per_seqsq = self.dense_attn_flops_per_seqsq + n_loops * self.loop_attn_flops_per_seqsq
@@ -329,6 +358,12 @@ class TinyMoETransformer(nn.Module):
             f"{(n_loops * self.lm_head_flops_per_token + self.mtp_flops_per_token)/1e6:.0f}M + attn "
             f"{self.attn_flops_per_seqsq * max_seq_len/1e6:.0f}M @ seq_len={max_seq_len})"
         )
+        if self.prefix_attn_flops_per_pair > 0:
+            logger.info(
+                f"key/value reader prefix attention: {self.prefix_attn_flops_per_pair/1e3:.0f}k FLOP per "
+                f"(query token, evidence token of its segment) over {n_loops} loops, not counted in "
+                f"forward FLOP/token above (evidence_prefix_attn_flops bills a batch)"
+            )
         if self.evidence_encoder_flops_per_token > 0:
             # NOT part of the figure above on purpose -- see the comment where this is computed
             logger.info(
@@ -337,6 +372,34 @@ class TinyMoETransformer(nn.Module):
                 f"(scales with the batch's real evidence token count, not max_seq_len)"
             )
     
+    def evidence_prefix_attn_flops(
+        self, query_cu_seqlens: torch.Tensor, evidence_cu_seqlens: torch.Tensor, n_loops: int = None
+    ) -> int:
+        """Forward FLOPs of the key/value reader's prefix attention for one batch.
+
+        Each query token of segment ``s`` attends over the ``E_s`` evidence tokens of its own
+        segment at every loop, for 4 * hidden_size FLOP per (query token, evidence token) pair per
+        loop (QK^T plus AV, 2 FLOP per MAC, fully visible), so the batch costs
+        ``4 * hidden_size * n_loops * sum_s(L_s * E_s)``. Zero without the key/value reader. The
+        evidence encoder is a separate term (``evidence_encoder_flops_per_token``) and neither is in
+        ``flops_per_token_fwd``, which has no evidence length.
+
+        Args:
+            query_cu_seqlens: ``[S + 1]`` cumulative query segment lengths (the batch's ``cu_seqlens``).
+            evidence_cu_seqlens: ``[S + 1]`` cumulative evidence token counts per query segment.
+            n_loops: loops actually run (loop count sampling); defaults to the configured count.
+
+        Returns:
+            Total FLOPs, a Python int (one host read of the two small tensors).
+        """
+        if not self.moe.reader_kv:
+            return 0
+        loops = self.moe.n_loops if n_loops is None else int(n_loops)
+        q = torch.diff(query_cu_seqlens.detach().cpu().long())
+        e = torch.diff(evidence_cu_seqlens.detach().cpu().long())
+        assert q.shape == e.shape, f"{q.shape[0]} query segments but {e.shape[0]} evidence segments"
+        return int(self.prefix_attn_flops_per_loop_per_pair * loops * int((q * e).sum().item()))
+
     @property
     def token_count(self):
         return self._token_tracker.get_count()

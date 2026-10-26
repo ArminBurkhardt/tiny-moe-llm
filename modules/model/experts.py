@@ -124,16 +124,19 @@ class InformationRetrievalExpert(nn.Module):
         self.input_size = input_size
         self.dropout = nn.Dropout(dropout)
         self.norm = RMSNorm(input_size)
-        # kept unconditionally, even when direct_read makes it unused compute: a checkpoint trained
-        # under the averaging path keeps these weights loadable if direct_read is ever switched back
-        # off for an A/B, rather than the state dict silently dropping a whole trained submodule.
-        self.attn = GroupedQueryAttention(
-            hidden_size=input_size,
-            num_attention_heads=num_heads,
-            num_key_value_heads=num_kv_heads,
-            head_dim=input_size // num_heads,
-            dropout=dropout,
-        )
+        # the inner attention exists only for the averaged output stage (direct_read off, the A/B
+        # path). Under the direct read it never runs, so building it left four weights per IR expert
+        # with no gradient (DDP refuses that without find_unused_parameters) and billed their FLOPs.
+        # utils.load_model_state drops the tensors an older checkpoint carries for it.
+        self.attn = None
+        if not direct_read:
+            self.attn = GroupedQueryAttention(
+                hidden_size=input_size,
+                num_attention_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                head_dim=input_size // num_heads,
+                dropout=dropout,
+            )
 
         # operate on the per-head dimension for more efficient retrieval
         self.ir_module = InformationRetrievalModule(
@@ -186,7 +189,7 @@ class InformationRetrievalExpert(nn.Module):
         - ``direct_read=True`` (default): each token's own retrieved vector (``information`` below)
           reaches the output through ``direct_gate`` alone -- no attention over any other token's
           read.
-        - ``direct_read=False``: the ORIGINAL path, an inner ``GroupedQueryAttention`` with queries
+        - ``direct_read=False``: the ORIGINAL path (the inner attention is built only here), an inner ``GroupedQueryAttention`` with queries
           from the residual and keys/values from every position's own retrieved vector, causal over
           the document. This measurably does not do what it looks like it does: with ``information``
           at RMS 0.004-0.008 and a default-init ``k_proj``, the attention logits' std is on the order

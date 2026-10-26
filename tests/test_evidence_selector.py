@@ -90,10 +90,16 @@ def test_direct_read():
 
     # the averaged path this replaces DOES mix -- confirms 1/2 exercise the actual fix rather than
     # this expert being a no-op regardless of which path runs
-    expert.direct_read = False
+    # a separate expert built on the averaged stage (the inner attention only exists there), sharing
+    # the direct expert's retrieval tensors
+    averaged = InformationRetrievalExpert(
+        input_size=64, num_entries=128, ir_dim=32, num_heads=8, num_kv_heads=4, dropout=0.0,
+        direct_read=False,
+    ).to(DEVICE).to(BF16).eval()
+    averaged.load_state_dict(expert.state_dict(), strict=False)
     with torch.no_grad():
-        base_attn = expert(x)
-        moved_attn = expert(x2)
+        base_attn = averaged(x)
+        moved_attn = averaged(x2)
     delta_attn = (moved_attn - base_attn).abs().sum(dim=-1)[0]
     assert delta_attn[2] > 0 and delta_attn[3:].sum() > 0, (
         f"the averaged path did not mix later positions -- comparison is not meaningful: "

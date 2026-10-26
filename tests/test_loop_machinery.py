@@ -214,16 +214,25 @@ try:
     model.zero_grad(set_to_none=True)
     h_5, _, _ = model(**fwd, n_loops=5, detach_loops=2)
     assert h_5.shape[0] == 5 and torch.equal(h_5[:N_LOOPS], h_ref), "depth override with a detached prefix"
-    for bad in (N_LOOPS, -1):
-        try:
-            model(**fwd, detach_loops=bad)
-            raise SystemExit(f"detach_loops={bad} must be rejected")
-        except AssertionError:
-            pass
+    try:
+        model(**fwd, detach_loops=-1)
+        raise SystemExit("detach_loops=-1 must be rejected")
+    except AssertionError:
+        pass
+    # a sampled depth at or below the prefix clamps to depth - 1 instead of failing (loop_count_sampling
+    # with detach_loops > 0 would otherwise crash on a depth 1 step)
+    h_clamp, _, _ = model(**fwd, detach_loops=N_LOOPS)
+    assert torch.equal(h_clamp, h_dn), "detach_loops == n_loops must clamp to n_loops - 1"
+    assert model.moe.last_detach_loops == N_LOOPS - 1
+    model.zero_grad(set_to_none=True)
+    h_one_ref, aux_one_ref, _ = model(**fwd, n_loops=1)
+    h_one, aux_one, _ = model(**fwd, n_loops=1, detach_loops=2)
+    assert torch.equal(h_one, h_one_ref) and h_one.requires_grad == h_one_ref.requires_grad,         "a depth 1 step with detach_loops=2 must be the plain depth 1 forward"
+    assert model.moe.last_detach_loops == 0 and torch.equal(aux_one, aux_one_ref)
 finally:
     model.moe.set_router_noise(noise_before)
 print(f"[ok] detach_loops: 0 bit-identical, {N_LOOPS - 1} keeps every loop's state bit-identical, "
-      f"loop_scale grad {g.tolist()} reaches only the last pass, {N_LOOPS} and -1 rejected")
+      f"loop_scale grad {g.tolist()} reaches only the last pass, -1 rejected, a depth at or below the prefix clamps")
 
 # --- weight decay param grouping ---
 from scripts.pretrain import build_param_groups, sync_master_grads_, sync_master_values_
@@ -271,7 +280,7 @@ assert model.moe.router.noise_scale == ROUTER_NOISE_SCALE == 0.3
 print(f"[ok] router noise_scale = {model.moe.router.noise_scale}")
 
 # --- FLOP components ---
-expected_attn_layers = P["num_layers"] + N_LOOPS * (1 + 2 * P["num_attn_experts"] + P["num_ir_experts"])
+expected_attn_layers = P["num_layers"] + N_LOOPS * (1 + 2 * P["num_attn_experts"])  # the IR expert has no attention under the direct read
 assert model.attn_flops_per_seqsq == 2 * P["hidden_size"] * expected_attn_layers
 assert model.lm_head_flops_per_token == 2 * sum(p.numel() for p in model.lm_head.parameters())
 assert model.flops_per_token_fwd > model.body_flops_per_token

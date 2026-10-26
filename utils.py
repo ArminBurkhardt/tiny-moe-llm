@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import torch
 
@@ -174,6 +175,60 @@ READER_MODE_KEYS = ("moe.evidence_reader_rotary_off", "moe.evidence_reader_kv")
 # checkpoint before 2026-10-19 routed with, so an absent buffer loads as exactly that model; a
 # checkpoint that carries one routes with it from the load on, in any training mode.
 BALANCE_KEYS = ("moe.balance_bias",)
+# the IR expert's inner attention (``moe.experts.{i}.attn.*`` for an IR expert i). Since 2026-10-25 it
+# is built only when the expert runs the averaged output stage (``direct_read`` off, the A/B path);
+# under the direct read every config uses it never ran and never got a gradient. A checkpoint
+# written before that carries those tensors for each IR expert, so a model without the slot drops
+# them on load. The drop is scoped by name and by the model's own keys: only ``attn.*`` of an IR
+# expert (found by its sibling ``ir_module.*`` keys; a self attention expert's ``attn.*`` is never
+# touched), and only keys the model has no slot for. Every other key stays strict.
+IR_INNER_ATTN_PATTERN = re.compile(
+    r"^(?P<expert>(?:.*\.)?moe\.experts\.\d+)\.attn\."
+    r"(?:[qkvo]_proj\.|q_norm\.|k_norm\.|norm\.|_extra_state$)"
+)
+IR_EXPERT_PATTERN = re.compile(r"^(?P<expert>(?:.*\.)?moe\.experts\.\d+)\.ir_module\.")
+
+
+def ir_inner_attn_keys(state_dict) -> list:
+    """Keys of ``state_dict`` that belong to an IR expert's inner attention.
+
+    Args:
+        state_dict: a model state dict (or any iterable of its keys).
+
+    Returns:
+        The sorted keys ``moe.experts.{i}.attn.*`` where expert ``i`` is an IR expert, i.e. has
+        ``ir_module.*`` keys of its own.
+    """
+    keys = list(state_dict)
+    ir_experts = {m.group("expert") for m in map(IR_EXPERT_PATTERN.match, keys) if m}
+    out = []
+    for key in keys:
+        m = IR_INNER_ATTN_PATTERN.match(key)
+        if m and m.group("expert") in ir_experts:
+            out.append(key)
+    return sorted(out)
+
+
+def drop_ir_inner_attn(state_dict, own_keys):
+    """``state_dict`` without the IR inner attention tensors the model has no slot for.
+
+    Args:
+        state_dict: the checkpoint's model state.
+        own_keys: the live model's state dict keys.
+
+    Returns:
+        ``state_dict`` itself when nothing applies, else a copy without those keys.
+    """
+    own = set(own_keys)
+    stale = [k for k in ir_inner_attn_keys(state_dict) if k not in own]
+    if not stale:
+        return state_dict
+    stale = set(stale)
+    logger.warning(
+        "dropping %d IR inner attention tensors the model has no slot for (direct read): %s ...",
+        len(stale), sorted(stale)[0],
+    )
+    return {k: v for k, v in state_dict.items() if k not in stale}
 
 
 def with_balance_default(model, state_dict):
@@ -209,13 +264,15 @@ def load_model_state(model, state_dict):
     values in place -- there is no information to recover and no ambiguity about what it was.
     ``NEUTRAL_LOOP_KEYS`` is the same case for the loop conditioned queries and the evidence
     reader's per-loop gain.
+    ``IR_INNER_ATTN_*`` drops the IR experts' inner attention tensors of a checkpoint written
+    before the direct read stopped building them, when the model has no slot for them.
 
     Kept as a named exception rather than ``strict=False`` for the reason ``load_checkpoint``'s
     docstring gives: a blanket non-strict load is how a trunk tensor stays randomly initialized
     without anyone noticing.
     """
-    state = dict(state_dict)
     own = model.state_dict()
+    state = dict(drop_ir_inner_attn(state_dict, own.keys()))
     for key in own:
         if key.endswith(IR_TEMPERATURE_KEYS + NEUTRAL_LOOP_KEYS + READER_MODE_KEYS + BALANCE_KEYS) and key not in state:
             state[key] = own[key]

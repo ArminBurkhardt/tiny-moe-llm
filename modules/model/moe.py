@@ -435,6 +435,7 @@ class LoopMixtureOfExperts(nn.Module):
         # the three is checkpoint state.
         self.register_buffer("balance_bias", torch.zeros(n_loops, self.num_experts), persistent=True)
         self._balance_bias_fp32 = None
+        self._balance_stamp = None
         self._balance_counts = None
         self._balance_load = None
         self.balance_tracking = False
@@ -820,7 +821,8 @@ class LoopMixtureOfExperts(nn.Module):
                 ``evidence_selection_term`` / ``evidence_contrastive_term`` skip the prefix passes
                 (``last_detach_loops``), so no term's gradient shrinks with the prefix length.
                 Under ``use_checkpointing`` they run outside the per pass checkpoint wrapper: a pass
-                with no graph has nothing to recompute. Must be below the number of loops run. 0
+                with no graph has nothing to recompute. Clamped to the number of loops run minus one (a
+                sampled depth at or below the prefix keeps its last pass live). 0
                 (the default) is the forward this model ran before the argument existed, bit for
                 bit.
             reader_sites_kept (int, optional): read ablation. Evidence read sites are numbered 1, 2,
@@ -887,9 +889,10 @@ class LoopMixtureOfExperts(nn.Module):
         assert reader_sites_kept is None or (
             reader_sites_kept >= 0 and not self.training and kv_cache is None and exit_check is None
         ), "reader_sites_kept is a non negative inference-only argument, exclusive with the KV cache and exit_check"
-        assert 0 <= detach_loops < n_loops, (
-            f"detach_loops={detach_loops} must be in [0, n_loops={n_loops}): at least one pass needs a gradient"
-        )
+        assert detach_loops >= 0, f"detach_loops={detach_loops} must not be negative"
+        # a sampled depth at or below the prefix (loop_count_sampling can run one pass) keeps its
+        # last pass live instead of failing: at least one pass always needs a gradient
+        detach_loops = min(detach_loops, n_loops - 1)
         total_load_balancing_loss = 0.0
         hidden_states_all = []
 
@@ -1018,11 +1021,22 @@ class LoopMixtureOfExperts(nn.Module):
 
         The shadow starts from the buffer, so a resumed run continues from the saved bias (rounded
         once to the buffer's dtype at the save, which is the only rounding the bias ever sees).
+        The buffer's in-place version counter and data pointer are stamped whenever the shadow and
+        the buffer are in step (creation, and the end of ``update_balance_bias``); any other write
+        (``load_state_dict`` after a train mode forward, a ``.to()``) changes the stamp and the
+        shadow is rebuilt from the buffer on the next call, so a stale shadow is never copied over
+        a loaded bias. The counts and the load EMA are kept across a rebuild. A Python comparison,
+        no device sync.
         """
+        stamp = (self.balance_bias._version, self.balance_bias.data_ptr(), device)
         if self._balance_bias_fp32 is None or self._balance_bias_fp32.device != device:
             self._balance_bias_fp32 = self.balance_bias.detach().to(device=device, dtype=torch.float32).clone()
             self._balance_counts = torch.zeros_like(self._balance_bias_fp32)
             self._balance_load = torch.zeros_like(self._balance_bias_fp32)
+            self._balance_stamp = stamp
+        elif self._balance_stamp != stamp:
+            self._balance_bias_fp32.copy_(self.balance_bias.detach())
+            self._balance_stamp = stamp
         return self._balance_bias_fp32, self._balance_counts, self._balance_load
 
     @torch.no_grad()
@@ -1052,6 +1066,7 @@ class LoopMixtureOfExperts(nn.Module):
         step = step - step.mean(dim=-1, keepdim=True)
         bias[:, first:] += rate * step * ran.to(bias.dtype)
         self.balance_bias.copy_(bias.to(self.balance_bias.dtype))
+        self._balance_stamp = (self.balance_bias._version, self.balance_bias.data_ptr(), self.balance_bias.device)
         share = counts / counts.sum(dim=-1, keepdim=True).clamp_min(1.0)
         load.copy_(torch.where(ran, 0.9 * load + 0.1 * share, load))
         counts.zero_()

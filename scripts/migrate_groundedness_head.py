@@ -41,7 +41,7 @@ import torch
 from modules.model.moe import is_fresh_loop_param
 from modules.model.transformer import TinyMoETransformer
 from config import ModelConfig
-from utils import BALANCE_KEYS, BASE_DIR, BF16, logger, model_params_for_state_dict
+from utils import BALANCE_KEYS, BASE_DIR, BF16, drop_ir_inner_attn, logger, model_params_for_state_dict
 
 
 def stray_added_keys(added):
@@ -103,6 +103,9 @@ def main():
     model.delayed_mtp_loss(True)
 
     fresh = model.state_dict()
+    # an IR expert's inner attention exists only on the averaged output stage; a source written
+    # before the direct read stopped building it carries those tensors, and the model has no slot
+    state = drop_ir_inner_attn(state, fresh.keys())
     added = sorted(set(fresh) - set(state))
     missing = sorted(set(state) - set(fresh))
     if missing:

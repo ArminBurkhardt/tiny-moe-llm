@@ -58,7 +58,7 @@ from transformers import AutoTokenizer
 from modules.model.information_retrieval import is_rebuilt_ir_param
 from modules.model.transformer import TinyMoETransformer
 from config import ModelConfig
-from utils import BASE_DIR, BF16, TOKENIZER_DIR, logger, model_params_for_state_dict
+from utils import BASE_DIR, BF16, TOKENIZER_DIR, drop_ir_inner_attn, logger, model_params_for_state_dict
 
 EMBEDDER_REPO = "BAAI/bge-small-en-v1.5"
 
@@ -205,6 +205,7 @@ def main():
 
     fresh = model.state_dict()
     carried = {k: v for k, v in state.items() if not is_ir_tensor(k)}
+    carried = dict(drop_ir_inner_attn(carried, fresh.keys()))
     # the IR expert's direct read gate counts as rebuilt here, not as a missing trunk tensor: it is
     # zero-init, so the expert's value stream is zero through it exactly as it is through a zeroed
     # g_proj, and a source written before that output stage existed has nothing to carry over
