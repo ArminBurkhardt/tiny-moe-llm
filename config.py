@@ -39,6 +39,7 @@ class ModelConfig:
         # loop_inject/evidence_port are, so a checkpoint trained before this flag existed has no
         # direct_gate tensor and needs one added before this can be set True for it.
         "ir_direct_read": bool(Config["model"].get("ir_direct_read", True)),
+        "check_store_embed_dim": True,
         "dropout": float(Config["model"]["dropout"]),
         "top_k": int(Config["model"]["top_k"]),
         "n_loops": int(Config["model"]["n_loops"]),
@@ -246,6 +247,7 @@ class SFTConfig:
 
     checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 25_000_000))
     keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", 3))
+    keep_every_tokens = int(_Block.get("keep_every_tokens", 0))
     eval_every_tokens = int(_Block.get("eval_every_tokens", 25_000_000))
     eval_max_batches = int(_Block.get("eval_max_batches", 40))
 
@@ -314,6 +316,7 @@ class RepairConfig(SFTConfig):
     # ever having written a rolling checkpoint
     checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 10_000_000))
     keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    keep_every_tokens = int(_Block.get("keep_every_tokens", SFTConfig.keep_every_tokens))
     eval_every_tokens = int(_Block.get("eval_every_tokens", 5_000_000))
     eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
     # the whole reason this profile exists -- on by default here, unlike SFTConfig
@@ -365,6 +368,7 @@ class IRConfig(SFTConfig):
     seed = int(_Block.get("seed", SFTConfig.seed))
     checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 50_000_000))
     keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    keep_every_tokens = int(_Block.get("keep_every_tokens", SFTConfig.keep_every_tokens))
     eval_every_tokens = int(_Block.get("eval_every_tokens", 10_000_000))
     eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
     # off: this is a pretraining-style pass over documents, not a conversation-level policy fix
@@ -476,6 +480,7 @@ class EvidenceConfig(SFTConfig):
     seed = int(_Block.get("seed", SFTConfig.seed))
     checkpoint_every_tokens = int(_Block.get("checkpoint_every_tokens", 10_000_000))
     keep_local_checkpoints = int(_Block.get("keep_local_checkpoints", SFTConfig.keep_local_checkpoints))
+    keep_every_tokens = int(_Block.get("keep_every_tokens", SFTConfig.keep_every_tokens))
     eval_every_tokens = int(_Block.get("eval_every_tokens", 2_500_000))
     eval_max_batches = int(_Block.get("eval_max_batches", SFTConfig.eval_max_batches))
     conversation_loss_weighting = bool(_Block.get("conversation_loss_weighting", True))

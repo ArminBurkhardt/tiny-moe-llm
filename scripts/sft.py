@@ -43,6 +43,37 @@ Run from the repo root:
     python scripts/sft.py -c ckpts/training/checkpoint_phase2_final.pt
     python scripts/sft.py                     # resume from the newest checkpoint in ckpts/sft
     python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
+
+**Data parallel training (``--evidence`` on a multi GPU node).** The same file runs under
+``accelerate launch`` or ``torchrun``; one process per GPU, DDP through accelerate. On the cluster
+the launch is by hand and detached, one of
+
+    TINY_LLM_CONFIG=config_run2.yaml setsid nohup accelerate launch --num_processes 8         --mixed_precision no scripts/sft.py --evidence -c SEED --run-name NAME ...         > run.log 2>&1 < /dev/null & disown
+    TINY_LLM_CONFIG=config_run2.yaml setsid nohup torchrun --nproc_per_node 8         scripts/sft.py --evidence -c SEED --run-name NAME ... > run.log 2>&1 < /dev/null & disown
+
+(``--mixed_precision no``: the model is already bf16 and the trainer keeps its own fp32 masters).
+**``batch_size`` is per GPU**, so the global batch is ``batch_size * num_processes *
+grad_accumulation_steps`` rows (8 x 4096 x 2 x 8 = 524,288 tokens per update on 8 GPUs); the
+cosine spans the same tokens as a one process run because ``total_steps`` counts per rank rows.
+With one process nothing below applies and the run is exactly what it was. With more:
+
+  * every rank streams its own interleaved share of the document positions
+    (``SFTDataset(rank, world_size)``; the resume cursor stays one scalar and a relaunch on
+    another number of ranks resumes at a valid position); the accelerate loader is NOT used (its
+    iterable dataset sharding would shard the stream a second time), the rank loaders are kept in
+    lockstep by ``lockstep_batches`` (a MIN over the ranks every ``LOG_INTERVAL`` batches), so
+    every rank takes the same number of micro steps and a few trailing batches of an epoch are
+    dropped, like ``drop_last``;
+  * DDP with ``find_unused_parameters=True`` (a rank whose slice has no evidence, gold flag or
+    answer start leaves the port, the groundedness head and the selection terms unused) and
+    ``broadcast_buffers=False`` (the balance bias moves from counts summed over the ranks, not
+    from rank 0's copy);
+  * at the log cadence one float64 all-reduce carries the token count, the evidence count, the
+    stop and checkpoint requests of any rank, and the means of the logged scalars; eval batches
+    are sharded by batch index and their sums gathered (``merge_eval_states``); the loss-free
+    balancer's counts are summed before every bias update; after an IR cluster refresh rank 0's
+    IR state is broadcast;
+  * saves, ``run_state.json``, graphs, uploads and retention are rank 0's, between two barriers.
 """
 import os
 import re
@@ -52,6 +83,9 @@ import time
 import math
 import random
 import argparse
+import hashlib
+from collections import deque
+from datetime import timedelta
 
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(parent_dir)
@@ -62,6 +96,7 @@ from torch import optim
 from transformers import AutoTokenizer
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, InitProcessGroupKwargs
 
 import transformer_engine.pytorch as te
 
@@ -75,12 +110,12 @@ from modules.model.mtp import compute_mtp_loss
 from modules.model.optim import build_optimizer, check_resume_kind, partition_summary
 from modules.model.transformer import TinyMoETransformer
 from modules.runtime import checkpoints as ckpt_lib
-from modules.runtime.control import EXIT_OK, EXIT_USER_STOP, RunControl
+from modules.runtime.control import EXIT_OK, EXIT_PREEMPTED, EXIT_RESUME_FAILED, EXIT_USER_STOP, RunControl
 from modules.runtime.hf_sync import HFSync
 from modules.runtime.status import eta_seconds, format_duration, write_status
 from config import EvidenceConfig, IRConfig, ModelConfig, RepairConfig, SFTConfig, TrainingConfig
 from scripts.pretrain import (
-    USE_LOW_PRECISION, answer_start_positions, chosen_recipe, log_precision_mode,
+    USE_LOW_PRECISION, answer_start_positions, chosen_recipe, log_precision_mode, next_grid_point,
     predicting_positions, sample_n_loops, save_expert_selection_graph, save_loss_graph, train_step,
 )
 # the same ranking metric eval_abstention.py reports G3b with, imported rather than restated so the
@@ -144,7 +179,8 @@ SAVE_FP32_MASTERS = True
 DATA_KEYS = ("data_dir", "train_split", "val_split")
 
 
-def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True):
+def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True,
+                 rank: int = 0, world_size: int = 1):
     """``SFTDataset`` when the split has a loss mask, the pretraining ``Dataset`` when it does not.
 
     The IR sharpening pass trains on a general LM mix with chat replay, which
@@ -162,6 +198,9 @@ def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True
     Args:
         shuffle: ignored for the LM reader, which reads in on-disk order on purpose (the corpus
             builder already baked the source mix into that order).
+        rank, world_size: the data parallel shard the reader streams (the training split only;
+            validation readers keep the full stream and are sharded by batch index in
+            ``evaluate``). The LM reader has no sharding and refuses a world above one.
     """
     if os.path.isfile(os.path.join(data_dir, f"{split}.ev")):
         # a third reader, picked by the same rule: the evidence corpus carries a second token stream
@@ -173,13 +212,19 @@ def make_dataset(data_dir: str, split: str, tokenizer, cfg, shuffle: bool = True
             seed=cfg.seed, shuffle=shuffle,
             max_evidence_tokens=getattr(cfg, "max_evidence_tokens", 12288),
             loss_weight_floor_tokens=getattr(cfg, "loss_weight_floor_tokens", 64),
+            rank=rank, world_size=world_size,
         )
     if os.path.isfile(os.path.join(data_dir, f"{split}.mask")):
         return SFTDataset(
             data_dir=data_dir, tokenizer=tokenizer, batch_size=cfg.Batch_size,
             max_length=cfg.Seq_length, split=split,
             num_mtp_tokens=ModelConfig.Params["mtp_num_extra_tokens"],
-            seed=cfg.seed, shuffle=shuffle,
+            seed=cfg.seed, shuffle=shuffle, rank=rank, world_size=world_size,
+        )
+    if world_size > 1:
+        raise SystemExit(
+            f"{split} has no loss mask, so it is read by the pretraining Dataset, which does not "
+            f"shard across data parallel ranks; multi GPU runs need an SFT or evidence split"
         )
     return Dataset(
         data_dir=data_dir, tokenizer=tokenizer, batch_size=cfg.Batch_size,
@@ -466,25 +511,6 @@ def pull_from_hub(repo_id: str, filename: str, dest_dir: str, token: str = None)
     return hf_hub_download(repo_id=repo_id, filename=filename, local_dir=dest_dir, token=token)
 
 
-def next_grid_point(tokens: int, every: int) -> int:
-    """The first multiple of ``every`` strictly above ``tokens``.
-
-    The save and eval cadence after a resume: a relaunch at 300.4M with a 25M cadence saves next
-    at 325M, not at 325.4M, so stops and relaunches do not shift the grid. At ``tokens = 0`` (a
-    fresh run) it equals ``tokens + every``, the old form.
-
-    Args:
-        tokens: tokens trained in this run so far.
-        every: the cadence in tokens; a cadence of zero or below keeps the old ``tokens + every``.
-
-    Returns:
-        The token count at which the next save (or eval) is due.
-    """
-    if every <= 0:
-        return tokens + every
-    return (tokens // every + 1) * every
-
-
 def split_changes(saved: dict, current: dict, base_dir: str = BASE_DIR) -> list:
     """The data fields a resume would change, as ``(name, saved value, current value)`` triples.
 
@@ -591,6 +617,460 @@ def stop_needs_save(optimizer_steps: int, steps_at_last_save, slack_steps: int) 
     return optimizer_steps - steps_at_last_save > slack_steps
 
 
+def plan_total_steps(rows_per_epoch: int, num_epochs: int, batch_size: int,
+                     grad_accumulation_steps: int, world_size: int = 1) -> int:
+    """Optimizer steps the LR schedule is fitted to.
+
+    ``rows_per_epoch`` counts the rows of every rank together (the estimator replays all the
+    interleaved streams), and each rank trains ``batch_size`` rows per micro step, so a step
+    consumes ``batch_size * grad_accumulation_steps * world_size`` rows and the cosine spans the
+    same tokens whatever the number of ranks. One rank reproduces the old expression exactly.
+
+    Args:
+        rows_per_epoch: ``estimate_packed_rows``'s estimate over all ranks.
+        num_epochs: epochs of the profile.
+        batch_size: rows per micro step PER GPU.
+        grad_accumulation_steps: micro steps per optimizer step.
+        world_size: number of data parallel ranks.
+
+    Returns:
+        The per rank optimizer step count, at least 1.
+    """
+    micro_steps = rows_per_epoch * num_epochs / (batch_size * world_size)
+    return max(1, int(micro_steps / grad_accumulation_steps))
+
+
+def select_retention_deletions(paths, keep_recent: int, keep_every_tokens: int) -> list:
+    """Rolling checkpoints to delete under the long-term keep rule.
+
+    Keeps the newest ``keep_recent`` rolling saves, every ``*_final.pt``, and the long-term keeps:
+    a save is one when it is the first at or past a multiple of ``keep_every_tokens`` (names carry
+    the token count truncated to millions and a save lands a log step past its grid point, so "a
+    multiple" is read as "first save at or past one"). Everything else rolling is returned.
+
+    Args:
+        paths: checkpoint paths of one run directory.
+        keep_recent: ``keep_local_checkpoints``.
+        keep_every_tokens: spacing of the long-term keeps, 0 for none (nothing is selected, the
+            old behaviour: only upload-confirmed pruning applies).
+
+    Returns:
+        The paths to delete, oldest first.
+    """
+    if keep_every_tokens <= 0:
+        return []
+    rolling = []
+    for path in paths:
+        name = os.path.basename(path)
+        match = re.search(r"_tok(\d+)M_", name)
+        if ckpt_lib.is_final(name) or match is None:
+            continue
+        rolling.append((int(match.group(1)) * 1_000_000, path))
+    rolling.sort()
+    older = rolling[:max(len(rolling) - keep_recent, 0)]
+    doomed, previous = [], 0
+    for tokens, path in rolling:
+        milestone = tokens // keep_every_tokens > previous // keep_every_tokens
+        previous = tokens
+        if (tokens, path) in older and not milestone:
+            doomed.append(path)
+    return doomed
+
+
+def plan_changed(saved: dict, current: dict) -> list:
+    """The plan fields a resume would change, as ``(name, saved, current)`` triples.
+
+    ``total_steps`` is rebuilt from the corpus estimate on every launch and the new value is the
+    one the schedule then follows, so a split switch, an estimator change or another number of
+    ranks moves the cosine under a run that already began it. A field the checkpoint does not
+    record is never a change.
+
+    Args:
+        saved: ``total_steps``, ``rows_per_epoch`` and ``world_size`` from the checkpoint.
+        current: the same fields for this launch.
+
+    Returns:
+        The differing fields, empty when the plan is the checkpoint's.
+    """
+    return [(key, saved[key], current.get(key)) for key in ("total_steps", "rows_per_epoch",
+                                                              "world_size")
+            if saved.get(key) is not None and saved[key] != current.get(key)]
+
+
+def check_run_state(run_state, phase: str, resumed_tokens, slack_tokens: int):
+    """Whether a launch is consistent with the ``run_state.json`` the last process left.
+
+    A run directory that lost its checkpoints (or a ``-c`` relaunch into a wiped directory that
+    kept ``run_state.json``) would otherwise train from the seed again behind a plausible loss
+    curve. A state recorded under another phase, or with no tokens, compares to nothing, and a
+    directory with no ``run_state.json`` is a fresh run.
+
+    Args:
+        run_state: ``ckpt_lib.read_run_state``'s output, or None.
+        phase: this launch's phase label.
+        resumed_tokens: the token count of the checkpoint that loaded, or None when none did.
+        slack_tokens: how far behind the recorded count a resume may be, ``2 *
+            checkpoint_every_tokens`` (the fall back to an older checkpoint).
+
+    Returns:
+        None when the launch is consistent, else the message to log before exiting 30.
+    """
+    if run_state is None or run_state.get("phase") != phase:
+        return None
+    recorded = int(run_state.get("token_count", 0))
+    if recorded <= 0:
+        return None
+    if resumed_tokens is None:
+        return (f"resume verification failed for {phase}: run_state.json records {recorded:,} "
+                f"tokens (checkpoint {run_state.get('checkpoint')}) but no checkpoint loads from "
+                f"this directory, so this launch would start again from the seed. Restore the "
+                f"checkpoints, or remove run_state.json to start fresh on purpose.")
+    if resumed_tokens >= recorded - slack_tokens:
+        return None
+    return (f"resume verification failed for {phase}: run_state.json records {recorded:,} tokens "
+            f"but the newest checkpoint that loads is at {resumed_tokens:,} (slack "
+            f"{slack_tokens:,}). Refusing to retrain ground already covered; inspect the run "
+            f"directory before restarting.")
+
+
+# ---------------------------------------------------------------------------------------------
+# data parallel helpers. Everything here is pure or takes its collective as an argument, so the
+# logic is tested with fake ranks; sft() passes torch.distributed's.
+# ---------------------------------------------------------------------------------------------
+
+class RankLog:
+    """``utils.logger`` for a multi process run: info from rank 0 only, warnings and errors from
+    every rank with the rank in the message, so eight processes do not print every line eight
+    times and a failure on rank 3 is still seen."""
+
+    def __init__(self, base, rank: int = 0):
+        self.base, self.rank = base, rank
+
+    def info(self, msg, *args, **kwargs):
+        if self.rank == 0:
+            self.base.info(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        self.base.warning(msg if self.rank == 0 else f"[rank {self.rank}] {msg}", *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        self.base.error(msg if self.rank == 0 else f"[rank {self.rank}] {msg}", *args, **kwargs)
+
+
+def dist_env() -> tuple:
+    """``(rank, world_size)`` from the launcher's environment (accelerate and torchrun both set
+    ``RANK`` and ``WORLD_SIZE``); ``(0, 1)`` for a plain ``python scripts/sft.py``."""
+    return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
+
+
+def accelerator_kwargs(world_size: int, grad_accumulation_steps: int) -> dict:
+    """The ``Accelerator`` arguments for a run of ``world_size`` processes.
+
+    One process keeps the arguments every earlier run used. More processes get DDP with unused
+    parameters allowed and no buffer broadcast (kept for any DDP wrap; the trainer reduces the
+    gradients itself, see ``pretrain.all_reduce_grads``), each rank feeding its
+    own loader (``split_batches`` and ``dispatch_batches`` off), and a 30 minute collective
+    timeout, since rank 0's save (a multi GB write) keeps the others at a barrier.
+
+    Args:
+        world_size: the number of processes.
+        grad_accumulation_steps: micro steps per optimizer step.
+
+    Returns:
+        Keyword arguments for ``Accelerator``.
+    """
+    if world_size <= 1:
+        return dict(device_placement=True, split_batches=True,
+                    gradient_accumulation_steps=grad_accumulation_steps)
+    return dict(
+        device_placement=True,
+        gradient_accumulation_steps=grad_accumulation_steps,
+        dataloader_config=DataLoaderConfiguration(split_batches=False, dispatch_batches=False),
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(find_unused_parameters=True, broadcast_buffers=False),
+            InitProcessGroupKwargs(timeout=timedelta(minutes=30)),
+        ],
+    )
+
+
+def lockstep_batches(batches, chunk: int, reduce_min):
+    """Yield from ``batches`` so that every rank yields exactly the same number of batches.
+
+    The ranks' shards pack to different row counts, and an all-reduce with one rank out of
+    batches is a hang. Every ``chunk`` batches each rank reports how many it has buffered, the
+    MINIMUM over the ranks is the number all of them take, and the first chunk in which any rank
+    has none ends the epoch on every rank at once; the buffered batches beyond it are dropped
+    (a few rows of an epoch, like ``drop_last``). A batch counts as consumed when it is yielded, so
+    a stop between chunks leaves the unconsumed ones to be read again after a resume.
+
+    One host sync per chunk (the reduce), the same cadence as the log block's.
+
+    Args:
+        batches: this rank's batch iterable.
+        chunk: batches buffered per reduce, ``LOG_INTERVAL``.
+        reduce_min: ``int -> int`` MIN of the argument over the ranks.
+
+    Yields:
+        This rank's batches, as many as every rank has.
+    """
+    iterator = iter(batches)
+    buffered = deque()
+    while True:
+        while len(buffered) < chunk:
+            try:
+                buffered.append(next(iterator))
+            except StopIteration:
+                break
+        take = int(reduce_min(len(buffered)))
+        if take <= 0:
+            return
+        for _ in range(take):
+            yield buffered.popleft()
+
+
+# one float64 vector, summed over the ranks, per log step: counts first, then (value, valid) pairs
+# for each scalar, then the per loop CE
+COUNT_KEYS = ("tokens", "evidence", "stop_user", "stop_preempt", "checkpoint")
+LOG_SCALAR_KEYS = ("loss", "ce", "aux", "p_max", "top1", "selection", "contrastive", "grounded")
+OPTIONAL_LOG_KEYS = ("selection", "contrastive", "grounded")
+
+
+def pack_log_vector(counts: dict, scalars: dict, per_loop, device) -> torch.Tensor:
+    """The log step's all-reduce payload.
+
+    Args:
+        counts: ``COUNT_KEYS`` -> number (this rank's token and evidence deltas since the last
+            log, and 0 or 1 for a stop or checkpoint request); missing keys are 0.
+        scalars: ``LOG_SCALAR_KEYS`` -> 0-dim tensor, or None / non finite when the rank has no
+            value this step (a slice with no evidence has no selection loss); such a rank adds
+            nothing to the mean.
+        per_loop: the per loop CE tensors.
+        device: where the vector is built.
+
+    Returns:
+        ``[len(COUNT_KEYS) + 2 * len(LOG_SCALAR_KEYS) + len(per_loop)]`` float64.
+    """
+    head = torch.tensor([float(counts.get(k, 0)) for k in COUNT_KEYS], dtype=torch.float64,
+                        device=device)
+    zero = torch.zeros((), dtype=torch.float64, device=device)
+    cols = []
+    for key in LOG_SCALAR_KEYS:
+        value = scalars.get(key)
+        if value is None:
+            cols += [zero, zero]
+            continue
+        v = value.detach().to(device=device, dtype=torch.float64).reshape(())
+        # only the terms a slice may lack are left out when not finite; a diverged loss, CE or aux
+        # on any rank must propagate as NaN, not vanish from the mean
+        ok = torch.isfinite(v) if key in OPTIONAL_LOG_KEYS else torch.ones_like(v)
+        cols += [torch.where(ok.bool(), v, zero) if key in OPTIONAL_LOG_KEYS else v, ok.to(torch.float64)]
+    loops = [ce.detach().to(device=device, dtype=torch.float64).reshape(()) for ce in per_loop]
+    return torch.cat([head, torch.stack(cols), torch.stack(loops) if loops else zero.new_empty(0)])
+
+
+def unpack_log_vector(values, world_size: int) -> dict:
+    """Invert ``pack_log_vector`` on the summed vector (``.tolist()``): the summed counts, the mean
+    of each scalar over the ranks that had one (NaN when none did), and the mean per loop CE."""
+    counts = dict(zip(COUNT_KEYS, values[:len(COUNT_KEYS)]))
+    scalars, at = {}, len(COUNT_KEYS)
+    for key in LOG_SCALAR_KEYS:
+        total, n = values[at], values[at + 1]
+        scalars[key] = total / n if n > 0 else float("nan")
+        at += 2
+    return {"counts": counts, "scalars": scalars,
+            "per_loop": [v / world_size for v in values[at:]]}
+
+
+def stop_exit_code(counts: dict):
+    """The exit code a reduced log vector asks for: a restartable stop (SIGTERM) wins over a user
+    stop (STOP file), None when nobody asked. Identical on every rank, the vector being a sum."""
+    if counts["stop_preempt"] > 0:
+        return EXIT_PREEMPTED
+    if counts["stop_user"] > 0:
+        return EXIT_USER_STOP
+    return None
+
+
+def control_counts(control, include_user_stop: bool = True) -> dict:
+    """This rank's stop and checkpoint requests as ``pack_log_vector`` counts.
+
+    Args:
+        control: the rank's ``RunControl``.
+        include_user_stop: False on ranks that must not act on the STOP file (only rank 0 polls
+            it; every rank's signal handlers still set the flags).
+    """
+    stopped = control.stop_requested
+    return {
+        "stop_preempt": int(stopped and control.exit_code == EXIT_PREEMPTED),
+        "stop_user": int(stopped and control.exit_code != EXIT_PREEMPTED and include_user_stop),
+        "checkpoint": int(control.take_checkpoint_request()),
+    }
+
+
+def tensors_checksum(tensors) -> torch.Tensor:
+    """One float64 sum per tensor, to compare across ranks at startup."""
+    sums = [t.detach().double().sum() for t in tensors]
+    return torch.stack(sums) if sums else torch.zeros(0, dtype=torch.float64)
+
+
+def check_ranks_identical(named, reduce_min, reduce_max) -> None:
+    """Raise when a tensor's checksum differs between ranks.
+
+    Run once after the model, the fp32 masters and DDP are in place: ranks that began from
+    different weights (a seed that left a tensor at a random init, a checkpoint read short on one
+    node) would train eight models that only average their gradients.
+
+    Args:
+        named: ``[(name, tensor)]``.
+        reduce_min, reduce_max: callables returning the MIN / MAX of a tensor over the ranks.
+
+    Raises:
+        RuntimeError: naming the first few tensors that differ.
+    """
+    names = [n for n, _ in named]
+    local = tensors_checksum([t for _, t in named])
+    low, high = reduce_min(local.clone()), reduce_max(local.clone())
+    differs = (low != high).cpu().tolist()
+    bad = [name for name, flag in zip(names, differs) if flag]
+    if bad:
+        raise RuntimeError(
+            f"{len(bad)} of {len(names)} tensors differ between the data parallel ranks at "
+            f"startup (first: {bad[:5]}): the ranks did not start from the same weights"
+        )
+
+
+def reseed_cuda_for_rank(cuda_state: torch.Tensor, rank: int):
+    """The CUDA RNG state a rank resumes from.
+
+    Rank 0 takes the saved state exactly (a one process resume is bit for bit what it was). Another
+    rank derives a seed from the same saved state and its own rank, so the ranks' dropout masks
+    and loss subsamples stay different from each other and a function of the checkpoint.
+
+    Args:
+        cuda_state: the checkpoint's ``cuda_rng_state`` (rank 0's).
+        rank: this process's data parallel rank.
+
+    Returns:
+        ``(state, seed)``: rank 0 gets ``(cuda_state, None)``; another rank ``(None, seed)`` to
+        pass to ``torch.cuda.manual_seed``.
+    """
+    if rank == 0:
+        return cuda_state, None
+    digest = hashlib.sha256(bytes(cuda_state.cpu().tolist()) + rank.to_bytes(4, "little"))
+    return None, int(digest.hexdigest()[:15], 16)
+
+
+def ir_sync_tensors(moe, optimizer, master_pairs) -> list:
+    """Every tensor an IR cluster refresh may have changed: the IR modules' parameters and buffers,
+    the fp32 masters of those parameters and the optimizer's state for them.
+
+    The refresh clusters and recycles from each rank's own query reservoir and usage counts, so
+    after it the ranks' tables, centroids and moments differ; rank 0's are broadcast to the rest.
+    """
+    masters = {id(p): m for p, m in master_pairs}
+    tensors = []
+    for module in moe.ir_modules:
+        for param in module.parameters():
+            tensors.append(param.data)
+            master = masters.get(id(param))
+            if master is not None:
+                tensors.append(master.data)
+                state = optimizer.state.get(master)
+                if state:
+                    tensors.extend(v for v in state.values() if torch.is_tensor(v))
+        tensors.extend(module.buffers())
+    return tensors
+
+
+def sync_ir_from_main(moe, optimizer, master_pairs, broadcast) -> int:
+    """Broadcast rank 0's IR state to every rank after a cluster refresh; returns the tensor count.
+
+    Args:
+        broadcast: callable that overwrites a tensor with rank 0's copy in place
+            (``lambda t: torch.distributed.broadcast(t, src=0)``).
+    """
+    tensors = ir_sync_tensors(moe, optimizer, master_pairs)
+    for tensor in tensors:
+        broadcast(tensor)
+    return len(tensors)
+
+
+def worker_offset(rows: list, stride: int, fallback: int) -> int:
+    """The resume position from every stream's last consumed position: the minimum, plus the
+    stride (the next position that stream wants), so no stream's unconsumed work is skipped.
+
+    Args:
+        rows: ``worker_state`` as a list, -1 for a stream that produced nothing yet. Under data
+            parallel training these are the streams of every rank (the ranks' states are merged
+            with a MAX first: a stream is only ever written by its own rank).
+        stride: ``NUM_DATA_WORKERS * world_size``.
+        fallback: the position the run started from, used when no stream has produced anything.
+    """
+    seen = [r for r in rows if r >= 0]
+    return min(seen) + stride if seen else fallback
+
+
+def _merge_numeric(a: dict, b: dict) -> dict:
+    """Sum two nested dicts of numbers key by key; a key only one side has is kept."""
+    out = dict(a)
+    for key, value in b.items():
+        if key not in out:
+            out[key] = value
+        elif isinstance(value, dict):
+            out[key] = _merge_numeric(out[key], value)
+        else:
+            out[key] = out[key] + value
+    return out
+
+
+EVAL_SCALARS = ("ce_sum", "ce_weight_sum", "token_sum", "n_batches", "selection_sum",
+                "selection_batches", "contrastive_sum", "contrastive_batches", "grounded_sum",
+                "grounded_batches")
+EVAL_DICTS = ("signal_sums", "cond_ce_sum", "cond_weight_sum", "cond_ce_by_loop_sum",
+              "source_cond_sum", "source_cond_weight", "source_token_sum")
+EVAL_LISTS = ("grounded_scores", "grounded_labels", "grounded_has_evidence")
+
+
+def merge_eval_states(states: list) -> dict:
+    """Combine the per rank accumulators of ``evaluate`` into the one a single process would hold.
+
+    Sums add, the nested per condition, per loop and per source sums add key by key, and the
+    per token score lists and the selector sink concatenate in rank order (the AUROCs and means
+    they feed do not depend on order).
+
+    Args:
+        states: one state dict per rank, in rank order.
+
+    Returns:
+        The merged state, same keys.
+    """
+    out = {k: sum(s[k] for s in states) for k in EVAL_SCALARS}
+    for key in EVAL_DICTS:
+        merged = {}
+        for state in states:
+            merged = _merge_numeric(merged, state[key])
+        out[key] = merged
+    for key in EVAL_LISTS:
+        out[key] = [item for state in states for item in state[key]]
+    sink = {}
+    for state in states:
+        for loop_idx, entry in state["selector_sink"].items():
+            into = sink.setdefault(loop_idx, {name: [] for name in entry})
+            for name, items in entry.items():
+                into[name].extend(items)
+    out["selector_sink"] = sink
+    return out
+
+
+def all_gather_states(world_size: int):
+    """``gather`` for ``evaluate``: ``torch.distributed.all_gather_object`` over the ranks."""
+    def gather(state):
+        out = [None] * world_size
+        torch.distributed.all_gather_object(out, state)
+        return out
+    return gather
+
+
 def fp32_master_state(named_masters) -> dict:
     """The fp32 masters as a CPU dict keyed like the model's state dict.
 
@@ -642,12 +1122,16 @@ def restore_fp32_masters(named_masters, saved) -> str:
     return f"reseeded the fp32 masters from bf16 ({reason})"
 
 
-def restore_rng_states(loop_rng: random.Random, sft_extra: dict) -> list:
+def restore_rng_states(loop_rng: random.Random, sft_extra: dict, rank: int = 0) -> list:
     """Restore the depth sampling RNG and the CUDA RNG when the checkpoint recorded them.
 
     Args:
         loop_rng: the trainer's depth sampling RNG, seeded from the config.
         sft_extra: the checkpoint's ``sft`` fields.
+        rank: this process's data parallel rank. The depth sampling RNG is restored identically on
+            every rank (it is consumed in lockstep, so rank 0's saved state is every rank's); the
+            CUDA RNG is rank 0's saved state, which another rank turns into its own seed
+            (``reseed_cuda_for_rank``).
 
     Returns:
         The names of the states restored; empty for a checkpoint that recorded neither.
@@ -660,7 +1144,11 @@ def restore_rng_states(loop_rng: random.Random, sft_extra: dict) -> list:
         restored.append("loop_rng")
     cuda_state = sft_extra.get("cuda_rng_state")
     if cuda_state is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state(cuda_state.cpu())
+        state, seed = reseed_cuda_for_rank(cuda_state, rank)
+        if state is not None:
+            torch.cuda.set_rng_state(state.cpu())
+        else:
+            torch.cuda.manual_seed(seed)
         restored.append("cuda")
     return restored
 
@@ -782,6 +1270,10 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
         "losses": checkpoint.get("losses", None) or [],
         "seed": sft_extra.get("seed", SFTConfig.seed),
         "kill_checked": sft_extra.get("kill_checked", False),
+        # the plan the run's cosine was fitted to, None for a checkpoint written before they were saved
+        "total_steps": sft_extra.get("total_steps"),
+        "rows_per_epoch": sft_extra.get("rows_per_epoch"),
+        "world_size": sft_extra.get("world_size"),
     }
 
 
@@ -931,7 +1423,8 @@ def _summarize_selector_readings(sink: dict) -> dict:
 
 @torch.no_grad()
 def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_batches: int,
-             conversation_weighting: bool = False, selector_by_loop: bool = False):
+             conversation_weighting: bool = False, selector_by_loop: bool = False,
+             rank: int = 0, world_size: int = 1, gather=None):
     """Validation pass over the val split: CE on supervised tokens plus the calibration signals.
 
     Reports ``p_max``/top-1 accuracy because the acceptance criterion is about the abstention
@@ -972,6 +1465,12 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
         selector_by_loop: also collect the selector's per loop readings at the answer start
             positions (see ``_selector_readings_by_loop``), returned as ``selector_by_loop``. Needs
             the gold flag and ``condition_ids``; silently absent without them.
+        rank, world_size, gather: data parallel evaluation. Every rank iterates the same full
+            stream and evaluates the batches whose index is ``rank`` modulo ``world_size``, among
+            the first ``max_batches`` (a batch with no supervised token costs its slot, where one
+            process would read on), then ``gather`` (``state -> [state per rank]``, rank order)
+            hands every rank all the accumulators and each computes the same result through
+            ``merge_eval_states``. One process (the default) is the old pass, byte for byte.
     """
     was_training = model.training
     model.eval()
@@ -996,8 +1495,13 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     grounded_scores, grounded_labels, grounded_has_evidence = [], [], []
     selector_sink = {}
 
-    for batch in dataset:
-        if n_batches >= max_batches:
+    for batch_index, batch in enumerate(dataset):
+        if world_size > 1:
+            if batch_index >= max_batches:
+                break
+            if batch_index % world_size != rank:
+                continue
+        elif n_batches >= max_batches:
             break
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -1183,6 +1687,36 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     if was_training:
         model.train()
 
+    if world_size > 1:
+        merged = merge_eval_states(gather({
+            "ce_sum": ce_sum, "ce_weight_sum": ce_weight_sum, "token_sum": token_sum,
+            "n_batches": n_batches, "selection_sum": selection_sum,
+            "selection_batches": selection_batches, "contrastive_sum": contrastive_sum,
+            "contrastive_batches": contrastive_batches, "grounded_sum": grounded_sum,
+            "grounded_batches": grounded_batches, "signal_sums": signal_sums,
+            "cond_ce_sum": cond_ce_sum, "cond_weight_sum": cond_weight_sum,
+            "cond_ce_by_loop_sum": cond_ce_by_loop_sum, "source_cond_sum": source_cond_sum,
+            "source_cond_weight": source_cond_weight, "source_token_sum": source_token_sum,
+            "grounded_scores": grounded_scores, "grounded_labels": grounded_labels,
+            "grounded_has_evidence": grounded_has_evidence, "selector_sink": selector_sink,
+        }))
+        ce_sum, ce_weight_sum, token_sum = (merged["ce_sum"], merged["ce_weight_sum"],
+                                            merged["token_sum"])
+        n_batches = merged["n_batches"]
+        selection_sum, selection_batches = merged["selection_sum"], merged["selection_batches"]
+        contrastive_sum, contrastive_batches = (merged["contrastive_sum"],
+                                                merged["contrastive_batches"])
+        grounded_sum, grounded_batches = merged["grounded_sum"], merged["grounded_batches"]
+        signal_sums, cond_ce_sum, cond_weight_sum = (
+            merged["signal_sums"], {c: merged["cond_ce_sum"].get(c, 0.0) for c in CONDITIONS},
+            {c: merged["cond_weight_sum"].get(c, 0.0) for c in CONDITIONS})
+        cond_ce_by_loop_sum = merged["cond_ce_by_loop_sum"]
+        source_cond_sum, source_cond_weight = merged["source_cond_sum"], merged["source_cond_weight"]
+        source_token_sum = merged["source_token_sum"]
+        grounded_scores, grounded_labels = merged["grounded_scores"], merged["grounded_labels"]
+        grounded_has_evidence = merged["grounded_has_evidence"]
+        selector_sink = merged["selector_sink"]
+
     if token_sum == 0 or ce_weight_sum == 0:
         return None
     result = {"ce": ce_sum / ce_weight_sum, "tokens": token_sum, "batches": n_batches}
@@ -1228,6 +1762,8 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
 
 
 def sft(args):
+    rank, world_size = dist_env()
+    log = RankLog(logger, rank)
     # one function, three profiles. --repair / --ir swap the config class, the phase label and the
     # checkpoint directory and nothing else: see this module's docstring for why the repair pass is
     # not a second script.
@@ -1253,7 +1789,7 @@ def sft(args):
     ) if value}
     if overrides:
         cfg = type(cfg.__name__, (cfg,), overrides)
-        logger.info(f"data overrides: {overrides}")
+        log.info(f"data overrides: {overrides}")
     ceiling_by_source, ceiling_all = {}, None
     if getattr(args, "ceiling_json", None):
         with open(args.ceiling_json, "r", encoding="utf-8") as f:
@@ -1261,7 +1797,7 @@ def sft(args):
         ceiling_all = (ceiling.get("all") or {}).get("ceiling")
         ceiling_by_source = {name: entry["ceiling"] for name, entry in
                              (ceiling.get("by_source") or {}).items() if "ceiling" in entry}
-        logger.info(f"in-context ceiling read from {args.ceiling_json}: pooled {ceiling_all}, "
+        log.info(f"in-context ceiling read from {args.ceiling_json}: pooled {ceiling_all}, "
                     f"by source {ceiling_by_source}")
     # two variants of the same profile (different seeds, identical everything else) would otherwise
     # share a directory, and the second would silently RESUME the first instead of starting from
@@ -1269,7 +1805,7 @@ def sft(args):
     if args.run_name:
         checkpoint_dir = f"{checkpoint_dir}_{args.run_name}"
     if run_already_complete(checkpoint_dir, phase):
-        logger.warning(
+        log.warning(
             f"run already complete: {ckpt_lib.final_name(phase)} is the newest checkpoint in "
             f"{checkpoint_dir} and run_state.json names it; nothing to train and exiting 0. A "
             f"longer run on the same data needs a new run directory seeded from it with -c (and "
@@ -1278,20 +1814,40 @@ def sft(args):
         )
         return EXIT_OK
 
+    # built before the model and the datasets: under several processes every rank must put its model
+    # on accelerator.device (cuda:local_rank), not on cuda:0, and the shard of the data it reads
+    # is its process index
+    accelerator = Accelerator(**accelerator_kwargs(world_size, cfg.grad_accumulation_steps))
+    if accelerator.num_processes != world_size or accelerator.process_index != rank:
+        raise SystemExit(
+            f"the launcher environment says rank {rank} of {world_size} but accelerate sees "
+            f"{accelerator.process_index} of {accelerator.num_processes}"
+        )
+    is_main = accelerator.is_main_process
+    device = accelerator.device
+    if world_size > 1:
+        log.info(
+            f"data parallel: {world_size} processes, batch {cfg.Batch_size} per GPU x accum "
+            f"{cfg.grad_accumulation_steps} -> {cfg.Batch_size * world_size * cfg.grad_accumulation_steps} "
+            f"rows per optimizer step; logged loss, CE, aux, p_max, top1, selection, contrastive, "
+            f"grounded and per loop CE are means over the ranks, the IR entropy and the external mass "
+            f"are rank 0's slice"
+        )
+
     data_dir = os.path.join(BASE_DIR, cfg.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
-    logger.info(f"Tokenizer loaded from {TOKENIZER_DIR} with vocab size {tokenizer.vocab_size}")
+    log.info(f"Tokenizer loaded from {TOKENIZER_DIR} with vocab size {tokenizer.vocab_size}")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Using device: {device}")
+    log.info(f"Using device: {device}")
     log_precision_mode()
-    logger.info(
+    log.info(
         f"Profile: {phase} (lr={cfg.lr:.1e}, {cfg.num_epochs} epoch(s), "
         f"splits {cfg.train_split}/{cfg.val_split}, per-conversation loss weighting "
         f"{'ON' if cfg.conversation_loss_weighting else 'off'}) -> {checkpoint_dir}"
     )
 
-    train_dataset = make_dataset(data_dir, cfg.train_split, tokenizer, cfg)
+    train_dataset = make_dataset(data_dir, cfg.train_split, tokenizer, cfg,
+                                 rank=rank, world_size=world_size)
     # a stable order makes successive eval numbers comparable
     val_dataset = make_dataset(data_dir, cfg.val_split, tokenizer, cfg, shuffle=False)
     fixed_dataset = None
@@ -1309,21 +1865,32 @@ def sft(args):
     dataloader = DataLoader(train_dataset, batch_size=None, num_workers=NUM_DATA_WORKERS,
                             prefetch_factor=2)
 
-    rows_per_epoch = estimate_packed_rows(
-        train_dataset.idx_path, cfg.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
-        split_documents=isinstance(train_dataset, Dataset),
-        evidx_path=getattr(train_dataset, "evidx_path", None),
-        max_evidence_tokens=getattr(train_dataset, "max_evidence_tokens", 0),
-        order=(train_dataset.document_order(train_dataset.num_docs)
-               if getattr(train_dataset, "shuffle", False) else None),
-        num_workers=NUM_DATA_WORKERS,
-    )
-    micro_steps = rows_per_epoch * cfg.num_epochs / cfg.Batch_size
-    total_steps = max(1, int(micro_steps / cfg.grad_accumulation_steps))
-    logger.info(
+    def estimate_rows():
+        # one stream per (rank, worker) pair, so the estimate replays NUM_DATA_WORKERS * world_size
+        # streams and counts the rows of every rank together
+        return estimate_packed_rows(
+            train_dataset.idx_path, cfg.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
+            split_documents=isinstance(train_dataset, Dataset),
+            evidx_path=getattr(train_dataset, "evidx_path", None),
+            max_evidence_tokens=getattr(train_dataset, "max_evidence_tokens", 0),
+            order=(train_dataset.document_order(train_dataset.num_docs)
+                   if getattr(train_dataset, "shuffle", False) else None),
+            num_workers=NUM_DATA_WORKERS * world_size,
+        )
+
+    if world_size > 1:
+        # the replay is a long python loop over the corpus: rank 0 does it once and shares the number
+        shared = [estimate_rows() if is_main else None]
+        torch.distributed.broadcast_object_list(shared, src=0)
+        rows_per_epoch = shared[0]
+    else:
+        rows_per_epoch = estimate_rows()
+    total_steps = plan_total_steps(rows_per_epoch, cfg.num_epochs, cfg.Batch_size,
+                                   cfg.grad_accumulation_steps, world_size)
+    log.info(
         f"{phase} plan: ~{rows_per_epoch:,} packed rows/epoch x {cfg.num_epochs} epochs "
         f"-> ~{total_steps:,} optimizer steps at batch {cfg.Batch_size} x accum "
-        f"{cfg.grad_accumulation_steps}"
+        f"{cfg.grad_accumulation_steps}" + (f" x {world_size} ranks" if world_size > 1 else "")
     )
 
     # dropout override only; every other model hyperparameter must match the pretrained checkpoint.
@@ -1345,7 +1912,7 @@ def sft(args):
         # the seed decides every other mode; this one is chosen here because no seed carries it yet.
         # The run's own checkpoints do, so its resumes must pass the flag again or fail to load
         model_params["evidence_reader_rotary"] = False
-        logger.info("evidence reader: no rotary (query and evidence keys unrotated)")
+        log.info("evidence reader: no rotary (query and evidence keys unrotated)")
     if args.reader_kv:
         if not args.evidence:
             raise SystemExit("--reader-kv only applies to --evidence")
@@ -1354,7 +1921,7 @@ def sft(args):
         if not model_params.get("evidence_port"):
             raise SystemExit("--reader-kv needs a seed with the evidence port")
         model_params["evidence_reader"] = "kv"
-        logger.info("evidence reader: key/value (evidence as leading keys of shared_attn, every loop)")
+        log.info("evidence reader: key/value (evidence as leading keys of shared_attn, every loop)")
     model = TinyMoETransformer(**model_params).to(device).to(BF16).train()
     model.set_checkpointing(False, False)
     model.delayed_mtp_loss(True)
@@ -1368,7 +1935,7 @@ def sft(args):
     # counted in every mode so the step line reads the load under the aux term too; the rate
     # train_step passes is zero outside loss-free, so the bias never moves there
     model.moe.set_balance_tracking(True)
-    logger.info(f"moe balancing: {TrainingConfig.moe_balancing}" + (
+    log.info(f"moe balancing: {TrainingConfig.moe_balancing}" + (
         f" (bias rate {TrainingConfig.moe_balance_bias_rate})"
         if TrainingConfig.moe_balancing == "loss_free" else f" (weight {TrainingConfig.aux_loss_weight})"
     ))
@@ -1398,12 +1965,15 @@ def sft(args):
     names = {id(p): n for n, p in model.named_parameters()}
     names_by_master = {id(master): names[id(param)] for param, master in master_pairs}
     optimizer = build_optimizer(TrainingConfig.optimizer, param_groups, names_by_master, lr=cfg.lr)
-    logger.info(f"optimizer {TrainingConfig.optimizer}: {partition_summary(optimizer)}")
+    log.info(f"optimizer {TrainingConfig.optimizer}: {partition_summary(optimizer)}")
     scheduler = build_sft_scheduler(optimizer, total_steps, cfg)
 
     os.makedirs(checkpoint_dir, exist_ok=True)
-    ckpt_lib.cleanup_stale_files(checkpoint_dir)
+    if is_main:
+        ckpt_lib.cleanup_stale_files(checkpoint_dir)
     run_state_path = os.path.join(checkpoint_dir, "run_state.json")
+    run_state = ckpt_lib.read_run_state(run_state_path)
+    resume_slack = 2 * cfg.checkpoint_every_tokens
 
     start_epoch, step_offset, start_doc_idx = 0, 0, 0
     losses, resumed, resumed_kill_checked = [], False, False
@@ -1413,12 +1983,39 @@ def sft(args):
                    "val_split": cfg.val_split}
     resumed_masters, resumed_rng, steps_at_last_save = None, {}, None
 
-    found = ckpt_lib.find_resume_checkpoint(
-        checkpoint_dir,
-        lambda path: load_sft_checkpoint(model, optimizer, scheduler, path, phase, checkpoint_dir),
-    )
+    try:
+        found = ckpt_lib.find_resume_checkpoint(
+            checkpoint_dir,
+            lambda path: load_sft_checkpoint(model, optimizer, scheduler, path, phase, checkpoint_dir),
+        )
+    except RuntimeError as e:
+        # checkpoints exist and none loads: with a run_state.json behind them that is a lost run, not
+        # a fresh start, and the supervisor must not restart it
+        if check_run_state(run_state, phase, None, resume_slack) is None:
+            raise
+        log.error(str(e))
+        log.error(check_run_state(run_state, phase, None, resume_slack))
+        return EXIT_RESUME_FAILED
+    # the check the pretraining trainer makes: a directory that lost its checkpoints, or whose newest
+    # loadable one is far behind what run_state.json recorded, would otherwise train from the seed
+    # (or from old ground) again behind a plausible loss curve
+    problem = check_run_state(run_state, phase,
+                              found[1]["token_count"] if found is not None else None, resume_slack)
+    if problem is not None:
+        log.error(problem)
+        return EXIT_RESUME_FAILED
+    plan = {"total_steps": total_steps, "rows_per_epoch": rows_per_epoch, "world_size": world_size}
     if found is not None:
         _, state = found
+        moved = plan_changed(state, plan)
+        if moved:
+            log.warning(
+                "the plan differs from the one this run's cosine was fitted to: "
+                + "; ".join(f"{key} {old:,} -> {new:,}" for key, old, new in moved)
+                + f". Keeping the new total_steps ({total_steps:,}); the schedule's shape changes "
+                f"under the resumed run (a split switch, another number of ranks or an estimator "
+                f"change)"
+            )
         start_epoch = state["epoch"]
         step_offset = state["step"]
         token_count = state["token_count"]
@@ -1436,7 +2033,7 @@ def sft(args):
                 f"function of the seed -- restore the old seed or start a fresh run directory."
             )
         if not state["data"]:
-            logger.info(
+            log.info(
                 f"the checkpoint does not record its data (written before the field existed); "
                 f"resuming on {data_fields}"
             )
@@ -1444,18 +2041,18 @@ def sft(args):
             changes = check_split_switch(state["data"], data_fields,
                                          getattr(args, "switch_split", False))
             if changes:
-                logger.warning(
+                log.warning(
                     "--switch-split: resuming on other data than the checkpoint's: "
                     + "; ".join(f"{key} {old!r} -> {new!r}" for key, old, new in changes)
                     + ". The document position carries over unchanged."
                 )
             elif getattr(args, "switch_split", False):
-                logger.info("--switch-split passed but the data match the checkpoint's")
+                log.info("--switch-split passed but the data match the checkpoint's")
         resumed_masters, resumed_rng = state.pop("fp32_masters"), state["rng"]
         steps_at_last_save = state["optimizer_steps"]
         model._token_tracker.num_tokens = token_count
         resumed = True
-        logger.info(
+        log.info(
             f"Resumed {phase} at epoch {start_epoch}, position {start_doc_idx:,}, "
             f"{(token_count - start_token_count) / 1e6:.1f}M {phase} tokens"
         )
@@ -1469,12 +2066,16 @@ def sft(args):
                     "--hub-repo"
                 )
             token = get_hf_token()
+            if not is_main:
+                accelerator.wait_for_everyone()      # rank 0 downloads first, the rest hit the cache
             init_path = pull_from_hub(repo, args.hub_file, PRETRAINED_DIR, token)
             try:
                 pull_from_hub(repo, "manifest.json", BASE_DIR, token)
             except Exception as e:
                 # the manifest matters for prepare_sft_data.py (holdout hashes), not for training
-                logger.warning(f"could not pull manifest.json from {repo}: {e}")
+                log.warning(f"could not pull manifest.json from {repo}: {e}")
+            if is_main and world_size > 1:
+                accelerator.wait_for_everyone()
         if not init_path:
             raise SystemExit(
                 f"no {phase} checkpoint to resume and no checkpoint to initialize from -- pass "
@@ -1493,7 +2094,7 @@ def sft(args):
     # a resume, which an in place copy does not disturb.
     named_masters = [(names[id(param)], param, master) for param, master in master_pairs]
     if resumed:
-        logger.info(restore_fp32_masters(named_masters, resumed_masters))
+        log.info(restore_fp32_masters(named_masters, resumed_masters))
     else:
         with torch.no_grad():
             for bf16_param, master in master_pairs:
@@ -1503,13 +2104,13 @@ def sft(args):
     if frozen_gate is not None:
         gate_value = float(frozen_gate.detach().float().item())
         if gate_value != 0.0:
-            logger.warning(
+            log.warning(
                 f"evidence_gate_scale loaded as {gate_value:.4e}; zeroing it, since the gate is "
                 f"frozen and only a zero scale makes it exactly 1.0"
             )
             with torch.no_grad():
                 frozen_gate.zero_()
-        logger.info("evidence_gate_scale frozen at 0 (ungated reader, no gradient)")
+        log.info("evidence_gate_scale frozen at 0 (ungated reader, no gradient)")
 
     if args.evidence:
         # read once: two zero matrices in series (g_proj inside the table module, direct_gate on the
@@ -1522,12 +2123,12 @@ def sft(args):
             g_rms = expert.ir_module.g_proj.weight.detach().float().pow(2).mean().sqrt().item()
             gate = getattr(expert, "direct_gate", None)
             d_rms = gate.weight.detach().float().pow(2).mean().sqrt().item() if gate is not None else None
-            logger.info(
+            log.info(
                 f"seed IR value path: |g_proj|rms {g_rms:.3e}"
                 + (f", |direct_gate|rms {d_rms:.3e}" if d_rms is not None else "")
             )
             if g_rms == 0.0 and d_rms == 0.0:
-                logger.warning(
+                log.warning(
                     "g_proj and direct_gate are both exactly zero: they hold each other at zero, so "
                     "the IR expert's output is zero for this run and the selector learns only from "
                     "the selection loss (the frozen gate removes its other path through the reader)"
@@ -1537,85 +2138,164 @@ def sft(args):
     # of a SIGTERM instead of losing everything since the last save. clear_sentinel() first: a STOP
     # left over from a previous run would otherwise kill every relaunch before it trains a step.
     control = RunControl(checkpoint_dir)
-    control.clear_sentinel()
+    if is_main:
+        # only rank 0 touches the STOP file; every rank's signal handlers set their own flags and the
+        # flags meet in the log step's reduction
+        control.clear_sentinel()
     control.install()
 
     upload_repo = args.upload_repo if args.upload_repo is not None else cfg.upload_repo(HF_UPLOAD_REPO)
-    if not upload_repo:
-        logger.warning(
+    if not upload_repo and is_main:
+        log.warning(
             f"{phase} uploads are OFF ({phase}.hf_upload_repo is empty). Fine locally; on a rented "
             "box the checkpoints die with the instance -- pass --upload-repo <repo> there."
         )
-    hf = HFSync(upload_repo, token=get_hf_token())
+    hf = HFSync(upload_repo if is_main else "", token=get_hf_token())
     loss_png = os.path.join(checkpoint_dir, "loss_graph.png")
     experts_png = os.path.join(checkpoint_dir, "expert_selection.png")
     status_path = os.path.join(checkpoint_dir, "status.json")
 
-    accelerator = Accelerator(
-        device_placement=True,
-        split_batches=True,
-        gradient_accumulation_steps=cfg.grad_accumulation_steps,
-    )
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    def broadcast_from_main(tensor):
+        # NCCL cannot broadcast a CPU tensor (AdamW's step counter is one)
+        if tensor.is_cuda:
+            torch.distributed.broadcast(tensor, src=0)
+        else:
+            moved = tensor.to(device)
+            torch.distributed.broadcast(moved, src=0)
+            tensor.copy_(moved.cpu())
+
+    def reduce_op(op):
+        def reduce(tensor):
+            tensor = tensor.to(device)
+            torch.distributed.all_reduce(tensor, op=op)
+            return tensor
+        return reduce
+
+    if world_size > 1:
+        # DDP broadcasts rank 0's parameters and buffers when it wraps the model, which would hide
+        # a rank that began from other weights while its masters and moments kept the local ones
+        check_ranks_identical(
+            [(f"param {n}", p) for n, p in model.named_parameters()]
+            + [(f"buffer {n}", b) for n, b in model.named_buffers()]
+            + [(f"master {n}", m) for n, _, m in named_masters],
+            reduce_op(torch.distributed.ReduceOp.MIN), reduce_op(torch.distributed.ReduceOp.MAX),
+        )
+        # the accelerate loader is not used: with an iterable dataset it would shard the stream a
+        # second time (IterableDatasetShard), and the datasets already read their own share. The
+        # model is NOT wrapped in DDP either: the LM heads run outside its forward, so its reducer
+        # would never see their gradients; train_step averages every gradient in fp32 instead
+        optimizer = accelerator.prepare(optimizer)
+    else:
+        model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     unwrapped_model = accelerator.unwrap_model(model)
 
     full_n_loops = ModelConfig.Params["n_loops"]
+    # seeded identically on every rank on purpose: the sampled depth must match across ranks (the
+    # collectives and the balancer's counts assume it). The CUDA RNG (the MTP subsample's randperm,
+    # dropout) is per rank and stays that way, which is fine: those only need to be random
     loop_rng = random.Random(cfg.seed)
+    if rank > 0 and torch.cuda.is_available():
+        # a different dropout and subsample stream per rank on a fresh run (a resume reseeds below)
+        torch.cuda.manual_seed(cfg.seed + 1000 * rank)
     if resumed:
-        restored = restore_rng_states(loop_rng, resumed_rng)
-        logger.info(f"RNG states restored: {restored}" if restored else
+        restored = restore_rng_states(loop_rng, resumed_rng, rank)
+        log.info(f"RNG states restored: {restored}" if restored else
                     "the checkpoint records no RNG state; depth sampling restarts from the seed")
-    worker_state = torch.full((max(NUM_DATA_WORKERS, 1),), -1, dtype=torch.long, device=device)
+    # one entry per (rank, worker) stream, indexed by the worker_id the dataset reports
+    stream_stride = max(NUM_DATA_WORKERS, 1) * world_size
+    worker_state = torch.full((stream_stride,), -1, dtype=torch.long, device=device)
 
-    def snapshot_global_offset(fallback):
+    def snapshot_global_offset(fallback, collective=True):
         # same conservative min-across-workers rule as pretrain.py: a worker at position p next
-        # wants p + NUM_DATA_WORKERS, so the smallest such value skips nobody's unconsumed work
-        rows = worker_state.cpu().tolist()
-        seen = [r for r in rows if r >= 0]
-        return min(seen) + NUM_DATA_WORKERS if seen else fallback
+        # wants p + the stride, so the smallest such value skips nobody's unconsumed work. Under data
+        # parallel training each rank only wrote its own streams' entries, so the ranks' states are
+        # merged with a MAX first (every rank calls this, being a collective)
+        state = worker_state
+        if world_size > 1 and collective:
+            state = worker_state.clone()
+            torch.distributed.all_reduce(state, op=torch.distributed.ReduceOp.MAX)
+        return worker_offset(state.cpu().tolist(), stream_stride, fallback)
 
     timer = time.time()
     last_log_time = timer
     last_token_count = unwrapped_model._token_tracker.sync()
+    # this rank's own tracker total as of the last log: the reduction sums the ranks' deltas, so the
+    # global count is the resumed or seeded count plus what every rank has trained since
+    last_local_total = last_token_count
+    gather_eval = all_gather_states(world_size) if world_size > 1 else None
     target_tokens = None  # filled in after the first log interval, once tokens/row is known
 
-    def save_and_sync(epoch, step, loss_value, tokens, final=False):
+    def save_and_sync(epoch, step, loss_value, tokens, final=False, collective=True):
+        """Write a checkpoint. Every rank calls it (the save is a collective: barriers around it and
+        the merge of the ranks' stream positions), rank 0 alone writes. ``collective=False`` is the
+        interrupt path, where only the interrupted rank may be alive: rank 0 writes with its own
+        stream positions and no barrier."""
         nonlocal steps_at_last_save
-        name = (ckpt_lib.final_name(phase) if final
-                else ckpt_lib.rolling_name(phase, tokens - start_token_count, loss_value))
-        path = os.path.join(checkpoint_dir, name)
-        sft_fields = dict(data_fields)
-        sft_fields["loop_rng_state"] = loop_rng.getstate()
-        sft_fields["cuda_rng_state"] = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-        save_sft_checkpoint(
-            unwrapped_model, optimizer, scheduler, path,
-            epoch=epoch, step=step, token_count=tokens, start_token_count=start_token_count,
-            global_offset=snapshot_global_offset(start_doc_idx), losses=losses,
-            seed=cfg.seed, phase=phase, kill_checked=kill_checked, sft_fields=sft_fields,
-            fp32_masters=fp32_master_state(named_masters) if SAVE_FP32_MASTERS else None,
-        )
-        steps_at_last_save = int(scheduler.last_epoch)
-        ckpt_lib.write_run_state(run_state_path, phase, tokens, name)
-        try:
-            save_loss_graph(losses, loss_png)
-            save_expert_selection_graph(unwrapped_model.moe.expert_tracker.get_stats(), experts_png)
-        except Exception as e:
-            logger.error(f"Error occurred while saving graphs: {e}")
+        use_collectives = collective and world_size > 1
+        if use_collectives:
+            accelerator.wait_for_everyone()
+        global_offset = snapshot_global_offset(start_doc_idx, collective=collective)
+        if world_size > 1 and not collective:
+            # only this rank's streams are known: step back a few chunks of the stride so the
+            # other ranks' streams, which may lag, lose nothing on the resume
+            global_offset = max(start_doc_idx, global_offset - 4 * LOG_INTERVAL * stream_stride)
+        if is_main:
+            name = (ckpt_lib.final_name(phase) if final
+                    else ckpt_lib.rolling_name(phase, tokens - start_token_count, loss_value))
+            path = os.path.join(checkpoint_dir, name)
+            sft_fields = dict(data_fields)
+            sft_fields["loop_rng_state"] = loop_rng.getstate()
+            # rank 0's CUDA state; a resumed rank derives its own from it (restore_rng_states)
+            sft_fields["cuda_rng_state"] = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+            # the plan the cosine was fitted to, compared on the next resume
+            sft_fields.update(plan)
+            # the masters and the weights are identical on every rank after a reduced step
+            save_sft_checkpoint(
+                unwrapped_model, optimizer, scheduler, path,
+                epoch=epoch, step=step, token_count=tokens, start_token_count=start_token_count,
+                global_offset=global_offset, losses=losses,
+                seed=cfg.seed, phase=phase, kill_checked=kill_checked, sft_fields=sft_fields,
+                fp32_masters=fp32_master_state(named_masters) if SAVE_FP32_MASTERS else None,
+            )
+            ckpt_lib.write_run_state(run_state_path, phase, tokens, name)
+            try:
+                save_loss_graph(losses, loss_png)
+                save_expert_selection_graph(unwrapped_model.moe.expert_tracker.get_stats(), experts_png)
+            except Exception as e:
+                log.error(f"Error occurred while saving graphs: {e}")
 
-        repo_dir = f"{phase}/final" if final else phase
-        hf.upload(path, f"{repo_dir}/{name}", droppable=not final)
-        for local, remote in ((status_path, f"{phase}/status.json"),
-                              (loss_png, f"{phase}/graphs/loss_graph.png")):
-            if os.path.isfile(local):
-                hf.upload(local, remote)
-        # retention: only deletes what is both outside the window AND confirmed uploaded. With
-        # uploads off (the local default) is_uploaded is never true, so nothing is pruned and the
-        # local run simply keeps every checkpoint -- which is the right default when the disk is
-        # the only copy.
-        for deleted in ckpt_lib.prune_checkpoints(
-            checkpoint_dir, cfg.keep_local_checkpoints, hf.is_uploaded
-        ):
-            hf.delete(f"{phase}/{os.path.basename(deleted)}")
+            repo_dir = f"{phase}/final" if final else phase
+            hf.upload(path, f"{repo_dir}/{name}", droppable=not final)
+            for local, remote in ((status_path, f"{phase}/status.json"),
+                                  (loss_png, f"{phase}/graphs/loss_graph.png")):
+                if os.path.isfile(local):
+                    hf.upload(local, remote)
+            # retention: only deletes what is both outside the window AND confirmed uploaded. With
+            # uploads off (the local default) is_uploaded is never true, so nothing is pruned and the
+            # local run simply keeps every checkpoint -- which is the right default when the disk is
+            # the only copy.
+            for deleted in ckpt_lib.prune_checkpoints(
+                checkpoint_dir, cfg.keep_local_checkpoints, hf.is_uploaded
+            ):
+                hf.delete(f"{phase}/{os.path.basename(deleted)}")
+            # long-term retention for runs with uploads off: delete old rolling saves that are not
+            # milestones, whatever the uploader says (keep_every_tokens 0 keeps today's behaviour)
+            keep_every = int(getattr(cfg, "keep_every_tokens", 0) or 0)
+            if keep_every:
+                names = [os.path.join(checkpoint_dir, n) for n in os.listdir(checkpoint_dir)
+                         if n.startswith(ckpt_lib.CKPT_PREFIX) and n.endswith(".pt")]
+                for doomed in select_retention_deletions(names, cfg.keep_local_checkpoints, keep_every):
+                    try:
+                        os.remove(doomed)
+                        logger.info(f"retention: deleted {os.path.basename(doomed)} (not a "
+                                    f"{keep_every:,} token milestone, outside the newest "
+                                    f"{cfg.keep_local_checkpoints})")
+                    except OSError as e:
+                        logger.warning(f"retention: could not delete {doomed}: {e}")
+        # every rank, so the stop and resume decisions that read it stay identical across ranks
+        steps_at_last_save = int(scheduler.last_epoch)
+        if use_collectives:
+            accelerator.wait_for_everyone()
 
     def grounded_str(stats):
         if "grounded_auroc" not in stats and "grounded_auroc_evidence" not in stats:
@@ -1633,10 +2313,11 @@ def sft(args):
         Either is None when it could not be read."""
         stats = evaluate(unwrapped_model, fixed_dataset, device, tokenizer.pad_token_id,
                          cfg.fixed_eval_max_batches, conversation_weighting=False,
-                         selector_by_loop=True)
+                         selector_by_loop=True, rank=rank, world_size=world_size,
+                         gather=gather_eval)
         per_condition = (stats or {}).get("per_condition_ce") or {}
         if "none" not in per_condition or "gold" not in per_condition:
-            logger.warning(f"fixed-target pass read no gold/none tokens from {fixed_split}")
+            log.warning(f"fixed-target pass read no gold/none tokens from {fixed_split}")
             return None, None
         # token-level mean over the answer tokens, the unit the in-context ceiling was measured in
         none_ce = per_condition["none"]
@@ -1661,7 +2342,7 @@ def sft(args):
         if grounded_str(stats):
             parts.append(grounded_str(stats))
         parts.append(f"{stats['tokens']:,} answer tokens over {stats['batches']} batches")
-        logger.info(" | ".join(parts))
+        log.info(" | ".join(parts))
         by_loop_ce = stats.get("per_condition_ce_by_loop") or {}
         selector = stats.get("selector_by_loop") or {}
         for loop_idx in sorted(set(by_loop_ce) | set(selector)):
@@ -1673,7 +2354,7 @@ def sft(args):
                     line += " | gain vs none: {" + ", ".join(
                         f"{c}: {loop_ce['none'] - v:+.4f}" for c, v in loop_ce.items()
                         if c != "none") + "}"
-                logger.info(line)
+                log.info(line)
             reading = selector.get(loop_idx)
             if reading is None:
                 continue
@@ -1689,7 +2370,7 @@ def sft(args):
                                ("gold_share", "gold share")):
                 if key in reading:
                     fields.append(f"{label} {reading[key]:.4f}")
-            logger.info(f"[eval fixed] loop {loop_idx + 1} | " + " | ".join(fields))
+            log.info(f"[eval fixed] loop {loop_idx + 1} | " + " | ".join(fields))
         # the pooled numbers above are what the decision reads; these only say which source moves them
         by_source = stats.get("per_source_condition_ce") or {}
         for name, source_ce in by_source.items():
@@ -1709,7 +2390,7 @@ def sft(args):
                 fields.append(f"gold gain {source_gains['gold'] / source_ceiling:.1%} of the "
                               f"{source_ceiling:.2f} nat in-context ceiling (same split)")
             fields.append(f"{stats['per_source_tokens'].get(name, 0):,} answer tokens")
-            logger.info(" | ".join(fields))
+            log.info(" | ".join(fields))
         return gold_gain, content_gain
 
     def run_validation(epoch, step):
@@ -1717,9 +2398,10 @@ def sft(args):
         ``(gold_gain, content_gain)``, both None without a fixed split."""
         stats = evaluate(unwrapped_model, val_dataset, device, tokenizer.pad_token_id,
                          cfg.eval_max_batches,
-                         conversation_weighting=cfg.conversation_loss_weighting)
+                         conversation_weighting=cfg.conversation_loss_weighting,
+                         rank=rank, world_size=world_size, gather=gather_eval)
         if stats is None:
-            logger.warning(
+            log.warning(
                 f"validation pass produced no supervised tokens -- is {cfg.val_split} empty?"
             )
         else:
@@ -1743,7 +2425,7 @@ def sft(args):
             sel_str += f" | grounded: {stats['grounded']:.4f}"
             if grounded_str(stats):
                 sel_str += f" ({grounded_str(stats)})"
-        logger.info(
+        log.info(
             f"[eval] epoch {epoch} step {step} | CE: {stats['ce']:.4f} | ppl: {stats['ppl']:.3f} | "
             f"p_max: {stats['p_max']:.4f} | top1_acc: {stats['top1_acc']:.4f} | "
             f"{stats['tokens']:,} supervised tokens over {stats['batches']} batches"
@@ -1794,7 +2476,7 @@ def sft(args):
                 norms.append(f"{_fresh_family(name)}: "
                              + (f"{grad.detach().float().norm().item():.3e}" if grad is not None
                                 else "None"))
-            logger.info(f"grad norms at optimizer step {optimizer_step} (pre-clip): "
+            log.info(f"grad norms at optimizer step {optimizer_step} (pre-clip): "
                         + ", ".join(norms))
         return probe
 
@@ -1814,7 +2496,16 @@ def sft(args):
                 worker_state.fill_(-1)
                 step = 0
 
-            for local_step, batch in enumerate(dataloader):
+            batches = dataloader
+            if world_size > 1:
+                def min_over_ranks(n):
+                    t = torch.tensor([n], dtype=torch.long, device=device)
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+                    return int(t.item())
+                # every rank takes the same number of micro steps, or a collective hangs
+                batches = lockstep_batches(dataloader, LOG_INTERVAL, min_over_ranks)
+
+            for local_step, batch in enumerate(batches):
                 step = local_step + (step_offset if resume_epoch else 0)
                 worker_state[batch["worker_id"][0].to(worker_state.device)] = (
                     batch["doc_idx"][0].to(worker_state.device)
@@ -1888,13 +2579,44 @@ def sft(args):
                     continue
 
                 # everything below pulls to the host; throttled to LOG_INTERVAL like pretrain.py
-                val_loss = loss.item()
-                losses.append(val_loss)
-                token_count = unwrapped_model._token_tracker.sync()
+                if world_size == 1:
+                    reduced = None
+                    val_loss = loss.item()
+                    losses.append(val_loss)
+                    token_count = unwrapped_model._token_tracker.sync()
+                    if evidence_token_pending is not None:
+                        evidence_token_count += int(evidence_token_pending.item())
+                        evidence_token_pending.zero_()
+                else:
+                    # the one reduction of the log step: token and evidence deltas, any rank's stop
+                    # and checkpoint request, the means of the logged scalars. Every decision below
+                    # reads this vector's sum, so every rank takes the same branch
+                    local_total = unwrapped_model._token_tracker.sync()
+                    local_evidence = 0
+                    if evidence_token_pending is not None:
+                        local_evidence = int(evidence_token_pending.item())
+                        evidence_token_pending.zero_()
+                    if is_main:
+                        control.poll()
+                    counts = control_counts(control, include_user_stop=is_main)
+                    counts.update(tokens=local_total - last_local_total, evidence=local_evidence)
+                    last_local_total = local_total
+                    vec = pack_log_vector(
+                        counts,
+                        {"loss": loss, "ce": loss_ce, "aux": aux_loss,
+                         "p_max": metrics.get("p_max"), "top1": metrics.get("top1_acc"),
+                         "selection": metrics.get("selection_loss"),
+                         "contrastive": metrics.get("contrastive_loss"),
+                         "grounded": metrics.get("groundedness_loss")},
+                        metrics["per_loop_ce"], device,
+                    )
+                    torch.distributed.all_reduce(vec)
+                    reduced = unpack_log_vector(vec.tolist(), world_size)
+                    val_loss = reduced["scalars"]["loss"]
+                    losses.append(val_loss)
+                    token_count += int(round(reduced["counts"]["tokens"]))
+                    evidence_token_count += int(round(reduced["counts"]["evidence"]))
                 sft_tokens = token_count - start_token_count
-                if evidence_token_pending is not None:
-                    evidence_token_count += int(evidence_token_pending.item())
-                    evidence_token_pending.zero_()
                 now = time.time()
                 interval_s = max(now - last_log_time, 1e-6)
                 tokens_per_sec = (token_count - last_token_count) / interval_s
@@ -1929,17 +2651,26 @@ def sft(args):
                         ),
                     )
                     next_refresh = sft_tokens + refresh_tokens
+                    if world_size > 1:
+                        # each rank clustered and recycled from its own reservoir; rank 0's result wins
+                        sync_ir_from_main(
+                            unwrapped_model.moe, optimizer, master_pairs,
+                            broadcast_from_main,
+                        )
                     # logged as its own line so a loss step at a refresh boundary is attributable to
                     # the refresh rather than to the data; candidate recall (the number that says
                     # whether the partition is still covering what the read wants) is already inside
                     # ir_refresh_stats, reported identically regardless of which profile triggered it
-                    logger.info(
+                    log.info(
                         f"IR cluster refresh at {sft_tokens / 1e6:.1f}M {phase} tokens"
                         + (f" (temperature scale {scale:.4f})" if args.ir else "")
                         + f": {ir_refresh_stats}"
                     )
 
-                per_loop_ce = ", ".join(f"{ce.item():.4f}" for ce in metrics["per_loop_ce"])
+                per_loop_ce = ", ".join(
+                    f"{v:.4f}" for v in (reduced["per_loop"] if reduced is not None
+                                         else [ce.item() for ce in metrics["per_loop_ce"]])
+                )
                 loop_scale = ", ".join(f"{s:.4f}" for s in unwrapped_model.moe.loop_scale.tolist())
                 # per loop IR retrieval entropy over ln(num_ir_entries), same field pretrain.py logs
                 ir_entropy = (
@@ -1947,7 +2678,8 @@ def sft(args):
                     if unwrapped_model.moe.ir_tracker is not None else []
                 )
                 ir_entropy_str = (
-                    f"IR E/ln{unwrapped_model.moe.ir_tracker.num_entries}: ["
+                    f"IR E/ln{unwrapped_model.moe.ir_tracker.num_entries}"
+                    f"{' (rank 0 slice)' if world_size > 1 else ''}: ["
                     + ", ".join(f"{e:.4f}" for e in ir_entropy) + "] | "
                     if ir_entropy else ""
                 )
@@ -1985,16 +2717,19 @@ def sft(args):
                     # says the selector is ranking; either alone can move for the other's reason.
                     sel = metrics.get("selection_loss")
                     if sel is not None:
-                        ir_entropy_str += f"selection: {sel.item():.4f} | "
+                        ir_entropy_str += (f"selection: {reduced['scalars']['selection']:.4f} | "
+                                           if reduced is not None else f"selection: {sel.item():.4f} | ")
                     # the retriever's term; NaN on a run that does not carry it
                     con = metrics.get("contrastive_loss")
                     if con is not None and TrainingConfig.evidence_contrastive_weight > 0.0:
-                        ir_entropy_str += f"contrastive: {con.item():.4f} | "
+                        ir_entropy_str += (f"contrastive: {reduced['scalars']['contrastive']:.4f} | "
+                                           if reduced is not None else f"contrastive: {con.item():.4f} | ")
                     # the other supervised head on the port. NaN whenever the checkpoint carries no
                     # head or the corpus no .ans, which is a missing label rather than a zero loss
                     grounded = metrics.get("groundedness_loss")
                     if grounded is not None:
-                        ir_entropy_str += f"grounded: {grounded.item():.4f} | "
+                        ir_entropy_str += (f"grounded: {reduced['scalars']['grounded']:.4f} | "
+                                           if reduced is not None else f"grounded: {grounded.item():.4f} | ")
                     evidence_module = unwrapped_model.moe.shared_evidence
                     if unwrapped_model.moe.reader_kv:
                         # no zero-init tensor to watch in this mode: the read shares shared_attn's
@@ -2026,11 +2761,19 @@ def sft(args):
                             if bool((cond_ids_flat == idx).any())
                         ]
                         if mass_by_cond:
-                            ir_entropy_str += f"external mass: {{{', '.join(mass_by_cond)}}} | "
+                            ir_entropy_str += (
+                                f"external mass{' (rank 0 slice)' if world_size > 1 else ''}: "
+                                f"{{{', '.join(mass_by_cond)}}} | "
+                            )
 
                 def _metric(key):
+                    if reduced is not None:
+                        return reduced["scalars"][{"top1_acc": "top1"}.get(key, key)]
                     value = metrics.get(key)
                     return value.item() if value is not None else float("nan")
+
+                ce_val = reduced["scalars"]["ce"] if reduced is not None else loss_ce.item()
+                aux_val = reduced["scalars"]["aux"] if reduced is not None else aux_loss.item()
 
                 eta = eta_seconds(sft_tokens, target_tokens or 0, tokens_per_sec) if target_tokens else None
                 # a separate field from "{phase} tokens", never folded into it: that counter anchors
@@ -2041,9 +2784,9 @@ def sft(args):
                 evidence_field = (
                     f" | evidence stream: {evidence_token_count / 1e6:.2f}M" if args.evidence else ""
                 )
-                logger.info(
-                    f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {loss_ce.item():.4f} | "
-                    f"Aux: {aux_loss.item():.4f} | loop_scale: [{loop_scale}] | "
+                log.info(
+                    f"Epoch {epoch} | Step {step} | Loss: {val_loss:.4f} | Loss (CE): {ce_val:.4f} | "
+                    f"Aux: {aux_val:.4f} | loop_scale: [{loop_scale}] | "
                     f"p_max: {_metric('p_max'):.4f} | top1_acc: {_metric('top1_acc'):.4f} | "
                     f"per-loop CE: [{per_loop_ce}] | {ir_entropy_str}"
                     f"LR: {scheduler.get_last_lr()[0]:.3e} | {phase} tokens: {sft_tokens / 1e6:.2f}M"
@@ -2054,23 +2797,25 @@ def sft(args):
                     + (f" | ETA: {format_duration(eta)}" if eta is not None else "")
                 )
 
-                write_status(
-                    status_path, phase=phase, tokens=sft_tokens,
-                    phase_target=target_tokens or 0, run_target=target_tokens or 0,
-                    tokens_per_sec=tokens_per_sec, loss=val_loss,
-                    eta_phase=format_duration(eta) if eta is not None else "n/a",
-                    eta_run=format_duration(eta) if eta is not None else "n/a",
-                    step=step, epoch=epoch,
-                )
+                if is_main:
+                    write_status(
+                        status_path, phase=phase, tokens=sft_tokens,
+                        phase_target=target_tokens or 0, run_target=target_tokens or 0,
+                        tokens_per_sec=tokens_per_sec, loss=val_loss,
+                        eta_phase=format_duration(eta) if eta is not None else "n/a",
+                        eta_run=format_duration(eta) if eta is not None else "n/a",
+                        step=step, epoch=epoch,
+                    )
 
                 if sft_tokens >= next_eval:
                     gold_gain, content_gain = run_validation(epoch, step)
-                    next_eval = sft_tokens + cfg.eval_every_tokens
+                    # on the grid, not one cadence past a log step that overshot it
+                    next_eval = next_grid_point(sft_tokens, cfg.eval_every_tokens)
                     if kill_tokens and not kill_checked and sft_tokens >= kill_tokens:
                         min_gain = cfg.kill_min_gain
                         if gold_gain is None or content_gain is None:
                             # left armed: a pass that read nothing is not a decision
-                            logger.info(
+                            log.info(
                                 "kill check skipped: the fixed-target pass read no gold, none or "
                                 "distractors tokens; it runs again at the next eval"
                             )
@@ -2081,7 +2826,7 @@ def sft(args):
                             readings = (f"gold gain {gold_gain:+.4f} nats, content gain "
                                         f"{content_gain:+.4f} nats")
                             if gold_gain < min_gain or content_gain < min_gain:
-                                logger.warning(
+                                log.warning(
                                     f"KILL: fixed-target {readings}; one is under {min_gain} at "
                                     f"{sft_tokens / 1e6:.2f}M {phase} tokens. Saving and stopping "
                                     f"(exit {EXIT_USER_STOP}, not restarted by a wrapper)."
@@ -2090,32 +2835,47 @@ def sft(args):
                                 exit_code = EXIT_USER_STOP
                                 stop_training = True
                                 break
-                            logger.info(
+                            log.info(
                                 f"kill check passed at {sft_tokens / 1e6:.2f}M {phase} tokens: "
                                 f"{readings}, both >= {min_gain}"
                             )
 
                 # polled at the log cadence: a stat every few seconds, no GPU sync, and well
                 # inside vast's SIGTERM grace period
-                control.poll()
-                if control.stop_requested:
+                if reduced is None:
+                    control.poll()
+                    stop_now, stop_code, stop_reason = (control.stop_requested, control.exit_code,
+                                                        control.reason)
+                    checkpoint_request = None
+                else:
+                    # the requests of every rank, summed at the top of this log step (rank 0's STOP
+                    # file and any rank's SIGTERM or SIGUSR1): the same answer on every rank
+                    stop_code = stop_exit_code(reduced["counts"])
+                    stop_now = stop_code is not None
+                    stop_reason = control.reason or "a stop request on another rank"
+                    checkpoint_request = reduced["counts"]["checkpoint"] > 0
+                if stop_now:
                     if stop_needs_save(int(scheduler.last_epoch), steps_at_last_save,
                                        stop_slack_steps):
-                        logger.info(f"Stopping: {control.reason}. Saving checkpoint...")
+                        log.info(f"Stopping: {stop_reason}. Saving checkpoint...")
                         save_and_sync(epoch, step, val_loss, token_count)
                     else:
-                        logger.info(
-                            f"Stopping: {control.reason}. The last checkpoint is "
+                        log.info(
+                            f"Stopping: {stop_reason}. The last checkpoint is "
                             f"{int(scheduler.last_epoch) - steps_at_last_save} optimizer step(s) "
                             f"back, within one log interval: exiting on it without another save"
                         )
-                    exit_code = control.exit_code
+                    exit_code = stop_code
                     stop_training = True
                     break
 
-                if sft_tokens >= next_checkpoint or control.take_checkpoint_request():
+                if sft_tokens >= next_checkpoint or (
+                    checkpoint_request if reduced is not None else control.take_checkpoint_request()
+                ):
                     save_and_sync(epoch, step, val_loss, token_count)
-                    next_checkpoint = sft_tokens + cfg.checkpoint_every_tokens
+                    # the next grid point past where this save landed (a SIGUSR1 save included),
+                    # not one cadence past it: a coarse log step must not walk the grid
+                    next_checkpoint = next_grid_point(sft_tokens, cfg.checkpoint_every_tokens)
 
             if stop_training:
                 break
@@ -2124,29 +2884,39 @@ def sft(args):
             start_doc_idx, step_offset = 0, 0
             resumed = False
             worker_state.fill_(-1)
-            logger.info(f"Epoch {epoch} finished at {sft_tokens / 1e6:.2f}M {phase} tokens")
+            log.info(f"Epoch {epoch} finished at {sft_tokens / 1e6:.2f}M {phase} tokens")
 
         if stop_training:
             # a stop is not a finished run: no final checkpoint, and a restartable exit code so a
             # wrapper knows to relaunch (the rolling checkpoint just written is the resume point)
             return exit_code
 
-        token_count = unwrapped_model._token_tracker.sync()
+        if world_size == 1:
+            token_count = unwrapped_model._token_tracker.sync()
+        else:
+            # the ranks left their last chunk together, so this reduction is matched on every rank
+            final_delta = torch.tensor(
+                [float(unwrapped_model._token_tracker.sync() - last_local_total)],
+                dtype=torch.float64, device=device)
+            torch.distributed.all_reduce(final_delta)
+            token_count += int(round(final_delta.item()))
         run_validation(cfg.num_epochs - 1, step)
         save_and_sync(cfg.num_epochs - 1, step, losses[-1] if losses else float("nan"),
                       token_count, final=True)
-        logger.info(
+        log.info(
             f"{phase} complete: {(token_count - start_token_count) / 1e6:.2f}M tokens over "
             f"{cfg.num_epochs} epochs in {(time.time() - timer) / 60:.1f} min"
         )
     except KeyboardInterrupt:
-        logger.info("Interrupted. Saving checkpoint...")
+        log.info("Interrupted. Saving checkpoint...")
         exit_code = EXIT_USER_STOP
         try:
+            # no collectives here: only the interrupted process may still be alive
             save_and_sync(epoch, step, losses[-1] if losses else float("nan"),
-                          unwrapped_model._token_tracker.sync())
+                          unwrapped_model._token_tracker.sync() if world_size == 1 else token_count,
+                          collective=False)
         except Exception as e:
-            logger.error(f"Failed to save the interrupt checkpoint: {e}")
+            log.error(f"Failed to save the interrupt checkpoint: {e}")
     finally:
         # never let a stop race the uploader: drain before the process goes away
         hf.drain(timeout=600)

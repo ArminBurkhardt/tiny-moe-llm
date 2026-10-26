@@ -88,6 +88,8 @@ class EvidenceDataset(SFTDataset):
         shuffle: bool = True,
         max_evidence_tokens: int = 12288,
         loss_weight_floor_tokens: int = 64,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         """
         Args:
@@ -111,12 +113,14 @@ class EvidenceDataset(SFTDataset):
                 conversation's total weight at ``n / floor < 1`` instead of exactly 1 -- it reduces a
                 short conversation's pull, it does not restore parity by inflating the long ones. See
                 the arithmetic where it is applied, below.
+            rank, world_size: the data parallel shard this reader streams, see ``SFTDataset``.
             (everything else: see ``SFTDataset``.)
         """
         super().__init__(
             data_dir=data_dir, tokenizer=tokenizer, batch_size=batch_size,
             max_length=max_length, split=split, num_mtp_tokens=num_mtp_tokens,
             start_doc_idx=start_doc_idx, seed=seed, epoch=epoch, shuffle=shuffle,
+            rank=rank, world_size=world_size,
         )
         self.max_evidence_tokens = max_evidence_tokens
         self.loss_weight_floor_tokens = loss_weight_floor_tokens
@@ -237,8 +241,11 @@ class EvidenceDataset(SFTDataset):
         order = self.document_order(num_docs)
 
         worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
+        local_worker = worker_info.id if worker_info is not None else 0
+        local_workers = worker_info.num_workers if worker_info is not None else 1
+        # one stream per (rank, worker) pair, interleaved over the positions: see SFTDataset
+        num_workers = local_workers * self.world_size
+        worker_id = local_worker * self.world_size + self.rank
         first = self.start_doc_idx + ((worker_id - self.start_doc_idx) % num_workers)
         logger.info(
             f"[worker {worker_id}] evidence epoch {self.epoch}: starting at position "

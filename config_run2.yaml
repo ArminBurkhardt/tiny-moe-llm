@@ -1,0 +1,99 @@
+# the real run (shape L, docs/plans/RUN2.md): width 768, 8 prelude layers, 32 routed experts top 2,
+# 3 loops, seq 4096, key/value reader (set by sft.py --reader-kv on the seed). select it with
+# TINY_LLM_CONFIG=config_run2.yaml. relative to the repo root. every model: and training: key
+# config.py reads is present here. the control (config_run2_control.yaml) differs in its split, its
+# token budget and the warmup fraction only; tests/test_run2_config.py asserts that.
+# decided 2026-10-25 (the user) unless a line says otherwise; the model block is config.yaml's with
+# the overrides named below
+model:
+  vocab_size: 65536          # same tokenizer and uint16 corpus as every run
+  max_seq_length: 4096
+  hidden_size: 768           # shape L is the configured shape, not the blueprint's 1024 (RUN2 row 0, 2026-10-25)
+  intermediate_size: 2304    # dense decoder MLP
+  moe_intermediate_size: 2304
+  num_layers: 8              # prelude layers
+  num_attention_heads: 12    # 3 kv heads (num_heads // 4)
+  head_dim: 64
+  dropout: 0.0
+  per_layer_embeddings_size: 32
+  num_mlp_experts: 32        # kept at 32 routed experts (RUN2 row 1, 2026-10-25); the expert count is a cost choice (expert_count_pilot.md)
+  num_attn_experts: 1
+  top_k: 2
+  n_loops: 3                 # depth 3, loop_count_sampling 0.3 below (RUN2 Scope)
+  num_ir_experts: 1
+  num_ir_entries: 256        # the pilot's selector table; config.yaml's 65536 entries are dropped (NEXT.md Decisions, learned IR table; RUN2 build item 2, 2026-10-25)
+  ir_dim: 384                # bge width, the external keys arrive at it
+  ir_num_clusters: 0         # exact full-table read as at pilot (RUN2 Model table): at 256 entries the two stage read buys nothing, and 0 divides any entry count; probe clusters below are inert
+  ir_probe_clusters: 4
+  ir_read_top_k: 32
+  ir_direct_read: true
+  evidence_encoder: true     # the encoder runs over all 8 prelude layers (RUN2 Model table)
+  mtp_num_extra_tokens: 2
+  lm_head_factor: 4
+
+training:                    # loss weights, read by train_step for every profile
+  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation 2 x 8 GPUs = 524,288 tokens per update
+  seq_length: 4096
+  lr: 4.0e-4                 # the 16B run's rate at this width and batch (RUN2 Schedule, Optimizer)
+  weight_decay: 0.1          # config.yaml has 0.02; the micro and pilot value every leak read ran under (RUN2 Schedule, Optimizer; build item 2)
+  grad_clip: 1.0
+  optimizer: adamw           # Muon dropped 2026-10-21
+  num_epochs: 1
+  lambda_mtp: 0.1
+  aux_loss_weight: 0.01      # inert under loss_free
+  moe_balancing: loss_free   # config.yaml has aux; R8, decided 2026-10-21 (RUN2 Scope, balancing)
+  moe_balance_bias_rate: 0.001
+  evidence_selection_weight: 0.1
+  groundedness_weight: 0.1   # the seed carries the head (migrate_groundedness_head.py); gated on labels
+  evidence_selection_weighting: segment # config.yaml has token; RUN2 row 2, decided 2026-10-25
+  evidence_contrastive_weight: 0.0   # no retriever term; bge keys the store (decided 2026-10-21, unchanged 2026-10-24)
+  evidence_contrastive_temperature: 0.07
+  evidence_contrastive_loops: [0]   # inert at weight 0; the 2026-10-24 default
+  evidence_contrastive_trunk_grad: 1.0
+  target_tokens: 280000000000 # 280B (RUN2 row 6); the evidence trainer's budget is num_epochs x the split, see evidence: num_epochs
+  warmup_steps: 1000         # 0.52B tokens (RUN2 Schedule, Optimizer); the evidence profile reads warmup_fraction below
+  noise_anneal_tokens: 1000000000 # router noise annealed over 1B tokens (RUN2 Schedule, Optimizer)
+  loop_ce_weights: [0.2, 0.3, 1.0]
+  loop_ce_subsample: 0.25
+  loop_count_sampling: 0.3
+  grad_accumulation_steps: 2 # see batch_size
+  seed: 42
+  data_dir: "data/prepared_run2"
+  phase: "phase1"
+  checkpoint_every_tokens: 1000000000
+  hf_upload_repo: ""         # the pilot's value; set on the cluster by hand (RUN2 Storage: 280 uploads at the 1B cadence)
+
+sft:
+  data_dir: "data/prepared_run2"
+  seq_length: 4096
+  dropout: 0.0
+  hf_upload_repo: ""
+
+evidence:
+  train_split: "run2_warm_train"       # every launch passes --train-split; the switch relaunches on run2_main_train (scripts/launch_run2.sh)
+  val_split: "inject_val"              # filler only, written by the bios_main stage (docs/plans/RUN2_corpus.md)
+  fixed_split: "evidence_fixed"        # the held-out QA pass; the launcher links it into the data dir from DATA_ROOT/prepared
+  fixed_eval_max_batches: 100
+  kill_tokens: 5000000000              # the built kill at the first fixed eval past 5B (RUN2 Early signals)
+  kill_min_gain: 0.1
+  freeze_evidence_gate: true
+  lr: 4.0e-4
+  fresh_lr: 4.0e-4                     # from scratch: one rate for everything, as the pilot
+  num_epochs: 3                        # the trainer's budget is num_epochs x split rows; 280B needs 2.8 passes over a 100B split, see the report: build the merges at 93.33B or accept 300B
+  weight_decay: 0.1
+  dropout: 0.0
+  batch_size: 8                        # per GPU, see training: batch_size
+  grad_accumulation_steps: 2
+  warmup_fraction: 0.00187             # 1000 steps of about 534,000 (280B / 524,288)
+  lr_min_factor: 0.1                   # cosine to 0.1 lr (RUN2 Schedule, Optimizer)
+  seed: 1234
+  checkpoint_every_tokens: 1000000000  # save every 1B (RUN2 Schedule, Cadence)
+  keep_local_checkpoints: 2            # the newest two rolling saves stay; the rest are deleted by keep_every_tokens (2026-10-26)
+  keep_every_tokens: 10000000000       # keep the first save at or past every 10B tokens and the final (RUN2 Schedule; 2026-10-26)
+  eval_every_tokens: 2000000000        # [eval] is 1B and [eval fixed] 2B in RUN2, but the trainer runs both in one pass at this key: 2B
+  eval_max_batches: 40
+  conversation_loss_weighting: false   # plain per-token CE: this is pretraining, not policy
+  loss_weight_floor_tokens: 64
+  max_evidence_tokens: 9216            # per row, about 9k (RUN2 Schedule, Batch); set from the packing line in minute one
+  cluster_refresh_tokens: 0
+  dead_quantile: 0.0

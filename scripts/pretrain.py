@@ -103,6 +103,92 @@ def log_precision_mode():
             + ". Note the routed MoE grouped GEMM stays BF16 by design (see moe.py)."
         )
 
+def next_grid_point(tokens: int, every: int) -> int:
+    """The first multiple of ``every`` strictly above ``tokens``.
+
+    The save and eval cadence after a resume and after every save or eval: a relaunch at 300.4M
+    with a 25M cadence saves next at 325M, not at 325.4M, and a save taken a log interval past a
+    grid point is followed by the next grid point, not by one that carries the overshoot, so
+    stops, relaunches and coarse log steps never shift the grid. At ``tokens = 0`` (a fresh run)
+    it equals ``tokens + every``, the old form.
+
+    Args:
+        tokens: tokens trained in this run so far.
+        every: the cadence in tokens; a cadence of zero or below keeps the old ``tokens + every``.
+
+    Returns:
+        The token count at which the next save (or eval) is due.
+    """
+    if every <= 0:
+        return tokens + every
+    return (tokens // every + 1) * every
+
+
+def reduce_balance_counts(moe, all_reduce) -> None:
+    """Sum the loss-free balancer's hard counts over the data parallel ranks, in place.
+
+    Each rank counts the selections of its own slice, so the bias would move from a different
+    load on every rank and the ranks' routers would drift apart. Called once per optimizer step
+    on every rank, right before ``update_balance_bias``: the bias and its fp32 shadow then move
+    from the same global counts everywhere. One device collective on a ``[n_loops, num_experts]``
+    tensor, no host sync.
+
+    Args:
+        moe: the unwrapped ``LoopMixtureOfExperts``.
+        all_reduce: callable that sums a tensor over the ranks in place
+            (``torch.distributed.all_reduce``).
+    """
+    counts = moe._balance_state(moe.balance_bias.device)[1]
+    all_reduce(counts)
+
+
+def all_reduce_grads(params, all_reduce, world_size: int, bucket_numel: int = 1 << 26) -> None:
+    """Average the parameters' gradients over the data parallel ranks, in fp32, in place.
+
+    Replaces DDP: the loss heads (``lm_head``, the MTP head, the groundedness head) are applied
+    outside the wrapped forward, so DDP's reducer cannot see their gradients. A parameter with no
+    gradient on this rank (the port on a slice with no evidence) contributes zeros, so every rank
+    reduces the same buckets in the same order. Gradients are summed in fp32 buckets and divided
+    by the world size, then written back in the parameter's dtype. Device collectives only, no host
+    sync.
+
+    Args:
+        params: the trainable parameters, in the same order on every rank.
+        all_reduce: callable summing a tensor over the ranks in place.
+        world_size: number of ranks.
+        bucket_numel: elements per fp32 bucket.
+    """
+    bucket, owners, size = [], [], 0
+
+    def flush():
+        nonlocal bucket, owners, size
+        if not bucket:
+            return
+        flat = torch.cat(bucket)
+        all_reduce(flat)
+        flat /= world_size
+        at = 0
+        for p in owners:
+            n = p.numel()
+            piece = flat[at:at + n].view_as(p).to(p.dtype)
+            if p.grad is None:
+                p.grad = piece
+            else:
+                p.grad.copy_(piece)
+            at += n
+        bucket, owners, size = [], [], 0
+
+    for p in params:
+        g = p.grad.detach().float().reshape(-1) if p.grad is not None else torch.zeros(
+            p.numel(), dtype=torch.float32, device=p.device)
+        bucket.append(g)
+        owners.append(p)
+        size += g.numel()
+        if size >= bucket_numel:
+            flush()
+    flush()
+
+
 def answer_start_positions(labels: torch.Tensor) -> torch.Tensor:
     """``[B, S]`` mask of the last PROMPT token before each supervised span.
 
@@ -327,6 +413,10 @@ def train_step(
                 and evidence.chunk_gold is not None
                 and answerable is not None
             ):
+                assert not (unwrapped.use_checkpointing or unwrapped.use_sub_checkpointing), (
+                    "the groundedness loss reads tensors the forward stashed, which gradient "
+                    "checkpointing recomputes under no_grad -- it would train nothing."
+                )
                 groundedness = unwrapped.groundedness_term(
                     evidence.chunk_gold, answerable, answer_start_positions(labels)
                 )
@@ -352,6 +442,9 @@ def train_step(
             # clip on the real update step only (matters once gradient accumulation > 1).
             # accelerator.clip_grad_norm_ unscales/handles the wrapped params correctly.
             if accelerator.sync_gradients:
+                if getattr(accelerator, "num_processes", 1) > 1:
+                    all_reduce_grads([p for p in unwrapped.parameters() if p.requires_grad],
+                                     torch.distributed.all_reduce, accelerator.num_processes)
                 if grad_probe is not None:
                     grad_probe()
                 accelerator.clip_grad_norm_(model.parameters(), TrainingConfig.grad_clip)
@@ -363,7 +456,11 @@ def train_step(
             if accelerator.sync_gradients:
                 # once per real update, from the hard counts the micro steps since the last one
                 # accumulated; on device, no sync. under the aux term the rate is zero, so the
-                # call only folds the counts into the load log and resets them
+                # call only folds the counts into the load log and resets them. Under data parallel
+                # training the counts are summed over the ranks first, so every rank moves the
+                # same bias from the same global load
+                if getattr(accelerator, "num_processes", 1) > 1:
+                    reduce_balance_counts(unwrapped.moe, torch.distributed.all_reduce)
                 unwrapped.moe.update_balance_bias(
                     TrainingConfig.moe_balance_bias_rate if TrainingConfig.moe_balancing == "loss_free" else 0.0
                 )
@@ -862,8 +959,8 @@ def pretrain(phase=None):
         for deleted_path in deleted:
             hf.delete(f"checkpoints/{os.path.basename(deleted_path)}")
 
-    # first periodic checkpoint one interval after wherever this process picked up
-    next_checkpoint_tokens = last_token_count + TrainingConfig.checkpoint_every_tokens
+    # first periodic checkpoint on the next grid point after wherever this process picked up
+    next_checkpoint_tokens = next_grid_point(last_token_count, TrainingConfig.checkpoint_every_tokens)
     exit_code = EXIT_OK
 
     stop_training = False
@@ -1073,7 +1170,7 @@ def pretrain(phase=None):
                     # drained for logging -- no extra host sync. SIGUSR1 forces one immediately.
                     if n_tokens >= next_checkpoint_tokens or control.take_checkpoint_request():
                         save_and_sync(epoch, dataset_idx, val_loss, n_tokens)
-                        next_checkpoint_tokens = n_tokens + TrainingConfig.checkpoint_every_tokens
+                        next_checkpoint_tokens = next_grid_point(n_tokens, TrainingConfig.checkpoint_every_tokens)
 
             # the dataloader ran dry -- a legitimate end of a phase, not an error. nominally the
             # phase token target fires first (25.415B vs a phase1.bin built for 25.5B), but that

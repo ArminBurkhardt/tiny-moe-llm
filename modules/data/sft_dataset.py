@@ -27,6 +27,14 @@ with the same ``position % num_workers`` arithmetic, so one conservative min-acr
 (the trainer's ``global_offset``) is still enough. Reading it back under a different ``seed`` or
 ``epoch`` would resume against a different permutation -- both are checkpointed for that reason.
 
+**Data parallel ranks are more workers.** With ``world_size`` ranks each reading its own loader,
+every (rank, worker) pair is one stream: stream ``worker * world_size + rank`` of ``workers *
+world_size`` takes the positions congruent to it, so the ranks interleave rather than split the
+permutation into blocks. Interleaving keeps the resume point ONE scalar (the minimum position any
+stream reached, plus the stride) and valid for any later number of ranks; the trainer merges the
+ranks' per stream positions with a MAX before it reads the minimum. ``world_size=1`` is exactly the
+per worker arithmetic above.
+
 Every batch also carries **``loss_weights``**, a ``[B, S]`` float tensor holding ``1 / (supervised
 tokens in this conversation)`` on each supervised position and 0 elsewhere -- NEXT.md Phase 2's
 fix #3. Under plain per-token CE every supervised token counts the same, so a conversation's
@@ -64,6 +72,8 @@ class SFTDataset(IterableDataset):
         seed: int = 42,
         epoch: int = 0,
         shuffle: bool = True,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         """
         Args:
@@ -85,8 +95,16 @@ class SFTDataset(IterableDataset):
             epoch: which epoch's permutation to generate; set via ``set_epoch``.
             shuffle: False reads in on-disk order (used for the validation split, where a stable
                 order makes successive eval numbers comparable).
+            rank: this data parallel rank's index, ``process_index`` under accelerate.
+            world_size: how many data parallel ranks read the split. Each rank then streams only
+                its own share of the positions (see ``_batch_iterator``); the defaults read all
+                of them, which is every caller before data parallel training existed.
         """
         super().__init__()
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank {rank} is outside world_size {world_size}")
+        self.rank = rank
+        self.world_size = world_size
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.max_length = max_length
@@ -148,8 +166,16 @@ class SFTDataset(IterableDataset):
         order = self.document_order(num_docs)
 
         worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
+        local_worker = worker_info.id if worker_info is not None else 0
+        local_workers = worker_info.num_workers if worker_info is not None else 1
+        # every (rank, worker) pair is one stream over the positions ``position % num_workers ==
+        # worker_id`` with ``num_workers = ranks * workers`` and ``worker_id = worker * ranks +
+        # rank``: interleaved, not blocked, so the resume point is still ONE scalar (the minimum
+        # position any stream has reached, plus the stride) whatever the number of ranks, and a
+        # relaunch on another number of ranks resumes at a valid position. With one rank this is
+        # exactly the old per worker arithmetic.
+        num_workers = local_workers * self.world_size
+        worker_id = local_worker * self.world_size + self.rank
 
         # positions (not raw doc ids) are what gets sharded and checkpointed -- see the module
         # docstring. same arithmetic as dataset.py so the resume story is unchanged.

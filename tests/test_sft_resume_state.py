@@ -21,6 +21,17 @@
    trained on epoch 0's order again; ``select_epoch`` keeps the two in step and a fresh run's
    passes read epochs 0, 1, 2 as before.
 
+9. **Every save and eval point is on the grid.** A simulated run of coarse log steps, taking each
+   point at the first log step past it and scheduling the next with ``next_grid_point`` from the
+   tokens it landed on, schedules only multiples of the cadence (the old ``tokens + every`` walked
+   off the grid by each overshoot), and a SIGUSR1 save in between does not move it.
+10. **The resume check names a lost run**: a ``run_state.json`` of this phase with no checkpoint,
+    or one more than ``2 * checkpoint_every_tokens`` ahead of the checkpoint that loaded, fails;
+    no state, another phase's state or a recent enough checkpoint passes.
+11. **The plan the cosine was fitted to is recorded and compared**: ``total_steps``,
+    ``rows_per_epoch`` and ``world_size`` survive the payload, differences are reported, and the
+    per rank step count spans the same tokens at any number of ranks.
+
 GPU free, but ``scripts/sft.py`` imports Transformer Engine, so run it in WSL after env_init.
 """
 import os
@@ -37,9 +48,9 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from modules.runtime import checkpoints as ckpt_lib
 from scripts.sft import (EVIDENCE_PHASE, check_split_switch, fp32_master_state, load_sft_checkpoint,
-                         next_grid_point, restore_fp32_masters, restore_rng_states,
-                         run_already_complete, save_sft_checkpoint, select_epoch, split_changes,
-                         stop_needs_save)
+                         check_run_state, next_grid_point, plan_changed, plan_total_steps,
+                         restore_fp32_masters, restore_rng_states, run_already_complete,
+                         save_sft_checkpoint, select_epoch, split_changes, stop_needs_save)
 
 
 def test_grid():
@@ -164,7 +175,8 @@ def test_payload_roundtrip():
         scheduler.step()
     fields = {"data_dir": "data/prepared_pilot", "train_split": "pilot_main_train",
               "val_split": "inject_val", "loop_rng_state": random.Random(1).getstate(),
-              "cuda_rng_state": None}
+              "cuda_rng_state": None, "total_steps": 30170, "rows_per_epoch": 241398,
+              "world_size": 8}
     common = dict(epoch=0, step=3, token_count=10, start_token_count=0, global_offset=0,
                   losses=[], seed=0, phase=EVIDENCE_PHASE)
     with tempfile.TemporaryDirectory() as tmp:
@@ -176,6 +188,8 @@ def test_payload_roundtrip():
         assert set(state["rng"]) == {"loop_rng_state"}, state["rng"]
         assert set(state["fp32_masters"]) == {"weight", "bias"}
         assert state["optimizer_steps"] == 3, state["optimizer_steps"]
+        assert (state["total_steps"], state["rows_per_epoch"], state["world_size"]) == (
+            30170, 241398, 8), state
 
         # a payload written before the fields: nothing recorded, nothing refused
         save_sft_checkpoint(model, optimizer, scheduler, path, **common)
@@ -184,6 +198,8 @@ def test_payload_roundtrip():
         assert set(payload["sft"]) == {"start_token_count", "seed", "kill_checked"}, payload["sft"]
         state = load_sft_checkpoint(model, optimizer, scheduler, path, EVIDENCE_PHASE, tmp)
         assert state["data"] == {} and state["rng"] == {} and state["fp32_masters"] is None
+        assert state["total_steps"] is None and state["rows_per_epoch"] is None
+        assert state["world_size"] is None
     print("6. payload fields survive save/load, an older payload loads with none   PASS")
 
 
@@ -257,6 +273,65 @@ def test_epoch_select():
     print("8. the epoch permutation is selected through the prepared loader on a resume   PASS")
 
 
+def test_grid_simulation():
+    every = 25_000_000
+    rng = random.Random(0)
+
+    def run(rule):
+        tokens, scheduled, taken = 0, [], []
+        due = rule(tokens)
+        for _ in range(400):
+            tokens += rng.randint(100_000, 9_000_000)
+            sigusr1 = rng.random() < 0.03
+            if tokens >= due or sigusr1:
+                taken.append(tokens)
+                due = rule(tokens)
+                scheduled.append(due)
+        return scheduled, taken
+
+    scheduled, taken = run(lambda t: next_grid_point(t, every))
+    assert len(scheduled) > 20
+    assert all(point % every == 0 for point in scheduled), scheduled[:6]
+    assert all(b >= a for a, b in zip(scheduled, scheduled[1:]))
+    rng = random.Random(0)
+    drifted, _ = run(lambda t: t + every if t else every)
+    assert not all(point % every == 0 for point in drifted), "the old rule stayed on the grid"
+    assert next_grid_point(60_000_000, every) == 75_000_000    # landed just past 50M: next is 75M
+    print("9. save and eval points stay on the grid across overshoots and extra saves   PASS")
+
+
+def test_run_state_check():
+    slack = 2 * 50_000_000
+    state = {"phase": "evidence", "token_count": 300_000_000, "checkpoint": "c.pt"}
+    assert check_run_state(None, "evidence", None, slack) is None
+    assert check_run_state({"phase": "sft", "token_count": 9e9}, "evidence", None, slack) is None
+    assert check_run_state({"phase": "evidence", "token_count": 0}, "evidence", None, slack) is None
+    message = check_run_state(state, "evidence", None, slack)
+    assert message and "300,000,000" in message and "no checkpoint loads" in message, message
+    assert check_run_state(state, "evidence", 300_000_000, slack) is None
+    assert check_run_state(state, "evidence", 200_000_000, slack) is None       # exactly the slack
+    message = check_run_state(state, "evidence", 199_999_999, slack)
+    assert message and "300,000,000" in message and "199,999,999" in message, message
+    assert check_run_state(state, "evidence", 400_000_000, slack) is None       # ahead is fine
+    print("10. a lost run directory or a checkpoint far behind run_state.json is refused   PASS")
+
+
+def test_plan():
+    one = plan_total_steps(241_398, 1, 8, 2, 1)
+    assert one == max(1, int(241_398 * 1 / 8 / 2)), one      # the old expression, unchanged
+    eight = plan_total_steps(241_398, 1, 8, 2, 8)
+    # a step eats batch * accum * world rows, so the same epoch is a world-th of the steps
+    assert abs(eight * 8 - one) <= 8, (one, eight)
+    assert plan_total_steps(3, 1, 8, 2, 8) == 1
+    saved = {"total_steps": 30170, "rows_per_epoch": 241398, "world_size": 1}
+    same = {"total_steps": 30170, "rows_per_epoch": 241398, "world_size": 1}
+    assert plan_changed(saved, same) == []
+    assert plan_changed({}, same) == [], "an old payload records no plan and changes nothing"
+    moved = plan_changed(saved, {"total_steps": 3771, "rows_per_epoch": 241398, "world_size": 8})
+    assert moved == [("total_steps", 30170, 3771), ("world_size", 1, 8)], moved
+    print("11. the plan is compared on resume and the cosine spans the same tokens per rank   PASS")
+
+
 def main():
     test_grid()
     test_split_switch()
@@ -266,6 +341,9 @@ def main():
     test_payload_roundtrip()
     test_run_complete()
     test_epoch_select()
+    test_grid_simulation()
+    test_run_state_check()
+    test_plan()
     print("all sft resume state checks passed")
 
 
