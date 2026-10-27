@@ -224,7 +224,32 @@ def test_manifest_key_required_for_ir():
     print("[ok] --manifest-key required with ir, default kept otherwise")
 
 
+def test_finished_phase_with_pruned_bins_is_not_declared_done():
+    """prune_filler deletes the bins; a --force rerun of the stage must fail loudly, not pass with empty files."""
+    d = tempfile.mkdtemp()
+    sources = make_sources(seed=3)
+    weights = {"a": 0.5, "b": 0.3, "c": 0.2}
+    target = sum(len(t) for texts in sources.values() for t in texts) // 4
+    state_path = os.path.join(d, "_state.json")
+    run_phase("phase1", source_entries_from(sources, weights), target, MockTokenizer(), d, state_path)
+    os.remove(os.path.join(d, "phase1.bin"))
+    os.remove(os.path.join(d, "phase1.idx"))
+    try:
+        run_phase("phase1", source_entries_from(sources, weights), target, MockTokenizer(), d, state_path)
+    except RuntimeError as e:
+        assert "deleted or lost" in str(e), e
+    else:
+        raise AssertionError("a finished phase whose bins are gone must not pass with empty files")
+    os.remove(state_path)
+    run_phase("phase1", source_entries_from(sources, weights), target, MockTokenizer(), d, state_path)
+    idx, binv = read_bin_idx(d, "phase1")
+    assert int(idx[-1]) == len(binv) > 0, "removing the state rebuilds the phase"
+    print("[ok] a finished phase with pruned bins fails instead of passing empty; no state rebuilds it")
+    shutil.rmtree(d)
+
+
 if __name__ == "__main__":
+    test_finished_phase_with_pruned_bins_is_not_declared_done()
     test_mix_ratio_and_bin_idx_consistency()
     test_interrupt_and_resume_no_gap_no_repeat()
     test_truncate_to_state_drops_uncommitted_tail()

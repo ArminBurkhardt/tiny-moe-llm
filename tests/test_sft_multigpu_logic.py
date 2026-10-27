@@ -455,8 +455,11 @@ def test_launch_arguments():
                            error=lambda m: logged.append(("error", m)))
     RankLog(base, 3).info("quiet")
     RankLog(base, 3).warning("loud")
+    RankLog(base, 3).error("failed")
+    RankLog(base, 0).warning("once")
     RankLog(base, 0).info("main")
-    assert logged == [("warning", "[rank 3] loud"), ("info", "main")], logged
+    # warnings print once (rank 0); an error on any rank is still seen with its rank
+    assert logged == [("error", "[rank 3] failed"), ("warning", "once"), ("info", "main")], logged
     os.environ.pop("RANK", None), os.environ.pop("WORLD_SIZE", None)
     assert dist_env() == (0, 1)
     os.environ["RANK"], os.environ["WORLD_SIZE"] = "5", "8"
@@ -496,8 +499,15 @@ def test_grad_reduction_and_retention():
     other = [g1[0].float().reshape(-1), g1[1].reshape(-1)]
     state = {"i": 0}
 
+    other_flags = torch.tensor([1.0, 1.0])
+    first = {"flags": True}
+
     def fake_all_reduce(flat, bucket_numel=None):
-        flat.add_(torch.cat(other))
+        # the first call of all_reduce_grads is the has-grad flag vector, the rest are buckets
+        if first.pop("flags", False):
+            flat.add_(other_flags)
+        else:
+            flat.add_(torch.cat(other))
 
     all_reduce_grads(ps, fake_all_reduce, 2)
     want0 = ((g0[0].float() + g1[0].float()) / 2).bfloat16()
@@ -506,10 +516,27 @@ def test_grad_reduction_and_retention():
     # small buckets give the same result
     ps2 = rank_params(g0)
     calls = []
+    flag_call = {"first": True}
     def fake_small(flat):
+        if flag_call.pop("first", False):
+            flat.add_(other_flags)
+            return
         at = sum(calls); calls.append(flat.numel()); flat.add_(torch.cat(other)[at:at + flat.numel()])
     all_reduce_grads(ps2, fake_small, 2, bucket_numel=4)
     assert len(calls) == 2 and torch.equal(ps2[0].grad, want0)
+
+    # a parameter with no gradient on any rank stays None (no zero grad for AdamW to decay)
+    ps3 = rank_params([torch.randn(5).bfloat16(), None])
+    seen = []
+    def fake_none(flat):
+        seen.append(flat.numel())
+        if len(seen) == 1:
+            flat.add_(torch.tensor([1.0, 0.0]))
+        else:
+            flat.add_(torch.cat([other[0]]))
+    all_reduce_grads(ps3, fake_none, 2)
+    assert ps3[1].grad is None, "a gradient absent on every rank must stay None"
+    assert ps3[0].grad is not None and seen == [2, 5], seen
 
     names = [f"checkpoint_evidence_tok{m}M_loss1.0000.pt" for m in
              (50, 100, 150, 200, 250, 9990, 10003, 10050, 10100, 19999, 20001, 20050, 20100)]

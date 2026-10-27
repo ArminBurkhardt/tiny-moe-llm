@@ -1,0 +1,31 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.06-py3
+
+%labels
+    purpose tiny-llm run 2 on MareNostrum 5 (no repo code inside, bind mount the checkout)
+    base_note 25.06 is CUDA 12.9 (the local dev stack is torch 2.8.0+cu129), inside the CUDA 13.0 the MN5 driver reports
+
+%post
+    # the image ships torch, transformer-engine and flash-attn built for it: never pip install them here.
+    # the rest is what scripts/setup.sh installs on the rented box, plus the hf cli for the login node.
+    pip install --no-cache-dir \
+        "transformers>=5.5.4" \
+        "numpy>=1.21.0" \
+        "pandas>=3.0.0" \
+        "pyarrow>=14.0.0" \
+        "huggingface_hub>=0.27.0" \
+        "zstandard>=0.23.0" \
+        "matplotlib>=3.10.0" \
+        "accelerate>=1.13.0"
+    mkdir -p /workspace
+
+%environment
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export LC_ALL=C.UTF-8
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec "$@"
+
+%test
+    python -c "import torch, transformer_engine, flash_attn, transformers, accelerate; print(torch.__version__, transformer_engine.__version__, flash_attn.__version__, transformers.__version__, accelerate.__version__)"

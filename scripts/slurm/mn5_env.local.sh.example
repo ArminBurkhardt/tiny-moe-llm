@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# copy to scripts/slurm/mn5_env.local.sh ON THE CLUSTER and fill in (gitignored; push_code.sh never sends or overwrites
+# it). sourced first by mn5_env.sh, so every value here wins over the defaults there.
+export REPO=/gpfs/projects/CHANGE_PROJECT/tiny-llm
+export DATA_ROOT=/gpfs/projects/CHANGE_PROJECT/run2          # corpus root of build_run2_corpus.py
+export SBATCH_ACCOUNT=CHANGE_ACCOUNT
+export SBATCH_QOS=acc_ehpc                                   # the queue that allows 72 hours (acc_debug cannot hold 71:50)
+# modules and the venv: CHANGE to what the cluster has
+# module purge
+# module load cuda/12.9 nccl python/3.12
+# source /gpfs/projects/CHANGE_PROJECT/venv/bin/activate
+# module load singularity                                    # the container runtime
+export SIF=/gpfs/projects/CHANGE_PROJECT/run2.sif            # empty = the venv (no container)
+# VENV=/gpfs/projects/CHANGE_PROJECT/venv                    # no container: the venv to activate
+# multi node NCCL: set what the fabric needs (interface names differ per site)
+# export NCCL_SOCKET_IFNAME=ib0
+# export NCCL_DEBUG=WARN
+# export SLURM_CPU_BIND=none                                 # when srun fails to bind the 20 cpus per task
+# export BIND_EXTRA=/gpfs/projects/CHANGE_PROJECT/models     # more bind mounts
+# export TINY_LLM_TOKENIZER=/path/to/tokenizer               # only when the default location under the checkout is not used

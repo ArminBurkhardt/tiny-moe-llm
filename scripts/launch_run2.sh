@@ -11,11 +11,13 @@
 #
 # env: DATA_ROOT    the corpus root of scripts/build_run2_corpus.py (merges in DATA_ROOT/prepared_run2,
 #                   held-out splits in DATA_ROOT/prepared); default data/run2
-#      NPROC        processes, one per GPU (default 8); the per GPU batch is the yaml's, so the global
-#                   batch is 8 x 4096 x accumulation 2 x NPROC tokens (524,288 at 8; at another
-#                   NPROC edit grad_accumulation_steps in config_run2.yaml to keep 524,288)
+#      NPROC        processes, one per GPU (default 8) on one node; the accumulation is computed as
+#                   524,288 / (8 x 4096 x NPROC) and passed as --grad-accumulation-steps (the yaml's 1 is
+#                   overridden), so the global batch stays 524,288 tokens; a count that does not divide
+#                   16 is refused. the multi node cluster path is scripts/slurm/ (sbatch), not this file
 #      SPLIT        the train split (default run2_warm_train)
-#      STOP_AFTER   regex on the token tag of the save after which STOP is dropped, warm-up only
+#      STOP_AFTER   token tag (4000M, 4B or a token count): STOP is dropped after the first save at or past it
+#                   (numeric, a save lands a log step past its grid point), warm-up only
 #                   (default empty: no automatic stop; the warm-up is 2B to 5B, read every 2B,
 #                   so pass e.g. STOP_AFTER='4000M' once the read at 4B is wanted)
 #      SEED         the grounded seed (default ckpts/inject/seed_run2_grounded.pt)
@@ -29,8 +31,11 @@ DRY=0
 [ "$1" = "--dry-run" ] && DRY=1
 ROOT=${TINY_LLM_ROOT:-/mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm}
 ENVI=${TINY_LLM_ENV_INIT:-env_init}
+source "$(cd "$(dirname "$0")" && pwd)/slurm/lib.sh"
 DATA_ROOT=${DATA_ROOT:-data/run2}
 NPROC=${NPROC:-8}
+ACCUM=$(accum_for "$NPROC") || exit 1
+[ -z "$STOP_AFTER" ] || stop_after_m "$STOP_AFTER" >/dev/null || { echo "STOP_AFTER='$STOP_AFTER' is not 4000M, 4B or a token count" >&2; exit 1; }
 SPLIT=${SPLIT:-run2_warm_train}
 SEED=${SEED:-ckpts/inject/seed_run2_grounded.pt}
 RUN=run2
@@ -38,8 +43,10 @@ D=$DATA_ROOT/prepared_run2
 L=ckpts/inject/$RUN.log
 EXTRA=""
 [ "$SPLIT" != run2_warm_train ] && EXTRA="$EXTRA --switch-split"
+EXTRA="$EXTRA ${PLAN_SPLIT_FLAG---plan-split run2_main_train}"
+[ "$SPLIT" = run2_warm_train ] && EXTRA="$EXTRA ${WARM_EPOCH_FLAG---max-epochs-this-split 1}"
 [ -n "$UPLOAD" ] && EXTRA="$EXTRA --upload-repo $UPLOAD"
-LAUNCH="accelerate launch --num_processes $NPROC --mixed_precision no scripts/sft.py --evidence --reader-kv -c $SEED --run-name $RUN --data-dir $D --train-split $SPLIT --val-split inject_val$EXTRA"
+LAUNCH="accelerate launch --num_processes $NPROC --mixed_precision no scripts/sft.py --evidence --reader-kv -c $SEED --run-name $RUN --data-dir $D --train-split $SPLIT --val-split inject_val --grad-accumulation-steps $ACCUM$EXTRA"
 if [ "$DRY" = 1 ]; then
   echo "cd $ROOT && source $ENVI"
   echo "TINY_LLM_CONFIG=config_run2.yaml"
@@ -59,7 +66,8 @@ for f in "$DATA_ROOT"/prepared/evidence_fixed.*; do
 done
 echo "launch $(date -Is) split $SPLIT nproc $NPROC" >> $L
 if [ -n "$STOP_AFTER" ]; then
-  setsid nohup bash scripts/reads/stop_after_save_run2.sh $RUN "$STOP_AFTER" >> $L 2>&1 < /dev/null &
+  FROM=$(stat -c %s "$L" 2>/dev/null || echo 0)
+  FROM=$FROM LOG=$L setsid nohup bash scripts/reads/stop_after_save_run2.sh $RUN "$STOP_AFTER" >> $L 2>&1 < /dev/null &
 fi
 setsid nohup bash -c "$LAUNCH >> $L 2>&1; echo \"trainer exit \$? \$(date -Is)\" >> $L" > /dev/null 2>&1 < /dev/null &
 disown

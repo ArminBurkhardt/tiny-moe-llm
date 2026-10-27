@@ -301,6 +301,105 @@ def main():
             assert meta == plain_meta
             assert "bridge" not in plain["meta"]
         print("8b. bridge build: buffers and sidecars byte identical, assistant turn is the bridge  PASS")
+        # 9. streaming: byte identical to drawing every question first, plain and bridge, with the
+        # training hop mix widened to 1..4 the way the corpus driver patches it; resumable
+        def files_of(directory, split):
+            return {os.path.basename(p): open(p, "rb").read() for p in pcd.split_files(directory, split)
+                    if os.path.exists(p) and not p.endswith((".build.json", ".build_state.json"))}
+
+        saved_defaults = chains.sample_hops.__defaults__
+        try:
+            for hop_mix in (saved_defaults, ((0.25, 0.25, 0.25, 0.25),)):
+                chains.sample_hops.__defaults__ = hop_mix
+                for bridge in (False, True):
+                    ref_dir, new_dir = os.path.join(tmp, f"ref_{len(hop_mix[0])}_{bridge}"),                         os.path.join(tmp, f"new_{len(hop_mix[0])}_{bridge}")
+                    os.makedirs(ref_dir), os.makedirs(new_dir)
+                    qs = pcd.make_split_questions("train", 330, 42, held)
+                    ref_report = pcd.build_split(ref_dir, "t", qs, template, FakeEmbedder(), held, batch=64,
+                                                 bridge=bridge)
+                    new_report = pcd.build_split_streaming(new_dir, "t", "train", 330, 0, 42, held, template,
+                                                           FakeEmbedder(), batch=50, bridge=bridge)
+                    assert files_of(ref_dir, "t") == files_of(new_dir, "t")
+                    for key in ("questions", "prompt_tokens", "ev_tokens", "chunks", "by_hops", "by_composition",
+                                "kinds", "distractors"):
+                        assert ref_report[key] == new_report[key], key
+                    for hops, base in ref_report["shortcuts"].items():
+                        assert all(abs(new_report["shortcuts"][hops][k] - v) < 1e-9 for k, v in base.items())
+            chains.sample_hops.__defaults__ = ((0.25, 0.25, 0.25, 0.25),)
+            for name, count, per_hop in (("val", 80, 0), ("eval", 0, 15), ("hop4", 0, 15)):
+                ref_dir, new_dir = os.path.join(tmp, f"ref_{name}"), os.path.join(tmp, f"new_{name}")
+                os.makedirs(ref_dir), os.makedirs(new_dir)
+                qs = pcd.make_split_questions(name, count, 42, held, per_hop)
+                pcd.build_split(ref_dir, "t", qs, template, FakeEmbedder(), held, batch=64,
+                                facts=name not in ("train", "val"))
+                pcd.build_split_streaming(new_dir, "t", name, count, per_hop, 42, held, template, FakeEmbedder(),
+                                          batch=7, facts=name not in ("train", "val"))
+                assert files_of(ref_dir, "t") == files_of(new_dir, "t"), name
+            print("9a. streamed builds equal the materialized ones byte for byte (plain, bridge, 1..3 and 1..4 hop "
+                  "mixes, val, eval, hop4)   PASS")
+
+            # 9b. resume after a stop and after a crash before the first batch, a junk tail, other arguments,
+            # the completion record, --overwrite
+            ref_dir = os.path.join(tmp, "ref_4_False")
+            ref_files = files_of(ref_dir, "t")
+            for mode, limit in (("stop", 3), ("crash", 1), ("crash", 4)):
+                d = os.path.join(tmp, f"res_{mode}_{limit}")
+                os.makedirs(d)
+                calls = {"n": 0}
+
+                def stop_check(mode=mode, limit=limit):
+                    calls["n"] += 1
+                    if calls["n"] == limit:
+                        if mode == "crash":
+                            raise RuntimeError("killed")
+                        return True
+                    return False
+
+                try:
+                    pcd.build_split_streaming(d, "t", "train", 330, 0, 42, held, template, FakeEmbedder(),
+                                              batch=50, checkpoint_seconds=0, stop_check=stop_check)
+                    raise AssertionError("the build did not stop")
+                except pcd.BuildInterrupted:
+                    assert mode == "stop"
+                except RuntimeError:
+                    assert mode == "crash"
+                state = json.load(open(os.path.join(d, "t.build_state.json")))
+                assert state["questions"] == (limit - 1) * 50
+                for suffix in ("bin", "evhop", "chains.jsonl", "ev"):
+                    with open(os.path.join(d, f"t.{suffix}"), "ab") as f:
+                        f.write(b"junk")
+                try:
+                    pcd.build_split_streaming(d, "t", "train", 330, 0, 43, held, template, FakeEmbedder(), batch=50)
+                    raise AssertionError("a resume with other arguments was accepted")
+                except SystemExit as refused:
+                    assert "other arguments" in str(refused)
+                try:
+                    pcd.build_split_streaming(d, "t", "train", 330, 0, 42, held, template, FakeEmbedder(), batch=50,
+                                              bridge=True)
+                    raise AssertionError("a resume with the bridge form was accepted")
+                except SystemExit:
+                    pass
+                report = pcd.build_split_streaming(d, "t", "train", 330, 0, 42, held, template, FakeEmbedder(),
+                                                   batch=50)
+                assert report["questions"] == 330
+                assert files_of(d, "t") == ref_files, (mode, limit)
+                assert not os.path.exists(os.path.join(d, "t.build_state.json"))
+                stamp = {n: os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)}
+                assert pcd.build_split_streaming(d, "t", "train", 330, 0, 42, held, template, FakeEmbedder(),
+                                                 batch=50) is None
+                assert stamp == {n: os.path.getmtime(os.path.join(d, n)) for n in os.listdir(d)}
+                try:
+                    pcd.build_split_streaming(d, "t", "train", 330, 0, 43, held, template, FakeEmbedder(), batch=50)
+                    raise AssertionError("a finished split was rebuilt with other arguments")
+                except FileExistsError:
+                    pass
+                again = pcd.build_split_streaming(d, "t", "train", 330, 0, 43, held, template, FakeEmbedder(),
+                                                  batch=50, overwrite=True)
+                assert again["questions"] == 330 and files_of(d, "t") != ref_files
+            print("9b. a stopped or crashed streamed build resumes byte identical, other arguments are refused, a "
+                  "finished split is left alone, --overwrite starts over   PASS")
+        finally:
+            chains.sample_hops.__defaults__ = saved_defaults
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("all chain generator checks passed")

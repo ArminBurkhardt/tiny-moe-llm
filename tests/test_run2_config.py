@@ -7,11 +7,13 @@ because ``config.py`` parses its yaml once at import). Checks:
    so ``num_ir_entries % ir_num_clusters`` cannot fail and the capacity rule is not in play;
 2. the decided training overrides: weight decay 0.1, loss-free balancing, segment weighting, no retriever
    term, AdamW, lr 4e-4, clip 1.0, per loop CE weights, depth sampling 0.3, noise anneal 1B;
-3. the batch: 8 per GPU x accumulation 2 x 8 GPUs x 4096 = 524,288 tokens per update;
-4. the evidence block: warm-up split, inject_val, evidence_fixed, kill at 5B / 0.1, frozen gate, plain CE,
-   a save every 1B, the cosine floor 0.1;
-5. the control differs from the run only in the split, the token budget, the epochs, the warmup fraction
-   and the kill, and its warmup is the same 1000 steps of its own length.
+3. the batch: 8 per GPU x 4096 x the yaml's accumulation 1 x 16 GPUs (4 nodes of 4) = 524,288 tokens per update
+   (the job scripts pass the accumulation for another GPU count, tests/test_run2_launchers.py);
+4. the evidence block: warm-up split, inject_val, evidence_fixed, kill at 8B / 0.1 (off in the control), frozen gate,
+   plain CE, a save every 1B, the cosine floor 0.1 (the control constant, lr_min_factor 1.0);
+5. the token target 800B (266.67B per split x 3 epochs), keep every 10B, uploads off;
+6. the control differs from the run only in the split, the token budget, the epochs, the warmup fraction,
+   the kill and lr_min_factor, and its warmup is the same 1000 steps of its own length.
 
 GPU free; neither import pulls in ``modules.model``.
 """
@@ -32,10 +34,10 @@ out = {
     "optimizer": getattr(T, "optimizer", None), "lr": T.lr, "grad_clip": T.grad_clip,
     "loop_ce_weights": list(T.loop_ce_weights), "loop_count_sampling": T.loop_count_sampling,
     "noise_anneal_tokens": T.noise_anneal_tokens, "target_tokens": T.target_tokens,
-    "warmup_steps": T.warmup_steps,
+    "warmup_steps": T.warmup_steps, "hf_upload_repo": T.hf_upload_repo,
     "ev": {k: getattr(E, k) for k in ("train_split", "val_split", "fixed_split", "kill_tokens", "kill_min_gain",
            "freeze_evidence_gate", "lr", "fresh_lr", "num_epochs", "weight_decay", "Batch_size",
-           "grad_accumulation_steps", "warmup_fraction", "lr_min_factor", "checkpoint_every_tokens",
+           "grad_accumulation_steps", "warmup_fraction", "lr_min_factor", "checkpoint_every_tokens", "keep_every_tokens", "hf_upload_repo",
            "eval_every_tokens", "conversation_loss_weighting", "max_evidence_tokens", "seed")},
     "modules_model_imported": "modules.model" in sys.modules,
 }
@@ -76,24 +78,29 @@ def main():
         assert c["loop_ce_weights"] == [0.2, 0.3, 1.0] and c["loop_count_sampling"] == 0.3, name
         assert c["noise_anneal_tokens"] == 1_000_000_000 and c["warmup_steps"] == 1000, name
         ev = c["ev"]
-        assert ev["Batch_size"] == 8 and ev["grad_accumulation_steps"] == 2, name
-        assert ev["Batch_size"] * ev["grad_accumulation_steps"] * 8 * 4096 == 524_288, name
+        assert ev["Batch_size"] == 8 and ev["grad_accumulation_steps"] == 1, name
+        assert ev["Batch_size"] * ev["grad_accumulation_steps"] * 16 * 4096 == 524_288, name
+        assert ev["keep_every_tokens"] == 10_000_000_000, name
+        assert c["hf_upload_repo"] == "" and ev["hf_upload_repo"] == "", name
         assert ev["val_split"] == "inject_val" and ev["fixed_split"] == "evidence_fixed", name
         assert ev["freeze_evidence_gate"] is True and ev["conversation_loss_weighting"] is False, name
-        assert ev["lr_min_factor"] == 0.1 and ev["checkpoint_every_tokens"] == 1_000_000_000, name
+        assert ev["lr_min_factor"] in (0.1, 1.0) and ev["checkpoint_every_tokens"] == 1_000_000_000, name
         assert ev["max_evidence_tokens"] == 9216, name
     assert run["ev"]["train_split"] == "run2_warm_train"
-    assert run["target_tokens"] == 280_000_000_000
-    assert run["ev"]["kill_tokens"] == 5_000_000_000 and run["ev"]["kill_min_gain"] == 0.1
+    assert run["target_tokens"] == 800_000_000_000
+    assert run["ev"]["lr_min_factor"] == 0.1 and ctl["ev"]["lr_min_factor"] == 1.0
+    assert run["ev"]["eval_every_tokens"] == 4_000_000_000
+    assert run["ev"]["kill_tokens"] == 8_000_000_000 and run["ev"]["kill_min_gain"] == 0.1
     assert run["ev"]["num_epochs"] == 3
     assert ctl["ev"]["train_split"] == "run2_control_train"
     assert ctl["target_tokens"] == 10_000_000_000 and ctl["ev"]["kill_tokens"] == 0 and ctl["ev"]["num_epochs"] == 1
     # the warmup is 1000 optimizer steps in both: fraction x steps, steps = tokens / 524,288
-    for c, tokens in ((run, 280e9), (ctl, 10e9)):
+    for c, tokens in ((run, 800e9), (ctl, 10e9)):
         steps = tokens / 524_288
-        assert abs(c["ev"]["warmup_fraction"] * steps - 1000) < 15, (c["ev"]["warmup_fraction"], steps)
+        assert abs(c["ev"]["warmup_fraction"] * steps - 1000) < 5, (c["ev"]["warmup_fraction"], steps)
     # everything else identical between the two files
-    drop = {"train_split", "kill_tokens", "num_epochs", "warmup_fraction"}
+    # lr_min_factor: the control holds a constant 4e-4 (the run is still at peak LR at 10B; an annealed control would store more)
+    drop = {"train_split", "kill_tokens", "num_epochs", "warmup_fraction", "lr_min_factor"}
     assert {k: v for k, v in run["ev"].items() if k not in drop} == {k: v for k, v in ctl["ev"].items() if k not in drop}
     assert run["params"] == ctl["params"]
     for k in ("weight_decay", "moe_balancing", "segment", "lr", "loop_ce_weights", "noise_anneal_tokens"):

@@ -22,7 +22,11 @@ properties the experiment leans on:
    the mask on value tokens unchanged; renamed documents carry the same placeholder in the document,
    the gold card and (distinct ones) the distractor cards;
 9. ``mask_first_name_mention`` and ``support_gold_only`` change ``.mask`` of the retrieval arm and
-   nothing else: the first name run alone is zeroed, gold-less documents lose every value span.
+   nothing else: the first name run alone is zeroed, gold-less documents lose every value span;
+10. the vectorized filler window cut equals the per window loop, ``stop_after_tokens`` builds are byte
+    prefixes of the full build, ``shared_outputs=False`` leaves shared files alone and refuses when
+    they are missing, ``train_factspan=False`` drops only that file, a separate single arm build
+    equals the combined one, and an interrupted (or crashed) then resumed build is byte identical.
 
 GPU free. Needs the pruned tokenizer (``utils.TOKENIZER_DIR``).
 """
@@ -277,8 +281,9 @@ def main():
             recorded = json.load(f)
         assert set(recorded["arms"]) == {"inject_full_train", "inject_masked_train",
                                         "inject_retrieval_train", "inject_retrieval_s90a90_train"}
+        assert build_injection(out, tokenizer, FakeEmbedder(), **common)["already_complete"]
         try:
-            build_injection(out, tokenizer, FakeEmbedder(), **common)
+            build_injection(out, tokenizer, FakeEmbedder(), **dict(common, swap_rate=0.4))
             raise SystemExit("an existing split was overwritten without the flag")
         except FileExistsError:
             pass
@@ -431,10 +436,267 @@ def main():
         assert g1["supported_span_share"] <= entry["supported_span_share"]
         print(f"9. mask flags: .mask only; {first_tokens} first name tokens zeroed in {bio_docs} documents, "
               f"{goldless_values} gold-less value spans all 0, gold documents unchanged   PASS")
+
+        # 10. large build support: window cut, prefix builds, shared outputs, factspan, resume
+        import gc, zlib
+        from scripts.prepare_injection_data import BuildInterrupted
+
+        def reference_windows(sources, window, seed, val_fraction):
+            train, val_ = [], []
+            cutoff = int(val_fraction * 1_000_000)
+            for source, (bin_path, idx_path) in enumerate(sources):
+                offsets = np.memmap(idx_path, dtype=np.uint64, mode="r")
+                for d in range(len(offsets) - 1):
+                    start, end = int(offsets[d]), int(offsets[d + 1])
+                    for w in range(start, end, window):
+                        length = min(window, end - w)
+                        if length < 32:
+                            continue
+                        is_val = zlib.crc32(f"{seed}:{source}:{w}".encode()) % 1_000_000 < cutoff
+                        (val_ if is_val else train).append((source, w, length))
+            return np.asarray(train, dtype=np.int64).reshape(-1, 3), np.asarray(val_, dtype=np.int64).reshape(-1, 3)
+
+        two = filler + write_filler(os.path.join(root, "filler2"), 30, 5)
+        for window in (1000, 200):
+            ref_train, ref_val = reference_windows(two, window, 7, 0.1)
+            _, new_train, new_val = load_filler_windows(two, window, 7, 0.1)
+            assert (ref_train == new_train).all() and (ref_val == new_val).all() and len(ref_val) > 0
+        print("10a. window cut equals the per window loop (train and validation)   PASS")
+
+        def same_files(dir_a, dir_b, names):
+            for name in names:
+                assert file_hash(os.path.join(dir_a, name)) == file_hash(os.path.join(dir_b, name)), name
+
+        def split_files(directory, split):
+            return sorted(n for n in os.listdir(directory) if n.startswith(split + "."))
+
+        per_doc = ("bin", "idx", "mask", "factspan", "ev", "evchunk", "evkey", "evgold", "cond", "ans",
+                   "evidx", "evkeyidx")
+        shared_before = {n: file_hash(os.path.join(out, n))
+                         for n in ("inject_val.bin", "inject_val.idx", "inject_val.factspan", "inject_facts.jsonl",
+                                   "inject_pools.json")}
+        store_before = file_hash(os.path.join(store_dir, "keys.npy"))
+        stop_at = 40_000
+        for tag, rate in (("s50", 0.5), ("s100", 1.0)):
+            if tag == "s100":
+                build_injection(out, tokenizer, FakeEmbedder(), **dict(
+                    common, arms=("full", "retrieval"), suffix=tag, swap_rate=1.0))
+            base_suffix = "" if tag == "s50" else tag
+            stopped = build_injection(out, tokenizer, FakeEmbedder(), **dict(
+                common, arms=("full", "retrieval"), suffix=tag + "stp", swap_rate=rate, stop_after_tokens=stop_at,
+                shared_outputs=False, block=50))
+            for arm in ("full", "retrieval"):
+                full_split, short_split = split_name(arm, base_suffix), split_name(arm, tag + "stp")
+                suffixes = per_doc if arm == "retrieval" else per_doc[:4]
+                for suffix in suffixes:
+                    a = open(os.path.join(out, f"{full_split}.{suffix}"), "rb").read()
+                    b = open(os.path.join(out, f"{short_split}.{suffix}"), "rb").read()
+                    assert 0 < len(b) < len(a) and a[:len(b)] == b, (arm, tag, suffix)
+            entry_s = stopped["arms"]["full"]
+            assert entry_s["stopped_early"] and entry_s["tokens"] >= stop_at
+            short = read_plain(out, split_name("full", tag + "stp"))
+            assert entry_s["tokens"] - len(short[-1]["ids"]) < stop_at and entry_s["docs"] == len(short)
+            short_ret = read_evidence(out, split_name("retrieval", tag + "stp"))
+            assert len(short_ret) == len(short)
+            r_entry = stopped["arms"]["retrieval"]
+            assert r_entry["goldless_docs"] == sum(d["cond"] == "distractors" for d in short_ret)
+            assert r_entry["anonymized_docs"] == sum(bool((d["codes"] == 7).any()) and not any(d["gold"])
+                                                     for d in short_ret)
+        assert shared_before == {n: file_hash(os.path.join(out, n)) for n in shared_before}
+        assert store_before == file_hash(os.path.join(store_dir, "keys.npy"))
+        assert set(json.load(open(os.path.join(out, "inject_build.json")))["common"]) >= {"documents"}
+        try:
+            build_injection(os.path.join(root, "out_missing"), tokenizer, FakeEmbedder(), **dict(
+                common, shared_outputs=False))
+            raise SystemExit("a build without shared outputs ran on an empty directory")
+        except SystemExit as stop:
+            assert "forbids writing" in str(stop), stop
+        print("10b. stopped builds are byte prefixes (full and retrieval, swap 0.5 and 1.0), shared files "
+              "untouched   PASS")
+
+        for arm in ("full", "masked"):
+            build_injection(out, tokenizer, FakeEmbedder(), **dict(common, arms=(arm,), suffix="alone"))
+            for suffix in ("bin", "idx", "mask", "factspan"):
+                assert file_hash(os.path.join(out, f"{split_name(arm, 'alone')}.{suffix}")) == \
+                    file_hash(os.path.join(out, f"{split_name(arm, '')}.{suffix}")), (arm, suffix)
+        print("10c. a separate single arm invocation equals the combined build   PASS")
+
+        out3 = os.path.join(root, "out3")
+        build_injection(out3, tokenizer, FakeEmbedder(), **dict(common, store_dir=None, train_factspan=False))
+        for split in ("inject_full_train", "inject_masked_train", "inject_retrieval_train"):
+            assert not os.path.exists(os.path.join(out3, f"{split}.factspan")), split
+            same_files(out, out3, [n for n in split_files(out, split) if not n.endswith(".factspan")])
+        assert os.path.exists(os.path.join(out3, "inject_val.factspan"))
+        same_files(out, out3, ["inject_val.factspan", "inject_val.bin"])
+        print("10d. no train factspan: train splits lack it, everything else and the validation split equal   PASS")
+
+        small_args = dict(common, arms=("full", "retrieval"), block=16, checkpoint_blocks=2, store_dir=None)
+        ref_dir = os.path.join(root, "out_ref")
+        build_injection(ref_dir, tokenizer, FakeEmbedder(), **small_args)
+        ref_files = sorted(n for n in os.listdir(ref_dir) if n != "inject_build.json")
+        assert not any(n.startswith(".inject_state") for n in ref_files)
+        for mode in ("graceful", "crash"):
+            res_dir = os.path.join(root, f"out_{mode}")
+            calls = {"n": 0}
+
+            def stop_check(limit=5, mode=mode):
+                calls["n"] += 1
+                if calls["n"] == limit:
+                    if mode == "crash":
+                        raise RuntimeError("killed")
+                    return True
+                return False
+
+            try:
+                build_injection(res_dir, tokenizer, FakeEmbedder(), stop_check=stop_check, **small_args)
+                raise SystemExit("the build did not stop")
+            except BuildInterrupted:
+                assert mode == "graceful"
+            except RuntimeError:
+                assert mode == "crash"
+            gc.collect()
+            state_files = [n for n in os.listdir(res_dir) if n.startswith(".inject_state")]
+            assert any(n.endswith(".json") for n in state_files) and any(n.endswith(".keys.npy") for n in state_files)
+            partial = os.path.getsize(os.path.join(res_dir, "inject_full_train.bin"))
+            for suffix in ("bin", "mask", "ev"):
+                for split in ("inject_full_train", "inject_retrieval_train"):
+                    path = os.path.join(res_dir, f"{split}.{suffix}")
+                    if os.path.exists(path):
+                        with open(path, "ab") as f:
+                            f.write(b"junk")
+            try:
+                build_injection(res_dir, tokenizer, FakeEmbedder(), **dict(small_args, swap_rate=0.4))
+                raise SystemExit("a resume with other arguments was accepted")
+            except SystemExit as refused:
+                assert "other arguments" in str(refused), refused
+            resumed = build_injection(res_dir, tokenizer, FakeEmbedder(), **small_args)
+            assert not [n for n in os.listdir(res_dir) if n.startswith(".inject_state")]
+            assert sorted(n for n in os.listdir(res_dir) if n != "inject_build.json") == ref_files
+            same_files(ref_dir, res_dir, ref_files)
+            assert partial < os.path.getsize(os.path.join(res_dir, "inject_full_train.bin"))
+            ref_metrics = json.load(open(os.path.join(ref_dir, "inject_build.json")))
+            res_metrics = json.load(open(os.path.join(res_dir, "inject_build.json")))
+            for m in (ref_metrics, res_metrics):
+                m["common"].pop("built_seconds")
+            assert ref_metrics == res_metrics, mode
+        print("10e. interrupted (SIGTERM path and crash with a junk tail) then resumed builds are byte "
+              "identical, other arguments refused, state removed   PASS")
+        # 10f: blocks with no biography (C1); the draws do not depend on the block size
+        sparse = dict(common, persons_per_tier={1: 8}, arms=("full", "retrieval"), store_dir=None, target_tokens=60_000)
+        sp_ref, sp_small = os.path.join(root, "sp_ref"), os.path.join(root, "sp_small")
+        build_injection(sp_ref, tokenizer, FakeEmbedder(), **sparse)
+        build_injection(sp_small, tokenizer, FakeEmbedder(), **dict(sparse, block=7))
+        sp_names = sorted(n for n in os.listdir(sp_ref) if n != "inject_build.json")
+        same_files(sp_ref, sp_small, sp_names)
+        print("10f. a block with no biography builds (block 7, eight people), equal to the large block build   PASS")
+
+        # 10g: a kill before the first checkpoint, and a finished build with no state (H3)
+        from scripts.prepare_injection_data import _val_problem
+        kill_dir = os.path.join(root, "out_kill0")
+        calls0 = {"n": 0}
+
+        def kill_first(*_):
+            calls0["n"] += 1
+            raise RuntimeError("killed")
+
+        try:
+            build_injection(kill_dir, tokenizer, FakeEmbedder(), stop_check=kill_first, **small_args)
+            raise SystemExit("the build did not stop")
+        except RuntimeError:
+            pass
+        gc.collect()
+        assert any(n.startswith(".inject_state") and n.endswith(".json") for n in os.listdir(kill_dir))
+        build_injection(kill_dir, tokenizer, FakeEmbedder(), **small_args)
+        same_files(ref_dir, kill_dir, ref_files)
+        before = {n: (os.path.getmtime(os.path.join(kill_dir, n)), file_hash(os.path.join(kill_dir, n)))
+                  for n in os.listdir(kill_dir)}
+        again = build_injection(kill_dir, tokenizer, FakeEmbedder(), **small_args)
+        assert again["already_complete"]
+        assert before == {n: (os.path.getmtime(os.path.join(kill_dir, n)), file_hash(os.path.join(kill_dir, n)))
+                          for n in os.listdir(kill_dir)}
+        try:
+            build_injection(kill_dir, tokenizer, FakeEmbedder(), **dict(small_args, swap_rate=0.4))
+            raise SystemExit("a finished build was rebuilt with other arguments")
+        except FileExistsError:
+            pass
+        build_injection(kill_dir, tokenizer, FakeEmbedder(), overwrite=True, **small_args)
+        same_files(ref_dir, kill_dir, ref_files)
+        print("10g. a kill before the first checkpoint resumes, a finished build with no state is left alone, "
+              "other arguments and --overwrite behave   PASS")
+
+        # 10h: a truncated validation split is rewritten, not trusted (M2)
+        trunc_dir = os.path.join(root, "out_trunc")
+        calls1 = {"n": 0}
+
+        def kill_at_five(*_):
+            calls1["n"] += 1
+            if calls1["n"] == 5:
+                raise RuntimeError("killed")
+            return False
+
+        try:
+            build_injection(trunc_dir, tokenizer, FakeEmbedder(), stop_check=kill_at_five, **small_args)
+            raise SystemExit("the build did not stop")
+        except RuntimeError:
+            pass
+        gc.collect()
+        for suffix in ("bin", "idx", "mask", "factspan"):
+            data = open(os.path.join(ref_dir, f"inject_val.{suffix}"), "rb").read()
+            open(os.path.join(trunc_dir, f"inject_val.{suffix}"), "wb").write(data[:-200] if suffix == "bin" else data)
+        open(os.path.join(trunc_dir, "inject_val.part.bin"), "wb").write(b"stale")
+        n_val = os.path.getsize(os.path.join(ref_dir, "inject_val.idx")) // 8 - 1
+        assert _val_problem(trunc_dir, "inject_val", n_val) is not None
+        assert _val_problem(ref_dir, "inject_val", n_val) is None
+        build_injection(trunc_dir, tokenizer, FakeEmbedder(), **small_args)
+        same_files(ref_dir, trunc_dir, ref_files)
+        assert not [n for n in os.listdir(trunc_dir) if ".part" in n]
+        try:
+            build_injection(trunc_dir, tokenizer, FakeEmbedder(), **dict(small_args, shared_outputs=False, suffix="x"))
+            ok = True
+        except SystemExit:
+            ok = False
+        assert ok
+        open(os.path.join(trunc_dir, "inject_val.bin"), "ab").write(b"xx")
+        try:
+            build_injection(trunc_dir, tokenizer, FakeEmbedder(), **dict(small_args, shared_outputs=False, suffix="y"))
+            raise SystemExit("a truncated validation split was trusted")
+        except SystemExit as refused:
+            assert "not whole" in str(refused), refused
+        print("10h. a truncated or stale validation split is rewritten on resume and refused without shared "
+              "outputs, no .part leftovers   PASS")
         print("all injection corpus checks passed")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def check_free_after_a_kill_before_the_first_state():
+    """11. a writer opened and killed before its first state write leaves empty files and an eight
+    byte idx header: the rerun rebuilds instead of raising FileExistsError; real output is protected."""
+    from scripts.prepare_injection_data import _check_free
+    from scripts.prepare_evidence_data import EVIDENCE_SUFFIXES
+    root = tempfile.mkdtemp()
+    try:
+        for suffix in EVIDENCE_SUFFIXES + ("factspan",):
+            with open(os.path.join(root, f"x.{suffix}"), "wb") as f:
+                f.write(b"\0" * 8 if suffix.endswith("idx") or suffix == "idx" else b"")
+        _check_free(root, "x", False)
+        assert not [n for n in os.listdir(root) if n.startswith("x.")], "untouched files are removed"
+        with open(os.path.join(root, "x.bin"), "wb") as f:
+            f.write(b"\1" * 64)
+        try:
+            _check_free(root, "x", False)
+        except FileExistsError:
+            pass
+        else:
+            raise AssertionError("a file with content must still need --overwrite")
+        _check_free(root, "x", True)
+        assert not os.path.exists(os.path.join(root, "x.bin"))
+        print("11. files left by a build killed before its first state write are rebuilt, real output is "
+              "protected   PASS")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":
     main()
+    check_free_after_a_kill_before_the_first_state()

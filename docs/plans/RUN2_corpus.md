@@ -1,277 +1,238 @@
-# Run 2 corpus build sheet (2026-10-26)
+# Run 2 corpus build sheet (rewritten 2026-10-27 from the code)
 
-The corpus of the real run, built with the existing builders by `scripts/build_run2_corpus.py`.
-Decision of the user, 2026-10-26: the pilot recipe at scale. The old build item 4 of
+The corpus of the real run, built with the existing builders by `scripts/build_run2_corpus.py` on
+MareNostrum 5. Decision of the user, 2026-10-26: the pilot recipe at scale. The old build item 4 of
 [RUN2.md](RUN2.md) (per-window bge retrieval on plain text, the fact tagger and span weights, the
-near-duplicate filter, the staircase visibility question) is not on the launch path. What is built
-is the pilot's three merges (`pilot_warm_train`, `pilot_main_train`, `pilot_control_train`, see the
-Record bullet "Pilot corpus" in CLAUDE.md and `ckpts/inject/build_pilot_bios.sh`,
-`merge_pilot.sh`, `merge_pilot2.sh`) scaled to the RUN2 token target, with `--support-gold-only` on
-the biography builds (RUN2 decision 3), the written bridge chains beside the plain ones (R9), QA
-from `prepare_evidence_data.py` at its finite passes and the filler from `prepare_data.py`.
+near-duplicate filter, the staircase visibility question) is not on the launch path. What is built is
+the pilot's three merges (`pilot_warm_train`, `pilot_main_train`, `pilot_control_train`; Record bullet
+"Pilot corpus" in CLAUDE.md, `ckpts/inject/build_pilot_bios.sh`, `merge_pilot.sh`, `merge_pilot2.sh`)
+at the Run 2 token target, with `--support-gold-only` on the biography builds (RUN2 decision 3), the
+written bridge chains beside the plain ones (R9), QA from `prepare_evidence_data.py` at its finite
+passes and the filler from `prepare_data.py`.
 
-Every number below is `scripts/build_run2_corpus.py plan` (the function `derive`), unless it says
-"measured" (a pilot log) or "estimate". Tests: `tests/test_build_run2_corpus.py`.
+Every number below is `python scripts/build_run2_corpus.py plan` (`derive`, `disk_schedule`,
+`hours_plan`), unless it says "measured" (a pilot log) or "estimate". `plan` takes the same flags as
+`build` (`--scale`, `--chain-tokens`, `--chain-share`, `--qa-target`, ...) and exits 2 when the disk
+plan is over budget (peak 3.4 TB, standing 2.0 TB). Tests: `tests/test_build_run2_corpus.py`.
 
-## What the recipe gives, against RUN2's Corpus table
+## 1. The numbers
 
-RUN2's table (web 70%, QA at its limit, chains 10%, chat replay 20%, biographies under 0.01%) was
-written for a builder that retrieves on every window. The pilot recipe has retrieval only on the
-QA, chain and biography rows; filler windows carry none. So the merged split is four slices and the
-evidence ratio is far below RUN2's 1.49 to 1.55.
-
-| slice | builder | share of the split | RUN2 line it stands for |
-|---|---|---|---|
-| bios (filler windows plus the biographies, evidence only on the 3,600 persons' cards) | `prepare_injection_data.py` | 95.4% (derived: the rest) | web, edu, code, math 70%, plus the chat replay share nobody can supply (below) |
-| qa (SQuAD v2, HotpotQA, web text with a held span, chat replay) | `prepare_evidence_data.py` | 1.6% (supply limited) | evidence QA at its limit, part of chat replay |
-| chains (plain, hops 1 / 2 / 3 at 25 / 50 / 25) | `prepare_chain_data.py` | 1.5% | synthetic chains, half of the chain share (default 3%, RUN2 10%) |
-| bridge (written bridge, hops 1 to 4 at 25 each) | `prepare_chain_data.py --bridge` | 1.5% | synthetic chains, half of the chain share |
-
-Shares RUN2 leaves undefined, and what is assumed (each is one flag of the driver):
-
-| undefined in RUN2 | assumption | flag |
-|---|---|---|
-| the chain share (RUN2: 10%) and the plain against bridge split | 3% by default (RUN2's 10% costs 6.8 TB and 3 to 4 days, section 4); half and half | `--chain-share`, `--bridge-fraction 0.5` |
-| hop mix of the chain rows in the main body (RUN2 gives 25 x 4 for the tail only) | plain at the pilot's 25 / 50 / 25 over hops 1 to 3, bridge at 25 each over hops 1 to 4 | none (the wrapper's `--hops 4`) |
-| the QA builder's target | 2.5B prompt tokens, which is more than its sources hold, so the realised slice is the supply (table below) | `--qa-target` |
-| chat replay at 20% | not reachable: the non holdout smoltalk2 left after phase 2 and ir is about 0.3B, ultrachat 0.24B, no_robots 5M; the 18.5 points go to the bios slice | none |
-| web text with retrieval | only the QA builder's web arm (a held 384 token span of an `ir` document as evidence), 1.0B tokens | `--ir-tokens` |
-| tiers over the run's epochs | the pilot's tiers per split, 1 / 10 / 100 / 1000 exposures per pass, so the run sees 3x that (3 / 30 / 300 / 3000); 3,600 persons, 162,000 renderings, 0.016% of the split | `--persons-per-tier` |
-| the tail curriculum (RUN2 Schedule: chains 25%, reasoning weighted) | not built: the main split covers the whole 280B with the main shares. A tail split is one more merge (phase 2 filler, chains 25%) and one more injection build | none |
-
-## 1. The arithmetic
-
-Unit: the merged split's prompt tokens, as `merge_evidence_splits.py --target-tokens` counts them.
+Unit: prompt tokens of the merged split, as `merge_evidence_splits.py --target-tokens` counts them.
+The evidence trainer runs whole epochs and ignores `target_tokens`, so the split is sized as the
+token target over the epoch count.
 
 | quantity | value | derivation |
 |---|---|---|
-| tokens per split T | 93,333,333,333 | `TOKEN_TARGET / EPOCHS` = 280B / 3; RUN2's 100B unique at up to 4 epochs is replaced because the evidence trainer runs whole epochs (`num_epochs` times the split's rows, it ignores `target_tokens`), so 100B at 3 epochs would train 300B |
-| run tokens | 280,000,000,000 | RUN2 decision 6 |
-| epochs of the split in the run | 3 (`EPOCHS`) | T times 3 is exactly 280B (`TOKEN_TARGET`); a fresh permutation each epoch |
-| warm-up read | at most 28B | RUN2 Schedule: stop and decide if unmet by 28B; the first 28% of the warm split |
-| control | 10,000,000,000 | RUN2 decision 8 |
-| chains slice | 2,800,000,000 | 3% of the split (`--chain-share`) |
-| plain chains | 1,400,000,000 tokens, 28,090,116 questions | 1.4B over 52.33 tokens per question (measured: `chains_train.mask` 104.66M for 2M questions), times 1.05 margin |
-| bridge chains | 1,400,000,000 tokens, 19,491,610 questions | 1.4B over 75.41 tokens per question (measured on the smoke build at hops 1 to 4 at 25 each: 2,351,504 tokens in 31,180 questions, 12.6 chunks per question; the pilot's hops 1 to 3 form was 67.35), times 1.05 |
-| qa slice | 1,526,747,326 | the sum of the arms below |
-| bios slice (the injection build's `--target-tokens`) | 89,006,586,007 | T minus qa minus chains |
-| filler built, phase1 | 84,896,651,867 | bios slice times 1.01 (the 1% margin for validation windows and the window cut) minus phase 2 |
-| filler built, phase2 | 5,000,000,000 | assumption: smoltalk2 (15% of phase 2) is the scarce source, see section 2 |
-| filler built, ir | 2,500,000,000 | the QA builder's web arm reads it; assumption, same reason |
-| persons, renderings | 3,600 persons, 162,000 renderings | the pilot's `--persons-per-tier 1000:100,100:500,10:1000,1:2000` unchanged, so the pilot's A1(b) probe reads at the same noise |
-| inject_val fraction | 1.63e-5 | 2,000 windows, as the pilot's 1,961 (the default 0.5% would hold 440M tokens at this size) |
+| token target / epochs | 800B / 3 | `TOKEN_TARGET`, `EPOCHS` |
+| tokens per split T | 266,666,666,667 | `TOKEN_TARGET / EPOCHS`; the main split, each epoch a fresh permutation |
+| warm-up read | at most 28B | the warm split is the first 28B of the main order (`merge_warm`, prefix mode) |
+| control | 10B | the first 10B of the main order, no evidence files (`merge_control`) |
+| bios slice | 262,339,919,341 (share 0.9838) | T minus qa minus chains; the injection build's `--target-tokens`; taken whole |
+| qa slice | 1,526,747,326 (0.0057) | sum of the arms below |
+| chains, plain / bridge | 1.4B / 1.4B (0.00525 each) | absolute, `--chain-tokens 2.8e9` (a chain prompt token carries about 177 bytes of chunk keys, so a share of the split would grow the disk with the corpus); `--chain-share` replaces it |
+| chain questions | 28,090,116 plain, 19,491,610 bridge | 52.33 and 75.41 tokens per question (measured on the pilot build and the smoke), times 1.05 |
+| filler built | phase 1 259,963,318,534; phase 2 5,000,000,000; ir 2,500,000,000 | phase 1 is the bios need times 1.01 minus phase 2; phase 2 and ir are assumptions bounded by the smoltalk2 supply; the injection build reads phase 1 and 2 as filler, ir belongs to the QA web arm |
+| persons, renderings | 10,800, 486,000 | the pilot's tiers at 3x the persons (`1000:300,100:1500,10:3000,1:6000`), so the leak read has about 1.7x lower sigma than the pilot's |
+| validation windows | cutoff 5 per million, about 1,837 | the builder's hash gives whole millionths only |
+| prefix builds | bios full 10.5B, bios warm 29.4B | token count of the split plus 5%, `--stop-after-tokens`: byte prefixes of a build |
+| merge documents | 477,832,853 | 477.8M at 37k documents per second with evidence, 118k without |
+| evidence | 11.98B tokens, ratio 0.045 per prompt token | the real split's ratio is about 0.045 (bios 90M, chains and QA nearly all), against RUN2's 1.49 |
 
-QA arms (the builder stops an arm at `weight x target` or at its supply; SQuAD and HotpotQA at
-`--max-source-epochs 2`, and the merge takes the slice for one pass, so the run sees them
-3 times; the pilot's QA slice was one build pass at two merge passes):
+QA arms (the builder stops an arm at `weight x target` or at its supply; `--qa-target 2.5e9` is more
+than the sources hold, so the slice is the supply; SQuAD and HotpotQA at `--max-source-epochs 2`):
 
-| arm | builder weight | per pass or supply (source) | realised, estimate |
+| arm | weight | realised, estimate | supply source |
 |---|---|---|---|
-| squad_v2 | 0.20 | 5.86M per pass (pilot state file) | 11.7M |
-| hotpot_qa | 0.15 | 4.86M per pass (pilot state file) | 9.7M |
-| webtext | 0.40 | 2.5B of `ir` times 0.402 prompt tokens per `ir` token (pilot: 60.1M prompt from 149.3M `ir` tokens) | 1,000M |
-| smoltalk2 | 0.12 | 1.8B in the 24 no_think files, minus phase 2 (0.75B) and ir (0.75B) | 300M |
-| ultrachat | 0.08 | 207k rows at 1,163 tokens (pilot state) | 200M |
-| no_robots | 0.05 | 5.3M (pilot state) | 5.3M |
+| squad_v2 | 0.20 | 11.7M | 5.86M per pass (pilot state file) |
+| hotpot_qa | 0.15 | 9.7M | 4.86M per pass |
+| webtext | 0.40 | 1,000M | `ir` tokens times 0.402 prompt tokens per `ir` token |
+| smoltalk2 | 0.12 | 300M | 1.8B in 24 files minus phase 2 and ir |
+| ultrachat | 0.08 | 200M | 207k rows at 1,163 tokens |
+| no_robots | 0.05 | 5.3M | pilot state |
 
-The three merge commands, as printed by `build --dry-run` (shares: bios 0.9727, qa 0.016358, chains
-0.015, bridge 0.015; the bios share is 2% over its size so the slice is taken whole and the document
-counts of the warm and main merges match, as the pilot's 0.6001 did for the control):
+Chat replay at RUN2's 20% is not reachable (the non-holdout chat left is about 0.5B); the share goes
+to the bios slice. The tail curriculum is not built.
 
-- warm: `--split run2_warm_train --target-tokens 100000000000`, bios from `inject_retrieval_s100a50g1_train`
-- main: `--split run2_main_train`, bios from `inject_retrieval_s15a50g1_train`, `--order-from run2_warm_train.slice`
-- control: `--split run2_control_train --target-tokens 10000000000 --no-evidence`, bios from
-  `inject_full_s15a50g1_train`, no `--order-from`: each slice's subsequence is a prefix of the same
-  seeded permutation, so the control is the first 10B of the stream at slice level (its
-  `md5_by_slice` is a prefix, not equal; the driver checks warm against main only)
+### Filler: sources, volume, repeat
 
-## 2. The filler: sources, volume, repeat
+Phase 1 is capped per source at its share of the Hub's supply (code_edu 95%, wikipedia 90%, the
+shortfall to nemotron_math up to 65%, then fineweb). Need against supply, all three phases:
 
-`prepare_data.py` as it stands has one crawl of fineweb-edu (`data/CC-MAIN-2025-26/`, 50 files, 14.78B
-tokens: the 16B run's "ran dry") and one tenth of dclm. Needed tokens per source across the three
-phases at the plan above, against supply (files times tokens per file, the per-file yield from the
-16B manifest: realised tokens over `files_used`):
-
-| source | needed | files needed | supply as coded | supply with `--fineweb-prefix data/` | verdict |
-|---|---|---|---|---|---|
-| fineweb | 52.9B | 179 | 14.8B (50 files) | about 713B (2,410 files, 110 crawls) | short as coded, fine patched |
-| dclm | 9.4B | 87 | 304B (2,790 files) | same | fine |
-| finepdfs | 7.3B | 8 | 99B | same | fine |
-| code_edu | 12.9B | 46 | 26.9B (95 files) | same | fine, uses 48% |
-| nemotron_math | 4.9B | 8 | 32B (46 files, gated, HF_TOKEN) | same | fine |
-| wikipedia | 3.4B | 29 | 5.0B (41 files) | same | fine, uses 68% |
-| smoltalk2 | 1.5B | 20 | 1.8B (24 files) | same | binding: phase 2 and ir take 1.5B, the QA replay arm gets 0.3B |
-
-Verdict: the 89.0B filler is reachable with no repeat only if fineweb's prefix is widened to all
-crawls. The driver does that without touching the builder (`wrap-prepare-data --fineweb-prefix data/`
-patches `SourceSpec.file_prefix` in memory). As coded, the build ends at about 48B of the 84B
-phase 1 target (every other source reaches its weight, fineweb stops at 14.8B), the biography
-build then cycles the filler 1.7x (the pilot repeated 2.18x); the driver does not default to that.
-Two more patches in the same wrapper: phase 2 and ir skip the files an earlier phase read (the
-manifest's `files_used`), because the builders each start at file 0 of a source and would copy
-phase 1's first documents into phase 2 and ir; and the `data_prep` manifest key is written by phase 1
-and 2 (the QA builder reads `data_prep.smoltalk2_holdout_hashes` from it), `ir_prep` by ir (the
-builder refuses `ir` without a key). A fresh cluster has no `manifest.json`; the driver refuses to run
-the filler stage over a manifest that already holds `data_prep.phase1` (the 16B run's counts).
-
-Filler repeat implied by the plan: 1.00x (phase 1 plus phase 2 supply 89.4B against 89.0B plus
-margin). The injection build reads `phase1,phase2` as filler (not `ir`, which belongs to the QA
-builder's web arm, so no document is both plain filler and a held span web row). The 0.5% default
-validation fraction becomes 1.63e-5. Memory: `load_filler_windows` holds every training window as a
-Python tuple, about 90M windows of up to 1,000 tokens at this size: plan for 20 to 40 GB of RAM in
-`bios_main` and `bios_warm` (estimate; the pilot's 375k windows did not show it).
-
-## 3. Stages, outputs and the cluster command
-
-| # | stage | builder | main outputs | check |
-|---|---|---|---|---|
-| 1 | filler | `prepare_data.py` x3 through `wrap-prepare-data` | `prepared/{phase1,phase2,ir}.{bin,idx}` | marker, outputs |
-| 2 | bios_main | `prepare_injection_data.py --arms full,retrieval --swap-rate 0.15 --support-gold-only --suffix s15a50g1` | `prepared_run2/inject_{full,retrieval}_s15a50g1_train.*`, `inject_val.*`, `index/run2_bios` | files |
-| 3 | bios_warm | the same, `--arms retrieval --swap-rate 1.0 --suffix s100a50g1` | `inject_retrieval_s100a50g1_train.*` | files |
-| 4 | qa | `prepare_evidence_data.py --max-evidence-tokens 4608 --max-source-epochs 2 --split-prefix evidence_run2 --webtext-phase ir` | `prepared/evidence_run2_train.*` | files |
-| 5 | chains_plain | `prepare_chain_data.py --prefix chains_run2` | `prepared/chains_run2_train.*` | files |
-| 6 | chains_bridge | `wrap-chains --hops 4` then `prepare_chain_data.py --bridge --prefix chains_bridge_run2` | `prepared/chains_bridge_run2_train.*` | files |
-| 7 | merge_warm | `merge_evidence_splits.py`, four slices | `prepared_run2/run2_warm_train.*`, `.slice`, `.merge.json` | `md5_by_slice` has bios, qa, chains, bridge |
-| 8 | merge_main | the same with `--order-from run2_warm_train.slice` | `run2_main_train.*` | `md5_by_slice` qa, chains, bridge equal the warm merge's, bios differs |
-| 9 | merge_control | `--no-evidence`, 10B | `run2_control_train.{bin,idx,mask,slice,merge.json}` | the four md5 lines |
-| 10 | heldout_qa | `prepare_evidence_data.py --heldout --max-evidence-tokens 4608` | `evidence_dev.*`, `evidence_fixed.*` | files |
-| 11 | heldout_chains | `prepare_chain_data.py --prefix chains --splits eval,heldout_tmpl,hop4 --seed 42` | `chains_{eval,heldout_tmpl,hop4}.*` | files; same seed, so the held out compositions are the pilot's |
-| 12 | val_clean | `prepare_clean_val.py` | `inject_val_clean.*` | files |
-| 13 | store_openqa, store_edit | `build_store.py` | `index/openqa`, `index/openqa_edit` | `meta.json` |
-
-Each stage is skipped when its marker (`DATA_ROOT/run2_done/STAGE.json`) and outputs exist; a
-failure leaves no marker, so rerunning the same command resumes at that stage (`prepare_data.py`
-and the QA builder resume themselves from their state files; the injection, chain and merge
-builders restart the stage). Logs: `DATA_ROOT/run2_logs/STAGE.log`. `--stage A,B` runs some,
-`--force` reruns, `--dry-run` prints every command.
-
-Cluster command (the rented box has no `env_init`; `HF_TOKEN` for nemotron_math and the gated
-reads; move any `manifest.json` out of the repo root first):
-
-```
-TINY_LLM_ROOT=/workspace/tiny-llm TINY_LLM_ENV_INIT=/dev/null HF_TOKEN=... \
-  nohup python scripts/build_run2_corpus.py build --data-root /data/run2 --device cuda \
-  > /data/run2/build.log 2>&1 &
-```
-
-The chain share defaults to 0.03; pass `--chain-share 0.10` for RUN2's 10%, see section 4. Stages 1 to 6 are
-independent of each other except that 2, 3 and 12 read stage 1 and 4 reads stages 1's `ir` and
-phase 2 manifest entry, so on a node with several CPUs run `--stage chains_plain`,
-`--stage chains_bridge` and `--stage bios_main` in parallel processes after `--stage filler`
-(one process per stage; the driver itself is sequential).
-
-## 4. Storage and time, scaled from the pilot logs
-
-Pilot rates (measured): the two biography builds of 600M tokens took 5 minutes each (12:35 to 12:45,
-`build_pilot_bios.log`); 2M chain questions took about 55 minutes on cuda (`chain_depth_micro.md`);
-the warm and main merges took about 30 minutes each for 3.49M documents (13:11 and 13:41, 1,940
-documents per second, one process) and the evidence-free control 2 minutes. Bytes per token from
-the pilot files: bin 2, mask 1, factspan 1, evidence 2 per evidence token (ev and evchunk each) and
-768 per chunk occurrence for the keys. The QA builder's and `prepare_data.py`'s wall clocks are not
-on disk (`prepare_data.py` ran on the rented box; the QA log was not kept): unmeasured, the
-builders print documents per second in minute one.
-
-Default chain share 0.03 against RUN2's 10%, nothing deleted:
-
-| item | chains 3% (default) | chains 10% (RUN2) |
-|---|---|---|
-| filler bins | 185 GB | 172 GB |
-| bios main build (full + retrieval) | 804 GB | 745 GB |
-| bios warm build | 448 GB | 415 GB |
-| qa build | 19 GB | 19 GB |
-| chains plain build | 275 GB | 916 GB |
-| chains bridge build | 201 GB | 671 GB |
-| merge warm | 853 GB | 1.94 TB |
-| merge main | 853 GB | 1.94 TB |
-| merge control | 30 GB | 30 GB |
-| **total, nothing deleted** | **3.7 TB** | **6.8 TB** |
-| left after deleting the build sources (warm, main, control, filler kept) | 1.9 TB | 4.1 TB |
-| chain questions, plain / bridge | 28.1M / 19.5M | 93.6M / 65.0M |
-| hours, chains plain / bridge builds (one process each) | 12 / 12 | 41 / 41 |
-| hours, bios main / warm builds | 25 / 12 | 23 / 12 |
-| hours, merge warm / main (one process each; 194M / 289M documents) | 28 / 28 | 42 / 42 |
-| hours, merge control | 0.3 | 0.4 |
-
-Against RUN2 Storage (corpus about 1.5 TB in the per-occurrence format, about 0.5 TB with chunks
-referenced by store id, plus 140 GB of kept saves): the default needs 1.9 TB standing and 3.7 TB at
-the peak, RUN2's shares 4.1 TB and 6.8 TB. The cause is the chains: a 52 token question carries 12
-chunk keys (9.2 KB), 177 bytes of key per prompt token, against 0.8 for the bios slice. Two other
-costs are the recipe's: the injection builds write `.mask` and `.factspan` beside every token (4
-bytes per token in all, before the merge copies it again), and the warm split must be built at the
-main split's full size because `--order-from` needs equal document counts although the run reads
-only its first 28B (the warm merge is 30% used).
-
-Wall clock with stages in parallel where independent: filler (unmeasured, the download of about 90B
-tokens of parquet and jsonl), then the longest chain of bios_main (25 h) and the merges (28 h, warm
-then main, or in parallel on two cores after bios_warm and the chains), so about 2 days after the
-filler at 3% and 3 days at 10%; "day 1 on CPUs" holds for the arithmetic and the builders that
-start, not for the finished corpus. The merge is the longest single process and has no sharding.
-
-Decision needed from the user before the cluster command: the chain share. The driver defaults to
-3% (2.8B tokens of chains per split, 28M plain and 19M bridge questions, each seen 3 times). RUN2's
-row-level 10% costs 6.8 TB at peak (7.3 TB at the earlier 100B split size) and 3 to 4 days
-(`--chain-share 0.10`). RUN2 itself names the 10% as a share with no rung behind it.
-
-## 5. What the builders lack, and how it is worked around
-
-| missing | exact flag and meaning | workaround in the driver |
-|---|---|---|
-| `prepare_data.py`: a source's file prefix or a crawl list | `--source-prefix KEY=PREFIX` (repeatable): replaces `SourceSpec.file_prefix` for the key, so fineweb can read `data/` (all crawls) | `wrap-prepare-data --fineweb-prefix` patches the imported `SourceSpec` in memory |
-| `prepare_data.py`: skip the files an earlier phase read | `--skip-files-of PHASE[,PHASE]`: drops the files listed under `manifest[key][PHASE].per_source[*].files_used` from the listing | `wrap-prepare-data --exclude-files-of` does it through `file_filter` |
-| `prepare_chain_data.py`: the training hop mix | `--train-hop-weights 1:25,2:25,3:25,4:25` for the train and val splits (the default stays 25 / 50 / 25 over 1..3; the hop 4 compositions are the seen ones, `seen_compositions(4)`) | `wrap-chains --hops 4` sets `chains.sample_hops.__defaults__`; the seed is unchanged, so the held out compositions and the eval splits are the pilot's |
-| `merge_evidence_splits.py`: a shorter warm split | `--order-from-prefix`: take the first N documents of the `.slice` file as the first N of the output and continue the interleave, so the warm split can stop at 28B | none: the warm split is built at full size (the disk cost above) |
-| `merge_evidence_splits.py`: sharding | `--shard I/N` on the output (the merge is one process, 28 h at 3% chains, 42 h at 10%) | none |
-| `prepare_chain_data.py`: sharded train build | `--shard I/N` over the question stream (the build is one process, 12 h at 3% chains, 41 h at 10%) | run plain and bridge as two processes |
-| `prepare_injection_data.py`: a separate size for the `full` arm | `--full-target-tokens N` (the control needs only 10B, the `full` arm writes 89B) | none: delete `inject_full_*` after `merge_control` |
-| `load_filler_windows` memory | a numpy accumulation instead of a Python list of tuples | none; size the node |
-
-## 6. Local smoke
-
-Run 2026-10-26 22:06 to 22:30, before T became 93.33B and the chain share 0.03 (so at the 100B plan and 10% chains; the mechanics and the md5 check are unchanged by the resize, which only moves targets), in WSL on the 5090 box while other test jobs shared the disk:
-
-```
-python scripts/build_run2_corpus.py build --data-root data/run2_smoke --scale 0.0005   --link-filler-from data/prepared --persons-per-tier 1000:4,100:20,10:40,1:80   --heldout-max-questions 200 --chain-eval-per-hop 200 --store-max-questions 100   --stage filler,bios_main,bios_warm,qa,chains_plain,chains_bridge,merge_warm,merge_main,merge_control,heldout_qa,heldout_chains,val_clean
-```
-
-Wall time 1,424 seconds (23.7 minutes), driver exit 0, 3.4 GB on disk (removed afterwards; logs, the
-three `merge.json` files and the markers are in `ckpts/inject/run2_corpus_smoke/`). The split is
-50M prompt tokens (scale 0.0005), the filler the local stand-in bins `phase1` and `phase2` (60M
-tokens, repeat factor 1.00x), the filler stage replaced by symlinks. Stage seconds: bios_main 136,
-bios_warm 127, qa 196, chains_plain 184, chains_bridge 172, merge_warm 105, merge_main 93,
-merge_control 100, heldout_qa 104, heldout_chains 127, val_clean 80 (each is mostly the model and
-embedder load on a contended disk, not the work).
-
-`md5_by_slice` lines (the driver's check passed: warm and main agree on qa, chains and bridge, the
-bios slices differ, as they must):
-
-| slice | warm | main | control (10% of the split, a prefix) |
+| source | need | files | supply (fineweb widened) |
 |---|---|---|---|
-| bios | `82fd520e514957e659d28d612de74746` | `03538acb47df94becdc1539243d2a3f9` | `bc97ec46867f615098d1b37460c654be` |
-| qa | `703e87853d673716912e9b0e798643c3` | `703e87853d673716912e9b0e798643c3` | `b80b08c1306929acecd2896e074d37f1` |
-| chains | `91ab61bf2fa7d41ebbc0417acc21907c` | `91ab61bf2fa7d41ebbc0417acc21907c` | `5f9938c1a0560e7a8d3c89633057a835` |
-| bridge | `da02ddff7c05b3e693c8e7bca6469b82` | `da02ddff7c05b3e693c8e7bca6469b82` | `db394ecaee4251a9c725df53ccfaf169` |
+| fineweb | 165.2B | 559 | 713B (2,410 files, 110 crawls); one crawl is 14.8B |
+| dclm | 28.9B | 265 | 304B |
+| finepdfs | 20.9B | 22 | 99B |
+| code_edu | 25.5B | 91 | 26.9B (95% used) |
+| nemotron_math | 20.9B | 30 | 32.2B (gated) |
+| wikipedia | 4.5B | 37 | 5.0B (90% used) |
+| smoltalk2 | 1.5B | 20 | 1.8B (binding for the QA replay arm) |
 
-Merge totals (warm): 49.83M prompt tokens, 21.18M evidence tokens (ratio 0.43), 153,334 documents;
-slice shares realised bios 0.879, qa 0.024, chains 0.050, bridge 0.047 (target 0.884, 0.015, 0.05,
-0.05; the QA slice is above its share at this scale because no arm is exhausted, the bridge slice
-is short because the smoke built it with the pre-smoke estimate of 84.2 tokens per question
-against the measured 75.4: the constant is corrected). The main merge reused the warm order
-(`--order-from`) with equal document counts per slice. The evidence ratio of the real split is
-about 0.4 (chains and QA carry nearly all of it), against RUN2's 1.49: the evidence per row cap
-(4608) and the packing line are the pilot's, the Cost section's rate estimate (RUN2 Cost) is
-conservative for this corpus.
+Phase 1 weights after the cap: fineweb 0.6315, dclm 0.1111, finepdfs 0.0778, code_edu 0.0923,
+nemotron_math 0.0724, wikipedia 0.0150 (`--phase1-weights`, passed by the stage). The filler is
+reachable with no repeat only with fineweb's prefix widened to all crawls (`wrap-prepare-data
+--fineweb-prefix data/`, a patch in memory); phases 2 and ir skip the files an earlier phase used
+(`files_used` of the manifest); `data_prep` holds phase 1 and 2 (the QA builder reads its
+`smoltalk2_holdout_hashes`), `ir_prep` holds ir. **Filler repeat is checked**: after each biography
+build the driver reads `common.filler_repeat_factor` of `inject_build.json` and fails the stage above
+1.001 (a smoke with `--link-filler-from` or `--allow-filler-repeat` skips it). `load_filler_windows`
+holds every training window as a Python tuple: size the node for tens of GB of RAM in the biography
+builds (estimate).
 
-Read off the smoke: the bridge at hops 1 to 4 builds through `wrap-chains --hops 4` (hops
-7,742 / 7,871 / 7,788 / 7,779 of 31,180), 75.41 tokens and 12.6 chunks per question; the
-`--support-gold-only` biography build reports supported spans 80.2% against 80.2% gold in the
-buffer (a gold-less document supports nothing); `wrap-prepare-data` loads, patches fineweb and, for
-the later phases, reports the files to skip (checked against the local 16B manifest with
-`--help`).
+## 2. Stages
 
-Not run locally, and what the cluster needs:
+`build --stage NAME[,NAME]` (default all), in this order. Each stage runs its commands through bash
+(`cd ROOT && source ENV_INIT && ...`, `TINY_LLM_ROOT` and `TINY_LLM_ENV_INIT=/dev/null` on the
+cluster), tees `DATA_ROOT/run2_logs/STAGE.log`, checks its outputs and writes `run2_done/STAGE.json`.
 
-| stage | why not | what the cluster needs |
-|---|---|---|
-| filler (`prepare_data.py` x3) | a full source download (about 90B tokens, 179 fineweb files, 87 dclm, 46 code_edu and the rest, listed above) | `HF_TOKEN` with access accepted for `nvidia/Nemotron-CC-Math-v1`, about 0.2 TB for the bins plus a few shards of scratch; no `manifest.json` in the repo root; the wrapper's fineweb prefix and file skipping are exercised only up to `--help` |
-| store_openqa, store_edit | NQ and TriviaQA downloads (`build_store.py` fetches the NQ file whole) | disk and network for NQ; the driver passes `--store-max-questions` through |
-| the real scale of everything | the point of the cluster | sections 1 to 4 |
+| stage | tool | writes | rerun after a kill |
+|---|---|---|---|
+| filler | `prepare_data.py` x3 through `wrap-prepare-data` (phase1, phase2, ir) | `prepared/{phase1,phase2,ir}.{bin,idx}`, `manifest.json` entries | resumes from its state files; `--force` on a pruned filler now fails (the state records more bytes than the bins hold) |
+| qa | `prepare_evidence_data.py` | `prepared/evidence_run2_train.*` | resumes |
+| bios_main | `prepare_injection_data.py`, arm retrieval, swap 0.15, gold-only support | `prepared_run2/inject_retrieval_s15a50g1_train.*`, `inject_val.*`, `index/run2_bios` | resumes (state file; a kill before the first state write is rebuilt) |
+| val_clean | `prepare_clean_val.py` | `inject_val_clean.*` | partial outputs deleted, rerun |
+| bios_full | injection builder, arm full | `inject_full_s15a50g1_train.{bin,idx,mask}`, a 10.5B prefix | resumes |
+| bios_warm | injection builder, arm retrieval, swap 1.0 | `inject_retrieval_s100a50g1_train.*`, a 29.4B prefix | resumes |
+| prune_filler | `rm` | deletes the filler bins | idempotent |
+| chains_plain | `prepare_chain_data.py` | `prepared/chains_run2_train.*` | resumes |
+| chains_bridge | `wrap-chains --hops 4`, `--bridge` | `prepared/chains_bridge_run2_train.*` | resumes |
+| qa_shuffle | `merge_evidence_splits.py` over the qa build alone | `prepared_run2/run2_qa_shuf_train.*` | resumes (merge state) |
+| order | `build_run2_corpus.py order`, numpy, about 9 GB | `run2_order.slice`, `run2_order.json` | partial deleted, rerun |
+| merge_main | `merge_evidence_splits.py --order-prefix-from run2_order.slice`, whole order | `run2_main_train.*`, `.slice`, `.merge.json` | resumes (merge state, `--overwrite`) |
+| merge_warm | the same, prefix of main to 28B | `run2_warm_train.*`, then `run2_main_train.order.json` (`epoch0_head_docs`) | resumes |
+| merge_control | the same, `--no-evidence`, prefix to 10B | `run2_control_train.{bin,idx,mask,slice,merge.json}` | resumes |
+| rows | `sft.py --evidence --estimate-rows-only`, CPU | `run2_{main,control}_train.rows_estimate.json` (entries for 1, 2, 4, 8, 16 ranks) | partial deleted, rerun |
+| prune_sources | `rm` | deletes the bios, qa (build and shuffled copy) and chain train builds | idempotent |
+| heldout_qa | `prepare_evidence_data.py --heldout` | `evidence_dev.*`, `evidence_fixed.*` | partial deleted, rerun |
+| heldout_chains | `prepare_chain_data.py --prefix chains` | `chains_{eval,heldout_tmpl,hop4}.*` (same seed as the pilot) | partial deleted, rerun |
+| store_openqa, store_edit | `build_store.py` | `index/openqa`, `index/openqa_edit` | partial deleted, rerun |
+
+Rules the driver enforces:
+
+- A stage with a marker and its outputs (or pruned by a later prune stage) is skipped; `--force`
+  reruns. Its post checks still run on a skip (the md5 and prefix checks of the merges, the filler
+  repeat check); an inbox directory deleted after the filler is fine on that path.
+- `run2_done/STAGE.lock`: a non-blocking `flock` per stage; a second driver process reaching a held
+  stage fails it at once instead of running the same merge beside the first.
+- SIGTERM is forwarded to the child's process group, the child is waited for, no marker is written,
+  exit 20; rerun the same command. A stop that lands after the work is done is checked and marked first.
+- `DATA_ROOT/run2_logs/last_child_output` is touched when any child prints a line (at most once per
+  10 s) and at every stage start and end, in `--parallel` mode for every child; the driver's 300 s
+  heartbeat does not touch it. The corpus job's stall check reads its mtime (`STALL_MIN`, default 120).
+- Exit codes of `build`: 0 done, 1 a stage failed, 2 refused before running (disk plan over budget,
+  filler preflight: a `manifest.json` that holds `data_prep.phase1` this root did not write; this
+  root's own `run2_data_root` stamp, a filler marker, or its `_prepare_state_phase1.json` is proof),
+  20 interrupted.
+
+The three merges are one document stream. `order` interleaves the four slices in proportion to their
+size, storage order inside a slice (document k of a slice of n sorts at (k + 0.5) / n). The merge
+tool's prefix mode takes slice i's k-th document in storage order, so a slice must already be in
+random order: the biography layout and the chain generator's seeded questions are, **the QA builder's
+rows are not** (smooth weighted round robin over its arms: SQuAD, HotpotQA and no_robots run out in
+about the first 30% of the build, so the warm prefix and the control would carry about 3x the run's
+share of extractive QA). `qa_shuffle` therefore rewrites the QA build as a one-slice merge (share 1,
+every document, the tool's seeded permutation of seed, label and count; seed 42) and every later
+stage reads that copy; `run2_order.json` records it under `permuted_slices` (seed, md5, documents).
+The warm and control splits are byte prefixes in slice order of the main merge, checked by the driver
+(md5 of the `.slice` prefix and the non-biography documents); the biography documents differ in length
+between the forms (swaps), so `md5_by_slice` differs between the splits (each is the md5 of its own prefix).
+
+## 3. Disk and time (`plan`, estimates from the pilot rates)
+
+| stage | writes | deletes | running |
+|---|---|---|---|
+| filler | 537.6 GB (+30 GB scratch) | | 537.6 GB |
+| qa | 18.8 GB | | 556.4 GB |
+| bios_main | 800.4 GB | | 1.36 TB |
+| bios_full / bios_warm | 31.6 / 89.6 GB | | 1.48 TB |
+| prune_filler | | 537.6 GB | 940.7 GB |
+| chains_plain / chains_bridge | 315.2 / 239.1 GB | | 1.50 TB |
+| qa_shuffle | 18.8 GB | | 1.51 TB |
+| merge_main | 1.37 TB | | 2.89 TB |
+| merge_warm / merge_control | 144.2 / 30.2 GB | | 3.06 TB |
+| prune_sources | | 1.51 TB | 1.55 TB |
+| held out, stores | 1.8 GB | | 1.55 TB |
+
+Peak 3.06 TB (budget 3.4 TB, the filler's inbox window counted when the mirror is on), standing
+1.55 TB (budget 2.0 TB). The cause of the size is the chains (12 chunk keys of 768 bytes per 52 token
+question, 177 bytes per prompt token against 0.8 for the bios slice) and the injection builders'
+`.mask` and `.factspan` beside every token.
+
+Hours, one process each: bios_main 35.2, bios_full 1.4, bios_warm 3.9, chains_plain 12.3,
+chains_bridge 12.3, qa_shuffle under 0.1, order 0.3, merge_main 3.6, merge_warm 0.4, merge_control
+under 0.1; filler, qa and val_clean unmeasured. Every stage over 60 hours must be resumable (a 72 h
+job loses a non-resumable one); `plan` flags it. Independent stages can share a node
+(`--parallel chains_plain,chains_bridge,bios_main`; the driver refuses two injection builds in one
+group).
+
+## 4. The cluster: no internet on any node
+
+No MareNostrum 5 node, login nodes included, reaches the Hub, so the filler reads its shards through
+the mirror (`scripts/mirror_sources.py`, demand driven) and the other Hub reads come from a staged
+cache. Recipe in `scripts/slurm/README.md` ("The filler through the mirror"); in short:
+
+1. On the PC, once: `python scripts/mirror_sources.py list --out listing.json` (the plan flags as for
+   the build; 444 GB in 1,127 files at the full plan, limit 2 TB) and `python scripts/mirror_sources.py
+   stage-small --hf-home DIR` (tokenizer, bge, SQuAD, HotpotQA, smoltalk2, ultrachat, no_robots, NQ,
+   TriviaQA); copy `DIR` to `$HF_HOME` and `listing.json` to `$DATA_ROOT/listing.json` on the cluster.
+   `python scripts/build_run2_corpus.py check-offline --offline-stage $HF_HOME` lists what a stage lacks.
+2. Cluster, the filler job (a whole node, 72 h jobs chained, resumable):
+   `STAGES=filler CORPUS_ARGS="--mirror-inbox $DATA_ROOT/inbox --mirror-listing $DATA_ROOT/listing.json --offline-stage $HF_HOME" bash scripts/slurm/submit_chain.sh CORPUS 3`
+3. PC, at the same time: `python scripts/mirror_sources.py push --listing listing.json --remote
+   USER@transfer1.bsc.es:$DATA_ROOT/inbox --window-gb 120 --transfer-limit-gb 2000`. The inbox holds at
+   most the window; the file the consumer waits on is sent even when later files of other sources fill
+   the window. The push ends when the driver drops `.filler_done` into the inbox after the filler;
+   delete the inbox afterwards (later driver runs, `--stage all` included, do not mind).
+4. Every other stage group, in the order of section 2: `STAGES=qa,bios_main,... bash
+   scripts/slurm/submit_chain.sh CORPUS 3` with `CORPUS_ARGS="--offline-stage $HF_HOME"` where the stage
+   reads the Hub (qa, the chains' embedder, held out, stores); the Slurm side (stall watchdog, locks,
+   chain ids) is `scripts/slurm/corpus.sbatch` and its README. The CPU-only stages (the merges, `rows`)
+   may use a CPU partition.
+5. The `rows` stage (CPU) must have run before any training job: the trainer exits 2 without a row
+   estimate for its rank count (entries for 1, 2, 4, 8 and 16 ranks are written).
+
+On a machine with internet (local smoke, the earlier rented box) none of this applies: `python
+scripts/build_run2_corpus.py build --data-root DIR --device cuda` with `HF_TOKEN` for nemotron_math
+and no `manifest.json` in the repo root. `--dry-run` prints every command and runs nothing.
+
+## 5. What the builders lack, and how the driver works around it
+
+| missing | workaround |
+|---|---|
+| `prepare_data.py`: a source's file prefix, skipping an earlier phase's files, a mirror | `wrap-prepare-data` patches the imported module in memory (`--fineweb-prefix`, `--exclude-files-of`, `--phase1-weights`, `--mirror-inbox`) |
+| `prepare_chain_data.py`: the training hop mix 1..4 at equal weight | `wrap-chains --hops 4` sets `chains.sample_hops.__defaults__`; seed unchanged, so the held out compositions are the pilot's |
+| `prepare_evidence_data.py` and `build_store.py` without internet | `wrap-hub --stage-dir` answers the Hub dataset calls from the staged directory |
+| QA rows in storage order are not random | the `qa_shuffle` stage (section 2) |
+| a separate size for the `full` arm | `--stop-after-tokens` builds a prefix; the control reads 10.5B of it |
+| `merge_evidence_splits.py` has no sharding | none; 3.6 h at the estimated rate |
+
+## 6. History: the local smoke of 2026-10-26 (the 100B plan, not the current one)
+
+Run 22:06 to 22:30 at scale 0.0005 on the 100B plan with 10% chains, before the split became 93.3B and
+then 266.7B and before `qa_shuffle` existed; the mechanics and the md5 check are unchanged by the
+resize. Wall time 1,424 s, exit 0, 3.4 GB, stages filler (linked), bios_main, bios_warm, qa,
+chains_plain, chains_bridge, merge_warm, merge_main, merge_control, heldout_qa, heldout_chains,
+val_clean. `md5_by_slice` of warm and main agreed on qa, chains and bridge and differed on bios, as
+they must (`ckpts/inject/run2_corpus_smoke/`). Read off it: the bridge at hops 1 to 4 builds through
+`wrap-chains --hops 4` (75.41 tokens and 12.6 chunks per question, which the plan uses), and
+`--support-gold-only` supports a span exactly when the gold card is in the buffer.
+
+## 7. Local smoke of the final code, 2026-10-27
+
+`python scripts/build_run2_corpus.py build --data-root /tmp/r2smoke_final --scale 0.0005 --link-filler-from data/prepared --heldout-max-questions 200 --chain-eval-per-hop 200 --store-max-questions 100`
+on the final code (the plan at scale 0.0005: T 133M per split; log `/tmp/r2smoke_final.log`, outside the repo). Every stage ok, driver exit 0,
+1,710 s (28.5 min), 2.8 GB (deleted afterwards). `qa_shuffle` 66 s, order 1 s, merges 65 to 69 s each, rows 207 s.
+`run2_order.json` records `permuted_slices.qa`: split `run2_qa_shuf_train`, seed 42, 4,461 documents,
+md5 `7db095139554f65da39574b25185451e` (equal to the main merge's qa `md5_by_slice`: the main merge takes the whole
+permuted slice). `epoch0_head_docs` 68,748. `md5_by_slice`, warm / main / control (the warm and control splits are
+prefixes of the main stream, so their md5 differ from the main's by construction; the driver checks the `.slice`
+prefix and the non-biography documents instead):
+
+| slice | warm | main | control |
+|---|---|---|---|
+| bios | `214d50dde974c2150fd78f866b13f378` | `6923079cbbcf91654989fae71839fd09` | `bfae38143e1555a0341f789c4d48353c` |
+| qa | `2950ee50bc644b47c2a66757ddcbd495` | `7db095139554f65da39574b25185451e` | `30da3e247ba57ec359671ca703058cd9` |
+| chains | `03e59667804498724abc8335b6e842f4` | `1b568a08ce8a8a9bf86a3d6d45adc18f` | `feb4616bb3971a0541c77b65e8984361` |
+| bridge | `2ae17fc41cb5a60591b71723d6d3eafe` | `9da0b67de96b6f1967735f0200c2b4f5` | `23cb6a05ea0b9807c65a9f4c8a271627` |
+
+Filler repeat 1.49x: the local stand-in filler is small, and `--link-filler-from` skips the repeat check.

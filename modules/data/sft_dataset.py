@@ -22,6 +22,13 @@ into ``max_length`` rows, batch-aligned ``document_ids`` the trainer turns into 
     worker derives independently -- so it stays a pure function of the checkpointed
     ``(epoch, doc position)`` pair and resume works exactly like the pretraining one.
 
+**Head-first epoch 0.** A split with a ``{split}.order.json`` sidecar holding ``epoch0_head_docs``
+(H) is a superset whose first H documents are another split's documents in the same order (the
+warm-up split is a prefix of the main split). Its epoch 0 permutation is the permutation of
+``[0, H)`` the shorter split would use, then a permutation of ``[H, num_docs)`` from a distinct
+stream, so a switch to it at position ``p < H`` visits the head documents not yet seen first.
+No sidecar, no change.
+
 Resume granularity is a *position in the permuted order*, not a raw document id: workers shard it
 with the same ``position % num_workers`` arithmetic, so one conservative min-across-workers scalar
 (the trainer's ``global_offset``) is still enough. Reading it back under a different ``seed`` or
@@ -46,6 +53,7 @@ answer carry the same weight regardless of length. It is emitted unconditionally
 float per token, computed in the worker); whether the loss actually uses it is the trainer's
 decision (``SFTConfig.conversation_loss_weighting``), so the same corpus serves both objectives.
 """
+import json
 import os
 from typing import Iterator
 
@@ -55,6 +63,63 @@ from torch.utils.data import IterableDataset
 from transformers import PreTrainedTokenizerBase
 
 from utils import logger
+
+
+ORDER_SIDECAR_SUFFIX = ".order.json"
+
+
+def read_epoch0_head_docs(path: str, num_docs: int):
+    """The head size ``H`` from a split's ``{split}.order.json``, or None when there is no sidecar.
+
+    Args:
+        path: the sidecar path.
+        num_docs: the split's document count; ``H`` must lie in ``[1, num_docs]``.
+
+    Returns:
+        ``epoch0_head_docs`` as an int, None when the file does not exist.
+
+    Raises:
+        ValueError: the sidecar is unreadable, lacks the key, or the value is out of range.
+    """
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            head = json.load(f)["epoch0_head_docs"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"{path} is unreadable or has no epoch0_head_docs: {e!r}") from e
+    if isinstance(head, bool) or not isinstance(head, int) or not 0 < head <= num_docs:
+        raise ValueError(
+            f"{path}: epoch0_head_docs {head!r} must be an integer in [1, {num_docs}] "
+            f"(the split has {num_docs} documents)"
+        )
+    return head
+
+
+def epoch_order(seed: int, epoch: int, num_docs: int, head_docs=None) -> np.ndarray:
+    """One epoch's document permutation.
+
+    Without ``head_docs`` this is ``default_rng([seed, epoch]).permutation(num_docs)``. With it,
+    epoch 0 is the permutation of the first ``head_docs`` documents, which equals the epoch 0
+    order of a split holding only those documents, followed by a permutation of the rest from its
+    own stream. Epochs from 1 on are unchanged.
+
+    Args:
+        seed: base seed.
+        epoch: epoch index.
+        num_docs: documents in the split.
+        head_docs: size of the head, None for the plain permutation.
+    """
+    if head_docs is None or epoch != 0:
+        return np.random.default_rng([seed, epoch]).permutation(num_docs)
+    if not 0 < head_docs <= num_docs:
+        raise ValueError(f"head_docs {head_docs} is outside [1, {num_docs}]")
+    # in place on one int64 array: ``Generator.permutation(n)`` is ``shuffle(arange(n))``, so this
+    # is byte identical to permuting the two parts apart and joining them, at one array of memory
+    out = np.arange(num_docs, dtype=np.int64)
+    np.random.default_rng([seed, 0]).shuffle(out[:head_docs])
+    np.random.default_rng([seed, 0, 1]).shuffle(out[head_docs:])
+    return out
 
 
 class SFTDataset(IterableDataset):
@@ -140,6 +205,16 @@ class SFTDataset(IterableDataset):
             f"SFTDataset[{split}]: {self.num_docs:,} conversations, {n_tokens:,} tokens, "
             f"shuffle={shuffle}"
         )
+        # read once here; an unshuffled reader (validation) has no permutation to reorder
+        self.order_path = os.path.join(data_dir, f"{split}{ORDER_SIDECAR_SUFFIX}")
+        self.epoch0_head_docs = (
+            read_epoch0_head_docs(self.order_path, self.num_docs) if shuffle else None
+        )
+        if self.epoch0_head_docs is not None:
+            logger.info(
+                f"SFTDataset[{split}]: epoch 0 reads its first {self.epoch0_head_docs:,} "
+                f"documents in the order of a {self.epoch0_head_docs:,} document split ({self.order_path})"
+            )
 
     def set_epoch(self, epoch: int) -> None:
         """Select which epoch's permutation the next iteration uses (call before iterating)."""
@@ -154,7 +229,7 @@ class SFTDataset(IterableDataset):
         """
         if not self.shuffle:
             return np.arange(num_docs, dtype=np.int64)
-        return np.random.default_rng([self.seed, self.epoch]).permutation(num_docs)
+        return epoch_order(self.seed, self.epoch, num_docs, self.epoch0_head_docs)
 
     def _batch_iterator(self) -> Iterator[dict]:
         # reopened per worker/epoch rather than held on the object -- a long-lived memmap handed

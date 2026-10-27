@@ -151,9 +151,9 @@ def split_compositions(seed: int, held_out_fraction: float = 0.2) -> Tuple[Set[T
 def seen_compositions(length: int, held_out: Set[Tuple[str, ...]]) -> List[Tuple[str, ...]]:
     """Tuples a training or seen-composition eval question of this length may use.
 
-    Length 3 drops every tuple containing a held out pair: a 3-hop question holding a held out
-    pair would teach that exact pairing and void the held out test. Length 1 and 4 are unrestricted
-    (length 4 only ever appears in its own split).
+    Length 1 is unrestricted and length 2 drops the held out pairs themselves. Every length of 3 or
+    more (4 included) drops each tuple containing a held out pair as a consecutive pair: a question
+    holding one would teach that exact pairing and void the held out test.
 
     Args:
         length: number of hops.

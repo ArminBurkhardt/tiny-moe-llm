@@ -45,7 +45,7 @@ Run from the repo root:
     python scripts/sft.py --repair -c ckpts/trained/checkpoint_sft_final_phase0.pt
 
 **Data parallel training (``--evidence`` on a multi GPU node).** The same file runs under
-``accelerate launch`` or ``torchrun``; one process per GPU, DDP through accelerate. On the cluster
+``accelerate launch`` or ``torchrun``; one process per GPU, no DDP wrap. On the cluster
 the launch is by hand and detached, one of
 
     TINY_LLM_CONFIG=config_run2.yaml setsid nohup accelerate launch --num_processes 8         --mixed_precision no scripts/sft.py --evidence -c SEED --run-name NAME ...         > run.log 2>&1 < /dev/null & disown
@@ -64,16 +64,52 @@ With one process nothing below applies and the run is exactly what it was. With 
     lockstep by ``lockstep_batches`` (a MIN over the ranks every ``LOG_INTERVAL`` batches), so
     every rank takes the same number of micro steps and a few trailing batches of an epoch are
     dropped, like ``drop_last``;
-  * DDP with ``find_unused_parameters=True`` (a rank whose slice has no evidence, gold flag or
-    answer start leaves the port, the groundedness head and the selection terms unused) and
-    ``broadcast_buffers=False`` (the balance bias moves from counts summed over the ranks, not
-    from rank 0's copy);
+  * the model is NOT wrapped in DDP (the LM heads run outside the model forward, which a DDP
+    reducer would never see): ``pretrain.all_reduce_grads`` averages every gradient in fp32
+    buckets inside ``train_step``, a rank whose slice has no evidence, gold flag or answer start
+    contributing zeros; only the optimizer goes through ``accelerator.prepare``. Nothing
+    broadcasts weights or buffers, so ``check_ranks_identical`` verifies at startup that every
+    rank holds the same parameters, buffers and fp32 masters, and the balance bias moves from
+    counts summed over the ranks;
   * at the log cadence one float64 all-reduce carries the token count, the evidence count, the
     stop and checkpoint requests of any rank, and the means of the logged scalars; eval batches
     are sharded by batch index and their sums gathered (``merge_eval_states``); the loss-free
     balancer's counts are summed before every bias update; after an IR cluster refresh rank 0's
     IR state is broadcast;
   * saves, ``run_state.json``, graphs, uploads and retention are rank 0's, between two barriers.
+
+``--grad-accumulation-steps N`` overrides the profile's ``grad_accumulation_steps`` so a job script
+can hold the global batch fixed across node sizes (8 x 4096 x N x GPUs: N = 2 on 8 GPUs, 1 on 16).
+``total_steps`` and the cosine follow it; the plan (``total_steps``, ``rows_per_epoch``,
+``world_size``, ``grad_accumulation_steps``) is saved in every checkpoint and a resume under
+another value warns and keeps the new ``total_steps``.
+
+**Head-first epoch 0.** When ``{data_dir}/{split}.order.json`` holds ``epoch0_head_docs`` (H), the
+training split's epoch 0 order is the permutation of its first H documents that a split of just
+those H documents would use, then a permutation of the rest from a distinct stream (see
+``modules/data/sft_dataset.py``). A warm-up split built as the first H documents of the main split
+then lets the ``--switch-split`` relaunch at position p < H visit the head documents it has not
+seen before the rest. Epochs from 1 on and splits without the sidecar are unchanged. H is saved in
+the checkpoint (``epoch0_head_docs``) and a resume on the same split under another H is refused.
+
+**Warm-up to main switch (run notes).** ``--plan-split SPLIT`` (same data dir) makes the packed row
+estimate, ``total_steps`` and so the LR schedule (warmup length and cosine) come from SPLIT instead
+of the training split; the job scripts pass the main split on every launch of the main run, warm
+and main, so the schedule spans the whole run from step 0 and the switch changes nothing in the
+plan. It is saved in the checkpoint (``plan_split``) and a resume under another one warns.
+``--max-epochs-this-split N`` (warm launches pass 1): on reaching the end of epoch N - 1 the run
+saves at that epoch, logs "warm split exhausted" and exits 10, never entering the next epoch of the
+warm split. ``--switch-split`` is then checked against the checkpoint and refused with exit 30
+unless the saved epoch is 0, the saved position lies within the new split's head (its
+``order.json`` H, else its document count), the warm run left no ``_final.pt``, and the warm
+split's saved document count equals the new split's H or the new split's own count (the
+checkpoint's ``num_docs``). The packed row estimate is cached in ``{data_dir}/{plan split}.
+rows_estimate.json`` under a key of the index files' sizes and content fingerprints and the packing and order
+parameters; ``--estimate-rows-only`` (CPU, exit 0, ``--estimate-world-sizes 8,16``) writes it, and
+a launch of more than one rank with no valid cache for its rank count exits 2 instead of computing
+it. The kill check (``kill_tokens``) may run during the warm-up and
+``kill_checked`` then carries across the switch, by design. Every exit path of a multi process run
+destroys the process group.
 """
 import os
 import re
@@ -365,9 +401,13 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
     """
     offsets = np.fromfile(idx_path, dtype=np.uint64)
     doc_lengths = np.diff(offsets).astype(np.int64)
-    lengths = doc_lengths + num_mtp_tokens
+    del offsets
     if split_documents:
-        return max(1, int(lengths.sum() // max_length) + 1)
+        return max(1, int((doc_lengths + num_mtp_tokens).sum() // max_length) + 1)
+    # int32 from here: a document is far under 2**31 tokens, and at hundreds of millions of
+    # documents every int64 copy of the index is several GB (the counts are the same)
+    doc_lengths = doc_lengths.astype(np.int32)
+    lengths = doc_lengths + np.int32(num_mtp_tokens)
 
     # the evidence reader packs to one position under the row, so a row ends with a pad segment;
     # the SFT reader packs to the full row. lengths assume the BOS the builders always write
@@ -376,7 +416,8 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
     ev_lengths = np.zeros_like(lengths)
     if evidx_path and max_evidence_tokens:
         ev_offsets = np.fromfile(evidx_path, dtype=np.uint64)
-        ev_lengths = np.diff(ev_offsets).astype(np.int64)
+        ev_lengths = np.diff(ev_offsets).astype(np.int32)
+        del ev_offsets
 
     # the reader's own stream order, when it has one. Only the two budget case actually needs this
     # (see the Args note), but running it for every profile keeps one code path
@@ -386,6 +427,7 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
     keep = lengths <= row_limit
     # both readers skip empty documents
     keep &= (doc_lengths[order] if order is not None else doc_lengths) > 0
+    del doc_lengths
     if max_evidence_tokens:
         keep &= ev_lengths <= max_evidence_tokens
 
@@ -405,6 +447,138 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
             used, used_ev, open_row = used + length, used_ev + ev, True
         rows += int(open_row)
     return max(1, rows)
+
+
+ROWS_CACHE_SUFFIX = ".rows_estimate.json"
+ROWS_CACHE_VERSION = 2
+EXIT_NO_ROWS_CACHE = 2
+FINGERPRINT_BYTES = 1 << 20
+
+
+def _file_stamp(path):
+    """Size and a sha1 of the first and last megabyte of ``path`` for a cache key, None for no file.
+
+    No mtime: a copy of the corpus to another disk or a restage does not preserve it, and the
+    cache must stay valid for identical bytes.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    size = os.path.getsize(path)
+    digest = hashlib.sha1()
+    with open(path, "rb") as f:
+        digest.update(f.read(FINGERPRINT_BYTES))
+        if size > FINGERPRINT_BYTES:
+            f.seek(max(FINGERPRINT_BYTES, size - FINGERPRINT_BYTES))
+            digest.update(f.read(FINGERPRINT_BYTES))
+    return [size, digest.hexdigest()]
+
+
+def rows_cache_key(dataset, max_length: int, num_mtp_tokens: int) -> dict:
+    """Everything ``estimate_packed_rows``'s result depends on except the number of workers.
+
+    Args:
+        dataset: the plan split's dataset (``idx_path``, optional ``evidx_path``, ``seed``,
+            ``shuffle``, ``epoch0_head_docs``, ``max_evidence_tokens``).
+        max_length: row length.
+        num_mtp_tokens: separator slots per document.
+
+    Returns:
+        A JSON-comparable dict: the index files' sizes and content fingerprints (first and last MB), the packing parameters, the
+        reader rule and the epoch 0 order's seed and head.
+    """
+    return {
+        "version": ROWS_CACHE_VERSION,
+        "num_docs": getattr(dataset, "num_docs", None),
+        "idx": _file_stamp(dataset.idx_path),
+        "evidx": _file_stamp(getattr(dataset, "evidx_path", None)),
+        "max_length": int(max_length),
+        "num_mtp_tokens": int(num_mtp_tokens),
+        "max_evidence_tokens": int(getattr(dataset, "max_evidence_tokens", 0) or 0),
+        "split_documents": isinstance(dataset, Dataset),
+        "shuffle": bool(getattr(dataset, "shuffle", False)),
+        "seed": getattr(dataset, "seed", None),
+        "epoch0_head_docs": getattr(dataset, "epoch0_head_docs", None),
+    }
+
+
+def rows_cache_path(data_dir: str, split: str) -> str:
+    return os.path.join(data_dir, f"{split}{ROWS_CACHE_SUFFIX}")
+
+
+def read_rows_cache(path: str, key: dict, num_workers: int):
+    """The cached row estimate for ``num_workers`` streams, or None when absent, unreadable, for
+    other inputs (``key`` differs) or for another worker count."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("key") != key:
+            return None
+        rows = saved["rows"].get(str(num_workers))
+        return int(rows) if rows is not None else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def write_rows_cache(path: str, key: dict, num_workers: int, rows: int) -> None:
+    """Record an estimate atomically, keeping the other worker counts cached under the same key."""
+    entries = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("key") == key:
+            entries = dict(saved.get("rows") or {})
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    entries[str(num_workers)] = int(rows)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"key": key, "rows": entries}, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def resolve_rows_estimate(cache_path: str, key: dict, world_size: int, compute,
+                          write_on_compute: bool = True):
+    """The plan's row estimate: from the cache, computed (one process only), or refused.
+
+    Args:
+        cache_path: the plan split's ``rows_estimate.json``.
+        key: ``rows_cache_key``'s dict.
+        world_size: ranks of this launch; the estimate is per ``NUM_DATA_WORKERS * world_size``.
+        compute: ``workers -> rows``, called only for a single process launch with no valid cache.
+        write_on_compute: write the cache after computing (rank 0).
+
+    Returns:
+        ``(rows, "cache" | "computed")``, or ``(None, "refused")`` for several ranks with no valid
+        cache: computing there would hold the other ranks at a collective for minutes.
+    """
+    workers = NUM_DATA_WORKERS * world_size
+    rows = read_rows_cache(cache_path, key, workers)
+    if rows is not None:
+        return rows, "cache"
+    if world_size > 1:
+        return None, "refused"
+    rows = compute(workers)
+    if write_on_compute:
+        try:
+            write_rows_cache(cache_path, key, workers, rows)
+        except OSError as e:
+            logger.warning(f"could not write the row estimate cache {cache_path}: {e!r}")
+    return rows, "computed"
+
+
+def compute_rows_estimate(dataset, max_length: int, num_mtp_tokens: int, num_workers: int) -> int:
+    """``estimate_packed_rows`` over a dataset's own files and epoch 0 order."""
+    return estimate_packed_rows(
+        dataset.idx_path, max_length, num_mtp_tokens,
+        split_documents=isinstance(dataset, Dataset),
+        evidx_path=getattr(dataset, "evidx_path", None),
+        max_evidence_tokens=getattr(dataset, "max_evidence_tokens", 0),
+        order=(dataset.document_order(dataset.num_docs)
+               if getattr(dataset, "shuffle", False) else None),
+        num_workers=num_workers,
+    )
 
 
 @torch.no_grad()
@@ -533,8 +707,8 @@ def split_changes(saved: dict, current: dict, base_dir: str = BASE_DIR) -> list:
             continue
         new = current.get(key)
         if key == "data_dir":
-            same = (new is not None and os.path.normpath(os.path.join(base_dir, old))
-                    == os.path.normpath(os.path.join(base_dir, new)))
+            same = (new is not None and os.path.realpath(os.path.join(base_dir, old))
+                    == os.path.realpath(os.path.join(base_dir, new)))
         else:
             same = old == new
         if not same:
@@ -562,15 +736,92 @@ def check_split_switch(saved: dict, current: dict, allow_switch: bool,
         SystemExit: the data differ and the switch was not asked for.
     """
     changes = split_changes(saved, current, base_dir)
-    if changes and not allow_switch:
+    # a corpus moved to another directory is not other data: the document count check in the
+    # caller guards it
+    data_changes = [c for c in changes if c[0] != "data_dir"]
+    if data_changes and not allow_switch:
         listed = "; ".join(f"{key}: checkpoint {old!r}, this launch {new!r}"
-                           for key, old, new in changes)
+                           for key, old, new in data_changes)
         raise SystemExit(
             f"this launch resumes on other data than the checkpoint was trained on ({listed}). "
             f"Relaunch with the checkpoint's values, or pass --switch-split to change the data "
             f"on purpose."
         )
     return changes
+
+
+def check_head_docs(saved_head, current_head, same_data: bool) -> None:
+    """Refuse a resume on the same split under another head-first epoch 0 order.
+
+    The resume position indexes into epoch 0's permutation, and the head size ``H`` of the split's
+    ``order.json`` sidecar (None without one) is part of it. A switch to other data reads the new
+    split's own ``H`` and is the normal case.
+
+    Args:
+        saved_head: ``epoch0_head_docs`` the checkpoint recorded (None when none or not recorded).
+        current_head: the value this launch's training dataset read.
+        same_data: the data fields match the checkpoint's.
+
+    Raises:
+        SystemExit: same data, different ``H``.
+    """
+    if same_data and saved_head != current_head:
+        raise SystemExit(
+            f"checkpoint was trained with epoch0_head_docs={saved_head!r} but this launch's "
+            f"split reads {current_head!r}. The resume position indexes into epoch 0's order, "
+            f"which that value sets -- restore the split's order.json or start a fresh run directory."
+        )
+
+
+def check_switch_state(saved_epoch, saved_offset, saved_num_docs, new_num_docs, new_head):
+    """Whether a ``--switch-split`` resume lands on a position the new split can continue from.
+
+    The warm-up split is the first H documents of the main split, visited in epoch 0. A warm run
+    that crossed its own epoch boundary saved epoch 1 (the main launch would then skip main's
+    epoch 0), and a warm split that is not the head of the new split (a stale or missing
+    ``order.json``) would continue at a position that means something else.
+
+    Args:
+        saved_epoch: the checkpoint's epoch.
+        saved_offset: the checkpoint's resume position (``global_offset``).
+        saved_num_docs: documents of the split the checkpoint trained on, None when not recorded.
+        new_num_docs: documents of the new training split.
+        new_head: the new split's ``epoch0_head_docs`` (None without a sidecar).
+
+    Returns:
+        None when the switch is sound, else the message to log before exiting 30.
+    """
+    if saved_epoch != 0:
+        return (f"--switch-split refused: the checkpoint is at epoch {saved_epoch}, not 0. The warm "
+                f"split crossed its own epoch boundary, and resuming the new split at that epoch "
+                f"would skip its epoch 0.")
+    limit = new_head if new_head is not None else new_num_docs
+    if saved_offset > limit:
+        return (f"--switch-split refused: the checkpoint's position {saved_offset:,} is past the new "
+                f"split's head of {limit:,} documents.")
+    if saved_num_docs is None:
+        return (f"--switch-split refused: the checkpoint records no document count for its split, so "
+                f"it cannot be checked against the new split (head {new_head!r}, "
+                f"{new_num_docs:,} documents).")
+    if (new_head is not None and new_head == saved_num_docs) or new_num_docs == saved_num_docs:
+        return None
+    return (f"--switch-split refused: the checkpoint's split has {saved_num_docs:,} documents but the "
+            f"new split's order.json head is {'absent' if new_head is None else f'{new_head:,}'} and it "
+            f"has {new_num_docs:,} documents; the "
+            f"warm split is not a head of the new one (missing or stale sidecar).")
+
+
+def final_checkpoint_data(path: str) -> dict:
+    """The data fields a finished run's final checkpoint recorded, read without loading tensors.
+
+    Args:
+        path: the ``*_final.pt`` path.
+
+    Returns:
+        ``data_dir``, ``train_split`` and ``val_split`` as saved (empty when not recorded).
+    """
+    saved = (torch.load(path, map_location="cpu", mmap=True).get("sft") or {})
+    return {key: saved[key] for key in DATA_KEYS if saved.get(key) is not None}
 
 
 def select_epoch(dataloader, dataset, epoch: int) -> None:
@@ -686,14 +937,17 @@ def plan_changed(saved: dict, current: dict) -> list:
     record is never a change.
 
     Args:
-        saved: ``total_steps``, ``rows_per_epoch`` and ``world_size`` from the checkpoint.
+        saved: ``total_steps``, ``rows_per_epoch``, ``world_size`` and
+            ``grad_accumulation_steps`` from the checkpoint.
         current: the same fields for this launch.
 
     Returns:
         The differing fields, empty when the plan is the checkpoint's.
     """
     return [(key, saved[key], current.get(key)) for key in ("total_steps", "rows_per_epoch",
-                                                              "world_size")
+                                                              "world_size",
+                                                              "grad_accumulation_steps",
+                                                              "plan_split")
             if saved.get(key) is not None and saved[key] != current.get(key)]
 
 
@@ -739,7 +993,7 @@ def check_run_state(run_state, phase: str, resumed_tokens, slack_tokens: int):
 # ---------------------------------------------------------------------------------------------
 
 class RankLog:
-    """``utils.logger`` for a multi process run: info from rank 0 only, warnings and errors from
+    """``utils.logger`` for a multi process run: info and warnings from rank 0 only, errors from
     every rank with the rank in the message, so eight processes do not print every line eight
     times and a failure on rank 3 is still seen."""
 
@@ -751,7 +1005,9 @@ class RankLog:
             self.base.info(msg, *args, **kwargs)
 
     def warning(self, msg, *args, **kwargs):
-        self.base.warning(msg if self.rank == 0 else f"[rank {self.rank}] {msg}", *args, **kwargs)
+        # every rank reaches the same warnings (plan changed, switch notes): rank 0 prints them once
+        if self.rank == 0:
+            self.base.warning(msg, *args, **kwargs)
 
     def error(self, msg, *args, **kwargs):
         self.base.error(msg if self.rank == 0 else f"[rank {self.rank}] {msg}", *args, **kwargs)
@@ -1274,6 +1530,10 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
         "total_steps": sft_extra.get("total_steps"),
         "rows_per_epoch": sft_extra.get("rows_per_epoch"),
         "world_size": sft_extra.get("world_size"),
+        "grad_accumulation_steps": sft_extra.get("grad_accumulation_steps"),
+        "epoch0_head_docs": sft_extra.get("epoch0_head_docs"),
+        "num_docs": sft_extra.get("num_docs"),
+        "plan_split": sft_extra.get("plan_split"),
     }
 
 
@@ -1761,7 +2021,89 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     return result
 
 
+def cli_overrides(args) -> dict:
+    """The profile overrides the command line asks for.
+
+    A flag left unset (None) or empty is no override; a ``--grad-accumulation-steps 0`` is kept so
+    the ``< 1`` check refuses it instead of the run silently using the profile's value.
+
+    Args:
+        args: the parsed arguments.
+
+    Returns:
+        ``data_dir``, ``train_split``, ``val_split`` and ``grad_accumulation_steps`` that were given.
+
+    Raises:
+        SystemExit: ``--grad-accumulation-steps`` below 1.
+    """
+    overrides = {name: value for name, value in (
+        ("data_dir", getattr(args, "data_dir", None)),
+        ("train_split", getattr(args, "train_split", None)),
+        ("val_split", getattr(args, "val_split", None)),
+        ("grad_accumulation_steps", getattr(args, "grad_accumulation_steps", None)),
+    ) if value is not None and value != ""}
+    if overrides.get("grad_accumulation_steps", 1) < 1:
+        raise SystemExit("--grad-accumulation-steps must be at least 1")
+    return overrides
+
+
+def estimate_rows_only(args, cfg, log) -> int:
+    """Compute the plan split's row estimate for the given rank counts, write the cache, exit 0.
+
+    CPU only: no accelerator, no model. The corpus driver runs it after the merges so a training
+    launch reads the cache instead of replaying hundreds of millions of documents.
+
+    Args:
+        args: parsed arguments (``plan_split``, ``estimate_world_sizes``).
+        cfg: the profile class after the overrides.
+        log: the rank log.
+
+    Returns:
+        ``EXIT_OK``.
+    """
+    data_dir = os.path.join(BASE_DIR, cfg.data_dir)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+    split = getattr(args, "plan_split", None) or cfg.train_split
+    dataset = make_dataset(data_dir, split, tokenizer, cfg)
+    mtp_tokens = ModelConfig.Params["mtp_num_extra_tokens"]
+    key = rows_cache_key(dataset, cfg.Seq_length, mtp_tokens)
+    path = rows_cache_path(data_dir, split)
+    for world in sorted({int(w) for w in str(args.estimate_world_sizes).split(",") if w.strip()}):
+        workers = NUM_DATA_WORKERS * world
+        cached = read_rows_cache(path, key, workers)
+        if cached is not None:
+            log.info(f"row estimate for {split!r} at {world} ranks already cached: {cached:,}")
+            continue
+        started = time.time()
+        rows = compute_rows_estimate(dataset, cfg.Seq_length, mtp_tokens, workers)
+        write_rows_cache(path, key, workers, rows)
+        log.info(f"row estimate for {split!r} at {world} ranks: {rows:,} packed rows per epoch "
+                 f"in {time.time() - started:.0f}s -> {path}")
+    return EXIT_OK
+
+
+def destroy_process_group_quietly() -> None:
+    """Tear down the process group at exit, so torch does not warn that it was never destroyed
+    (that line lands after the last step line). A failure here never changes the exit code."""
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+    except Exception as e:
+        logger.warning(f"could not destroy the process group: {e!r}")
+
+
 def sft(args):
+    """Run the profile and return its exit code; a multi process run destroys its process group on
+    every way out (returns of 0, 10, 20 and 30 and an exception)."""
+    _, world_size = dist_env()
+    try:
+        return _sft_impl(args)
+    finally:
+        if world_size > 1:
+            destroy_process_group_quietly()
+
+
+def _sft_impl(args):
     rank, world_size = dist_env()
     log = RankLog(logger, rank)
     # one function, three profiles. --repair / --ir swap the config class, the phase label and the
@@ -1782,14 +2124,12 @@ def sft(args):
     # a subclass rather than a mutation, so every other attribute keeps inheriting and the config
     # class other code imports is untouched. The effective values are saved in the checkpoint and
     # a resume on other ones is refused without --switch-split, so relaunch with the same flags
-    overrides = {name: value for name, value in (
-        ("data_dir", getattr(args, "data_dir", None)),
-        ("train_split", getattr(args, "train_split", None)),
-        ("val_split", getattr(args, "val_split", None)),
-    ) if value}
+    overrides = cli_overrides(args)
     if overrides:
         cfg = type(cfg.__name__, (cfg,), overrides)
         log.info(f"data overrides: {overrides}")
+    if getattr(args, "estimate_rows_only", False):
+        return estimate_rows_only(args, cfg, log)
     ceiling_by_source, ceiling_all = {}, None
     if getattr(args, "ceiling_json", None):
         with open(args.ceiling_json, "r", encoding="utf-8") as f:
@@ -1805,6 +2145,27 @@ def sft(args):
     if args.run_name:
         checkpoint_dir = f"{checkpoint_dir}_{args.run_name}"
     if run_already_complete(checkpoint_dir, phase):
+        if getattr(args, "switch_split", False):
+            # a warm-up that finished every epoch of its split left a final checkpoint: the main
+            # launch would read it as a complete run and exit 0 without training
+            try:
+                saved_data = final_checkpoint_data(
+                    os.path.join(checkpoint_dir, ckpt_lib.final_name(phase)))
+                moved = [c for c in split_changes(saved_data, {"data_dir": cfg.data_dir,
+                                                               "train_split": cfg.train_split,
+                                                               "val_split": cfg.val_split})
+                         if c[0] != "data_dir"]
+            except Exception as e:
+                log.error(f"--switch-split: could not read the final checkpoint's data fields: {e!r}")
+                return EXIT_RESUME_FAILED
+            if moved:
+                log.error(
+                    f"--switch-split refused: {ckpt_lib.final_name(phase)} exists in {checkpoint_dir}, "
+                    f"so the run on {saved_data.get('train_split')!r} finished all its epochs and the "
+                    f"switch would read it as a complete run. The warm launch must stop at its split's "
+                    f"epoch end (--max-epochs-this-split 1)."
+                )
+                return EXIT_RESUME_FAILED
         log.warning(
             f"run already complete: {ckpt_lib.final_name(phase)} is the newest checkpoint in "
             f"{checkpoint_dir} and run_state.json names it; nothing to train and exiting 0. A "
@@ -1865,26 +2226,39 @@ def sft(args):
     dataloader = DataLoader(train_dataset, batch_size=None, num_workers=NUM_DATA_WORKERS,
                             prefetch_factor=2)
 
-    def estimate_rows():
-        # one stream per (rank, worker) pair, so the estimate replays NUM_DATA_WORKERS * world_size
-        # streams and counts the rows of every rank together
-        return estimate_packed_rows(
-            train_dataset.idx_path, cfg.Seq_length, ModelConfig.Params["mtp_num_extra_tokens"],
-            split_documents=isinstance(train_dataset, Dataset),
-            evidx_path=getattr(train_dataset, "evidx_path", None),
-            max_evidence_tokens=getattr(train_dataset, "max_evidence_tokens", 0),
-            order=(train_dataset.document_order(train_dataset.num_docs)
-                   if getattr(train_dataset, "shuffle", False) else None),
-            num_workers=NUM_DATA_WORKERS * world_size,
-        )
+    # the schedule is fitted to the plan split when one is named (the main split on every launch of
+    # the main run, warm-up included), else to the training split as before
+    plan_split = getattr(args, "plan_split", None) or None
+    plan_dataset = train_dataset
+    if plan_split and plan_split != cfg.train_split:
+        plan_dataset = make_dataset(data_dir, plan_split, tokenizer, cfg,
+                                    rank=rank, world_size=world_size)
+        log.info(f"schedule planned on {plan_split!r} ({plan_dataset.num_docs:,} documents), "
+                 f"training on {cfg.train_split!r}")
 
-    if world_size > 1:
-        # the replay is a long python loop over the corpus: rank 0 does it once and shares the number
-        shared = [estimate_rows() if is_main else None]
-        torch.distributed.broadcast_object_list(shared, src=0)
-        rows_per_epoch = shared[0]
-    else:
-        rows_per_epoch = estimate_rows()
+    # one stream per (rank, worker) pair, so the estimate replays NUM_DATA_WORKERS * world_size
+    # streams and counts the rows of every rank together. At hundreds of millions of documents the
+    # replay takes minutes and gigabytes, so a multi rank job reads it from the cache that
+    # --estimate-rows-only wrote and never computes it
+    mtp_tokens = ModelConfig.Params["mtp_num_extra_tokens"]
+    cache_path = rows_cache_path(data_dir, plan_split or cfg.train_split)
+    cache_key = rows_cache_key(plan_dataset, cfg.Seq_length, mtp_tokens)
+    rows_per_epoch, how = resolve_rows_estimate(
+        cache_path, cache_key, world_size,
+        lambda workers: compute_rows_estimate(plan_dataset, cfg.Seq_length, mtp_tokens, workers),
+        write_on_compute=is_main)
+    if how == "cache":
+        log.info(f"row estimate from cache: {rows_per_epoch:,} ({cache_path})")
+    elif how == "refused":
+        log.error(
+            f"no valid row estimate for {plan_split or cfg.train_split!r} at {world_size} ranks in "
+            f"{cache_path} (missing, an older cache format, written for other inputs, or for another rank count). Computing "
+            f"it inside the multi rank job would hold every rank at a collective: run `python "
+            f"scripts/sft.py --evidence --estimate-rows-only --data-dir {cfg.data_dir} --train-split "
+            f"{cfg.train_split}" + (f" --plan-split {plan_split}" if plan_split else "")
+            + f" --estimate-world-sizes {world_size}` first (CPU only)."
+        )
+        return EXIT_NO_ROWS_CACHE
     total_steps = plan_total_steps(rows_per_epoch, cfg.num_epochs, cfg.Batch_size,
                                    cfg.grad_accumulation_steps, world_size)
     log.info(
@@ -2004,14 +2378,22 @@ def sft(args):
     if problem is not None:
         log.error(problem)
         return EXIT_RESUME_FAILED
-    plan = {"total_steps": total_steps, "rows_per_epoch": rows_per_epoch, "world_size": world_size}
+    plan = {"total_steps": total_steps, "rows_per_epoch": rows_per_epoch, "world_size": world_size,
+            "grad_accumulation_steps": cfg.grad_accumulation_steps, "plan_split": plan_split}
+    head_docs = getattr(train_dataset, "epoch0_head_docs", None)
+    data_fields_saved = {"epoch0_head_docs": head_docs,
+                         "num_docs": getattr(train_dataset, "num_docs", None)}
+    if head_docs is not None:
+        log.info(f"epoch 0 head-first order: {head_docs:,} head documents "
+                 f"({train_dataset.order_path})")
     if found is not None:
         _, state = found
         moved = plan_changed(state, plan)
         if moved:
             log.warning(
                 "the plan differs from the one this run's cosine was fitted to: "
-                + "; ".join(f"{key} {old:,} -> {new:,}" for key, old, new in moved)
+                + "; ".join(f"{key} {old:,} -> {new:,}" if isinstance(old, int) and isinstance(new, int)
+                            else f"{key} {old!r} -> {new!r}" for key, old, new in moved)
                 + f". Keeping the new total_steps ({total_steps:,}); the schedule's shape changes "
                 f"under the resumed run (a split switch, another number of ranks or an estimator "
                 f"change)"
@@ -2038,9 +2420,34 @@ def sft(args):
                 f"resuming on {data_fields}"
             )
         else:
-            changes = check_split_switch(state["data"], data_fields,
-                                         getattr(args, "switch_split", False))
+            all_changes = check_split_switch(state["data"], data_fields,
+                                             getattr(args, "switch_split", False))
+            moved_dir = [c for c in all_changes if c[0] == "data_dir"]
+            changes = [c for c in all_changes if c[0] != "data_dir"]
+            if moved_dir and "train_split" not in {c[0] for c in changes}:
+                saved_docs = state.get("num_docs")
+                now_docs = getattr(train_dataset, "num_docs", None)
+                if saved_docs is not None and now_docs is not None and saved_docs != now_docs:
+                    log.error(
+                        f"the corpus moved ({moved_dir[0][1]!r} -> {moved_dir[0][2]!r}) and the split "
+                        f"{cfg.train_split!r} has {now_docs:,} documents where the checkpoint trained "
+                        f"on {saved_docs:,}: this is not the same corpus, so the resume position "
+                        f"means something else. Restore the corpus or start a fresh run directory."
+                    )
+                    return EXIT_RESUME_FAILED
+                log.warning(
+                    f"data_dir moved: {moved_dir[0][1]!r} -> {moved_dir[0][2]!r}; same split "
+                    f"{cfg.train_split!r}, resuming as a plain resume (document count "
+                    f"{now_docs if now_docs is None else format(now_docs, ',')} "
+                    f"{'matches the checkpoint' if saved_docs is not None else 'not recorded'})"
+                )
             if changes:
+                refusal = None if "train_split" not in {c[0] for c in changes} else (
+                    check_switch_state(state["epoch"], state["global_offset"], state.get("num_docs"),
+                                       getattr(train_dataset, "num_docs", 0), head_docs))
+                if refusal is not None:
+                    log.error(refusal)
+                    return EXIT_RESUME_FAILED
                 log.warning(
                     "--switch-split: resuming on other data than the checkpoint's: "
                     + "; ".join(f"{key} {old!r} -> {new!r}" for key, old, new in changes)
@@ -2048,6 +2455,7 @@ def sft(args):
                 )
             elif getattr(args, "switch_split", False):
                 log.info("--switch-split passed but the data match the checkpoint's")
+            check_head_docs(state.get("epoch0_head_docs"), head_docs, not changes)
         resumed_masters, resumed_rng = state.pop("fp32_masters"), state["rng"]
         steps_at_last_save = state["optimizer_steps"]
         model._token_tracker.num_tokens = token_count
@@ -2138,9 +2546,11 @@ def sft(args):
     # of a SIGTERM instead of losing everything since the last save. clear_sentinel() first: a STOP
     # left over from a previous run would otherwise kill every relaunch before it trains a step.
     control = RunControl(checkpoint_dir)
-    if is_main:
+    keep_stop = bool(getattr(args, "keep_stop", False))
+    if is_main and not keep_stop:
         # only rank 0 touches the STOP file; every rank's signal handlers set their own flags and the
-        # flags meet in the log step's reduction
+        # flags meet in the log step's reduction. --keep-stop leaves it for the check before the
+        # first step, so a STOP dropped while a container was starting is not lost
         control.clear_sentinel()
     control.install()
 
@@ -2205,6 +2615,9 @@ def sft(args):
     stream_stride = max(NUM_DATA_WORKERS, 1) * world_size
     worker_state = torch.full((stream_stride,), -1, dtype=torch.long, device=device)
 
+    # the ranks' worker positions as MAX-merged at the latest log step, for the interrupt save
+    last_merged_state = None
+
     def snapshot_global_offset(fallback, collective=True):
         # same conservative min-across-workers rule as pretrain.py: a worker at position p next
         # wants p + the stride, so the smallest such value skips nobody's unconsumed work. Under data
@@ -2223,6 +2636,17 @@ def sft(args):
     # global count is the resumed or seeded count plus what every rank has trained since
     last_local_total = last_token_count
     gather_eval = all_gather_states(world_size) if world_size > 1 else None
+    max_epochs_this_split = int(getattr(args, "max_epochs_this_split", 0) or 0)
+
+    def synced_token_count(count, local_total):
+        # the end of epoch count, as the final save reads it: the ranks left their last chunk
+        # together, so the reduction is matched on every rank
+        if world_size == 1:
+            return unwrapped_model._token_tracker.sync()
+        delta = torch.tensor([float(unwrapped_model._token_tracker.sync() - local_total)],
+                             dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(delta)
+        return count + int(round(delta.item()))
     target_tokens = None  # filled in after the first log interval, once tokens/row is known
 
     def save_and_sync(epoch, step, loss_value, tokens, final=False, collective=True):
@@ -2234,11 +2658,15 @@ def sft(args):
         use_collectives = collective and world_size > 1
         if use_collectives:
             accelerator.wait_for_everyone()
-        global_offset = snapshot_global_offset(start_doc_idx, collective=collective)
         if world_size > 1 and not collective:
-            # only this rank's streams are known: step back a few chunks of the stride so the
-            # other ranks' streams, which may lag, lose nothing on the resume
-            global_offset = max(start_doc_idx, global_offset - 4 * LOG_INTERVAL * stream_stride)
+            # only this rank's streams are known, and the ranks' streams drift apart by thousands
+            # of documents within an epoch: save the last position every rank agreed on at a log
+            # step. The resume then repeats at most a log interval of batches and skips nobody's
+            global_offset = (worker_offset(last_merged_state.cpu().tolist(), stream_stride,
+                                           start_doc_idx)
+                             if last_merged_state is not None else start_doc_idx)
+        else:
+            global_offset = snapshot_global_offset(start_doc_idx, collective=collective)
         if is_main:
             name = (ckpt_lib.final_name(phase) if final
                     else ckpt_lib.rolling_name(phase, tokens - start_token_count, loss_value))
@@ -2249,6 +2677,7 @@ def sft(args):
             sft_fields["cuda_rng_state"] = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
             # the plan the cosine was fitted to, compared on the next resume
             sft_fields.update(plan)
+            sft_fields.update(data_fields_saved)
             # the masters and the weights are identical on every rank after a reduced step
             save_sft_checkpoint(
                 unwrapped_model, optimizer, scheduler, path,
@@ -2480,6 +2909,18 @@ def sft(args):
                         + ", ".join(norms))
         return probe
 
+    if keep_stop:
+        stop_at_start = torch.tensor([1.0 if (is_main and os.path.exists(control.sentinel_path))
+                                      else 0.0], device=device)
+        if world_size > 1:
+            torch.distributed.all_reduce(stop_at_start)
+        if stop_at_start.item() > 0:
+            log.info(f"--keep-stop: a STOP sentinel is present at {control.sentinel_path}; exiting "
+                     f"{EXIT_USER_STOP} before the first step, nothing saved, the sentinel kept")
+            hf.drain(timeout=600)
+            hf.close()
+            return EXIT_USER_STOP
+
     if not resumed:
         # the baseline every later reading is a difference from; the seed's reader is dead, so the
         # fixed-target gain should read about zero here
@@ -2492,6 +2933,7 @@ def sft(args):
             # is where the corpus builder already put the source mix
             select_epoch(dataloader, train_dataset, epoch)
             train_dataset.start_doc_idx = start_doc_idx if resume_epoch else 0
+            last_merged_state = None
             if not resume_epoch:
                 worker_state.fill_(-1)
                 step = 0
@@ -2528,7 +2970,12 @@ def sft(args):
 
                 # log steps pinned to full depth so the recorded loss curve is always read at one
                 # operating point (same reasoning as pretrain.py)
-                is_log_step = step % LOG_INTERVAL == 0
+                # and on a micro step that completes an accumulation window (accelerate's counter
+                # restarts at zero in every process, so the step index alone cannot say): a stop or
+                # a save then never lands with half a window's rows consumed and never stepped.
+                # At accumulation 1 this is exactly step % LOG_INTERVAL == 0
+                ends_window = (accelerator.step + 1) % max(cfg.grad_accumulation_steps, 1) == 0
+                is_log_step = ends_window and step % LOG_INTERVAL < max(cfg.grad_accumulation_steps, 1)
                 step_n_loops = full_n_loops if is_log_step else sample_n_loops(
                     loop_rng, full_n_loops, TrainingConfig.loop_count_sampling
                 )
@@ -2611,6 +3058,9 @@ def sft(args):
                         metrics["per_loop_ce"], device,
                     )
                     torch.distributed.all_reduce(vec)
+                    last_merged_state = worker_state.clone()
+                    torch.distributed.all_reduce(last_merged_state,
+                                                 op=torch.distributed.ReduceOp.MAX)
                     reduced = unpack_log_vector(vec.tolist(), world_size)
                     val_loss = reduced["scalars"]["loss"]
                     losses.append(val_loss)
@@ -2880,6 +3330,17 @@ def sft(args):
             if stop_training:
                 break
 
+            if max_epochs_this_split and epoch + 1 >= max_epochs_this_split:
+                # a warm split never wraps into its next epoch: the save keeps this epoch and the
+                # position at the end of it, which is what the switch to the main split continues
+                # from (check_switch_state refuses a saved epoch past 0)
+                token_count = synced_token_count(token_count, last_local_total)
+                log.info(f"warm split exhausted: epoch {epoch} of {cfg.train_split!r} finished at "
+                         f"{(token_count - start_token_count) / 1e6:.2f}M {phase} tokens; saving and "
+                         f"exiting {EXIT_USER_STOP} before epoch {epoch + 1}")
+                save_and_sync(epoch, step, losses[-1] if losses else float("nan"), token_count)
+                return EXIT_USER_STOP
+
             # end of epoch: the next one starts its own permutation from position 0
             start_doc_idx, step_offset = 0, 0
             resumed = False
@@ -2973,6 +3434,33 @@ def main():
                              "SPLIT=pilot_main_train bash ckpts/inject/launch_pilot_X.sh with "
                              "--switch-split. Without it such a resume is refused; pass it only on "
                              "the one launch that switches")
+    parser.add_argument("--plan-split", default=None,
+                        help="fit the packed row estimate, total_steps and so the LR schedule to "
+                             "this split of the same data dir instead of the training split. The "
+                             "warm-up to main run passes the main split on every launch, so the "
+                             "schedule spans the whole run from step 0 and the switch changes "
+                             "nothing in the plan. Saved in the checkpoint")
+    parser.add_argument("--keep-stop", action="store_true",
+                        help="honour a STOP sentinel already present at startup: after the setup "
+                             "every rank exits 10 before the first step, saving nothing and leaving "
+                             "the file. Default off: a launch deletes a leftover STOP")
+    parser.add_argument("--estimate-rows-only", action="store_true",
+                        help="CPU only: compute the plan split's packed row estimate for each rank "
+                             "count in --estimate-world-sizes, write {data_dir}/{split}."
+                             "rows_estimate.json and exit 0 without building the model. A launch "
+                             "of more than one rank refuses to start without a valid cache")
+    parser.add_argument("--estimate-world-sizes", default="8,16",
+                        help="with --estimate-rows-only: comma separated rank counts to cache the "
+                             "estimate for (it depends on NUM_DATA_WORKERS x ranks)")
+    parser.add_argument("--max-epochs-this-split", type=int, default=0,
+                        help="stop at the end of epoch N - 1 of the training split: save at that "
+                             "epoch, log 'warm split exhausted' and exit 10 instead of entering "
+                             "epoch N. The warm launch passes 1; 0 (default) is off")
+    parser.add_argument("--grad-accumulation-steps", type=int, default=None,
+                        help="override the profile's grad_accumulation_steps (keep the global batch "
+                             "fixed: per GPU batch x accumulation x GPUs). total_steps and the "
+                             "cosine follow it; a resume under another value warns that the plan "
+                             "moved")
     parser.add_argument("--ceiling-json", default=None,
                         help="--evidence only: the in-context ceiling file written by "
                              "scripts/evidence_ceiling_probe.py --fixed-split; each source's gold "

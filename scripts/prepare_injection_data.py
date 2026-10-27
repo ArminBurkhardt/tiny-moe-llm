@@ -62,9 +62,26 @@ Per bio document in the ``retrieval`` arm, in this order:
 ``.factspan`` is one uint8 per ``.bin`` token: 0 none, 1 to 5 the attribute (index in ``ATTRIBUTES``
 plus one), 6 a name mention, 7 a placeholder. It is for evals and build metrics; no trainer reads it.
 
-The build rebuilds a split from scratch; it has no resume. The facts, the pools, the biography store
-and the validation split are written once and kept when they already exist, so a second build with
-other swap rates (``--suffix``) shares them.
+The facts, the pools, the biography store and the validation split are written once and kept when
+they already exist, so a second build with other swap rates (``--suffix``) shares them.
+
+Large builds (added 2026-10-26):
+
+- ``--stop-after-tokens N`` builds the layout ``--target-tokens`` defines (same windows, same
+  biography placement, same draws) but stops at the first document boundary at or after N ``.bin``
+  tokens of the first arm in ``--arms``. Every per document file of the stopped build is a byte
+  prefix of the full build's. Use it for the warm-up and control prefixes of a main build.
+- ``--no-shared-outputs`` writes none of the files builds share (facts, pools, biography store,
+  ``inject_val``, the ``common`` block of ``inject_build.json``); it checks that they exist and
+  match what this build would have written, and refuses otherwise.
+- ``--no-train-factspan`` skips ``.factspan`` of the training splits (the validation split keeps
+  it); no trainer, merge or eval reads it.
+- The build checkpoints every ``--checkpoint-blocks`` blocks to ``{out_dir}/.inject_state_{arms}_{suffix}.json``
+  (file sizes and counters behind an fsync, the card keys beside it) and resumes from it on relaunch
+  with the same arguments, truncating any bytes past the checkpoint; different arguments are
+  refused. SIGTERM writes a checkpoint at the next block and exits 20. The state is removed when the
+  build finishes. ``--overwrite`` discards it. The setup (people, filler windows, order) is
+  recomputed on every start.
 
 Usage:
 
@@ -79,8 +96,10 @@ import zlib
 import string
 import random
 import hashlib
+import shutil
+import signal
 import argparse
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -168,19 +187,32 @@ def load_filler_windows(sources: Sequence[Tuple[str, str]], window: int, seed: i
     """
     memmaps, train, val = [], [], []
     cutoff = int(val_fraction * 1_000_000)
+    docs_per_chunk = 1 << 20
     for source, (bin_path, idx_path) in enumerate(sources):
         memmaps.append(np.memmap(bin_path, dtype=np.uint16, mode="r"))
-        offsets = np.memmap(idx_path, dtype=np.uint64, mode="r")
-        for d in range(len(offsets) - 1):
-            start, end = int(offsets[d]), int(offsets[d + 1])
-            for w in range(start, end, window):
-                length = min(window, end - w)
-                if length < MIN_WINDOW:
-                    continue
-                is_val = zlib.crc32(f"{seed}:{source}:{w}".encode()) % 1_000_000 < cutoff
-                (val if is_val else train).append((source, w, length))
-    return memmaps, np.asarray(train, dtype=np.int64).reshape(-1, 3), \
-        np.asarray(val, dtype=np.int64).reshape(-1, 3)
+        offsets = np.asarray(np.memmap(idx_path, dtype=np.uint64, mode="r"), dtype=np.int64)
+        for lo in range(0, len(offsets) - 1, docs_per_chunk):
+            starts = offsets[lo:min(lo + docs_per_chunk, len(offsets) - 1)]
+            ends = offsets[lo + 1:lo + 1 + len(starts)]
+            counts = np.maximum(ends - starts, 0)
+            counts = (counts + window - 1) // window
+            total = int(counts.sum())
+            if not total:
+                continue
+            doc_of = np.repeat(np.arange(len(starts)), counts)
+            first = np.cumsum(counts) - counts
+            w = starts[doc_of] + (np.arange(total) - first[doc_of]) * window
+            length = np.minimum(window, ends[doc_of] - w)
+            keep = length >= MIN_WINDOW
+            w, length = w[keep], length[keep]
+            prefix = f"{seed}:{source}:".encode()
+            is_val = np.fromiter((zlib.crc32(prefix + b"%d" % x) % 1_000_000 < cutoff for x in w.tolist()),
+                                 dtype=bool, count=len(w))
+            rows = np.stack([np.full(len(w), source, dtype=np.int64), w, length], axis=1)
+            train.append(rows[~is_val])
+            val.append(rows[is_val])
+    return memmaps, np.concatenate(train).reshape(-1, 3) if train else np.zeros((0, 3), dtype=np.int64), \
+        np.concatenate(val).reshape(-1, 3) if val else np.zeros((0, 3), dtype=np.int64)
 
 
 def pick_filler(train: np.ndarray, need_tokens: int, seed: int) -> Tuple[np.ndarray, float]:
@@ -207,7 +239,8 @@ def pick_filler(train: np.ndarray, need_tokens: int, seed: int) -> Tuple[np.ndar
         take = min(int(np.searchsorted(cumulative, need_tokens)) + 1, len(order))
         chosen.append(train[order[:take]])
         total = int(cumulative[take - 1])
-    return np.concatenate(chosen), float(total / min(total, available))
+    picked = chosen[0] if len(chosen) == 1 else np.concatenate(chosen)
+    return picked, float(total / min(total, available))
 
 
 # ------------------------------------------------------------------------------------- the writers
@@ -216,31 +249,67 @@ def _check_free(data_dir: str, split: str, overwrite: bool) -> None:
     for suffix in EVIDENCE_SUFFIXES + ("factspan",):
         path = os.path.join(data_dir, f"{split}.{suffix}")
         if os.path.exists(path):
-            if not overwrite:
+            # a writer opened and killed before its first state write leaves files of at most the
+            # eight byte idx header: nothing to protect, nothing to resume
+            if not overwrite and os.path.getsize(path) > 8:
                 raise FileExistsError(f"{path} exists; pass --overwrite to rebuild {split}")
             os.remove(path)
 
 
-class PlainWriter:
-    """``bin idx mask factspan`` for one split, appended document by document."""
+def _truncate_to(path: str, size: int) -> None:
+    """Cut ``path`` to ``size`` bytes; a shorter file means the checkpoint outran its fsync."""
+    have = os.path.getsize(path)
+    if have < size:
+        raise SystemExit(f"{path} has {have} bytes, the checkpoint needs {size}; remove the state "
+                         f"file and the split to rebuild")
+    if have > size:
+        with open(path, "r+b") as f:
+            f.truncate(size)
+        logger.warning(f"truncated {os.path.basename(path)} from {have} to {size} bytes "
+                       f"(the uncommitted tail of an interrupted build)")
 
-    def __init__(self, data_dir: str, split: str):
-        self.files = {s: open(os.path.join(data_dir, f"{split}.{s}"), "wb")
-                      for s in ("bin", "idx", "mask", "factspan")}
-        self.files["idx"].write(np.array([0], dtype=np.uint64).tobytes())
-        self.tokens = 0
-        self.docs = 0
-        self.mask_zero = 0
+
+class PlainWriter:
+    """``bin idx mask factspan`` for one split, appended document by document.
+
+    Args:
+        data_dir: where the files go.
+        split: the split name.
+        factspan: write ``.factspan`` too.
+        state: a ``snapshot()`` to resume from; the files are cut back to it and appended to.
+    """
+
+    def __init__(self, data_dir: str, split: str, factspan: bool = True, state: Optional[dict] = None):
+        names = ("bin", "idx", "mask") + (("factspan",) if factspan else ())
+        self.tokens = self.docs = self.mask_zero = 0
+        if state is None:
+            self.files = {s: open(os.path.join(data_dir, f"{split}.{s}"), "wb") for s in names}
+            self.files["idx"].write(np.array([0], dtype=np.uint64).tobytes())
+        else:
+            self.tokens, self.docs, self.mask_zero = state["tokens"], state["docs"], state["mask_zero"]
+            sizes = {"bin": self.tokens * 2, "idx": (self.docs + 1) * 8, "mask": self.tokens,
+                     "factspan": self.tokens}
+            for s in names:
+                _truncate_to(os.path.join(data_dir, f"{split}.{s}"), sizes[s])
+            self.files = {s: open(os.path.join(data_dir, f"{split}.{s}"), "ab") for s in names}
 
     def write(self, ids: np.ndarray, mask: np.ndarray, codes: np.ndarray) -> None:
         assert len(ids) == len(mask) == len(codes)
         self.files["bin"].write(ids.astype(np.uint16).tobytes())
         self.files["mask"].write(mask.astype(np.uint8).tobytes())
-        self.files["factspan"].write(codes.astype(np.uint8).tobytes())
+        if "factspan" in self.files:
+            self.files["factspan"].write(codes.astype(np.uint8).tobytes())
         self.tokens += len(ids)
         self.docs += 1
         self.mask_zero += int((mask == 0).sum())
         self.files["idx"].write(np.array([self.tokens], dtype=np.uint64).tobytes())
+
+    def snapshot(self) -> dict:
+        """Flush every file to disk and return the counters a resume needs."""
+        for f in self.files.values():
+            f.flush()
+            os.fsync(f.fileno())
+        return {"tokens": self.tokens, "docs": self.docs, "mask_zero": self.mask_zero}
 
     def close(self) -> None:
         for f in self.files.values():
@@ -248,28 +317,55 @@ class PlainWriter:
 
 
 class RetrievalWriter:
-    """The eleven evidence files through ``EvidenceWriter`` plus ``factspan``."""
+    """The eleven evidence files through ``EvidenceWriter`` plus ``factspan``.
 
-    def __init__(self, data_dir: str, split: str):
-        self.inner = EvidenceWriter(data_dir, split, {})
-        self.factspan = open(os.path.join(data_dir, f"{split}.factspan"), "wb")
-        self.tokens = 0
-        self.docs = 0
-        self.mask_zero = 0
-        self.ev_tokens = 0
+    Args:
+        data_dir: where the files go.
+        split: the split name.
+        factspan: write ``.factspan`` too.
+        state: a ``snapshot()`` to resume from; the files are cut back to it and appended to.
+    """
+
+    def __init__(self, data_dir: str, split: str, factspan: bool = True, state: Optional[dict] = None):
+        self.tokens = self.docs = self.mask_zero = self.ev_tokens = 0
+        inner_state = {}
+        if state is not None:
+            self.tokens, self.docs = state["tokens"], state["docs"]
+            self.mask_zero, self.ev_tokens = state["mask_zero"], state["ev_tokens"]
+            inner_state = dict(state["inner"])
+        self.inner = EvidenceWriter(data_dir, split, inner_state)
+        self.factspan = None
+        if factspan:
+            path = os.path.join(data_dir, f"{split}.factspan")
+            if state is None:
+                self.factspan = open(path, "wb")
+            else:
+                _truncate_to(path, self.tokens)
+                self.factspan = open(path, "ab")
 
     def write(self, ids, mask, codes, ev_ids, ev_chunk, keys, ev_gold, condition_idx: int) -> None:
         self.inner.write(ids, mask, ev_ids, ev_chunk, keys, ev_gold, condition_idx, 1)
-        self.factspan.write(np.asarray(codes, dtype=np.uint8).tobytes())
+        if self.factspan is not None:
+            self.factspan.write(np.asarray(codes, dtype=np.uint8).tobytes())
         self.tokens += len(ids)
         self.docs += 1
         self.mask_zero += int((np.asarray(mask) == 0).sum())
         self.ev_tokens += len(ev_ids)
 
+    def snapshot(self) -> dict:
+        """Flush every file to disk and return the counters a resume needs."""
+        self.inner.sync()
+        if self.factspan is not None:
+            self.factspan.flush()
+            os.fsync(self.factspan.fileno())
+        return {"tokens": self.tokens, "docs": self.docs, "mask_zero": self.mask_zero,
+                "ev_tokens": self.ev_tokens, "inner": dict(self.inner.state)}
+
     def close(self) -> None:
         self.inner.sync()
         self.inner.close()
-        self.factspan.close()
+        if self.factspan is not None:
+            self.factspan.close()
 
 
 # ----------------------------------------------------------------------- the retrieval arm's logic
@@ -341,8 +437,11 @@ class RetrievalBuilder:
 
         Returns:
             Per document a dict with ``ids``, ``mask``, ``codes`` (BOS and EOS included), ``ev_ids``,
-            ``ev_chunk``, ``keys``, ``ev_gold`` and ``condition_idx``.
+            ``ev_chunk``, ``keys``, ``ev_gold`` and ``condition_idx``; an empty list for no
+            documents (a block with no biography).
         """
+        if not len(flat_docs):
+            return []
         specs = []
         for pid, j in flat_docs:
             person = self.people[pid]
@@ -474,7 +573,81 @@ def _write_json_atomic(path: str, payload: dict) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _split_sizes(out_dir: str, split: str) -> Dict[str, int]:
+    """Byte size of every file ``{split}.*`` in ``out_dir``."""
+    prefix = split + "."
+    return {n: os.path.getsize(os.path.join(out_dir, n)) for n in sorted(os.listdir(out_dir))
+            if n.startswith(prefix) and os.path.isfile(os.path.join(out_dir, n))}
+
+
+def _read_build_record(out_dir: str) -> Optional[dict]:
+    try:
+        with open(os.path.join(out_dir, "inject_build.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _already_complete(out_dir: str, names: Dict[str, str], signature: dict) -> bool:
+    """True when ``inject_build.json`` holds a completion record for every split with this build's
+    arguments and the split files on disk have the recorded sizes."""
+    record = _read_build_record(out_dir)
+    if not record or not names:
+        return False
+    wanted = json.loads(json.dumps(signature))
+    for split in names.values():
+        entry = record.get("arms", {}).get(split)
+        if not entry or not entry.get("complete") or entry.get("signature") != wanted:
+            return False
+        if entry.get("files") != _split_sizes(out_dir, split):
+            return False
+    return True
+
+
+def _drop_build_entries(out_dir: str, splits: Sequence[str]) -> None:
+    """Remove the arm entries of a build that starts over, so a stale completion record cannot
+    vouch for files that are being rewritten."""
+    record = _read_build_record(out_dir)
+    if record and any(s in record.get("arms", {}) for s in splits):
+        for s in splits:
+            record["arms"].pop(s, None)
+        _write_json_atomic(os.path.join(out_dir, "inject_build.json"), record)
+
+
+def _val_problem(out_dir: str, split: str, n_windows: int) -> Optional[str]:
+    """Why ``split`` is not a whole validation split of ``n_windows`` windows, or None when it is."""
+    paths = {s: os.path.join(out_dir, f"{split}.{s}") for s in ("bin", "idx", "mask", "factspan")}
+    missing = [s for s, p in paths.items() if not os.path.exists(p)]
+    if missing:
+        return f"missing {missing}"
+    idx_size = os.path.getsize(paths["idx"])
+    if idx_size != (n_windows + 1) * 8:
+        return f"{idx_size // 8 - 1} windows, expected {n_windows}"
+    with open(paths["idx"], "rb") as f:
+        f.seek(idx_size - 8)
+        tokens = int(np.frombuffer(f.read(8), dtype=np.uint64)[0])
+    if os.path.getsize(paths["bin"]) != tokens * 2:
+        return f".bin has {os.path.getsize(paths['bin'])} bytes, the idx says {tokens * 2}"
+    for s in ("mask", "factspan"):
+        if os.path.getsize(paths[s]) != tokens:
+            return f".{s} has {os.path.getsize(paths[s])} bytes, the idx says {tokens}"
+    return None
+
+
+class BuildInterrupted(Exception):
+    """A stop was requested; the checkpoint at the last block is on disk and a relaunch resumes."""
+
+
+_STOP = {"requested": False}
+
+
+def _request_stop(signum, frame) -> None:
+    _STOP["requested"] = True
 
 
 def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict[int, int],
@@ -483,7 +656,10 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
                     gold_drop_rate: float = 0.2, distractors: int = 3, seed: int = 42, arms: Sequence[str] = ARMS,
                     suffix: str = "", val_fraction: float = 0.005, store_dir: Optional[str] = None,
                     overwrite: bool = False, block: int = 4096,
-                    mask_first_name_mention: bool = False, support_gold_only: bool = False) -> dict:
+                    mask_first_name_mention: bool = False, support_gold_only: bool = False,
+                    stop_after_tokens: Optional[int] = None, shared_outputs: bool = True,
+                    train_factspan: bool = True, checkpoint_blocks: int = 50,
+                    stop_check: Optional[Callable[[], bool]] = None) -> dict:
     """Write the arm splits, the shared validation split, the facts, the pools and the store.
 
     Free of the Hub, so a test can drive it with a fake embedder and a small synthetic filler.
@@ -512,15 +688,64 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         block: documents rendered and written together.
         mask_first_name_mention: see the module docstring, rule 7; retrieval arm, ``.mask`` only.
         support_gold_only: see the module docstring, rule 8; retrieval arm, ``.mask`` only.
+        stop_after_tokens: stop at the first document boundary at or after this many ``.bin`` tokens
+            of the first arm; the layout is still the one ``target_tokens`` defines, so every
+            per document file is a byte prefix of the full build's. None builds everything.
+        shared_outputs: False writes none of the files builds share (facts, pools, store,
+            ``inject_val``, the ``common`` metrics) and instead requires them to exist and match.
+        train_factspan: False skips ``.factspan`` of the arm splits (the validation split keeps it).
+        checkpoint_blocks: blocks between resume checkpoints.
+        stop_check: called at every block boundary; True writes a checkpoint and raises
+            ``BuildInterrupted``. Defaults to the SIGTERM flag of ``main``.
 
     Returns:
         The build metrics, also merged into ``inject_build.json`` in ``out_dir``.
+
+    Raises:
+        BuildInterrupted: when a stop was requested; a relaunch with the same arguments resumes.
     """
     assert set(arms) <= set(ARMS), arms
     os.makedirs(out_dir, exist_ok=True)
     t0 = time.time()
     window = min(1000, seq_length - 24)
     bos, eos = tokenizer.bos_token_id, tokenizer.eos_token_id
+    stop_check = stop_check or (lambda: _STOP["requested"])
+
+    signature = {
+        "persons_per_tier": {str(k): v for k, v in sorted(persons_per_tier.items())},
+        "filler": [[os.path.getsize(b), os.path.getsize(i)] for b, i in filler],
+        "target_tokens": target_tokens, "seq_length": seq_length, "swap_rate": swap_rate,
+        "anon_rate": anon_rate, "placeholder_rate": placeholder_rate, "gold_drop_rate": gold_drop_rate,
+        "distractors": distractors, "seed": seed, "arms": list(arms), "suffix": suffix,
+        "val_fraction": val_fraction, "block": block, "mask_first_name_mention": mask_first_name_mention,
+        "support_gold_only": support_gold_only, "stop_after_tokens": stop_after_tokens,
+        "train_factspan": train_factspan,
+    }
+    stem = os.path.join(out_dir, f".inject_state_{'-'.join(arms)}_{suffix or 'base'}")
+    state_path, keys_path = stem + ".json", stem + ".keys.npy"
+    if overwrite:
+        for path in (state_path, keys_path):
+            if os.path.exists(path):
+                os.remove(path)
+    names = {arm: split_name(arm, suffix) for arm in arms}
+    if not overwrite and _already_complete(out_dir, names, signature):
+        for leftover in (state_path, keys_path):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        logger.info(f"already complete: {', '.join(names.values())} match the completion record in "
+                    f"inject_build.json for these arguments; nothing touched")
+        record = _read_build_record(out_dir)
+        return {"already_complete": True, "common": record.get("common", {}),
+                "arms": {arm: record["arms"][split] for arm, split in names.items()}}
+    resume = None
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            resume = json.load(f)
+        if resume["signature"] != signature:
+            differing = sorted(k for k in signature if resume["signature"].get(k) != signature[k])
+            raise SystemExit(f"{state_path} was written by a build with other arguments ({differing}); "
+                             f"relaunch with the same arguments or pass --overwrite to start over")
+        logger.info(f"resuming from {state_path}: block start {resume['next_lo']:,}")
 
     pools = bio.make_pools(seed)
     people = bio.make_people(pools, persons_per_tier, seed)
@@ -528,19 +753,37 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         (os.path.join(out_dir, "inject_facts.jsonl"), bio.save_facts, people, bio.load_facts),
         (os.path.join(out_dir, "inject_pools.json"), bio.save_pools, pools, bio.load_pools),
     ):
-        if os.path.exists(path) and not overwrite:
+        if os.path.exists(path) and (not overwrite or not shared_outputs):
             if loader(path) != payload:
                 raise SystemExit(f"{path} differs from this build's seed and tiers; pass --overwrite "
                                  f"or use another --out-dir")
+        elif not shared_outputs:
+            raise SystemExit(f"{path} is missing and --no-shared-outputs forbids writing it")
         else:
-            writer(path, payload)
+            writer(path + ".part", payload)
+            os.replace(path + ".part", path)
 
     store_ready = store_dir is not None and os.path.exists(os.path.join(store_dir, "meta.json")) \
-        and not overwrite
+        and (not overwrite or not shared_outputs)
+    if not shared_outputs and store_dir is not None and not store_ready:
+        raise SystemExit(f"{store_dir} has no store and --no-shared-outputs forbids writing it")
     keys = None
     if "retrieval" in arms or (store_dir is not None and not store_ready):
-        assert embedder is not None, "the card keys need an embedder"
-        keys = np.asarray(embedder.encode([p.store_chunk for p in people]), dtype=np.float32)
+        if resume is not None and os.path.exists(keys_path):
+            keys = np.load(keys_path)
+            logger.info(f"card keys read back from {keys_path}")
+        else:
+            assert embedder is not None, "the card keys need an embedder"
+            keys = np.asarray(embedder.encode([p.store_chunk for p in people]), dtype=np.float32)
+    if not shared_outputs and store_ready and keys is not None:
+        stored = np.load(os.path.join(store_dir, "keys.npy"))
+        if stored.shape != keys.shape:
+            raise SystemExit(f"the store at {store_dir} holds keys {stored.shape}, this build's are {keys.shape}")
+        drift = float(np.abs(stored.astype(np.float32) - keys).max())
+        if drift > 2e-3:
+            logger.warning(f"the store's keys differ from this build's embedding by {drift:.4f}")
+        else:
+            logger.info(f"the store's keys match this build's (max difference {drift:.5f})")
     if store_dir is not None and not store_ready:
         try:
             from modules.data.store import write_store
@@ -549,8 +792,11 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         else:
             card_tokens = [len(x) for x in tokenizer([p.store_chunk for p in people],
                                                      add_special_tokens=False)["input_ids"]]
+            part_dir = store_dir.rstrip("/\\") + ".part"
+            if os.path.exists(part_dir):
+                shutil.rmtree(part_dir)
             write_store(
-                store_dir,
+                part_dir,
                 [{"chunk_id": p.person_id, "text": p.store_chunk, "source": "bios",
                   "doc_id": str(p.person_id), "title": p.name} for p in people],
                 keys,
@@ -558,6 +804,9 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
                  "n_chunks": len(people), "sources": {"bios": len(people)},
                  "built": time.strftime("%Y-%m-%dT%H:%M:%S"), "dataset_revisions": {}},
             )
+            if os.path.exists(store_dir):
+                shutil.rmtree(store_dir)
+            os.replace(part_dir, store_dir)
             logger.info(f"wrote the biography store to {store_dir}")
 
     # every bio document, canonical render, once
@@ -584,19 +833,39 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
     memmaps, train_windows, val_windows = load_filler_windows(filler, window, seed, val_fraction)
     need = max(0, target_tokens - bio_tokens)
     chosen, repeat = pick_filler(train_windows, need, seed)
-    logger.info(f"filler: {len(train_windows):,} train windows, {len(val_windows):,} validation, "
+    n_train_windows = len(train_windows)
+    del train_windows
+    logger.info(f"filler: {n_train_windows:,} train windows, {len(val_windows):,} validation, "
                 f"{len(chosen):,} used for {need:,} tokens, repeat factor {repeat:.2f}x")
 
-    kinds = np.concatenate([np.full(len(chosen), FILLER), np.full(len(docs), BIO)])
-    indices = np.concatenate([np.arange(len(chosen)), np.arange(len(docs))])
+    val_split = "inject_val"
+    val_path = os.path.join(out_dir, f"{val_split}.bin")
+    if not shared_outputs:
+        val_idx = os.path.join(out_dir, f"{val_split}.idx")
+        if not (os.path.exists(val_path) and os.path.exists(val_idx)):
+            raise SystemExit(f"{val_path} is missing and --no-shared-outputs forbids writing it")
+        problem = _val_problem(out_dir, val_split, len(val_windows))
+        if problem:
+            raise SystemExit(f"{val_split} is not whole: {problem}")
+        logger.info(f"{val_split} exists with {len(val_windows):,} windows as expected, not rewritten")
+
+    small = max(len(chosen), len(docs)) < 2 ** 32
+    kinds = np.concatenate([np.full(len(chosen), FILLER, dtype=np.uint8), np.full(len(docs), BIO, dtype=np.uint8)])
+    indices = np.concatenate([np.arange(len(chosen), dtype=np.uint32 if small else np.int64),
+                              np.arange(len(docs), dtype=np.uint32 if small else np.int64)])
     order = np.random.default_rng(seed + 1).permutation(len(kinds))
     kinds, indices = kinds[order], indices[order]
+    del order
 
-    names = {arm: split_name(arm, suffix) for arm in arms}
     writers: Dict[str, object] = {}
+    if resume is None:
+        _drop_build_entries(out_dir, list(names.values()))
     for arm, split in names.items():
-        _check_free(out_dir, split, overwrite)
-        writers[arm] = RetrievalWriter(out_dir, split) if arm == "retrieval" else PlainWriter(out_dir, split)
+        if resume is None:
+            _check_free(out_dir, split, overwrite)
+        writer_class = RetrievalWriter if arm == "retrieval" else PlainWriter
+        writers[arm] = writer_class(out_dir, split, factspan=train_factspan,
+                                    state=None if resume is None else resume["writers"][arm])
     builder = None
     if "retrieval" in arms:
         builder = RetrievalBuilder(people, pools, keys, tokenizer, seed, swap_rate, anon_rate,
@@ -612,16 +881,61 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         mask[0] = 0
         return ids, mask, np.zeros(len(ids), dtype=np.uint8)
 
+    if resume is None and keys is not None and "retrieval" in arms:
+        np.save(keys_path, keys)
+    stop_arm = arms[0]
+    elapsed_before = 0.0
+    bio_doc_count = filler_doc_count = 0
+    start_lo = 0
+    if resume is not None:
+        start_lo = resume["next_lo"]
+        filler_doc_count, bio_doc_count = resume["counts"]
+        elapsed_before = resume["elapsed"]
+        if builder is not None:
+            builder.stats.update(resume["stats"])
+
+    def write_state(next_lo: int) -> None:
+        _write_json_atomic(state_path, {
+            "signature": signature, "next_lo": next_lo,
+            "writers": {arm: w.snapshot() for arm, w in writers.items()},
+            "counts": [filler_doc_count, bio_doc_count],
+            "stats": dict(builder.stats) if builder is not None else None,
+            "elapsed": elapsed_before + time.time() - t0,
+        })
+
+    if resume is None:
+        write_state(0)
+
+    def reached_stop() -> bool:
+        return stop_after_tokens is not None and writers[stop_arm].tokens >= stop_after_tokens
+
     none_idx = CONDITIONS.index("none")
     empty_keys = np.zeros((0, EMBED_DIM), dtype=np.float32)
-    bio_doc_count = filler_doc_count = 0
-    for lo in range(0, len(kinds), block):
+    stopped_early = False
+    blocks_since_checkpoint = 0
+    for lo in range(start_lo, len(kinds), block):
+        if stop_check():
+            write_state(lo)
+            for writer in writers.values():
+                writer.close()
+            raise BuildInterrupted(f"stopped at block start {lo:,}; checkpoint written to {state_path}")
+        if blocks_since_checkpoint >= checkpoint_blocks:
+            write_state(lo)
+            blocks_since_checkpoint = 0
+        if reached_stop():
+            stopped_early = True
+            break
         kind_block, index_block = kinds[lo:lo + block], indices[lo:lo + block]
         retrieval_docs = {}
+        stats_before = dict(builder.stats) if builder is not None else None
         if builder is not None:
             flat = [int(i) for k, i in zip(kind_block, index_block) if k == BIO]
             retrieval_docs = dict(zip(flat, builder.build([docs[i] for i in flat])))
+        written_bio = []
         for kind, index in zip(kind_block, index_block):
+            if reached_stop():
+                stopped_early = True
+                break
             index = int(index)
             if kind == FILLER:
                 ids, mask, codes = window_doc(chosen[index])
@@ -633,6 +947,7 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
                         writer.write(ids, mask, codes)
             else:
                 bio_doc_count += 1
+                written_bio.append(index)
                 ids_body, codes_body = canonical[index]
                 ids = np.concatenate(([bos], ids_body, [eos])).astype(np.uint16)
                 codes = np.concatenate(([0], codes_body, [0])).astype(np.uint8)
@@ -651,22 +966,39 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
                         d = retrieval_docs[index]
                         writer.write(d["ids"], d["mask"], d["codes"], d["ev_ids"], d["ev_chunk"],
                                      d["keys"], d["ev_gold"], d["condition_idx"])
+        if stopped_early:
+            if builder is not None:
+                # the block was rendered whole; count only the documents that were written
+                builder.stats = stats_before
+                if written_bio:
+                    builder.build([docs[i] for i in written_bio])
+            break
+        blocks_since_checkpoint += 1
         done = min(lo + block, len(kinds))
         if (lo // block) % 20 == 0:
             logger.info(f"  {done:,}/{len(kinds):,} documents ({time.time() - t0:.0f}s)")
     for writer in writers.values():
         writer.close()
+    if stopped_early:
+        logger.info(f"stopped at {writers[stop_arm].tokens:,} {stop_arm} tokens "
+                    f"({writers[stop_arm].docs:,} of {len(kinds):,} documents)")
 
-    val_split = "inject_val"
-    val_path = os.path.join(out_dir, f"{val_split}.bin")
-    if os.path.exists(val_path) and not overwrite:
+    if not shared_outputs:
+        pass
+    elif os.path.exists(val_path) and not overwrite and _val_problem(out_dir, val_split, len(val_windows)) is None:
         logger.info(f"{val_split} exists, kept (identical for every arm)")
     else:
-        _check_free(out_dir, val_split, True)
-        val_writer = PlainWriter(out_dir, val_split)
+        if os.path.exists(val_path) and not overwrite:
+            logger.warning(f"{val_split} is not whole ({_val_problem(out_dir, val_split, len(val_windows))}); rewriting")
+        part = val_split + ".part"
+        _check_free(out_dir, part, True)
+        val_writer = PlainWriter(out_dir, part)
         for row in val_windows:
             val_writer.write(*window_doc(row))
         val_writer.close()
+        _check_free(out_dir, val_split, True)
+        for suffix_ in ("bin", "mask", "factspan", "idx"):
+            os.replace(os.path.join(out_dir, f"{part}.{suffix_}"), os.path.join(out_dir, f"{val_split}.{suffix_}"))
         logger.info(f"{val_split}: {val_writer.docs:,} windows, {val_writer.tokens:,} tokens")
 
     metrics = {"arms": {}, "common": {
@@ -674,13 +1006,19 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         "bio_tokens": bio_tokens, "bio_token_share": bio_tokens / max(1, writers[arms[0]].tokens),
         "exposures_by_tier": {str(t): {"people": n, "exposures_each": t} for t, n in
                               sorted(persons_per_tier.items())},
-        "filler_repeat_factor": repeat, "filler_windows_train": int(len(train_windows)),
+        "filler_repeat_factor": repeat, "filler_windows_train": int(n_train_windows),
         "filler_windows_val": int(len(val_windows)), "seed": seed, "target_tokens": target_tokens,
-        "built_seconds": round(time.time() - t0, 1),
+        "built_seconds": round(elapsed_before + time.time() - t0, 1),
     }}
     for arm, writer in writers.items():
         entry = {"split": names[arm], "docs": writer.docs, "tokens": writer.tokens,
                  "mask_zero_share": writer.mask_zero / max(1, writer.tokens)}
+        if stop_after_tokens is not None:
+            entry.update({"stop_after_tokens": stop_after_tokens, "layout_documents": int(len(kinds)),
+                          "stopped_early": stopped_early})
+        entry.update({"complete": True, "signature": signature, "files": _split_sizes(out_dir, names[arm])})
+        if not train_factspan:
+            entry["train_factspan"] = False
         if arm == "retrieval":
             s = builder.stats
             entry.update({
@@ -709,8 +1047,12 @@ def build_injection(out_dir: str, tokenizer, embedder, *, persons_per_tier: Dict
         with open(path) as f:
             merged = json.load(f)
     merged["arms"].update({names[a]: e for a, e in metrics["arms"].items()})
-    merged["common"] = metrics["common"]
+    if shared_outputs or not merged.get("common"):
+        merged["common"] = metrics["common"]
     _write_json_atomic(path, merged)
+    for leftover in (state_path, keys_path):
+        if os.path.exists(leftover):
+            os.remove(leftover)
     return metrics
 
 
@@ -779,6 +1121,17 @@ def main():
     parser.add_argument("--val-fraction", type=float, default=0.005)
     parser.add_argument("--store-dir", default=os.path.join(BASE_DIR, "data", "index", "inject_bios"))
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--stop-after-tokens", type=int, default=None,
+                        help="build the layout --target-tokens defines but stop at the first document "
+                             "boundary at or after this many .bin tokens of the first arm; the outputs "
+                             "are byte prefixes of the full build's")
+    parser.add_argument("--no-shared-outputs", action="store_true",
+                        help="write none of the files builds share (facts, pools, store, inject_val, "
+                             "the common metrics); require them to exist and match")
+    parser.add_argument("--no-train-factspan", action="store_true",
+                        help="skip .factspan of the arm splits (the validation split keeps it)")
+    parser.add_argument("--checkpoint-blocks", type=int, default=50,
+                        help="blocks of 4096 documents between resume checkpoints")
     args = parser.parse_args()
 
     arms = [a for a in args.arms.split(",") if a]
@@ -790,9 +1143,24 @@ def main():
         filler.append(pair)
 
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
-    logger.info(f"loading the external embedder ({ChunkEmbedder.REPO}) on {args.device}")
-    embedder = ChunkEmbedder(device=args.device)
-    metrics = build_injection(
+    store_exists = os.path.exists(os.path.join(args.store_dir, "meta.json")) and not (
+        args.overwrite and not args.no_shared_outputs)
+    embedder = None
+    if "retrieval" in arms or not store_exists:
+        logger.info(f"loading the external embedder ({ChunkEmbedder.REPO}) on {args.device}")
+        embedder = ChunkEmbedder(device=args.device)
+    signal.signal(signal.SIGTERM, _request_stop)
+    try:
+        metrics = _build_from_args(args, arms, filler, tokenizer, embedder)
+    except BuildInterrupted as stop:
+        logger.warning(str(stop))
+        sys.exit(20)
+    if not metrics.get("already_complete"):
+        log_report(metrics)
+
+
+def _build_from_args(args, arms, filler, tokenizer, embedder) -> dict:
+    return build_injection(
         args.out_dir, tokenizer, embedder, persons_per_tier=parse_tiers(args.persons_per_tier),
         filler=filler, target_tokens=args.target_tokens, seq_length=args.seq_length,
         swap_rate=args.swap_rate, anon_rate=args.anon_rate,
@@ -800,8 +1168,9 @@ def main():
         mask_first_name_mention=args.mask_first_name_mention, support_gold_only=args.support_gold_only,
         distractors=args.distractors, seed=args.seed, arms=arms, suffix=args.suffix,
         val_fraction=args.val_fraction, store_dir=args.store_dir, overwrite=args.overwrite,
+        stop_after_tokens=args.stop_after_tokens, shared_outputs=not args.no_shared_outputs,
+        train_factspan=not args.no_train_factspan, checkpoint_blocks=args.checkpoint_blocks,
     )
-    log_report(metrics)
 
 
 if __name__ == "__main__":

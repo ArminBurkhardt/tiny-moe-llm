@@ -216,9 +216,13 @@ def main():
         evidx = load(out, "m", "evidx", np.uint64)
         assert evidx[0] == 0 and evidx[-1] == len(load(out, "m", "ev", np.uint16))
         assert (np.diff(load(out, "m", "evkeyidx", np.uint64)) == [len(d["gold"]) for d in docs]).all()
+        stamp = {n: os.path.getmtime(os.path.join(out, n)) for n in os.listdir(out)}
+        again = run(out, "m", target, 7, slices)
+        assert again["md5_by_slice"] == result["md5_by_slice"]
+        assert stamp == {n: os.path.getmtime(os.path.join(out, n)) for n in os.listdir(out)}
         try:
-            run(out, "m", target, 7, slices)
-            raise AssertionError("second run without --overwrite should refuse")
+            run(out, "m", target, 8, slices)
+            raise AssertionError("a second run with other arguments without --overwrite should refuse")
         except FileExistsError:
             pass
         print(f"1. {len(docs)} merged documents equal their sources, offsets rebuilt, plain docs empty   PASS")
@@ -406,6 +410,203 @@ def main():
         assert not res9b["src_carried"] and not os.path.exists(os.path.join(lab_out, "m.src"))
         assert not os.path.exists(os.path.join(out, "m.src"))
         print("9. src carried per document when every slice has it, absent otherwise   PASS")
+
+        # 10. --order-prefix-from
+        ref_slice = load(out, "m", "slice", np.uint8)
+        ref_path = os.path.join(out, "m.slice")
+        pre_target = 1000
+        pre_dir = os.path.join(root, "prefix")
+        resp = run(pre_dir, "m", pre_target, 7, slices, ["--order-prefix-from", ref_path])
+        pre_slice = load(pre_dir, "m", "slice", np.uint8)
+        n_pre = len(pre_slice)
+        assert n_pre == resp["num_docs"] == resp["documents"] == resp["order_prefix"]["documents"]
+        assert np.array_equal(pre_slice, ref_slice[:n_pre]) and n_pre < len(ref_slice)
+        pre_docs = read_merged(pre_dir, "m")
+        pre_lens = [len(d["ids"]) for d in pre_docs]
+        assert sum(pre_lens) >= pre_target and sum(pre_lens[:-1]) < pre_target
+        assert resp["prompt_tokens"] == sum(pre_lens)
+        seen = [0] * len(slices)
+        prefixes = [mes.parse_slice(t).prefix for t in slices]
+        for doc, s in zip(pre_docs, pre_slice):
+            same_doc(doc, source_doc(prefixes[s], seen[s]))
+            seen[s] += 1
+        assert resp["order_prefix"]["documents_per_slice"] == {
+            mes.parse_slice(t).label: seen[i] for i, t in enumerate(slices)}
+        by_hand = os.path.join(root, "prefix_nb")
+        run(by_hand, "m", pre_target, 7, slices, ["--order-prefix-from", ref_path, "--no-block-copy"])
+        assert file_bytes(by_hand, "m", suffixes) == file_bytes(pre_dir, "m", suffixes)
+        pre_plain = os.path.join(root, "prefix_plain")
+        resq = run(pre_plain, "m", pre_target, 7, slices, ["--order-prefix-from", ref_path, "--no-evidence"])
+        assert sorted(os.listdir(pre_plain)) == ["m.bin", "m.idx", "m.mask", "m.merge.json", "m.slice"]
+        assert file_bytes(pre_plain, "m", ("bin", "idx", "mask", "slice")) == \
+            file_bytes(pre_dir, "m", ("bin", "idx", "mask", "slice"))
+        assert resq["md5_by_slice"] == resp["md5_by_slice"]
+        # a shorter build that is a prefix by index gives the same bytes; one too short fails by name
+        short_src = os.path.join(root, "short_src")
+        os.makedirs(short_src)
+        keep = 12
+        bios_idx = np.fromfile(os.path.join(src, "bios.idx"), dtype=np.uint64)
+        evidx = np.fromfile(os.path.join(src, "bios.evidx"), dtype=np.uint64)
+        kidx = np.fromfile(os.path.join(src, "bios.evkeyidx"), dtype=np.uint64)
+        cut = lambda suffix, dtype, n, width=1: np.fromfile(os.path.join(src, f"bios.{suffix}"), dtype=dtype) \
+            .reshape(-1, width)[:n].tofile(os.path.join(short_src, f"bios.{suffix}"))
+        cut("bin", np.uint16, int(bios_idx[keep])), cut("mask", np.uint8, int(bios_idx[keep]))
+        cut("ev", np.uint16, int(evidx[keep])), cut("evchunk", np.uint16, int(evidx[keep]))
+        cut("evkey", np.float16, int(kidx[keep]), EMBED_DIM), cut("evgold", np.uint8, int(kidx[keep]))
+        cut("cond", np.uint8, keep), cut("ans", np.uint8, keep)
+        bios_idx[:keep + 1].tofile(os.path.join(short_src, "bios.idx"))
+        evidx[:keep + 1].tofile(os.path.join(short_src, "bios.evidx"))
+        kidx[:keep + 1].tofile(os.path.join(short_src, "bios.evkeyidx"))
+        short_slices = [slices[0].replace(f"{src}/bios", f"{short_src}/bios")] + slices[1:]
+        need_bios = seen[0]
+        if need_bios <= keep:
+            res_short = run(os.path.join(root, "prefix_short"), "m", pre_target, 7, short_slices,
+                            ["--order-prefix-from", ref_path])
+            assert file_bytes(os.path.join(root, "prefix_short"), "m", suffixes) == \
+                file_bytes(pre_dir, "m", suffixes)
+            assert res_short["md5_by_slice"] == resp["md5_by_slice"]
+        try:
+            run(os.path.join(root, "prefix_fail"), "m", 10 ** 6, 7, short_slices, ["--order-prefix-from", ref_path])
+        except ValueError as err:
+            assert "bios" in str(err) or "order" in str(err), err
+        else:
+            raise AssertionError("an input or an order that runs out before the target should fail")
+        try:
+            run(os.path.join(root, "prefix_excl"), "m", pre_target, 7, slices,
+                ["--order-prefix-from", ref_path, "--order-from", ref_path])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("--order-prefix-from and --order-from are exclusive")
+        print(f"10. --order-prefix-from: {n_pre} documents, slice file is the prefix of the recorded order, "
+              f"block copy equals per document, --no-evidence works   PASS")
+
+        # 11. resume across a stop
+        def strip(result):
+            result = json.loads(json.dumps(result))
+            result["args"].pop("out_dir")
+            return result
+
+        def stopped_then_resumed(name, target_tokens, extra, stop_at, garbage=True):
+            d = os.path.join(root, name)
+            try:
+                run(d, "m", target_tokens, 7, slices, extra + ["--stop-after-docs", str(stop_at)])
+            except SystemExit as exit_:
+                assert exit_.code == 20, exit_.code
+            else:
+                raise AssertionError("the stop hook should exit 20")
+            state_file = os.path.join(d, "m.merge_state.json")
+            assert os.path.exists(state_file) and not os.path.exists(os.path.join(d, "m.slice"))
+            state = json.load(open(state_file))
+            assert state["documents_done"] == stop_at
+            if garbage:
+                for s in state["offsets"]:
+                    with open(os.path.join(d, f"m.{s}"), "ab") as f:
+                        f.write(b"\xff" * 37)
+            try:
+                run(d, "m", target_tokens + 1, 7, slices, extra)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("a resume with other arguments should be refused")
+            res = run(d, "m", target_tokens, 7, slices, extra)
+            assert not os.path.exists(state_file)
+            return d, res
+
+        for label, extra, ref_dir, ref_res in (
+                ("default", [], out, result),
+                ("prefix", ["--order-prefix-from", ref_path], pre_dir, resp),
+                ("prefix plain", ["--order-prefix-from", ref_path, "--no-evidence"], pre_plain, resq)):
+            target_here = target if label == "default" else pre_target
+            suff = suffixes if "plain" not in label else ("bin", "idx", "mask", "slice")
+            n_here = ref_res["documents"]
+            for stop_at in sorted({1, n_here // 3, n_here - 1}):
+                d, res = stopped_then_resumed(f"resume_{label}_{stop_at}".replace(" ", "_"), target_here,
+                                              extra + ["--checkpoint-docs", "4"], stop_at)
+                assert file_bytes(d, "m", suff) == file_bytes(ref_dir, "m", suff), (label, stop_at)
+                assert strip(res) == strip(ref_res), (label, stop_at)
+                assert strip(json.load(open(os.path.join(d, "m.merge.json")))) == strip(ref_res)
+        sigdir = os.path.join(root, "sigterm")
+        sig_args = mes.build_parser().parse_args(
+            ["--out-dir", sigdir, "--split", "m", "--target-tokens", str(target), "--seed", "7",
+             "--checkpoint-docs", "4"] + sum((["--slice", s] for s in slices), []))
+        mes.STOP_REQUESTED = True
+        try:
+            mes.merge(sig_args)
+        except mes.MergeInterrupted:
+            pass
+        else:
+            raise AssertionError("a stop request should save and stop")
+        finally:
+            mes.STOP_REQUESTED = False
+        assert json.load(open(os.path.join(sigdir, "m.merge_state.json")))["documents_done"] == 4
+        mes.merge(sig_args)
+        assert file_bytes(sigdir, "m", suffixes) == file_bytes(out, "m", suffixes)
+        fresh = run(sigdir, "m", target, 7, slices, ["--no-resume"])
+        assert strip(fresh) == strip(result)
+        print("11. interrupted merges resume byte identical (files and digests), a stale tail is truncated, other "
+              "arguments are refused, a stop request saves state   PASS")
+        # 12. a kill before the first state save, a finished merge, the order file fingerprint
+        kill_dir = os.path.join(root, "kill0")
+        real_save = mes.save_state_atomic
+
+        def save_then_die(path, state):
+            real_save(path, state)
+            raise RuntimeError("killed")
+
+        mes.save_state_atomic = save_then_die
+        try:
+            run(kill_dir, "m", target, 7, slices)
+            raise AssertionError("the merge should have died")
+        except RuntimeError:
+            pass
+        finally:
+            mes.save_state_atomic = real_save
+        assert json.load(open(os.path.join(kill_dir, "m.merge_state.json")))["documents_done"] == 0
+        res12 = run(kill_dir, "m", target, 7, slices, ["--overwrite"])
+        assert file_bytes(kill_dir, "m", suffixes) == file_bytes(out, "m", suffixes)
+        assert strip(res12) == strip(result)
+        assert not os.path.exists(os.path.join(kill_dir, "m.merge_state.json"))
+        stamp = {n: os.path.getmtime(os.path.join(kill_dir, n)) for n in os.listdir(kill_dir)}
+        assert run(kill_dir, "m", target, 7, slices)["md5_by_slice"] == result["md5_by_slice"]
+        assert stamp == {n: os.path.getmtime(os.path.join(kill_dir, n)) for n in os.listdir(kill_dir)}
+        # a state left behind by a kill between merge.json and its removal: complete, state dropped
+        mid = os.path.join(root, "mid")
+        try:
+            run(mid, "m", target, 7, slices, ["--checkpoint-docs", "4", "--stop-after-docs", "4"])
+        except SystemExit:
+            pass
+        old_state = open(os.path.join(mid, "m.merge_state.json")).read()
+        run(mid, "m", target, 7, slices, ["--checkpoint-docs", "4"])
+        open(os.path.join(mid, "m.merge_state.json"), "w").write(old_state)
+        stamp = {n: os.path.getmtime(os.path.join(mid, n)) for n in os.listdir(mid) if "state" not in n}
+        run(mid, "m", target, 7, slices, ["--overwrite"])
+        assert not os.path.exists(os.path.join(mid, "m.merge_state.json"))
+        assert stamp == {n: os.path.getmtime(os.path.join(mid, n)) for n in os.listdir(mid)}
+        assert file_bytes(mid, "m", suffixes) == file_bytes(out, "m", suffixes)
+        # a finished merge with --overwrite and no state starts clean; a damaged one is not trusted
+        os.truncate(os.path.join(mid, "m.bin"), os.path.getsize(os.path.join(mid, "m.bin")) - 1)
+        try:
+            run(mid, "m", target, 7, slices)
+            raise AssertionError("a damaged merge was taken as complete")
+        except FileExistsError:
+            pass
+        run(mid, "m", target, 7, slices, ["--overwrite"])
+        assert file_bytes(mid, "m", suffixes) == file_bytes(out, "m", suffixes)
+        # the order file counts by content, not by path
+        order_a = os.path.join(root, "order_a.slice")
+        order_b = os.path.join(root, "order_b.slice")
+        data = open(os.path.join(out, "m.slice"), "rb").read()
+        open(order_a, "wb").write(data)
+        open(order_b, "wb").write(data)
+        digest = lambda path: mes.args_digest(mes.build_parser().parse_args(
+            ["--out-dir", root, "--split", "m", "--target-tokens", str(target), "--order-prefix-from", path]
+            + sum((["--slice", x] for x in slices), [])))
+        assert digest(order_a) == digest(order_b)
+        open(order_b, "wb").write(bytes([data[0] ^ 1]) + data[1:])
+        assert digest(order_a) != digest(order_b)
+        print("12. a kill before the first state save resumes under --overwrite, a finished merge is left alone, "
+              "a leftover state is dropped, a damaged merge is refused, the order file counts by content   PASS")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

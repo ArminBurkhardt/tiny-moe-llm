@@ -15,3 +15,9 @@ ckpts
 env_init
 # sanity checks :)
 # tests/
+# ops tooling state (scripts/ops)
+scripts/ops/ops.env
+ops_state/
+ops_transfer_ledger.tsv
+*.sif
+scripts/slurm/mn5_env.local.sh

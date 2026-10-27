@@ -176,7 +176,7 @@ def test_payload_roundtrip():
     fields = {"data_dir": "data/prepared_pilot", "train_split": "pilot_main_train",
               "val_split": "inject_val", "loop_rng_state": random.Random(1).getstate(),
               "cuda_rng_state": None, "total_steps": 30170, "rows_per_epoch": 241398,
-              "world_size": 8}
+              "world_size": 8, "num_docs": 12345, "plan_split": "pilot_main_train"}
     common = dict(epoch=0, step=3, token_count=10, start_token_count=0, global_offset=0,
                   losses=[], seed=0, phase=EVIDENCE_PHASE)
     with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +190,7 @@ def test_payload_roundtrip():
         assert state["optimizer_steps"] == 3, state["optimizer_steps"]
         assert (state["total_steps"], state["rows_per_epoch"], state["world_size"]) == (
             30170, 241398, 8), state
+        assert (state["num_docs"], state["plan_split"]) == (12345, "pilot_main_train"), state
 
         # a payload written before the fields: nothing recorded, nothing refused
         save_sft_checkpoint(model, optimizer, scheduler, path, **common)
@@ -200,6 +201,7 @@ def test_payload_roundtrip():
         assert state["data"] == {} and state["rng"] == {} and state["fp32_masters"] is None
         assert state["total_steps"] is None and state["rows_per_epoch"] is None
         assert state["world_size"] is None
+        assert state["num_docs"] is None and state["plan_split"] is None
     print("6. payload fields survive save/load, an older payload loads with none   PASS")
 
 

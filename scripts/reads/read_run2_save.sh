@@ -5,10 +5,12 @@
 #   TAG    token count or "final", used in the output names
 #   CHAINS 1 (default) runs eval_chains.py too; 0 skips it
 #   EXIT   1 also reads the per exit CE on the clean slice (eval_exit.py, 40 batches of 4, no evidence); default 0
-# outputs: ckpts/inject/run2_${TAG}_rank_{none,gold,swapped,prompt}.{json,log},
-#          ckpts/inject/run2_${TAG}_chains_{d123,hop4}.{json,log}, run2_${TAG}_exit_clean.{json,log}; every read is timed
-#          and skipped when its json exists, so a killed read set relaunches where it stopped.
-# env: DATA_ROOT (default data/run2: merges and facts in DATA_ROOT/prepared_run2, chains in
+# outputs: ckpts/inject/${RUN}_${TAG}_rank_{none,gold,swapped,prompt}.{json,log},
+#          ckpts/inject/${RUN}_${TAG}_chains_{d123,hop4}.{json,log}, ${RUN}_${TAG}_exit_clean.{json,log} (RUN the run
+#          name, default run2, so a control run never overwrites the main run's reads); every read is timed
+#          and skipped when its json exists, so a killed read set relaunches where it stopped. exit code 1 when any
+#          read failed (a nonzero exit of the read or no json written), 0 only when every read is there.
+# env: RUN (default run2), READ_CONFIG (default config_run2.yaml, or TINY_LLM_CONFIG), DATA_ROOT (default data/run2: merges and facts in DATA_ROOT/prepared_run2, chains in
 #      DATA_ROOT/prepared, the bios store in DATA_ROOT/index/run2_bios), RANK_BS (default 1024: the
 #      pilot read at 512 on 32 GB; batch size does not change a rank read, only its speed),
 #      CHAINS_BS (default 512, the pilot's 256), TINY_LLM_ROOT and TINY_LLM_ENV_INIT as tests/run_tests.sh.
@@ -18,11 +20,13 @@
 cd "${TINY_LLM_ROOT:-/mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm}" || exit 1
 source "${TINY_LLM_ENV_INIT:-env_init}"
 C=$1; TAG=$2; CHAINS=${3:-1}; EXIT=${4:-0}
-export TINY_LLM_CONFIG=config_run2.yaml
+export TINY_LLM_CONFIG=${READ_CONFIG:-${TINY_LLM_CONFIG:-config_run2.yaml}}
+RUN=${RUN:-run2}
+FAILED=0
 DATA_ROOT=${DATA_ROOT:-data/run2}
 RANK_BS=${RANK_BS:-1024}
 CHAINS_BS=${CHAINS_BS:-512}
-B=ckpts/inject/run2_${TAG}
+B=ckpts/inject/${RUN}_${TAG}
 R=$DATA_ROOT/prepared_run2
 FACTS="--facts $R/inject_facts.jsonl --pools $R/inject_pools.json --store $DATA_ROOT/index/run2_bios"
 run() {  # run OUT CMD...   skip when OUT.json exists
@@ -30,7 +34,14 @@ run() {  # run OUT CMD...   skip when OUT.json exists
   [ -f $out.json ] && { echo "skip $out"; return; }
   local t0=$(date +%s)
   "$@" --json-out $out.json > $out.log 2>&1
-  echo "$(basename $out) exit $? in $(( $(date +%s) - t0 ))s"
+  local rc=$?
+  echo "$(basename $out) exit $rc in $(( $(date +%s) - t0 ))s"
+  if [ $rc -ne 0 ] || [ ! -f $out.json ]; then
+    echo "READ FAILED: $(basename $out) (exit $rc, see $out.log)"
+    FAILED=1
+    # a json a failed read left behind must not make the next run skip it
+    [ $rc -ne 0 ] && rm -f $out.json
+  fi
 }
 for ev in none gold swapped prompt; do
   run ${B}_rank_$ev python scripts/closed_book_rank.py bios -c $C --form both --evidence $ev --batch-size $RANK_BS $FACTS
@@ -42,4 +53,5 @@ fi
 if [ "$EXIT" = 1 ]; then
   run ${B}_exit_clean python scripts/eval_exit.py -c $C --data-dir $R --split inject_val_clean --max-batches 40 --batch-size 4
 fi
+[ "$FAILED" = 0 ] || { echo "reads FAILED for $C"; exit 1; }
 echo "reads complete for $C"

@@ -1,1 +1,7 @@
 *.sh text eol=lf
+*.sbatch text eol=lf
+*.example text eol=lf
+*.def text eol=lf
+Dockerfile text eol=lf
+scripts/slurm/** text eol=lf
+scripts/ops/** text eol=lf

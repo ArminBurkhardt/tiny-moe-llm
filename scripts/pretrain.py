@@ -148,9 +148,11 @@ def all_reduce_grads(params, all_reduce, world_size: int, bucket_numel: int = 1 
     Replaces DDP: the loss heads (``lm_head``, the MTP head, the groundedness head) are applied
     outside the wrapped forward, so DDP's reducer cannot see their gradients. A parameter with no
     gradient on this rank (the port on a slice with no evidence) contributes zeros, so every rank
-    reduces the same buckets in the same order. Gradients are summed in fp32 buckets and divided
-    by the world size, then written back in the parameter's dtype. Device collectives only, no host
-    sync.
+    reduces the same buckets in the same order. A parameter with no gradient on any rank (the port
+    of an evidence-free run) is left with ``grad`` None, as on one GPU: the optimizer then skips it
+    instead of decaying it. Which those are is one small summed flag vector per call, read to the
+    host once. Gradients are summed in fp32 buckets and divided by the world size, then written
+    back in the parameter's dtype.
 
     Args:
         params: the trainable parameters, in the same order on every rank.
@@ -177,6 +179,14 @@ def all_reduce_grads(params, all_reduce, world_size: int, bucket_numel: int = 1 
                 p.grad.copy_(piece)
             at += n
         bucket, owners, size = [], [], 0
+
+    params = list(params)
+    if not params:
+        return
+    has_grad = torch.tensor([1.0 if p.grad is not None else 0.0 for p in params],
+                            dtype=torch.float32, device=params[0].device)
+    all_reduce(has_grad)
+    params = [p for p, any_rank in zip(params, (has_grad > 0).tolist()) if any_rank]
 
     for p in params:
         g = p.grad.detach().float().reshape(-1) if p.grad is not None else torch.zeros(

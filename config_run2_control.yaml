@@ -3,7 +3,7 @@
 # 3 loops, seq 4096, key/value reader (set by sft.py --reader-kv on the seed). select it with
 # TINY_LLM_CONFIG=config_run2_control.yaml. relative to the repo root. every model: and training: key
 # config.py reads is present here. it differs from config_run2.yaml in the split, the token budget,
-# the warmup fraction and the kill only; tests/test_run2_config.py asserts that.
+# the epochs, the warmup fraction, the kill and lr_min_factor only; tests/test_run2_config.py asserts that.
 # decided 2026-10-25 (the user) unless a line says otherwise; the model block is config.yaml's with
 # the overrides named below
 model:
@@ -33,13 +33,13 @@ model:
   lm_head_factor: 4
 
 training:                    # loss weights, read by train_step for every profile
-  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation 2 x 8 GPUs = 524,288 tokens per update
+  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation x GPUs = 524,288 tokens per update, so 16 GPUs run accumulation 1 and 8 GPUs accumulation 2
   seq_length: 4096
   lr: 4.0e-4                 # the 16B run's rate at this width and batch (RUN2 Schedule, Optimizer)
   weight_decay: 0.1          # config.yaml has 0.02; the micro and pilot value every leak read ran under (RUN2 Schedule, Optimizer; build item 2)
   grad_clip: 1.0
   optimizer: adamw           # Muon dropped 2026-10-21
-  num_epochs: 1
+  num_epochs: 1                        # pretrain.py only; the evidence trainer reads evidence: num_epochs below
   lambda_mtp: 0.1
   aux_loss_weight: 0.01      # inert under loss_free
   moe_balancing: loss_free   # config.yaml has aux; R8, decided 2026-10-21 (RUN2 Scope, balancing)
@@ -57,12 +57,12 @@ training:                    # loss weights, read by train_step for every profil
   loop_ce_weights: [0.2, 0.3, 1.0]
   loop_ce_subsample: 0.25
   loop_count_sampling: 0.3
-  grad_accumulation_steps: 2 # see batch_size
+  grad_accumulation_steps: 1 # 16 GPUs (4 nodes of 4); the job scripts pass --grad-accumulation-steps 16 / GPUs (scripts/slurm/lib.sh accum_for), which overrides this
   seed: 42
   data_dir: "data/prepared_run2"
   phase: "phase1"
   checkpoint_every_tokens: 1000000000
-  hf_upload_repo: ""         # the pilot's value; set on the cluster by hand (RUN2 Storage: 280 uploads at the 1B cadence)
+  hf_upload_repo: ""         # off, as config_run2.yaml
 
 sft:
   data_dir: "data/prepared_run2"
@@ -84,14 +84,14 @@ evidence:
   weight_decay: 0.1
   dropout: 0.0
   batch_size: 8                        # per GPU, see training: batch_size
-  grad_accumulation_steps: 2
+  grad_accumulation_steps: 1           # see training: grad_accumulation_steps; overridden by --grad-accumulation-steps
   warmup_fraction: 0.0524              # 1000 steps of about 19,100 (10B / 524,288): the main run's 1000 step warmup
-  lr_min_factor: 0.1                   # cosine to 0.1 lr (RUN2 Schedule, Optimizer)
+  lr_min_factor: 1.0                   # constant 4e-4 after the warmup: the main run is still at peak LR at 10B, an annealed control would store more and bias the paired leak read (validator, 2026-10-27)
   seed: 1234
   checkpoint_every_tokens: 1000000000  # save every 1B (RUN2 Schedule, Cadence)
   keep_local_checkpoints: 2            # the newest two rolling saves stay; the rest are deleted by keep_every_tokens (2026-10-26)
-  keep_every_tokens: 10000000000       # keep the first save at or past every 10B tokens and the final (RUN2 Schedule; 2026-10-26)
-  eval_every_tokens: 2000000000        # [eval] is 1B and [eval fixed] 2B in RUN2, but the trainer runs both in one pass at this key: 2B
+  keep_every_tokens: 10000000000       # as config_run2.yaml (the 10B control keeps its 10B save, which is its final)
+  eval_every_tokens: 4000000000        # as config_run2.yaml
   eval_max_batches: 40
   conversation_loss_weighting: false   # plain per-token CE: this is pretraining, not policy
   loss_weight_floor_tokens: 64

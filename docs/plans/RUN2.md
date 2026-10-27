@@ -14,9 +14,18 @@ per evidence token), `config_run2.yaml` and the control, multi-GPU on the eviden
 corpus pipeline on the existing builders ([RUN2_corpus.md](RUN2_corpus.md)). Three corpus
 decisions of the main thread are rows 11 to 13 of the table below.
 
+Status 2026-10-27: the allocation is MareNostrum 5 (BSC, AI Factories, the ACC partition; the
+section "The allocation and the cluster" below), and the user raised the token target to 800B
+(row 14): 266.67B unique prompt tokens per split, 3 epochs, on 16 H100, about 3,300 H100 hours at
+the expected rate against the 4,500 targeted. Built the same day, uncommitted: the corpus driver at
+800B with resumable builders, the Slurm job chain with its watchdog, the PC-side ops tools and the
+supervisor, the trainer additions for the chained jobs (Build plan, "Built 2026-10-27"). What the
+user does, in order: [RUN2_handover.md](RUN2_handover.md). Where a section below still reads 280B
+or 93.33B it is the 2026-10-25 and 2026-10-26 text, kept; the 2026-10-27 notes override it.
+
 ## Decisions (the user, 2026-10-25)
 
-Rows 1 to 7 are the main thread's; rows 0, 8 and 9 were raised while drafting; rows 11 to 13 are 2026-10-26 corpus decisions of the main thread. Every row was
+Rows 1 to 7 are the main thread's; rows 0, 8 and 9 were raised while drafting; rows 11 to 13 are 2026-10-26 corpus decisions of the main thread; row 14 is the user's of 2026-10-27, which supersedes rows 6 and 11 and the share in row 12. Every row was
 decided on the option the draft recommended; the consequence column is the draft's, kept.
 
 | # | decision | decided | consequence of each option |
@@ -27,19 +36,21 @@ decided on the option the draft recommended; the consequence column is the draft
 | 3 | `--support-gold-only` as a data rule | **yes**: carried into the real corpus builder as a data rule, **a build item behind a flag**; scope the biography-style supervised spans; the QA and natural-text analog (a value supported only by a chunk that also carries its subject) is a builder change | yes: held-out swapped-card following 0.67 to 0.79, held-out gold top-1 0.60 to 0.74 against 0.79 to 0.86 (those baselines are the recorded warm-up arm's; the same-code twin `cfb` reads following 0.64 to 0.65 and gold top-1 0.58 to 0.68, [leak]), no language or leak cost; copying at the 100M switch 0.88 to 0.90 against 0.95 to 0.96 for the same-code twin, so the flags slowed copying ([leak]), one seed. No: following stays at about 0.67 held out |
 | 4 | the goal's reasoning clause | **reworded** to "facts in the store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation per token"; the original clause, "reasoning in the looped trunk" (2026-09-30), is kept on record as the original goal and the aspiration to revisit after the real run (NEXT.md "The goal") | yes: L1 becomes descriptive and the written bridge read (R9's form) becomes the reasoning gate (Reads and gates); matches the measurement (latent composition at chance at every read, [chain]; written 0.997 held out, [bridge]). No: L1 stays a gate the pilot already failed at this shape |
 | 5 | R4b's sublayer half | **today's one block per pass**; the three-sublayer core is not built | one block: no build; one read site per pass, three per forward. Three sublayers: a day of architecture work plus review and two 1B arms ([review]), at a noise floor that read 4 against 8 experts as equal ([e4]); the pilot never showed the loop composing |
-| 6 | the token target | **280B tokens**, the hours derived; the application asks for 2.5k H100 hours plus the corpus build line plus a 20% buffer (about 3.0k), the 5k ceiling stated; G8 (2x) turns the same hours into the 400B data cap | the main thread's "280B for 2.5k hours" is [6b]'s figure for the blueprint width. At the configured shape (row 0) 280B costs about 1.1k to 1.3k H100 hours at today's MFU and the 400B cap about 1.6k to 1.9k (Cost), so the ask covers the 400B cap at today's MFU; raising the target to 400B uses that headroom, keeping 280B leaves it for 6a, 6e and the second arm a failed read would need |
+| 6 | the token target | (superseded 2026-10-27 by row 14: 800B) **280B tokens**, the hours derived; the application asks for 2.5k H100 hours plus the corpus build line plus a 20% buffer (about 3.0k), the 5k ceiling stated; G8 (2x) turns the same hours into the 400B data cap | the main thread's "280B for 2.5k hours" is [6b]'s figure for the blueprint width. At the configured shape (row 0) 280B costs about 1.1k to 1.3k H100 hours at today's MFU and the 400B cap about 1.6k to 1.9k (Cost), so the ask covers the 400B cap at today's MFU; raising the target to 400B uses that headroom, keeping 280B leaves it for 6a, 6e and the second arm a failed read would need |
 | 7 | R5 (the winner's eval set) | **tonight, on the local card, on arm P's final** (8 experts) and the bridge final, launched by the main thread | tonight: needs no decision beyond the shape, about 2 to 4 hours (estimate from the pilot ladder's 45 minutes for twelve reads plus the chain reads, [pilot]), and its margins enter the gate table before the run. On the cluster: costs H100 hours and lands after the application |
 | 8 | the A1 control at the real run's size | **a short matched control**: no retrieval, the same stream and shape, to 10B tokens, about 30 H100 hours (about 4 hours on an 8-GPU node if DDP scales linearly) | short control: A1(b)'s paired reading (decided 2026-10-17) and A1(a) read at matched 10B; the final saves read against the prior and the 10B level. No control: A1 rests on the pilot's 47x / 4x reduction ([pilot]) and the 16B checkpoint, unmatched. A full-length control doubles the run |
 | 9 | the thin tier 100 margin at micro | **accepted** as the recipe's known state on one seed, stated in the caveats; no second seed of `cfb` | held-out tier 100 at z 3.1 / 3.3 / 3.7 on the three same-recipe arms of 2026-10-25, paired inside noise: `cfb` against the recorded arm z -1.8 (`m1` and `g1` read z -0.9 and -1.5, but they are flagged variants, not same-recipe arms) ([leak]); a second seed says whether the R0b rule's tier 100 half holds on today's code |
 | 10 | staircase visibility in the real corpus builder | **not on the launch path 2026-10-26 (moot without per-window retrieval over plain text; revisit for a later run)**; was open for the user, blocking the real builder | the design's staircase (a window sees only the chunks retrieved up to it) has no form under the key/value reader, whose prefix is visible in full to every token of its segment; without a fix a token reads chunks retrieved for later windows (Build list 4). Option A, this draft's recommendation: retrieve once per document from its first 64 tokens and mask that opening's loss (no kernel work). Option B: a windowed prefix mask (kernel work, 6a era) |
-| 11 | split size and epochs | **93.33B prompt tokens per split, 3 epochs** (280B / 3), decided by the main thread 2026-10-26 as routine | 93.33B x 3: the evidence trainer runs whole epochs (`num_epochs` times the split's rows, it ignores `target_tokens`), so the split must be built at T = 280B / 3 for the run to be 280B. The Corpus section's 100B unique at up to 4 epochs would train 300B at 3 epochs or stop at 2.8 passes only by hand ([RUN2_corpus.md](RUN2_corpus.md) section 1) |
-| 12 | chain share of the split | **0.03** (`--chain-share`), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | 0.03: 3.7 TB peak disk, about 2 days after the filler download, 28.1M plain and 19.5M bridge questions each seen 3 times. RUN2's 0.10: 6.8 TB peak, 3 to 4 days, 93.6M / 65.0M questions; a share with no rung behind it (RUN2_corpus.md section 4) |
+| 11 | split size and epochs | (superseded 2026-10-27 by row 14: 266.67B per split, 3 epochs) **93.33B prompt tokens per split, 3 epochs** (280B / 3), decided by the main thread 2026-10-26 as routine | 93.33B x 3: the evidence trainer runs whole epochs (`num_epochs` times the split's rows, it ignores `target_tokens`), so the split must be built at T = 280B / 3 for the run to be 280B. The Corpus section's 100B unique at up to 4 epochs would train 300B at 3 epochs or stop at 2.8 passes only by hand ([RUN2_corpus.md](RUN2_corpus.md) section 1) |
+| 12 | chain share of the split | (replaced 2026-10-27 in the 800B plan by an absolute 2.8B per split, `--chain-tokens 2.8e9`: the same 1.4B plain and 1.4B bridge, since a chain prompt token carries about 177 bytes of chunk keys and a share of a 266.67B split would grow the disk with the corpus; [RUN2_corpus.md](RUN2_corpus.md) section 1) **0.03** (`--chain-share`), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | 0.03: 3.7 TB peak disk, about 2 days after the filler download, 28.1M plain and 19.5M bridge questions each seen 3 times. RUN2's 0.10: 6.8 TB peak, 3 to 4 days, 93.6M / 65.0M questions; a share with no rung behind it (RUN2_corpus.md section 4) |
 | 13 | chat replay share | **held at the supply limit** (about 0.5B unique non-holdout chat, so the 20% line is unreachable and the share goes to the filler), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | at supply: smoltalk2 binds (phase 2 and ir take 1.5B, the QA replay arm 0.3B), the 18.5 points go to the biography slice. At 20%: needs a chat source that does not exist at this size (RUN2_corpus.md section 1) |
+| 14 | the token target on the granted allocation | **800B tokens** (the user, 2026-10-27): 266.67B unique prompt tokens per split x 3 epochs, on 16 H100 (4 nodes of 4 at accumulation 1), for the MareNostrum 5 allocation (5,000 GPU hours applied, 4,500 targeted) | 800B: about 3,300 H100 hours at the expected 67k tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 206 hours of wall time at 16 GPUs, at least 3 chained 72 hour jobs; the floor is about 54k per GPU (about 4,100 hours for the run, the rest of the 4,500 for the corpus build and the control). The split, the chains (absolute 2.8B), the persons (3x the pilot's) and the filler (phase 1 about 260B) are resized in [RUN2_corpus.md](RUN2_corpus.md); 280B (rows 6 and 11) would have used about 1,160 of the 4,500 hours at the same rate |
 
 ## Question, and what it decides
 
 Does the pathway recipe that passed at pilot shape (externalization against a matched control, a
-copying reader, a port worth more than its in-context ceiling) hold at shape L over 280B tokens,
+copying reader, a port worth more than its in-context ceiling) hold at shape L over 280B tokens
+(800B since 2026-10-27, row 14),
 with retrieval attached to natural text, and does the trunk it leaves give 6e and 6f a base?
 
 - **Externalization**: A1(a) on natural-text facts (first readable here: the pilot had no
@@ -128,6 +139,23 @@ filler 95.4%, QA 1.6% at its supply, plain chains 1.5%, bridge chains 1.5%), cha
 an evidence ratio of about 0.4. The table and bullets below are the design this section was written
 for; the new builder features they need are not on the launch path.
 
+**Launch version at 800B, 2026-10-27** (row 14; [RUN2_corpus.md](RUN2_corpus.md), rewritten from the
+code, is the source for every number): T = 266.67B prompt tokens per split, 3 epochs; per split bios
+about 262.3B (share 0.984), QA 1.53B at its supply, plain chains 1.4B and bridge chains 1.4B (an
+absolute 2.8B, not a share); persons `1000:300,100:1500,10:3000,1:6000` (10,800 persons, 486,000
+renderings, 3x the pilot's, so about 1.7x lower sigma on the leak read); filler built phase 1 about
+260.0B, phase 2 5B, ir 2.5B, capped per source (fineweb widened to all crawls, no repeat); evidence
+about 12.0B tokens, a ratio of about 0.045 per prompt token (not the 0.4 of the 93.33B plan). The QA
+build is permuted once by a seeded `qa_shuffle` stage before the order (its round robin front-loads
+SQuAD and HotpotQA into the first 30% of the build, so the warm and control prefixes would have carried
+about 3x the run's share of extractive QA; found by the final corpus review). The warm split is the
+first about 28B of the main order and the control the first 10B (no evidence files, the full
+biography arm), both byte prefixes in slice order checked by the driver; epoch 0 of the main split
+starts with the warm split's documents in the warm split's order (`run2_main_train.order.json`,
+`epoch0_head_docs`), so the switch continues the stream rather than repeating it. Disk peak about
+3.06 TB, standing about 1.55 TB, in a 4 TB project quota. The tail curriculum (phase T below) is not
+built.
+
 100B unique tokens at up to 4 epochs (decided, [6b]); at 280B the run sees each token about 2.8
 times. Built on the cluster (decided 2026-10-21) by the pilot builder mode at scale ([6c]), which
 does not exist yet (Build list 4). Retrieval on every slice; the abstention condition is the only
@@ -166,6 +194,23 @@ evidence-free case.
 
 From a fresh seed (`init_scratch_seed.py` under `config_run2.yaml`, then
 `migrate_groundedness_head.py`), `--evidence --reader-kv`, one run directory.
+
+**At 800B, 2026-10-27** (row 14; `config_run2.yaml`): W runs on `run2_warm_train` (at most about 28B)
+with `--max-epochs-this-split 1`, launched with `STOP_AFTER='4000M'` (the watcher drops STOP after
+the first save at or past 4B; whether to read again at 12B is open for the user), then the switch
+decision; M is three epochs of `run2_main_train` to 800B; phase T does not exist in the launch
+version (the tail curriculum is not built). Every launch passes `--plan-split run2_main_train`, so
+the cosine spans the 800B plan from step 0 and the switch changes nothing in it; `warmup_fraction`
+0.000655 is 1000 steps of about 1,525,900 (about 1.1k in practice, the plan derived from the packed
+row estimate); accumulation 1 at 16 GPUs (the job scripts pass `16 / GPUs`); saves every 1B, the
+newest two kept plus the first at or past every 10B (about 80, 370 GB); `[eval]` and `[eval fixed]`
+in one pass every 4B (2B cost about 10% at 16 GPUs); the kill at the first fixed eval past 8B (5B
+could fire falsely: at 16 GPUs QA is about 20x thinner per update than at the pilot); uploads off.
+The control: the first 10B of the stream, one epoch, `lr_min_factor` 1.0 (constant 4e-4 after the
+warmup: the main run is still at peak LR at 10B, and an annealed control would store more and bias
+the paired leak read), kill off. The control's exposure is open for the user: at 10B it sees about
+3.75% of each person's renderings (a tier 1000 person about 37 times), so either probe tiers at
+2,667 / 26,667 exposures per pass (the control then sees 100 / 1000) or a denser build of its own.
 
 | phase | tokens | corpus form | ends when |
 |---|---|---|---|
@@ -224,7 +269,8 @@ The run has no zero-init tensor to watch; these replace that rule ([6d]).
 |---|---|---|
 | tokens per second under 0.8x the minute-one rate for an hour | step line | fix now (memory spill or straggler), CLAUDE.md "fix slow runs immediately" |
 | loss spike not recovered in 200M tokens, or NaN | step line | roll back to the last save and decide |
-| port: gold gain under 0.1 nats or content gain under 0 at the first fixed eval past 5B | `[eval fixed]`, the built kill (`kill_tokens` 5B, `kill_min_gain` 0.1) | automatic stop (exit 10); the pilot read +2.02 at 75M ([pilot]) |
+| port: gold gain under 0.1 nats or content gain under 0 at the first fixed eval past 5B (8B since 2026-10-27, `config_run2.yaml`) | `[eval fixed]`, the built kill (`kill_tokens` 5B, 8B since 2026-10-27; `kill_min_gain` 0.1) | automatic stop (exit 10; the job chain halts on it with the `KILL:` line); the pilot read +2.02 at 75M ([pilot]) |
+| no step line for 15 minutes, no save within the job's limit (49 minutes at 16 GPUs), a loss NaN, infinite or above 20 three times, or a finite loss whose 30-step median sits 1.0 nats above the job's lowest for 5 polls; a crash loop (3 bad jobs in the last 5, 2 early deaths, 2 jobs with no new save) | the Slurm watchdog every 60 s (`scripts/slurm/watchdog.sh`, 2026-10-27) | a stall: SIGTERM, save, the job marked stalled; a divergence: SIGKILL with no save and HALT (never restarted); a crash loop: HALT; every rule in `scripts/slurm/README.md` |
 | port: gold gain under 1.6 nats at 10B | `[eval fixed]` | stop and decide |
 | copy: switch criterion unmet at 28B | biography reads every 2B | stop and decide (the pilot spec's rule, [pilot]) |
 | leak: A1(b) at 10B fails the paired reading against the control at tier 100 on either form, or the run's tier 100 residual above a quarter of the control's | `compare` at matched 10B | stop and decide before the main spend |
@@ -247,6 +293,9 @@ chain-only bridge SFT on arm P's final erased the tier 1000 residual and the wea
 biographies, halved held-out copying, replaced answering and abstention on real questions with
 the bridge form or degenerate text and multiplied the clean-slice CE by about 2.8. The cadence
 column below is the main run's; the leak reads after post-training are the binding ones.
+Since 2026-10-27 `[eval]` and `[eval fixed]` run every 4B (`config_run2.yaml`), so the "every 2B"
+cadences below read every 4B, and the copy read before the switch is taken at the warm-up's 4B stop
+(a second read at 12B is open for the user).
 
 | gate | instrument | bar | noise | pilot margin | cadence |
 |---|---|---|---|---|---|
@@ -265,6 +314,20 @@ column below is the main run's; the leak reads after post-training are the bindi
 | G8 | tokens per second at shape L over an hour, checkpointing and upload live | at least 2x today's | | | 6a, before the launch |
 
 ## Cost
+
+**At 800B on MareNostrum 5, 2026-10-27** (row 14; supersedes the 280B lines below, kept as the
+2026-10-26 figures). At the expected 67.3k tokens per second per H100 (the line below at RUN2's ratio
+1.49 to 1.55): 800e9 / 67.3k = 3,302 H100 hours, about 206 hours of wall time on 16 GPUs, at least 3
+chained 72 hour jobs (submit 5 to 6; surplus jobs exit in seconds). At the corpus's own evidence
+ratio of about 0.045 (459M + 118.4M x 0.045 = 464M FLOP per token, 97k x 490 / 464 x 0.91 = 93k per
+second): about 2,400 hours. The floor is about 54k per GPU (about 4,100 hours, the rest of the 4,500
+for the corpus build and the control); the supervisor alerts under it and on projected hours over
+4,500. The control: about 27 H100 hours at 104k (about 2 hours at 16 GPUs). The corpus build on the
+cluster: about 400 GPU hours (estimate; a whole node is billed for each CPU-bound stage) plus about
+444 GB of filler shards pushed in through the transfer nodes ([RUN2_corpus.md](RUN2_corpus.md)
+section 4), or on the user's PC (about 3 TB of local disk needed, D: has about 125 GB free; open for
+the user). Charging is probably per whole node (unconfirmed, a question for support), so reads run
+four to a node.
 
 Application table (H100 hours). Every line is an estimate until the constructor prints the shape
 and the first hour prints the rate. Rate at the configured shape with evidence, **recomputed 2026-10-26 from the constructor print**
@@ -304,6 +367,7 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
 
 - **Wall clock**: on 8 H100s about 6.0 days for 280B at 67k per GPU (280e9 / (8 x 67.3k) = 520k s), 3.0 on 16, assuming linear
   DDP scaling (unmeasured: the multi-GPU evidence trainer was built 2026-10-26, its 2-GPU against 1-GPU check runs in the cluster's first hour).
+  At 800B (2026-10-27): about 206 hours on 16 GPUs at 67.3k per GPU.
 - **Storage**: 4.6 GB per save at the printed 330.4M (earlier estimate 4.7 GB; configured, 256-entry table: 0.67 GB bf16 weights, 1.33 GB fp32
   masters, 2.67 GB fp32 moments; the masters are saved since 2026-10-24, CLAUDE.md "SFT"); 30
   kept saves about 140 GB (with `keep_every_tokens` 10B and `keep_local_checkpoints` 2 the trainer keeps the newest two plus one per 10B, so about 30 saves of 4.6 GB at the end of the run is an upper bound); 280 uploads at the 1B cadence about 1.3 TB moved. Corpus in today's
@@ -312,6 +376,28 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
   referenced by store id (a builder option). All estimates. The corpus as the launch pipeline builds
   it is another size: 3.7 TB peak and 1.9 TB standing at the 3% chain share, the warm and main
   merges 853 GB each and the control 30 GB ([RUN2_corpus.md](RUN2_corpus.md) section 4).
+  At 800B (2026-10-27): the corpus peaks at about 3.06 TB and stands at about 1.55 TB (the main
+  merge 1.37 TB, warm 144 GB, control 30 GB; RUN2_corpus.md section 3) in the 4 TB project quota;
+  about 80 kept saves of 4.6 GB, about 370 GB, the 10B saves hard linked into `$DATA_ROOT/pinned`;
+  uploads off (no node has internet); weights leave as bf16 exports of about 0.67 GB
+  (`scripts/export_weights.py`, `scripts/ops/pull_exports.sh`) against the 2 TB transfer allowance,
+  counted in a local ledger.
+
+## The allocation and the cluster (2026-10-27)
+
+| item | value |
+|---|---|
+| system | MareNostrum 5 (BSC), AI Factories, the ACC partition: 4 x H100 64 GB per node, 80 CPUs, 512 GB RAM and a 480 GB node disk at `$TMPDIR`; QOS `acc_ehpc`; exclusive nodes, probably billed per whole node (unconfirmed) |
+| grant | 5,000 GPU hours applied, 4,500 targeted; 4 TB project storage; 2 TB transfer in and out |
+| limits | 72 hour jobs; no outbound internet on any node, login nodes included (inbound ssh to `alogin1` and `alogin2`, transfers through `transfer1` to `transfer4`); Singularity only |
+| run | 16 H100 (4 nodes), 8 x 4096 per GPU at accumulation 1, 524,288 tokens per update; at least 3 chained 72 hour jobs for 800B |
+| order | the user's access and day 1, the corpus build, the 10B control, the warm-up with `STOP_AFTER='4000M'`, the switch decision, the run ([RUN2_handover.md](RUN2_handover.md)) |
+| runbook | `scripts/slurm/README.md` (Day 0 on the PC, Day 1 on the cluster, the filler through the mirror, the chain rules, supervision, saves); the supervising session's standing instructions `scripts/ops/SUPERVISOR.md` |
+
+Open for the user (2026-10-27): the control's exposure (probe tiers at 2,667 / 26,667 exposures per
+pass, or a denser build of its own; Schedule), whether to read the warm-up at 12B in addition to 4B,
+and where the corpus is built (the cluster, about 400 GPU hours and about 444 GB of filler shards
+pushed in, or the PC, about 3 TB of local disk); and, from before, 6f's abstention reward.
 
 ## Build list before launch, in order
 
@@ -373,7 +459,7 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
 | L3 | multi-GPU on the evidence trainer under accelerate: per-rank sharding in `SFTDataset` and `EvidenceDataset`, DDP kwargs with `find_unused_parameters`, the token tracker and the balance counts all-reduced at the log cadence, kill, STOP and the save decided on rank 0 and broadcast, saves and `run_state` written by rank 0 behind a barrier, the eval and fixed-eval passes sharded by rank with reduced sums, the single-process path bit-identical | 1 d plus a Sonnet review; running 2026-10-26 | the single-process path bit-identical in tests; the 2-GPU against 1-GPU 100-step check happens in the cluster's first hour | L2 for the shared trainer lines |
 | L4 | `config_run2.yaml` (`config.yaml` with the decided overrides: `weight_decay` 0.1, `moe_balancing: loss_free`, `evidence_selection_weighting: segment`, `num_ir_entries` 256, the batch and LR from Scope), its seed, the constructor print replacing the estimates in Model and Cost; the control's config and launcher; the per-save read scripts and ladders moved from gitignored `ckpts/inject` into tracked `scripts/reads` | 0.5 d | the print against Model | L1 |
 | L5 | the corpus pipeline for the cluster on the existing builders (`prepare_data.py` for the filler mix, `prepare_injection_data.py` for the biographies and the warm-up split, `prepare_evidence_data.py` for QA, `prepare_chain_data.py` for the chains and the bridge rows, `merge_evidence_splits.py` for the three merges at the shares in Scope with `--support-gold-only` on), as one tracked script with a source list sized to the token target, a dry-run mode on a tiny slice, and a pilot-shape smoke under 5 hours local | 1 d; running 2026-10-26 | the dry run; the smoke's packing, fill, supported share and copy emergence | nothing |
-| L6 | cluster day 1 (2026-10-28): the 2-GPU against 1-GPU check, the corpus build on cluster CPUs, the 10B control (about 4 hours on a node), the main run's warm-up launch; plus (2026-10-26): the HF token with Nemotron access accepted, the user's confirmation of `--chain-share` (rows 12 and 13), and the first cluster job `build_run2_corpus.py --stage filler` | 1 d on the cluster | the 2-GPU match; the control's first reads | L3, L4, L5, the token, the confirmations |
+| L6 | cluster day 1 (2026-10-28): the 2-GPU against 1-GPU check, the corpus build on cluster CPUs, the 10B control (about 4 hours on a node), the main run's warm-up launch; plus (2026-10-26): the HF token with Nemotron access accepted, the user's confirmation of `--chain-share` (rows 12 and 13), and the first cluster job `build_run2_corpus.py --stage filler` | 1 d on the cluster | the 2-GPU match; the control's first reads | L3, L4, L5, the token, the confirmations (2026-10-27: the cluster is MareNostrum 5 with no internet on any node, so the HF token is used on the PC by `scripts/mirror_sources.py` and the filler reaches the cluster through the transfer nodes; the day 1 list is now `scripts/slurm/README.md` "Day 1" and [RUN2_handover.md](RUN2_handover.md)) |
 
 **L1 to L5 done 2026-10-26** (uncommitted in the tree; the commit line is the main thread's):
 
@@ -384,6 +470,15 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
 - **L5:** `scripts/build_run2_corpus.py` and `tests/test_build_run2_corpus.py`, the sheet [RUN2_corpus.md](RUN2_corpus.md): stages filler, bios_main, bios_warm, qa, chains_plain, chains_bridge, merge_warm, merge_main, merge_control, heldout_qa, heldout_chains, val_clean, store_openqa, store_edit, each idempotent with a marker, `--dry-run`, `--scale`, `--stage`; T = 93.33B per split, chain share 0.03, per-slice targets bios 89.0B, qa 1.53B, plain chains 1.4B, bridge chains 1.4B, control 10B. The smoke at scale 0.0005 ran every stage in 23.7 minutes with `md5_by_slice` agreeing across the warm and main merges. Not run locally: the filler download and the two store builds. The filler at 88.5B is reachable at 1.00x repeat only with fineweb's prefix widened to all crawls (the builder as coded has one crawl, 14.8B; the driver patches it in memory). Missing builder flags are listed in the sheet (section 5): `--order-from-prefix` so the warm merge need not be built at full size, the hop-weight flag, shard flags.
 
 **Not on the launch path, stated explicitly.** The new builder features of the old item 4 (per-window retrieval over plain text, the fact tagger, the near-duplicate filter, the staircase visibility question) are not built for this run: it uses the pilot recipe at scale. The staircase question is moot without per-window retrieval over plain text; its decisions-table row (row 10) stays, marked "not on the launch path, revisit for a later run".
+
+**Built 2026-10-27** (uncommitted in the tree; for MareNostrum 5 and the 800B target, row 14):
+
+- **The corpus driver at 800B** (`scripts/build_run2_corpus.py`, [RUN2_corpus.md](RUN2_corpus.md)): the stages filler, qa, bios_main, val_clean, bios_full, bios_warm, prune_filler, chains_plain, chains_bridge, qa_shuffle, order, merge_main, merge_warm, merge_control, rows, prune_sources, the held-out stages and the stores; the warm and control splits built as prefix merges of the main order; `rows` writes the packed row estimates for 1, 2, 4, 8 and 16 ranks (the trainer exits 2 without the entry for its rank count); every stage over 60 hours resumable after a kill, a `flock` per stage, SIGTERM forwarded with exit 20, a 300 s heartbeat and a `last_child_output` progress file the corpus job's stall check reads; `plan` refuses a disk plan over budget; `check-offline` lists what a stage lacks without internet. The builders made resumable: `prepare_injection_data.py` (state file, `--stop-after-tokens` prefixes), `prepare_chain_data.py` (streaming and resumable; the `seen_compositions` docstring corrected: tuples of 3 hops or more, 4 included, drop the held-out pairs, as the code already did, which matters now that the bridge trains hops 1 to 4), `merge_evidence_splits.py` (resume and the prefix mode). `scripts/mirror_sources.py`: `list`, `stage-small` (tokenizer, bge, the QA and store datasets into a staged `HF_HOME`) and `push` (the filler shards from the PC through a transfer node into the build's inbox, demand driven, in a 120 GB window, under the 2 TB limit). The smoke at scale 0.0005 on the final code: every stage ok, 28.5 minutes, 2.8 GB ([RUN2_corpus.md](RUN2_corpus.md) section 7).
+- **The trainer for chained jobs** (`scripts/sft.py`, `modules/data/sft_dataset.py`, `scripts/pretrain.py`): `--plan-split` (the schedule fitted to the main split from step 0), `--max-epochs-this-split` (the warm launch passes 1: save, "warm split exhausted", exit 10), `--grad-accumulation-steps`, `--estimate-rows-only` (CPU), `--keep-stop`; the switch and `epoch0_head_docs` checks (a resume on the same split under another head is refused); the rows cache, version 2, keyed on each index file's size and a sha1 of its first and last megabyte (no mtime, so a copied corpus keeps its cache); a moved `data_dir` with the same split is a plain resume; `all_reduce_grads` leaves a parameter with no gradient on any rank at `grad` None, as on one GPU (one summed flag vector per call); log steps only on sync steps.
+- **The Slurm job chain** (`scripts/slurm/`, runbook `scripts/slurm/README.md`): `submit_chain.sh TRAIN|CONTROL|CORPUS N` presubmits N jobs with `afterany` under one chain id, each job runs a precheck, takes a `flock` on the run directory and runs the trainer in the Singularity image (`container/`, built off cluster), one task per GPU (`rank_exec.sh`); a save 20 minutes before the 72 hour limit (exit 20, the next job resumes); the watchdog (Early signals); HALT with the reason on every failure a rerun would repeat (no container runtime, a bad `STOP_AFTER`, unfilled site values, the trainer's exit 1 or 2, the kill rule, exit 30, rank 0 exit 0 without a final); a cancel by hand respected (never resubmitted); `reads.sbatch` (four reads to a node, optional weight export), `corpus.sbatch` (stage groups with a 120 minute stall check), `status.sh` and `status.py` (one JSON, GPU hours from `sacct`).
+- **The PC-side ops** (`scripts/ops/`, run in WSL over ssh master sockets the user opens by hand): `push_code.sh`, `push_corpus.sh`, `pull_exports.sh` (sha256 verified, optional private HF upload) with a transfer ledger refusing a push past 2 TB; `supervise.py`, polled every 30 to 60 minutes by a local Claude Code `/loop` under the standing instructions `scripts/ops/SUPERVISOR.md` (resubmits a broken chain at most once an hour, pins the 10B saves, batches the reads, alerts on everything else, never cancels, deletes, switches or restarts after a HALT); `scripts/export_weights.py` (bf16 weights, about 0.67 GB, with a strict load check).
+- **Configs** (`config_run2.yaml`, `config_run2_control.yaml`): the Schedule note above.
+- **Reviews**: three Opus final reviewers (Slurm and ops, corpus, trainer and contracts) found no high-severity issue left in the corpus and the trainer; the Slurm review's two highs (supervisor actions silently skipped, a finite divergence unseen) and every medium and low were fixed; a detached Sonnet review of the trainer fixes found no high or medium issue. Tests added: `test_epoch0_head_order.py`, `test_mirror_sources.py`, `test_ops_tools.py`, `test_sft_contracts_2026_10_27.py`, `test_slurm_chain.py`. Nothing has run under real Slurm: the day 1 checks (the `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the signal path, the 2-GPU against 1-GPU check stopped after about 100 steps, the first hour's rate against 54k) are the user's, in [RUN2_handover.md](RUN2_handover.md).
 
 ### B. During the run, on the cluster or beside it (not blocking the launch)
 

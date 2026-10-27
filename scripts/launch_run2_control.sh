@@ -7,9 +7,10 @@
 #
 # env: DATA_ROOT    the corpus root of scripts/build_run2_corpus.py (merges in DATA_ROOT/prepared_run2,
 #                   held-out splits in DATA_ROOT/prepared); default data/run2
-#      NPROC        processes, one per GPU (default 8); the per GPU batch is the yaml's, so the global
-#                   batch is 8 x 4096 x accumulation 2 x NPROC tokens (524,288 at 8; at another
-#                   NPROC edit grad_accumulation_steps in config_run2_control.yaml to keep 524,288)
+#      NPROC        processes, one per GPU (default 8) on one node; the accumulation is computed as
+#                   524,288 / (8 x 4096 x NPROC) and passed as --grad-accumulation-steps (the yaml's 1 is
+#                   overridden), so the global batch stays 524,288 tokens; a count that does not divide
+#                   16 is refused. the multi node cluster path is scripts/slurm/ (sbatch), not this file
 #      SPLIT        the train split (default run2_control_train)
 #      SEED         the grounded seed (default ckpts/inject/seed_run2_grounded.pt)
 #      UPLOAD       an HF repo id passed as --upload-repo (default none: uploads off)
@@ -22,8 +23,10 @@ DRY=0
 [ "$1" = "--dry-run" ] && DRY=1
 ROOT=${TINY_LLM_ROOT:-/mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm}
 ENVI=${TINY_LLM_ENV_INIT:-env_init}
+source "$(cd "$(dirname "$0")" && pwd)/slurm/lib.sh"
 DATA_ROOT=${DATA_ROOT:-data/run2}
 NPROC=${NPROC:-8}
+ACCUM=$(accum_for "$NPROC") || exit 1
 SPLIT=${SPLIT:-run2_control_train}
 SEED=${SEED:-ckpts/inject/seed_run2_grounded.pt}
 RUN=run2_control
@@ -31,7 +34,7 @@ D=$DATA_ROOT/prepared_run2
 L=ckpts/inject/$RUN.log
 EXTRA=""
 [ -n "$UPLOAD" ] && EXTRA="$EXTRA --upload-repo $UPLOAD"
-LAUNCH="accelerate launch --num_processes $NPROC --mixed_precision no scripts/sft.py --evidence -c $SEED --run-name $RUN --data-dir $D --train-split $SPLIT --val-split inject_val$EXTRA"
+LAUNCH="accelerate launch --num_processes $NPROC --mixed_precision no scripts/sft.py --evidence -c $SEED --run-name $RUN --data-dir $D --train-split $SPLIT --val-split inject_val --grad-accumulation-steps $ACCUM$EXTRA"
 if [ "$DRY" = 1 ]; then
   echo "cd $ROOT && source $ENVI"
   echo "TINY_LLM_CONFIG=config_run2_control.yaml"

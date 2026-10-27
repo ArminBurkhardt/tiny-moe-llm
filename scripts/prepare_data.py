@@ -273,6 +273,13 @@ def truncate_to_state(bin_path: str, idx_path: str, state: dict) -> None:
     have left unflushed writes past this point that we can no longer trust."""
     tokens, docs = state.get("tokens_written", 0), state.get("doc_count", 0)
     for path, target in ((bin_path, tokens * 2), (idx_path, (docs + 1) * 8)):
+        if tokens or docs:
+            have = os.path.getsize(path) if os.path.exists(path) else 0
+            if have < target:
+                # a phase finished earlier whose bins were pruned (prune_filler) must not "finish" again empty
+                raise RuntimeError(f"{path} has {have} bytes but the state {os.path.basename(path)} records "
+                                   f"{target}: the output was deleted or lost; remove the _prepare_state file "
+                                   f"to rebuild the phase")
         if os.path.exists(path):
             cur = os.path.getsize(path)
             if target < cur:
@@ -395,6 +402,8 @@ def run_phase(
     checkpoint()
     bin_f.close()
     idx_f.close()
+    assert os.path.getsize(bin_path) == tokens_written * 2 and os.path.getsize(idx_path) == (doc_count + 1) * 8, (
+        f"[{phase}] output sizes disagree with {tokens_written} tokens / {doc_count} docs")
     return state
 
 
@@ -602,8 +611,12 @@ def main():
         logger.warning(f"combined bin size {total_bin_bytes / 1e9:.1f}GB exceeds the ~70GB peak-disk acceptance bound")
 
     manifest[args.manifest_key] = data_prep
-    with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+    tmp_manifest = MANIFEST_PATH + ".tmp"
+    with open(tmp_manifest, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_manifest, MANIFEST_PATH)
     logger.info(f"recorded {args.manifest_key} manifest in {MANIFEST_PATH}")
 
 

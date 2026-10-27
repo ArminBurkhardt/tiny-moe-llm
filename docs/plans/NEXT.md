@@ -10,12 +10,12 @@ are [docs/review_2026-09-18.md](../review_2026-09-18.md) (the pre-run code revie
 and the new references). The design itself, with blueprints of both runs, is
 [docs/evidence_path_design.html](../evidence_path_design.html).
 
-## Now (2026-10-26)
+## Now (2026-10-27)
 
 Mirrored in CLAUDE.md's "Now": the State block and the Open items table are the same text in both
 files. Restructured 2026-10-24 after the repository review; the history moved under Record.
 
-### State (2026-10-26)
+### State (2026-10-27)
 
 - **Ran and read 2026-10-24 and 2026-10-25:** the three micro retriever arms the review proposed
   (`bash ckpts/inject/launch_review_arms.sh`, about 40 minutes each plus the store recall read, on
@@ -269,12 +269,41 @@ files. Restructured 2026-10-24 after the repository review; the history moved un
   the sheet; the evidence ratio of this corpus is about 0.4, not RUN2's 1.49, so the with-evidence
   rate is better than the Cost table's estimate (about 85k per second and 910 hours at 0.4). The
   chain share and the chat replay are decisions of the main thread as routine (RUN2.md rows 12 and
-  13), pending the user's confirmation.
-- **Next, in order:** L1 to L5 done 2026-10-26; next the cluster: day 1 the filler download and the
-  corpus stages on CPUs, the 2-GPU against 1-GPU 100-step check, the 10B control, then the warm-up
-  launch; during the run the items of table B (`docs/plans/RUN2.md`, "Build plan with estimates,
-  2026-10-25, re-cut 2026-10-26 to the launch path"; the corpus sheet is `docs/plans/RUN2_corpus.md`).
-- **Open for the user:** 6f's abstention reward against the A3 re-read.
+  13), pending the user's confirmation. (Superseded 2026-10-27 in the token target, the split size,
+  the chain share and the evidence ratio: the next bullet.)
+- **Built 2026-10-27 (and decided, the user: 800B):** for the allocation on MareNostrum 5 (BSC AI
+  Factories, the ACC partition, 4 x H100 64 GB per node, 72 hour jobs, 5,000 GPU hours applied and
+  4,500 targeted, 4 TB project disk, 2 TB transfer, no internet on any node, Singularity only;
+  RUN2.md "The allocation and the cluster"), the token target is 800B (RUN2.md row 14: 266.67B
+  unique prompt tokens per split x 3 epochs, was 280B as 93.33B x 3): about 3,300 H100 hours at 67k
+  tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 206 hours
+  on 16 GPUs in at least 3 chained 72 hour jobs, the floor about 54k per GPU. `config_run2.yaml`:
+  `target_tokens` 800e9, `warmup_fraction` 0.000655, the kill at 8B, evals every 4B, accumulation 1
+  at 16 GPUs, uploads off; the control at constant LR after its warmup (`lr_min_factor` 1.0). Built,
+  uncommitted: the corpus driver at 800B (`docs/plans/RUN2_corpus.md`: per split bios about 262.3B,
+  QA 1.53B, plain and bridge chains 1.4B each, persons 3x the pilot's, a seeded `qa_shuffle` before
+  the order, the warm split (about 28B) and the control (10B) as prefixes of the main order, epoch 0
+  of the main split led by the warm split's documents, row estimates for 1 to 16 ranks, resumable
+  stages with locks and a progress file; disk peak about 3.06 TB, standing 1.55 TB; the smoke at
+  scale 0.0005 every stage ok in 28.5 minutes), `scripts/mirror_sources.py` (the filler pushed from
+  the PC through a transfer node), resumable builders, the trainer additions (`--plan-split`,
+  `--max-epochs-this-split`, `--grad-accumulation-steps`, `--estimate-rows-only`, `--keep-stop`, the
+  switch and head checks, rows cache version 2), `scripts/slurm/` (the job chain with its watchdog
+  and HALT rules), `scripts/ops/` (push, pull with a 2 TB ledger, `supervise.py` polled by a local
+  Claude Code `/loop`), `scripts/export_weights.py`. Three Opus final reviews (Slurm and ops,
+  corpus, trainer) left no high issue in the corpus and the trainer, the Slurm review's two highs and
+  every medium and low fixed, and a detached Sonnet review of the trainer fixes found no high or
+  medium issue. Nothing has run under real Slurm. The user's steps: `docs/plans/RUN2_handover.md`.
+- **Next, in order:** the user's cluster access and day 1 (`scripts/slurm/README.md` "Day 1": the
+  `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU
+  against 1-GPU check stopped after about 100 steps, the first hour's rate against 54k per GPU), the
+  corpus build, the 10B control, then the warm-up with `STOP_AFTER='4000M'` and the switch
+  decision; during the run table B of `docs/plans/RUN2.md`.
+- **Open for the user:** the control's exposure (at 10B it sees about 3.75% of each person's
+  renderings: probe tiers at 2,667 / 26,667 exposures per pass, or a denser build of its own);
+  whether to read the warm-up at 12B in addition to 4B; where the corpus is built (the cluster,
+  about 400 GPU hours, or the PC, about 3 TB of local disk where D: has about 125 GB free); 6f's
+  abstention reward against the A3 re-read.
 
 ### Open items
 
@@ -295,7 +324,7 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 | the goal's reasoning clause reworded | closed: decided 2026-10-25 (the user, RUN2.md row 4), open since 2026-10-17, on R9 (composes in written tokens, not in the loop): "facts in the store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation per token"; the original "reasoning in the looped trunk" kept as the original goal and the aspiration to revisit after the real run (NEXT.md "The goal") | none | nothing |
 | 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth; its mix carries the pretraining slices beside the bridge rows at a lower LR than the pilot's continuation, the A gates and the clean-slice CE read at every save under a kill rule (R5, 2026-10-25: chain-only bridge SFT lost every other gate) | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
 | 6a throughput, 6c corpus on the rented cluster, 6d run spec | 6d decided 2026-10-25 (the user, every row of `docs/plans/RUN2.md`'s first table on the recommended option; drafted the same evening: recipe by rung, cost table for the application, build list; the draft found the plan's 2.5k-hour figure was for the blueprint width 1024 while `config.yaml` is width 768, the evidence trainer single GPU, the real corpus builder unbuilt with the staircase visibility unresolved under the key/value reader); 6c and the rest of the spec's build list next, in RUN2.md's order; 6a after the spec (2026-10-21), carrying the deferred eval-pass rewrite | none | the build list (R5 read 2026-10-25) |
-| the real run's launch | built 2026-10-26 (launch path L1 to L5, RUN2.md): the model set, multi-GPU on the evidence trainer, `config_run2.yaml` and the control, the launchers, the read scripts, the corpus pipeline and its scale 0.0005 smoke; the 30-step shape L smoke ran at 25.4k to 27.4k tokens per second on the 5090; cluster access starts 2026-10-28 (day 1: the HF token, the filler stage first, the 2-GPU check, the 10B control, then the warm-up) | the 2-GPU against 1-GPU 100-step check (cannot be bit-exact; the loss and the per-rank counts agree within noise) and the first hour's rate against the 459M FLOP line (about 67k tokens per second per H100 at the Cost table's ratio, about 85k at the corpus's 0.4) | the cluster 2026-10-28, the two corpus confirmations (chain share 0.03 and chat replay at supply, RUN2.md rows 12 and 13) |
+| the real run's launch | built 2026-10-26 (launch path L1 to L5, RUN2.md) and 2026-10-27 for MareNostrum 5 at 800B (RUN2.md row 14 and "Built 2026-10-27"): the corpus driver at 800B with resumable builders and the filler mirror, the trainer additions for chained jobs, the Slurm job chain with its watchdog, the PC-side ops and supervisor, the weight export; the final reviews left no high issue; the user's steps in `docs/plans/RUN2_handover.md` | day 1 on the cluster (`scripts/slurm/README.md`): the `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU against 1-GPU check (STOP after about 100 steps; cannot be bit-exact, the loss and the per-rank counts agree within noise), the first hour's rate against the 54k floor (about 67k expected at RUN2's ratio, about 93k at the corpus's 0.045) | the user's cluster access; the user's three calls (the control's exposure, a 12B warm-up read, where the corpus is built) |
 
 ### Record
 
@@ -1176,6 +1205,53 @@ evidence, about 67k tokens per second, 1,040 to 1,220 H100 hours for 280B, the c
 ledger 1.26k to 1.54k, wall clock 6.0 days on 8 GPUs); the 30-step smoke at shape L on the 5090.
 Corpus: T = 93.33B per split x 3 epochs, chain share 0.03, chat replay at supply, the 23.7 minute
 smoke at scale 0.0005, filler and store builds not run locally. Next: the cluster.
+
+**2026-10-27: MareNostrum 5, 800B, the cluster tooling built** ([RUN2.md](RUN2.md) row 14, "The
+allocation and the cluster", the Schedule and Cost notes and "Built 2026-10-27";
+[RUN2_corpus.md](RUN2_corpus.md); [RUN2_handover.md](RUN2_handover.md); uncommitted in the tree).
+The allocation: MareNostrum 5 (BSC AI Factories), the ACC partition, 4 x H100 64 GB and 80 CPUs per
+node, 72 hour jobs, 5,000 GPU hours applied and 4,500 targeted, 4 TB project storage, 2 TB transfer
+in and out, no outbound internet on any node (login nodes included), Singularity only, QOS
+`acc_ehpc`, exclusive nodes, probably billed per whole node. Decided (the user): the token target is
+800B, 266.67B unique prompt tokens per split x 3 epochs (was 280B, 93.33B x 3). Config:
+`target_tokens` 800e9, `warmup_fraction` 0.000655 (1000 steps; about 1.1k in practice, the plan
+derived from the packed row estimate), the kill at 8B (5B could fire falsely at 16 GPUs), evals every
+4B (2B cost about 10%), accumulation 1 at 16 GPUs (the job scripts pass 16 / GPUs), keep every 10B,
+uploads off; the control constant at 4e-4 after its warmup (`lr_min_factor` 1.0, so the paired leak
+read is not biased by an annealed control) with the kill off. Corpus per split: bios about 262.3B,
+QA 1.53B at its supply, plain and bridge chains 1.4B each (absolute, not a share), persons
+`1000:300,100:1500,10:3000,1:6000`, filler phase 1 about 260B plus phase 2 5B and ir 2.5B under
+source caps; the QA build permuted once by a seeded `qa_shuffle` stage before the order (the QA
+builder's round robin front-loads SQuAD and HotpotQA; found by the final corpus review); the warm
+split the first about 28B of the main order and the control the first 10B (no evidence, the full
+biography arm), both prefixes; epoch 0 of the main split led by the warm split's documents in their
+order (`run2_main_train.order.json`, `epoch0_head_docs`), so the switch continues the stream; evidence
+ratio about 0.045; disk peak about 3.06 TB, standing about 1.55 TB; the smoke at scale 0.0005 on the
+final code every stage ok in 28.5 minutes and 2.8 GB. Cost: about 3,300 H100 hours at 67k tokens per
+second per GPU, about 2,400 at 93k, the floor about 54k to fit 4,500; about 206 hours of wall time at
+16 GPUs, at least 3 chained 72 hour jobs; the corpus build on the cluster about 400 GPU hours
+(whole-node billing, estimate) plus the filler shards pushed in, or on the user's PC (about 3 TB of
+local disk). Built: the corpus driver at 800B with its new stages (`qa_shuffle`, `order`, prefix
+merges, `rows` for 1, 2, 4, 8 and 16 ranks, the prunes), resumable stages, per-stage locks, a
+heartbeat and the `last_child_output` progress file; `scripts/mirror_sources.py`; the builders
+resumable (`prepare_injection_data.py`, `prepare_chain_data.py` streaming, `merge_evidence_splits.py`
+resume and prefix mode); in `sft.py` `--plan-split`, `--max-epochs-this-split`,
+`--grad-accumulation-steps`, `--estimate-rows-only`, `--keep-stop`, the switch and head-docs checks,
+the rows cache version 2 keyed on size and a content fingerprint, a moved `data_dir` as a plain
+resume, the has-gradient flags in `all_reduce_grads`, log steps on sync steps; `scripts/slurm/` (the
+job chain with its watchdog: a stall at 15 minutes, a save limit scaled by the GPU count, 49 minutes
+at 16 GPUs, the loss-rise halt, the crash-loop rules, the save 20 minutes before the limit, HALT on
+deterministic failures, a cancel respected); `scripts/ops/` (`push_code.sh`, `push_corpus.sh`,
+`pull_exports.sh` with a 2 TB transfer ledger, `supervise.py` run by a local Claude Code `/loop` on
+the user's PC every 30 to 60 minutes); `scripts/export_weights.py`. Reviews: three Opus final
+reviewers (Slurm and ops, corpus, trainer and contracts) found no high-severity issue left in the
+corpus and the trainer; the Slurm review's two highs (supervisor actions silently skipped, a finite
+divergence unseen) and every medium and low were fixed; a detached Sonnet review of the trainer
+fixes found no high or medium issue. Replaced in the State block: the "Next, in order" of
+2026-10-26 (day 1 the filler download and the corpus stages on cluster CPUs, the 2-GPU check, the
+10B control, the warm-up) and the launch row's wait on the two corpus confirmations (RUN2.md rows
+12 and 13; row 12's share replaced in the 800B plan by absolute chain tokens; neither is on the
+user's open list of 2026-10-27). Next: the user's cluster access and day 1.
 
 **The ladder, in order** (done steps kept so the order reads whole):
 
