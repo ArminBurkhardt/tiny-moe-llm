@@ -115,14 +115,14 @@ def slurm_checks():
     f = os.path.join(d, "st")
     assert fn(f"state_put {f} a 1; state_put {f} b 2; state_put {f} a 3; state_get {f} a; state_get {f} b")[1] == "3\n2"
 
-    # the training job, dry: 4 nodes x 4 GPUs by default
+    # the training job, dry: 2 nodes x 4 GPUs by default (the allocation's cap of 8 GPUs)
     r = slurm_dry("scripts/slurm/train_job.sh", MODE="run")
     assert r.returncode == 0, r.stderr
-    assert "nodes 4 gpus 16 accum 1" in r.stdout and "TINY_LLM_CONFIG=config_run2.yaml" in r.stdout, r.stdout
+    assert "nodes 2 gpus 8 accum 2" in r.stdout and "TINY_LLM_CONFIG=config_run2.yaml" in r.stdout, r.stdout
     srun = srun_line(r)
-    assert "--ntasks=16 --ntasks-per-node=4" in srun and "bash scripts/slurm/rank_exec.sh" in srun, srun
+    assert "--ntasks=8 --ntasks-per-node=4" in srun and "bash scripts/slurm/rank_exec.sh" in srun, srun
     assert ("--evidence --reader-kv -c ckpts/inject/seed_run2_grounded.pt --run-name run2 --data-dir /data/x/prepared_run2 "
-            "--train-split run2_warm_train --val-split inject_val --grad-accumulation-steps 1") in srun, srun
+            "--train-split run2_warm_train --val-split inject_val --grad-accumulation-steps 2") in srun, srun
     assert "--switch-split" not in srun and "--output=ckpts/inject/run2.log --open-mode=append" in srun, srun
     assert srun.endswith("--plan-split run2_main_train --max-epochs-this-split 1"), srun
     assert "--gpus-per-node=4 --gpu-bind=none" in srun, srun

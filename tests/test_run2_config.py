@@ -7,8 +7,8 @@ because ``config.py`` parses its yaml once at import). Checks:
    so ``num_ir_entries % ir_num_clusters`` cannot fail and the capacity rule is not in play;
 2. the decided training overrides: weight decay 0.1, loss-free balancing, segment weighting, no retriever
    term, AdamW, lr 4e-4, clip 1.0, per loop CE weights, depth sampling 0.3, noise anneal 1B;
-3. the batch: 8 per GPU x 4096 x the yaml's accumulation 1 x 16 GPUs (4 nodes of 4) = 524,288 tokens per update
-   (the job scripts pass the accumulation for another GPU count, tests/test_run2_launchers.py);
+3. the batch: 8 per GPU x 4096 x the yaml's accumulation 1 x 16 GPUs = 524,288 tokens per update; the run uses 8 GPUs
+   (the allocation's cap) and the job scripts pass accumulation 2 for it (tests/test_run2_launchers.py);
 4. the evidence block: warm-up split, inject_val, evidence_fixed, kill at 8B / 0.1 (off in the control), frozen gate,
    plain CE, a save every 1B, the cosine floor 0.1 (the control constant, lr_min_factor 1.0);
 5. the token target 800B (266.67B per split x 3 epochs), keep every 10B, uploads off;

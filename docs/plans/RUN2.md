@@ -16,8 +16,9 @@ decisions of the main thread are rows 11 to 13 of the table below.
 
 Status 2026-10-27: the allocation is MareNostrum 5 (BSC, AI Factories, the ACC partition; the
 section "The allocation and the cluster" below), and the user raised the token target to 800B
-(row 14): 266.67B unique prompt tokens per split, 3 epochs, on 16 H100, about 3,300 H100 hours at
-the expected rate against the 4,500 targeted. Built the same day, uncommitted: the corpus driver at
+(row 14): 266.67B unique prompt tokens per split, 3 epochs, on 8 H100 (2 nodes of 4, the
+allocation's GPU cap, row 15; planned on 16 H100 until the cap was read the same day), about 3,300
+H100 hours at the expected rate against the 4,500 targeted, about 413 hours (17 days) of wall time. Built the same day, uncommitted: the corpus driver at
 800B with resumable builders, the Slurm job chain with its watchdog, the PC-side ops tools and the
 supervisor, the trainer additions for the chained jobs (Build plan, "Built 2026-10-27"). What the
 user does, in order: [RUN2_handover.md](RUN2_handover.md). Where a section below still reads 280B
@@ -25,7 +26,7 @@ or 93.33B it is the 2026-10-25 and 2026-10-26 text, kept; the 2026-10-27 notes o
 
 ## Decisions (the user, 2026-10-25)
 
-Rows 1 to 7 are the main thread's; rows 0, 8 and 9 were raised while drafting; rows 11 to 13 are 2026-10-26 corpus decisions of the main thread; row 14 is the user's of 2026-10-27, which supersedes rows 6 and 11 and the share in row 12. Every row was
+Rows 1 to 7 are the main thread's; rows 0, 8 and 9 were raised while drafting; rows 11 to 13 are 2026-10-26 corpus decisions of the main thread; row 14 is the user's of 2026-10-27, which supersedes rows 6 and 11 and the share in row 12; row 15 is the user's of 2026-10-27, which supersedes the GPU count and the wall time in row 14. Every row was
 decided on the option the draft recommended; the consequence column is the draft's, kept.
 
 | # | decision | decided | consequence of each option |
@@ -44,7 +45,8 @@ decided on the option the draft recommended; the consequence column is the draft
 | 11 | split size and epochs | (superseded 2026-10-27 by row 14: 266.67B per split, 3 epochs) **93.33B prompt tokens per split, 3 epochs** (280B / 3), decided by the main thread 2026-10-26 as routine | 93.33B x 3: the evidence trainer runs whole epochs (`num_epochs` times the split's rows, it ignores `target_tokens`), so the split must be built at T = 280B / 3 for the run to be 280B. The Corpus section's 100B unique at up to 4 epochs would train 300B at 3 epochs or stop at 2.8 passes only by hand ([RUN2_corpus.md](RUN2_corpus.md) section 1) |
 | 12 | chain share of the split | (replaced 2026-10-27 in the 800B plan by an absolute 2.8B per split, `--chain-tokens 2.8e9`: the same 1.4B plain and 1.4B bridge, since a chain prompt token carries about 177 bytes of chunk keys and a share of a 266.67B split would grow the disk with the corpus; [RUN2_corpus.md](RUN2_corpus.md) section 1) **0.03** (`--chain-share`), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | 0.03: 3.7 TB peak disk, about 2 days after the filler download, 28.1M plain and 19.5M bridge questions each seen 3 times. RUN2's 0.10: 6.8 TB peak, 3 to 4 days, 93.6M / 65.0M questions; a share with no rung behind it (RUN2_corpus.md section 4) |
 | 13 | chat replay share | **held at the supply limit** (about 0.5B unique non-holdout chat, so the 20% line is unreachable and the share goes to the filler), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | at supply: smoltalk2 binds (phase 2 and ir take 1.5B, the QA replay arm 0.3B), the 18.5 points go to the biography slice. At 20%: needs a chat source that does not exist at this size (RUN2_corpus.md section 1) |
-| 14 | the token target on the granted allocation | **800B tokens** (the user, 2026-10-27): 266.67B unique prompt tokens per split x 3 epochs, on 16 H100 (4 nodes of 4 at accumulation 1), for the MareNostrum 5 allocation (5,000 GPU hours applied, 4,500 targeted) | 800B: about 3,300 H100 hours at the expected 67k tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 206 hours of wall time at 16 GPUs, at least 3 chained 72 hour jobs; the floor is about 54k per GPU (about 4,100 hours for the run, the rest of the 4,500 for the corpus build and the control). The split, the chains (absolute 2.8B), the persons (3x the pilot's) and the filler (phase 1 about 260B) are resized in [RUN2_corpus.md](RUN2_corpus.md); 280B (rows 6 and 11) would have used about 1,160 of the 4,500 hours at the same rate |
+| 14 | the token target on the granted allocation | **800B tokens** (the user, 2026-10-27): 266.67B unique prompt tokens per split x 3 epochs, on 16 H100 (4 nodes of 4 at accumulation 1; the GPU count and the wall time superseded 2026-10-27 by row 15: 8 H100, 2 nodes of 4 at accumulation 2, about 413 hours), for the MareNostrum 5 allocation (5,000 GPU hours applied, 4,500 targeted) | 800B: about 3,300 H100 hours at the expected 67k tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 206 hours of wall time at 16 GPUs, at least 3 chained 72 hour jobs; the floor is about 54k per GPU (about 4,100 hours for the run, the rest of the 4,500 for the corpus build and the control). The split, the chains (absolute 2.8B), the persons (3x the pilot's) and the filler (phase 1 about 260B) are resized in [RUN2_corpus.md](RUN2_corpus.md); 280B (rows 6 and 11) would have used about 1,160 of the 4,500 hours at the same rate |
+| 15 | the GPU count | **8 GPUs, the allocation's cap** (the user, 2026-10-27: the MareNostrum 5 allocation's "maximum number of GPUs" is 8): 8 H100, 2 nodes of 4, gradient accumulation 2 (the job scripts pass `16 / GPUs`; `scripts/slurm/train_run2.sbatch`, `train_run2_control.sbatch` and `train_job.sh` default to 2 nodes); the global batch stays 524,288 tokens per update (8 per GPU x 4096 x accumulation 2 x 8 GPUs), so the LR schedule, the warmup, the kill, the evals and the QA per update are unchanged | 8: the GPU hours unchanged (about 3,302 at 67.3k tokens per second per GPU, about 2,400 at 93k, about 4,100 at the floor of 54k), the wall time doubled: about 413 hours (17 days) at 67.3k, about 21 days at the floor, about 6 to 8 chained 72 hour jobs plus queue waits; the 10B control about 4 hours; the watchdog's no-save limit 97 minutes (49 at 16 GPUs); a save every 1B about 31 minutes at 8 x 67k. Open for the user: whether the cap is per job or concurrent; if concurrent, the 4-GPU reads jobs and any corpus job cannot run beside an 8-GPU training job, so reads run only in the gaps between chained training jobs (batched four to a node) or move to the PC on exported bf16 weights. 16 (row 14 as first written): about 206 hours, at least 3 jobs, accumulation 1 |
 
 ## Question, and what it decides
 
@@ -202,10 +204,13 @@ decision; M is three epochs of `run2_main_train` to 800B; phase T does not exist
 version (the tail curriculum is not built). Every launch passes `--plan-split run2_main_train`, so
 the cosine spans the 800B plan from step 0 and the switch changes nothing in it; `warmup_fraction`
 0.000655 is 1000 steps of about 1,525,900 (about 1.1k in practice, the plan derived from the packed
-row estimate); accumulation 1 at 16 GPUs (the job scripts pass `16 / GPUs`); saves every 1B, the
-newest two kept plus the first at or past every 10B (about 80, 370 GB); `[eval]` and `[eval fixed]`
-in one pass every 4B (2B cost about 10% at 16 GPUs); the kill at the first fixed eval past 8B (5B
-could fire falsely: at 16 GPUs QA is about 20x thinner per update than at the pilot); uploads off.
+row estimate); accumulation 2 at 8 GPUs (row 15; accumulation 1 at 16 GPUs as first planned; the
+job scripts pass `16 / GPUs`, so the update stays 524,288 tokens); saves every 1B (about 31 minutes
+at 8 x 67k), the newest two kept plus the first at or past every 10B (about 80, 370 GB); `[eval]` and
+`[eval fixed]` in one pass every 4B (2B cost about 10% of the run's time, an estimate made at 16
+GPUs; a share, so about the same at 8, where the training and the sharded eval both slow by 2x); the kill
+at the first fixed eval past 8B (5B could fire falsely: at 524,288 tokens per update QA is about 20x
+thinner per update than at the pilot); uploads off.
 The control: the first 10B of the stream, one epoch, `lr_min_factor` 1.0 (constant 4e-4 after the
 warmup: the main run is still at peak LR at 10B, and an annealed control would store more and bias
 the paired leak read), kill off. The control's exposure is open for the user: at 10B it sees about
@@ -270,7 +275,7 @@ The run has no zero-init tensor to watch; these replace that rule ([6d]).
 | tokens per second under 0.8x the minute-one rate for an hour | step line | fix now (memory spill or straggler), CLAUDE.md "fix slow runs immediately" |
 | loss spike not recovered in 200M tokens, or NaN | step line | roll back to the last save and decide |
 | port: gold gain under 0.1 nats or content gain under 0 at the first fixed eval past 5B (8B since 2026-10-27, `config_run2.yaml`) | `[eval fixed]`, the built kill (`kill_tokens` 5B, 8B since 2026-10-27; `kill_min_gain` 0.1) | automatic stop (exit 10; the job chain halts on it with the `KILL:` line); the pilot read +2.02 at 75M ([pilot]) |
-| no step line for 15 minutes, no save within the job's limit (49 minutes at 16 GPUs), a loss NaN, infinite or above 20 three times, or a finite loss whose 30-step median sits 1.0 nats above the job's lowest for 5 polls; a crash loop (3 bad jobs in the last 5, 2 early deaths, 2 jobs with no new save) | the Slurm watchdog every 60 s (`scripts/slurm/watchdog.sh`, 2026-10-27) | a stall: SIGTERM, save, the job marked stalled; a divergence: SIGKILL with no save and HALT (never restarted); a crash loop: HALT; every rule in `scripts/slurm/README.md` |
+| no step line for 15 minutes, no save within the job's limit (97 minutes at 8 GPUs, row 15; 49 at 16), a loss NaN, infinite or above 20 three times, or a finite loss whose 30-step median sits 1.0 nats above the job's lowest for 5 polls; a crash loop (3 bad jobs in the last 5, 2 early deaths, 2 jobs with no new save) | the Slurm watchdog every 60 s (`scripts/slurm/watchdog.sh`, 2026-10-27) | a stall: SIGTERM, save, the job marked stalled; a divergence: SIGKILL with no save and HALT (never restarted); a crash loop: HALT; every rule in `scripts/slurm/README.md` |
 | port: gold gain under 1.6 nats at 10B | `[eval fixed]` | stop and decide |
 | copy: switch criterion unmet at 28B | biography reads every 2B | stop and decide (the pilot spec's rule, [pilot]) |
 | leak: A1(b) at 10B fails the paired reading against the control at tier 100 on either form, or the run's tier 100 residual above a quarter of the control's | `compare` at matched 10B | stop and decide before the main spend |
@@ -317,12 +322,16 @@ cadences below read every 4B, and the copy read before the switch is taken at th
 
 **At 800B on MareNostrum 5, 2026-10-27** (row 14; supersedes the 280B lines below, kept as the
 2026-10-26 figures). At the expected 67.3k tokens per second per H100 (the line below at RUN2's ratio
-1.49 to 1.55): 800e9 / 67.3k = 3,302 H100 hours, about 206 hours of wall time on 16 GPUs, at least 3
-chained 72 hour jobs (submit 5 to 6; surplus jobs exit in seconds). At the corpus's own evidence
+1.49 to 1.55): 800e9 / 67.3k = 3,302 H100 hours, about 413 hours (17 days) of wall time on 8 GPUs
+(row 15), about 6 to 8 chained 72 hour jobs plus the queue waits between them (planned on 16 GPUs until
+the cap was read the same day: about 206 hours, at least 3 jobs, submit 5 to 6; surplus jobs exit in
+seconds). At the corpus's own evidence
 ratio of about 0.045 (459M + 118.4M x 0.045 = 464M FLOP per token, 97k x 490 / 464 x 0.91 = 93k per
-second): about 2,400 hours. The floor is about 54k per GPU (about 4,100 hours, the rest of the 4,500
-for the corpus build and the control); the supervisor alerts under it and on projected hours over
-4,500. The control: about 27 H100 hours at 104k (about 2 hours at 16 GPUs). The corpus build on the
+second): about 2,400 hours (about 300 hours of wall time on 8 GPUs). The floor is about 54k per GPU
+(about 4,100 hours, about 21 days on 8 GPUs and about 8 jobs, the rest of the 4,500 for the corpus
+build and the control); the supervisor alerts under it and on projected hours over
+4,500. The GPU hours do not depend on the GPU count; the wall time does. The control: about 27 H100
+hours at 104k (about 4 hours at 8 GPUs; about 2 at 16). The corpus build on the
 cluster: about 400 GPU hours (estimate; a whole node is billed for each CPU-bound stage) plus about
 444 GB of filler shards pushed in through the transfer nodes ([RUN2_corpus.md](RUN2_corpus.md)
 section 4), or on the user's PC (about 3 TB of local disk needed, D: has about 125 GB free; open for
@@ -367,7 +376,9 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
 
 - **Wall clock**: on 8 H100s about 6.0 days for 280B at 67k per GPU (280e9 / (8 x 67.3k) = 520k s), 3.0 on 16, assuming linear
   DDP scaling (unmeasured: the multi-GPU evidence trainer was built 2026-10-26, its 2-GPU against 1-GPU check runs in the cluster's first hour).
-  At 800B (2026-10-27): about 206 hours on 16 GPUs at 67.3k per GPU.
+  At 800B (2026-10-27): about 413 hours (17 days) on 8 GPUs at 67.3k per GPU (row 15; about 21
+  days at the floor of 54k, about 6 to 8 chained 72 hour jobs plus queue waits); about 206 hours on
+  16 GPUs, the count first planned.
 - **Storage**: 4.6 GB per save at the printed 330.4M (earlier estimate 4.7 GB; configured, 256-entry table: 0.67 GB bf16 weights, 1.33 GB fp32
   masters, 2.67 GB fp32 moments; the masters are saved since 2026-10-24, CLAUDE.md "SFT"); 30
   kept saves about 140 GB (with `keep_every_tokens` 10B and `keep_local_checkpoints` 2 the trainer keeps the newest two plus one per 10B, so about 30 saves of 4.6 GB at the end of the run is an upper bound); 280 uploads at the 1B cadence about 1.3 TB moved. Corpus in today's
@@ -388,16 +399,20 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
 | item | value |
 |---|---|
 | system | MareNostrum 5 (BSC), AI Factories, the ACC partition: 4 x H100 64 GB per node, 80 CPUs, 512 GB RAM and a 480 GB node disk at `$TMPDIR`; QOS `acc_ehpc`; exclusive nodes, probably billed per whole node (unconfirmed) |
-| grant | 5,000 GPU hours applied, 4,500 targeted; 4 TB project storage; 2 TB transfer in and out |
+| grant | 5,000 GPU hours applied, 4,500 targeted; 4 TB project storage; 2 TB transfer in and out; a maximum of 8 GPUs (row 15; per job or concurrent unconfirmed) |
 | limits | 72 hour jobs; no outbound internet on any node, login nodes included (inbound ssh to `alogin1` and `alogin2`, transfers through `transfer1` to `transfer4`); Singularity only |
-| run | 16 H100 (4 nodes), 8 x 4096 per GPU at accumulation 1, 524,288 tokens per update; at least 3 chained 72 hour jobs for 800B |
+| run | 8 H100 (2 nodes), 8 x 4096 per GPU at accumulation 2, 524,288 tokens per update; about 6 to 8 chained 72 hour jobs for 800B plus queue waits, about 413 hours (17 days) at 67.3k per GPU (row 15; first planned as 16 H100 on 4 nodes at accumulation 1, at least 3 jobs) |
 | order | the user's access and day 1, the corpus build, the 10B control, the warm-up with `STOP_AFTER='4000M'`, the switch decision, the run ([RUN2_handover.md](RUN2_handover.md)) |
 | runbook | `scripts/slurm/README.md` (Day 0 on the PC, Day 1 on the cluster, the filler through the mirror, the chain rules, supervision, saves); the supervising session's standing instructions `scripts/ops/SUPERVISOR.md` |
 
 Open for the user (2026-10-27): the control's exposure (probe tiers at 2,667 / 26,667 exposures per
 pass, or a denser build of its own; Schedule), whether to read the warm-up at 12B in addition to 4B,
 and where the corpus is built (the cluster, about 400 GPU hours and about 444 GB of filler shards
-pushed in, or the PC, about 3 TB of local disk); and, from before, 6f's abstention reward.
+pushed in, or the PC, about 3 TB of local disk); whether the allocation's 8 GPU cap is per job or
+concurrent (row 15: if concurrent, the 4-GPU reads jobs and any corpus job cannot run beside an
+8-GPU training job, so the reads run only in the gaps between chained training jobs, batched four
+to a node, or move to the PC on exported bf16 weights; a question for support); and, from before,
+6f's abstention reward.
 
 ## Build list before launch, in order
 

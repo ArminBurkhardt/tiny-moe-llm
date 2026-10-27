@@ -522,7 +522,8 @@ def main():
         assert fn(f"save_min_for {g} 1000000000")[1] == want, g
     r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="2")
     assert "watchdog save_min 97 startup_min 30" in r.stdout, r.stdout
-    assert "watchdog save_min 49 " in slurm_dry("scripts/slurm/train_job.sh", MODE="run").stdout
+    assert "watchdog save_min 97 " in slurm_dry("scripts/slurm/train_job.sh", MODE="run").stdout
+    assert "watchdog save_min 49 " in slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="4").stdout
     # mn5_env.sh returns 0 with an empty CTR, so `source mn5_env.sh && next` runs next
     r = bash("source scripts/slurm/mn5_env.sh >/dev/null && echo ran", REPO="/x", DATA_ROOT="/y", SBATCH_ACCOUNT="a")
     assert r.stdout.strip() == "ran", (r.stdout, r.stderr)

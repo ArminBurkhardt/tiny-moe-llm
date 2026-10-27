@@ -83,7 +83,7 @@ there means trying `BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3` (docker mode) b
    The watchdog cannot kill this: its save limit is derived from the GPU count (`SAVE_MIN` 386 minutes at 2 GPUs, plus 30
    for the first save; a 1B save takes about 2 hours there) and the step limit (15 minutes between step lines, 30 at startup)
    is far above the seconds a step takes. Do not shorten `SAVE_MIN` by hand for this check.
-6. The 10B control: `bash scripts/slurm/submit_chain.sh CONTROL 1` (about 2 hours at 16 GPUs).
+6. The 10B control: `bash scripts/slurm/submit_chain.sh CONTROL 1` (about 4 hours at 8 GPUs).
 7. Corpus stages if built on the cluster (each job takes a whole node: exclusive, all memory, 80 CPUs): `STAGES=... bash
    scripts/slurm/submit_chain.sh CORPUS 3` per stage group, in this order: filler (only through the mirror, "The filler through the mirror" below: no login node has internet), qa, bios_main (with the
    chains in parallel), val_clean, bios_full, bios_warm, prune_filler, qa_shuffle (after the chains), order, merges, rows (CPU only, after merge_control),
@@ -132,7 +132,7 @@ child; before the file exists the log and file times are used.
 `submit_chain.sh KIND N` queues N jobs with `--dependency=afterany` from the login node (default `CHAIN_MODE=presubmitted`:
 no job calls sbatch; `CHAIN_MODE=self` restores the old in-job resubmission). Each job runs the precheck first (final
 checkpoint, STOP, HALT, ended, job cap, two jobs without a new save) and a surplus job exits at once: about 10 to 30
-seconds of the allocation, 0.05 to 0.15 GPU hours at 16 GPUs. 800B is about 3 to 4 jobs of 71:50; submit 5 to 6.
+seconds of the allocation, 0.02 to 0.07 GPU hours at 8 GPUs. 800B is about 6 to 8 jobs of 71:50 at 8 GPUs; submit 4 at a time and resubmit.
 
 Two trainers on one run directory is the failure the chain is built against: every job of a chain carries the chain id
 (`submit_chain.sh` creates it, the first job writes it into `chain_state`), a job of another chain exits at once, a job takes
@@ -185,8 +185,9 @@ does not divide 16 is refused.
 Hours: `status.py` computes the account's GPU hours from `sacct -X -P -o JobID,JobName,ElapsedRaw,AllocTRES,State` since
 `--since` (every job that billed: killed at the limit, node failures, surplus, reads, corpus, the control; a job bills the larger of its gres count and 4 per node, so the exclusive one GPU
 corpus job counts 4) and falls back to the per job log (`ckpts/inject/RUN_gpu_hours.log`) when sacct gives nothing.
-GPU hours per job = nodes x 4 x hours. At 16 GPUs and 67.3k tokens per second per GPU, 800B is about 206 hours and
-3,302 H100 hours; the floor is about 54k tokens per second per GPU (about 4,100 hours). Charging is probably per whole node
+GPU hours per job = nodes x 4 x hours. At 8 GPUs (the allocation's cap, the default since 2026-10-27) and 67.3k tokens per second per GPU, 800B is
+about 413 hours (17 days) and 3,302 H100 hours; the floor is about 54k tokens per second per GPU (about 4,100 hours,
+21 days). The GPU hours do not depend on the GPU count, the wall time does. Charging is probably per whole node
 (unconfirmed): a one GPU job then bills 4 GPUs, so reads are batched four to a node.
 
 ## Supervision (the PC, in WSL)

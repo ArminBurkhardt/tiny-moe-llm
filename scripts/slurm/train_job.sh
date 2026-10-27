@@ -58,7 +58,7 @@ if [ -n "$STOP_AFTER" ]; then
   stop_after_m "$STOP_AFTER" >/dev/null || { halt_early "STOP_AFTER='$STOP_AFTER' is not 4000M, 4B or a token count"; exit 2; }
 fi
 
-NODES=${SLURM_JOB_NUM_NODES:-${NODES:-4}}
+NODES=${SLURM_JOB_NUM_NODES:-${NODES:-2}}
 GPN=${SLURM_NTASKS_PER_NODE:-${GPUS_PER_NODE:-4}}
 GPUS=$(( NODES * GPN ))
 ACCUM=$(accum_for "$GPUS") || { halt_early "$GPUS GPUs do not divide the global batch (accum_for)"; exit 2; }

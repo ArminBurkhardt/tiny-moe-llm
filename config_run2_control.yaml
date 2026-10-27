@@ -33,7 +33,7 @@ model:
   lm_head_factor: 4
 
 training:                    # loss weights, read by train_step for every profile
-  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation x GPUs = 524,288 tokens per update, so 16 GPUs run accumulation 1 and 8 GPUs accumulation 2
+  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation x GPUs = 524,288 tokens per update, so the run's 8 GPUs (the allocation's cap, decided 2026-10-27) run accumulation 2; 16 GPUs would run accumulation 1
   seq_length: 4096
   lr: 4.0e-4                 # the 16B run's rate at this width and batch (RUN2 Schedule, Optimizer)
   weight_decay: 0.1          # config.yaml has 0.02; the micro and pilot value every leak read ran under (RUN2 Schedule, Optimizer; build item 2)
@@ -57,7 +57,7 @@ training:                    # loss weights, read by train_step for every profil
   loop_ce_weights: [0.2, 0.3, 1.0]
   loop_ce_subsample: 0.25
   loop_count_sampling: 0.3
-  grad_accumulation_steps: 1 # 16 GPUs (4 nodes of 4); the job scripts pass --grad-accumulation-steps 16 / GPUs (scripts/slurm/lib.sh accum_for), which overrides this
+  grad_accumulation_steps: 1 # the job scripts pass --grad-accumulation-steps 16 / GPUs (scripts/slurm/lib.sh accum_for), which overrides this: 2 on the run's 8 GPUs (2 nodes of 4, the allocation's cap, decided 2026-10-27); 1 was the 16 GPU plan
   seed: 42
   data_dir: "data/prepared_run2"
   phase: "phase1"

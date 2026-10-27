@@ -6,8 +6,10 @@ and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervisin
 
 ## The plan in five lines
 
-- 800B tokens: 266.67B unique prompt tokens per split, 3 epochs, on 16 H100 (4 nodes), as a chain of 72 hour jobs.
-- About 3,300 GPU hours at the expected rate (67k tokens per second per GPU), about 206 hours of wall time; the run fits
+- 800B tokens: 266.67B unique prompt tokens per split, 3 epochs, on 8 H100 (2 nodes, the allocation's cap), as a chain
+  of 72 hour jobs (about 6 to 8 of them).
+- About 3,300 GPU hours at the expected rate (67k tokens per second per GPU), about 413 hours (17 days) of wall time,
+  21 days at the floor rate, plus queue waits between jobs; the run fits
   4,500 hours as long as the rate stays above about 54k per GPU (about 59k if the corpus build's estimated 400 hours
   come out of the same budget).
 - Order: corpus, the 2 GPU check, the 10B control, the warm-up (stop at 4B, read), the switch to the main split, the run.
@@ -42,7 +44,7 @@ and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervisin
 
 **Training**
 1. The 2 GPU against 1 GPU check: README Day 1 step 5. Touch STOP after about 100 steps; compare the loss lines.
-2. The 10B control: `bash scripts/slurm/submit_chain.sh CONTROL 1` (about 2 hours).
+2. The 10B control: `bash scripts/slurm/submit_chain.sh CONTROL 1` (about 4 hours).
 3. The warm-up: `STOP_AFTER='4000M' bash scripts/slurm/submit_chain.sh TRAIN 4`.
 4. Check the first hour's rate against 54k tokens per second per GPU (the supervisor alerts below it).
 5. At the 4B stop: read the save, decide the switch. Then
@@ -58,11 +60,12 @@ and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervisin
 
 ## How the cluster work goes
 
-- **Jobs.** Each training job runs up to 72 hours. Twenty minutes before its limit it saves and exits; the next job,
+- **Jobs.** Each training job runs up to 72 hours on 2 nodes (8 GPUs, gradient accumulation 2, the same 524,288
+  tokens per update as planned for 16). Twenty minutes before its limit it saves and exits; the next job,
   already queued behind it, resumes from that save. Saves every 1B tokens; the newest two and the first one at or past
   each 10B are kept (about 370 GB).
 - **On the cluster side.** A watchdog in every job kills and halts it on any of these: a stall (no step for 15 minutes), no
-  save within the job's limit (49 minutes at 16 GPUs), a loss that turns NaN or climbs and stays up, a crash loop (3 bad jobs
+  save within the job's limit (97 minutes at 8 GPUs), a loss that turns NaN or climbs and stays up, a crash loop (3 bad jobs
   in the last 5, 2 early deaths, 2 jobs with no new save). Any setup error that would repeat (container, paths, config,
   missing row estimates) halts the chain on the first try, with the reason in `HALT`. Nothing is ever deleted on a halt.
 - **On the PC side.** The supervisor reads one status JSON per poll. It resubmits a broken chain at most once an hour,

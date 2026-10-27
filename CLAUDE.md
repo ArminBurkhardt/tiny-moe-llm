@@ -275,10 +275,16 @@ Restructured 2026-10-24 after the repository review.
   4,500 targeted, 4 TB project disk, 2 TB transfer, no internet on any node, Singularity only;
   RUN2.md "The allocation and the cluster"), the token target is 800B (RUN2.md row 14: 266.67B
   unique prompt tokens per split x 3 epochs, was 280B as 93.33B x 3): about 3,300 H100 hours at 67k
-  tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 206 hours
-  on 16 GPUs in at least 3 chained 72 hour jobs, the floor about 54k per GPU. `config_run2.yaml`:
-  `target_tokens` 800e9, `warmup_fraction` 0.000655, the kill at 8B, evals every 4B, accumulation 1
-  at 16 GPUs, uploads off; the control at constant LR after its warmup (`lr_min_factor` 1.0). Built,
+  tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 413 hours
+  (17 days) of wall time on 8 GPUs, 2 nodes of 4 (RUN2.md row 15, the user, 2026-10-27: the
+  allocation's GPU cap is 8; was about 206 hours on 16 GPUs in at least 3 jobs), about 6 to 8
+  chained 72 hour jobs plus queue waits, the floor about 54k per GPU (about 21 days); the GPU hours
+  do not change with the count. `config_run2.yaml`: `target_tokens` 800e9, `warmup_fraction`
+  0.000655, the kill at 8B, evals every 4B, accumulation 2 at 8 GPUs (the job scripts pass
+  16 / GPUs and default to 2 nodes, the yaml's 1 is overridden; still 524,288 tokens per update, so
+  the schedule, the kill, the evals and the QA per update are unchanged), a save every 1B about 31
+  minutes apart, the watchdog's no-save limit 97 minutes, uploads off; the control at constant LR
+  after its warmup (`lr_min_factor` 1.0), about 4 hours on 8 GPUs. Built,
   uncommitted: the corpus driver at 800B (`docs/plans/RUN2_corpus.md`: per split bios about 262.3B,
   QA 1.53B, plain and bridge chains 1.4B each, persons 3x the pilot's, a seeded `qa_shuffle` before
   the order, the warm split (about 28B) and the control (10B) as prefixes of the main order, epoch 0
@@ -301,8 +307,11 @@ Restructured 2026-10-24 after the repository review.
 - **Open for the user:** the control's exposure (at 10B it sees about 3.75% of each person's
   renderings: probe tiers at 2,667 / 26,667 exposures per pass, or a denser build of its own);
   whether to read the warm-up at 12B in addition to 4B; where the corpus is built (the cluster,
-  about 400 GPU hours, or the PC, about 3 TB of local disk where D: has about 125 GB free); 6f's
-  abstention reward against the A3 re-read.
+  about 400 GPU hours, or the PC, about 3 TB of local disk where D: has about 125 GB free); whether
+  the allocation's 8 GPU cap is per job or concurrent (if concurrent, the 4-GPU reads jobs and any
+  corpus job cannot run beside an 8-GPU training job, so the reads run only in the gaps between
+  chained training jobs, batched four to a node, or move to the PC on exported bf16 weights; a
+  question for support); 6f's abstention reward against the A3 re-read.
 
 ### Open items
 
@@ -323,7 +332,7 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 | the goal's reasoning clause reworded | closed: decided 2026-10-25 (the user, RUN2.md row 4), open since 2026-10-17, on R9 (composes in written tokens, not in the loop): "facts in the store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation per token"; the original "reasoning in the looped trunk" kept as the original goal and the aspiration to revisit after the real run (NEXT.md "The goal") | none | nothing |
 | 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth; its mix carries the pretraining slices beside the bridge rows at a lower LR than the pilot's continuation, the A gates and the clean-slice CE read at every save under a kill rule (R5, 2026-10-25: chain-only bridge SFT lost every other gate) | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
 | 6a throughput, 6c corpus on the rented cluster, 6d run spec | 6d decided 2026-10-25 (the user, every row of `docs/plans/RUN2.md`'s first table on the recommended option; drafted the same evening: recipe by rung, cost table for the application, build list; the draft found the plan's 2.5k-hour figure was for the blueprint width 1024 while `config.yaml` is width 768, the evidence trainer single GPU, the real corpus builder unbuilt with the staircase visibility unresolved under the key/value reader); 6c and the rest of the spec's build list next, in RUN2.md's order; 6a after the spec (2026-10-21), carrying the deferred eval-pass rewrite | none | the build list (R5 read 2026-10-25) |
-| the real run's launch | built 2026-10-26 (launch path L1 to L5, RUN2.md) and 2026-10-27 for MareNostrum 5 at 800B (RUN2.md row 14 and "Built 2026-10-27"): the corpus driver at 800B with resumable builders and the filler mirror, the trainer additions for chained jobs, the Slurm job chain with its watchdog, the PC-side ops and supervisor, the weight export; the final reviews left no high issue; the user's steps in `docs/plans/RUN2_handover.md` | day 1 on the cluster (`scripts/slurm/README.md`): the `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU against 1-GPU check (STOP after about 100 steps; cannot be bit-exact, the loss and the per-rank counts agree within noise), the first hour's rate against the 54k floor (about 67k expected at RUN2's ratio, about 93k at the corpus's 0.045) | the user's cluster access; the user's three calls (the control's exposure, a 12B warm-up read, where the corpus is built) |
+| the real run's launch | built 2026-10-26 (launch path L1 to L5, RUN2.md) and 2026-10-27 for MareNostrum 5 at 800B on 8 H100, 2 nodes of 4 at accumulation 2, about 413 hours (RUN2.md rows 14 and 15 and "Built 2026-10-27"): the corpus driver at 800B with resumable builders and the filler mirror, the trainer additions for chained jobs, the Slurm job chain with its watchdog, the PC-side ops and supervisor, the weight export; the final reviews left no high issue; the user's steps in `docs/plans/RUN2_handover.md` | day 1 on the cluster (`scripts/slurm/README.md`): the `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU against 1-GPU check (STOP after about 100 steps; cannot be bit-exact, the loss and the per-rank counts agree within noise), the first hour's rate against the 54k floor (about 67k expected at RUN2's ratio, about 93k at the corpus's 0.045) | the user's cluster access; the user's four calls (the control's exposure, a 12B warm-up read, where the corpus is built, whether the 8 GPU cap is per job or concurrent) |
 
 **The design page moves with the architecture and the plan.** Any change to the architecture (a
 tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
@@ -871,7 +880,11 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   at 16 GPUs. Built: the corpus driver's new stages and resume, `mirror_sources.py`, resumable
   builders, the `sft.py` flags for chained jobs, `scripts/slurm/` with its watchdog, `scripts/ops/`
   with the supervisor, `export_weights.py`; three Opus final reviews and a Sonnet review of the
-  trainer fixes left no high issue. Next: the user's cluster access and day 1.
+  trainer fixes left no high issue. Next: the user's cluster access and day 1. Decided later the
+  same day (the user, RUN2.md row 15): the allocation's cap is 8 GPUs, so the run trains on 2 nodes
+  of 4 at accumulation 2 (still 524,288 tokens per update), the GPU hours unchanged and the wall
+  time about 413 hours (17 days) in about 6 to 8 jobs, the control about 4 hours; the 16 GPU, 206
+  hour and accumulation 1 figures above are the plan before the cap.
 
 - **The former "Next, in order" list, closed 2026-10-24** (items 1 to 4 done or closed, item 5
   moved to the Open items table; the full ladder with its done steps is in NEXT.md):
@@ -1074,9 +1087,10 @@ build. **The benchmark suite is the quality instrument**, diffed against
 Run 2 (decided 2026-10-25, `docs/plans/RUN2.md` row 6): shape L is the configured shape, width 768; token target 280B; the application asks about 3.0k H100 hours (the 2.5k of the blueprint width plus the corpus build line plus 20%; the configured shape alone needs about 1.1k to 1.3k), ceiling 5k (estimates until 6a measures the rate;
 the run spec fixes a token target and derives hours). Since 2026-10-27 (the user, RUN2.md row 14) the
 token target is 800B (266.67B unique prompt tokens per split x 3 epochs) on MareNostrum 5 (the ACC
-partition, 4 x H100 64 GB per node, 72 hour jobs, no internet on any node), 16 GPUs as a chain of
-Slurm jobs, about 3,300 H100 hours of the 4,500 targeted (5,000 applied) at 67k tokens per second
-per GPU; the operator's steps are [RUN2_handover.md](docs/plans/RUN2_handover.md). Pre-Phase-4 review:
+partition, 4 x H100 64 GB per node, 72 hour jobs, no internet on any node), 8 GPUs (2 nodes, the
+allocation's cap, RUN2.md row 15; 16 were planned before the cap) as a chain of about 6 to 8 Slurm
+jobs at accumulation 2, about 3,300 H100 hours of the 4,500 targeted (5,000 applied) at 67k tokens
+per second per GPU, about 413 hours (17 days) of wall time; the operator's steps are [RUN2_handover.md](docs/plans/RUN2_handover.md). Pre-Phase-4 review:
 [review_2026-09-18.md](docs/review_2026-09-18.md).
 
 **Binding verdicts** (each measured, each recorded):

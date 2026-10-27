@@ -35,7 +35,7 @@ model:
   lm_head_factor: 4
 
 training:                    # loss weights, read by train_step for every profile
-  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation x GPUs = 524,288 tokens per update, so 16 GPUs run accumulation 1 and 8 GPUs accumulation 2
+  batch_size: 8              # per GPU (RUN2 Schedule, Batch): 8 x 4096 x accumulation x GPUs = 524,288 tokens per update, so the run's 8 GPUs (the allocation's cap, decided 2026-10-27) run accumulation 2; 16 GPUs would run accumulation 1
   seq_length: 4096
   lr: 4.0e-4                 # the 16B run's rate at this width and batch (RUN2 Schedule, Optimizer)
   weight_decay: 0.1          # config.yaml has 0.02; the micro and pilot value every leak read ran under (RUN2 Schedule, Optimizer; build item 2)
@@ -59,7 +59,7 @@ training:                    # loss weights, read by train_step for every profil
   loop_ce_weights: [0.2, 0.3, 1.0]
   loop_ce_subsample: 0.25
   loop_count_sampling: 0.3
-  grad_accumulation_steps: 1 # 16 GPUs (4 nodes of 4); the job scripts pass --grad-accumulation-steps 16 / GPUs (scripts/slurm/lib.sh accum_for), which overrides this
+  grad_accumulation_steps: 1 # the job scripts pass --grad-accumulation-steps 16 / GPUs (scripts/slurm/lib.sh accum_for), which overrides this: 2 on the run's 8 GPUs (2 nodes of 4, the allocation's cap, decided 2026-10-27); 1 was the 16 GPU plan
   seed: 42
   data_dir: "data/prepared_run2"
   phase: "phase1"
@@ -77,7 +77,7 @@ evidence:
   val_split: "inject_val"              # filler only, written by the bios_main stage (docs/plans/RUN2_corpus.md)
   fixed_split: "evidence_fixed"        # the held-out QA pass; the launcher links it into the data dir from DATA_ROOT/prepared
   fixed_eval_max_batches: 100
-  kill_tokens: 8000000000              # the built kill at the first fixed eval past 8B (RUN2 Early signals said 5B; at 16 GPUs QA is about 20x thinner per update than the pilot, so 5B could fire falsely; validator, 2026-10-27)
+  kill_tokens: 8000000000              # the built kill at the first fixed eval past 8B (RUN2 Early signals said 5B; at 524,288 tokens per update QA is about 20x thinner per update than the pilot, so 5B could fire falsely; validator, 2026-10-27)
   kill_min_gain: 0.1
   freeze_evidence_gate: true
   lr: 4.0e-4
@@ -90,10 +90,10 @@ evidence:
   warmup_fraction: 0.000655            # 1000 steps of about 1,525,900 (800B / 524,288)
   lr_min_factor: 0.1                   # cosine to 0.1 lr (RUN2 Schedule, Optimizer)
   seed: 1234
-  checkpoint_every_tokens: 1000000000  # save every 1B (RUN2 Schedule, Cadence): about 16 minutes at 1M tokens per second on 16 GPUs; the 72 hour jobs end on a save and exit 20 (scripts/slurm/)
+  checkpoint_every_tokens: 1000000000  # save every 1B (RUN2 Schedule, Cadence): about 31 minutes at 8 x 67k tokens per second on the run's 8 GPUs (about 16 at 16 GPUs); the 72 hour jobs end on a save and exit 20 (scripts/slurm/)
   keep_local_checkpoints: 2            # the newest two rolling saves stay; the rest are deleted by keep_every_tokens (2026-10-26)
   keep_every_tokens: 10000000000       # keep the first save at or past every 10B tokens and the final: about 80 kept saves of 4.6 GB, about 370 GB, plus the newest two rolling; 10B keeps the control compare's save (2026-10-27)
-  eval_every_tokens: 4000000000        # the trainer runs [eval] and [eval fixed] in one pass at this key; 2B cost about 10% at 16 GPUs, so 4B (validator, 2026-10-27)
+  eval_every_tokens: 4000000000        # the trainer runs [eval] and [eval fixed] in one pass at this key; 2B cost about 10% of the run's time (a share, estimated at 16 GPUs, about the same at 8), so 4B (validator, 2026-10-27)
   eval_max_batches: 40
   conversation_loss_weighting: false   # plain per-token CE: this is pretraining, not policy
   loss_weight_floor_tokens: 64
