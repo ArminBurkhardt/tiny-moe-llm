@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# shared by the push and pull scripts (run in WSL or Linux on the user's PC, never on the cluster, never in the cloud).
+# shared by the push, pull and relay scripts (run in WSL or Linux on the user's PC or on the user's own relay VM, never
+# on the cluster, never on a third party service).
 # sourced, never run. settings come from scripts/ops/ops.env (copy ops.env.example) or the environment.
 OPS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [ -f "$OPS_DIR/ops.env" ] && source "$OPS_DIR/ops.env"

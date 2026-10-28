@@ -17,6 +17,7 @@ env_init
 # tests/
 # ops tooling state (scripts/ops)
 scripts/ops/ops.env
+scripts/ops/relay/relay.env
 ops_state/
 ops_transfer_ledger.tsv
 *.sif

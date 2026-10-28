@@ -1,0 +1,19 @@
+# systemd --user template: keeps one ssh master socket to MareNostrum 5 alive with the relay's own key.
+# instances: login (MN5_LOGIN_HOST, MN5_LOGIN_SOCK) and transfer (MN5_TRANSFER_HOST, MN5_TRANSFER_SOCK), both from
+# relay.env (copy relay.env.example to relay.env beside this file). the socket paths must equal SSH_SOCK and
+# SSH_SOCK_TRANSFER in ops.env. the restart delay is long on purpose: repeated failed logins can get this IP blocked.
+[Unit]
+Description=MareNostrum 5 ssh master socket (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=%h/tiny-llm/scripts/ops/relay/relay.env
+ExecStartPre=-/bin/rm -f ${MN5_SOCK_%i}
+ExecStart=/usr/bin/ssh -M -N -S ${MN5_SOCK_%i} -o ControlPersist=no -o BatchMode=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o ConnectTimeout=30 -i %h/.ssh/mn5_relay ${MN5_USER}@${MN5_HOST_%i}
+Restart=always
+RestartSec=300
+
+[Install]
+WantedBy=default.target

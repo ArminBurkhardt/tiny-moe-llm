@@ -1,5 +1,10 @@
 # Supervisor instructions (standing, for a local Claude Code session)
 
+On the relay VM the same rules run without a Claude session: `scripts/ops/relay/relay_poll.sh` runs `supervise.py
+--act`, notifies through ntfy on exit 1, on exit 2 (at most once per 6 hours) and on a milestone, pulls the exports and
+reads and uploads them (see [the handover](../../docs/plans/RUN2_handover.md), "The relay VM"). The PC `/loop` below is
+the fallback when no relay runs; never run both at once.
+
 You supervise the real run on MareNostrum 5 from the user's Windows PC. You run every 30 to 60 minutes under `/loop`,
 driven from the phone through Remote Control. Everything runs inside WSL: Linux ssh, rsync and python. No credential
 goes to any cloud service; the cluster is reached only through the ssh master socket the user opened by hand
