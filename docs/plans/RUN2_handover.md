@@ -1,8 +1,24 @@
 # Run 2 on MareNostrum 5: handover
 
-Written 2026-10-27. What you do, and how the cluster work goes. The details are in
+Written 2026-10-27, revised 2026-10-28 (the relay VM, the benchmark reads, serving retrieval, post-training on the PC).
+What you do, and how the cluster work goes. The details are in
 [scripts/slurm/README.md](../../scripts/slurm/README.md) (the runbook), [RUN2_corpus.md](RUN2_corpus.md) (the corpus)
 and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervising session).
+
+## The whole plan, start to a usable model
+
+1. **Before access:** ask BSC support three questions (below), commit, build the container, stage the small inputs.
+2. **Cluster, days 1 to about 5:** the day 1 checks, the corpus build.
+3. **Cluster, about 17 to 21 days:** the 2 GPU check, the 10B control, the warm-up and the switch, then the run to 800B.
+   The relay VM watches it, reads every kept save (the closed-book and chain reads plus the 13-task benchmark suite)
+   and uploads exports and reads to your HF repo.
+4. **PC, during the run:** prove the post-training recipe on the pilot model (running since 2026-10-28), decide on a
+   tail phase, and build a general-knowledge store (not built yet; see "During the run, on the PC").
+5. **PC, after the run:** the consolidation SFT on the final weights (under 5 hours on the 5090), its reads, then chat
+   with the store attached (`inference.py --store`).
+
+What the run alone gives you is a base model. It chats only after step 5, and it knows things mainly through the
+store: closed-book answers at this size stay weak by design.
 
 ## The plan in five lines
 
@@ -20,12 +36,17 @@ and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervisin
 ## What you have to do
 
 **Before access (PC, WSL)**
+0. Ask BSC support: (a) is unattended ssh key login (no 2FA prompt) allowed from a fixed server IP to alogin1 and
+   transfer1 (the relay depends on it); (b) is copying the project's own model weights to an external server within the
+   allocation's terms; (c) is the 8 GPU cap per job or for all jobs at once (if at once, the reads jobs only run in the
+   gaps between training jobs).
 1. Commit the tree (the one line command from the session).
 2. Decide where the corpus is built: on the cluster (about 400 GPU hours of node time, an estimate; about 450 GB of
    filler sources pushed in, the listing in RUN2_corpus.md) or
    on the PC (needs about 3 TB of local disk; D: has about 125 GB free). The cluster is the default.
 3. Build the container: `bash scripts/slurm/container/build.sh` (or `build.sh docker`). Check that the smoke lines pass.
-4. Stage the tokenizer and bge: `python scripts/mirror_sources.py stage-small --hf-home DIR`.
+4. Stage the tokenizer, bge and the benchmark datasets: `python scripts/mirror_sources.py stage-small --hf-home DIR`
+   (needs your HF token; without the benchmark data every benchmark read on the cluster fails).
 5. Copy `scripts/ops/ops.env.example` to `scripts/ops/ops.env` and fill in user and paths.
 
 **Day 1 (cluster)**
@@ -42,6 +63,9 @@ and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervisin
 1. Push the filler sources: `mirror_sources.py push` from the PC through the transfer node (RUN2_corpus.md).
 2. Submit the stage groups in the README's order (`STAGES=... bash scripts/slurm/submit_chain.sh CORPUS 3`).
    Every long stage resumes after a kill.
+3. **Before the `prune_sources` stage** (it deletes the QA builds): cut the post-training samples on the cluster,
+   `python scripts/build_post_sft_mix.py qa --profile run2 --data-root /data/run2 --out-dir /data/run2/post` and the
+   same with `replay`. Missed here, the run 2 post-training has no QA slice without rebuilding QA.
 
 **Training**
 1. The 2 GPU against 1 GPU check: README Day 1 step 5. Touch STOP after about 100 steps; compare the loss lines.
@@ -59,6 +83,8 @@ and [scripts/ops/SUPERVISOR.md](../../scripts/ops/SUPERVISOR.md) (the supervisin
 - Anything after a HALT, an exit 30, or a chain you cancelled: read the reason, then restart by hand.
 - Pulling weights out is automatic (the relay pulls them and uploads them to the HF repo; counted against the 2 TB
   ledger). By hand: `bash scripts/ops/pull_exports.sh`.
+- A tail phase, decided before about 700B (see "During the run, on the PC").
+- The general-knowledge store: which source and how big (same section).
 - Still open from the plan: the control's exposure (probe tiers or a denser build) and 6f's abstention reward.
 
 ## How the cluster work goes
@@ -122,3 +148,56 @@ about 55 GB of its 80 GB disk over the run (about 80 exports of 0.67 GB).
 If the VM is compromised: revoke the HF token, remove the `mn5_relay` line from `authorized_keys` on MareNostrum, and
 change the ntfy topic. Cost: about 24 euro a month at the price you quoted, billed hourly; delete the server after the
 run (after the last weights are in the HF repo).
+
+## During the run, on the PC
+
+- **The post-training rehearsal.** The same SFT recipe as step 5 below, on the pilot model (arm P's final, 97M
+  parameters), 150M tokens of mix (chat 40%, evidence QA 25%, pretraining replay 35%), launched 2026-10-28 on the 5090
+  (`ckpts/inject/postsft_pilot.log`, saves every 25M, read with `scripts/reads/read_post_sft_save.sh`). Done the same
+  day: 140.7M tokens in 62 minutes, every save read with verdict ok. Seed to final: stops on its own 0.33 to 0.53 of 40
+  chat prompts, replies that loop 0.90 to 0.80, gold-evidence exact match 0.044 to 0.091, abstention with the gold
+  passage attached 0.82 to 0.70, clean-text CE 3.267 to 3.292 (the kill line is +0.15), gold answer CE on the fixed
+  QA set 1.84 to 1.71. The recipe works without damage, but it fixes too little: the model still abstains on 70% of
+  answerable questions with the answer in front of it, and long replies still loop. Before the run 2 post-training,
+  lower the share of abstention rows in the QA slice (half its rows teach "the passage doesn't cover that" today) and
+  read the rehearsal again. The answers themselves stay poor at this size (97M on 1B tokens); that part says nothing
+  about the 800B model. Balancing is loss-free as in run 2; the shift of picks onto the dense slots (0.05 to about
+  0.5 within 100 steps) happens with or without the aux term and did not cost clean-text CE.
+- **A tail phase (your decision).** The run goes to 800B on one mix; most current models end on a short phase of their
+  best data while the learning rate falls. Not built. If wanted, it has to be decided and built before about 700B.
+- **A general-knowledge store (not built).** Serving retrieval works (`inference.py --store DIR`, `gradio_app.py --store
+  DIR`, 4 chunks per question, checked against the evaluation store: the right chunk in the top 4 for 16 of 20), but the
+  only stores today are the evaluation stores (passages of about 3,000 QA questions) and the fictional biographies.
+  A store over Wikipedia or a similar source is what makes the finished model useful; its size and source are open.
+
+## After the run: post-training on the PC
+
+The run's weights do not chat yet: they answer, abstain and stop only after a short consolidation SFT, which runs on your
+RTX 5090 in under 5 hours. A single-format SFT erased every other ability at pilot size (R5), so the mix carries the
+pretraining slices beside the chat and QA rows, and every save is read against the seed's own reads.
+
+1. Pull the final bf16 export from the HF repo (`scripts/export_weights.py` made it, about 0.67 GB). The trainer loads it
+   as it is, with `-c`: the file has a `model_state_dict` and the strict load takes bf16, so no conversion is needed; it
+   restarts the optimizer and reseeds the fp32 masters from the bf16 weights.
+2. The replay and QA samples were cut on the cluster during the corpus build (Corpus step 3: a seeded sample of
+   `run2_main_train` and of the corpus's QA build, with their val splits). Copy `/data/run2/post/post_replay_*` and
+   `/data/run2/post/postqa_*` to the PC's `data/prepared_post_run2/`.
+3. On the PC, from the repo in WSL: `python scripts/build_post_sft_mix.py chat --profile run2` (needs `manifest.json`
+   with the smoltalk2 holdout list in the repo root, or `--pull-manifest`), then `merge`, then
+   `verify` (it must print `verify: ok`: shares within 3%, every assistant turn ending in a supervised EOS, and at least
+   0.15 of the QA slice from SQuAD or HotpotQA). Also copy
+   `evidence_fixed.*` (cluster `prepared`) and `inject_val_clean.*` (cluster `prepared_run2`) into `data/prepared_post_run2/`.
+4. Read the seed first: `RUN=postsft_run2 CLEAN_DIR=data/prepared_post_run2 READ_CONFIG=config_run2_postsft.yaml
+   bash scripts/reads/read_post_sft_save.sh EXPORT seed` (the baseline the verdict compares against).
+5. Launch: `DATA_DIR=data/prepared_post_run2 FIXED_DIR=data/prepared_post_run2 bash scripts/launch_post_sft.sh config_run2_postsft.yaml EXPORT
+   post_sft_train postsft_run2`, and watch `ckpts/inject/postsft_run2.log`. Check the peak memory in minute one: batch 2 is a start.
+6. At every save (250M tokens) run `read_post_sft_save.sh CKPT TAG` with the same env as step 4; the last line is `verdict ok` or
+   `verdict KILL`. On KILL stop the run (`touch ckpts/evidence_postsft_run2/STOP`), lower the learning rate or the chat share, and
+   read the generations in `ckpts/inject/postsft_run2_TAG_chat.json` yourself: the numbers say whether it stops and repeats,
+   not whether the answers are good.
+7. Talk to it: `python scripts/inference.py -c CKPT --store data/index/STORE --show-retrieval -p "QUESTION"` or the
+   Gradio app with the same `--store`. Without `--store` it answers from memory alone, which this model was trained not
+   to rely on.
+
+Untested so far: the `replay` and `qa` stages of the run2 profile (step 2 and 3 need the cluster's corpus and the Hub)
+and batch 2 at shape L with this mix.

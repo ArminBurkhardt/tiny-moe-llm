@@ -458,6 +458,17 @@ to a node, or move to the PC on exported bf16 weights; a question for support); 
    QA, plain text) through `merge_evidence_splits.py`, extended to `.evhop` and `.factspan` (NEXT.md
    6f), and a 6f launcher that reads the A gates and the clean-slice CE per save with their kill
    rule. Needed by 6f, not by the launch.
+11. **Built 2026-10-28: the consolidation SFT (6e) on the PC** (after the main run; rehearsed on arm P's final). The mix
+   driver `scripts/build_post_sft_mix.py` (chat 0.40 from smoltalk2, ultrachat and no_robots through the existing chat
+   builder with the pretraining holdout honoured; evidence QA with gold, mixed, distractors and none 0.25; replay of the
+   pretraining slices 0.35, the biographies with their filler windows and the plain chains; merged by
+   `merge_evidence_splits.py`, with a check that every assistant turn ends in a supervised EOS), the configs
+   `config_run2_postsft.yaml` (lr 1e-4, one epoch, saves every 250M, batch 2 x 8) and `ckpts/inject/config_pilot_postsft.yaml`,
+   `scripts/launch_post_sft.sh`, the per save reads `scripts/reads/read_post_sft_save.sh` (A3 abstention read, clean slice CE
+   per exit, the chat read `scripts/eval_chat.py` with 40 fixed prompts) with the kill verdict against the seed (clean CE
+   at the last exit up more than 0.15, or gold EM below the seed's), and the steps in
+   [RUN2_handover.md](RUN2_handover.md) "After the run: post-training on the PC". The 6f mix builder (item 10) stays open
+   for the bridge rows.
 
 ## Build plan with estimates, 2026-10-25, re-cut 2026-10-26 to the launch path
 

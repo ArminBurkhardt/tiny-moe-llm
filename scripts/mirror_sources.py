@@ -80,6 +80,23 @@ SMALL_DATASETS = [
     ("florin-hf/nq_open_gold", ("test_dataset.json",), (".json",), None),
     ("mandarjoshi/trivia_qa", ("rc.wikipedia/validation",), (".parquet",), None),
 ]
+# the 13 benchmark tasks of eval_benchmarks.py plus PopQA: repo, revision (None = main), prefixes, suffixes.
+# a repo already in SMALL_DATASETS (trivia_qa) gets the union of both file lists.
+BENCH_DATASETS = [
+    ("Rowan/hellaswag", None, ("data/validation",), (".parquet",)),
+    ("allenai/ai2_arc", None, ("ARC-Easy/test", "ARC-Challenge/test"), (".parquet",)),
+    ("ybisk/piqa", "refs/convert/parquet", ("plain_text/validation",), (".parquet",)),
+    ("allenai/winogrande", None, ("winogrande_xl/validation",), (".parquet",)),
+    ("allenai/openbookqa", None, ("main/test",), (".parquet",)),
+    ("allenai/sciq", None, ("data/test",), (".parquet",)),
+    ("google/boolq", None, ("data/validation",), (".parquet",)),
+    ("EleutherAI/lambada_openai", None, ("en/test",), (".parquet",)),
+    ("cais/mmlu", None, ("all/test",), (".parquet",)),
+    ("mandarjoshi/trivia_qa", None, ("rc.nocontext/validation",), (".parquet",)),
+    ("google-research-datasets/nq_open", None, ("nq_open/validation",), (".parquet",)),
+    ("openai/gsm8k", None, ("main/test", "main/train"), (".parquet",)),
+    ("akariasai/PopQA", None, ("test.tsv",), (".tsv",)),
+]
 BGE_REPO = "BAAI/bge-small-en-v1.5"
 TOKENIZER_REPO = "ikeafisch4/DeepSeek-V4-Pro-tokenizer-65536"
 
@@ -658,6 +675,22 @@ def stage_small(hf_home: str, api, download: Callable, snapshot: Callable, log: 
         index["datasets"][repo] = {"sha": sha, "files": names, "bytes": size}
         total += size
         log(f"{repo}: {len(names)} files, {size / 1e9:.2f} GB (revision {sha[:10]})")
+    for repo, revision, prefixes, suffixes in BENCH_DATASETS:
+        sha = revision or api.dataset_info(repo).sha
+        names = small_selection(api.list_repo_files(repo, repo_type="dataset", revision=sha), prefixes, suffixes, None)
+        if not names:
+            raise RuntimeError(f"{repo}: nothing under {prefixes} at {sha}")
+        size = 0
+        for n in names:
+            path = download(repo, n, sha, os.path.join(ds_dir, repo_dir(repo)))
+            size += os.path.getsize(path)
+        old = index["datasets"].get(repo)
+        if old:
+            names = sorted(set(old["files"]) | set(names))
+            size += old["bytes"]
+            sha = old["sha"]
+        index["datasets"][repo] = {"sha": sha, "files": names, "bytes": size}
+        log(f"{repo}: {len(names)} files, {size / 1e9:.2f} GB (benchmarks, {sha[:10]})")
     index["models"][BGE_REPO] = snapshot(BGE_REPO, None, None, os.path.join(hf_home, "hub"))
     index["models"][TOKENIZER_REPO] = snapshot(TOKENIZER_REPO, None, os.path.join(hf_home, "tokenizer"), None)
     with open(os.path.join(ds_dir, STAGE_INDEX), "w") as f:

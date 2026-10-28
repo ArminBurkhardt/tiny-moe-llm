@@ -1566,8 +1566,19 @@ def main():
     parser.add_argument("--json-out", default=None, help="write this run's payload here")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--hf-token", default=None)
+    parser.add_argument("--offline-stage", default=os.environ.get("BENCH_OFFLINE_STAGE"),
+                        help="read the benchmark shards from this staged directory (HF_HOME/datasets as written by "
+                             "mirror_sources.py stage-small) instead of the Hub; defaults to $HF_HOME/datasets when "
+                             "HF_HUB_OFFLINE=1")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    if args.offline_stage is None and os.environ.get("HF_HUB_OFFLINE") == "1" and os.environ.get("HF_HOME"):
+        args.offline_stage = os.path.join(os.environ["HF_HOME"], "datasets")
+    if args.offline_stage:
+        from scripts.mirror_sources import install_offline_hub
+        install_offline_hub(args.offline_stage)
+        logger.info(f"benchmark shards read from the staged directory {args.offline_stage}")
 
     args.cache_dir = check_cache_dir(args.cache_dir, "cache-dir")
     args.peer_cache_dir = check_cache_dir(args.peer_cache_dir, "peer-cache-dir")

@@ -1,0 +1,96 @@
+# the consolidation SFT after the real run (docs/plans/RUN2_handover.md, "After the run: post-training on the PC"): the run's final bf16 export
+# trained on the mix of scripts/build_post_sft_mix.py (chat, evidence QA with every condition, replay of the pretraining slices) at lr 1e-4,
+# on the RTX 5090. the model block is config_run2.yaml's (the checkpoint decides shape anyway); the training: and evidence: blocks differ in
+# the numbers named there. select it with TINY_LLM_CONFIG=config_run2_postsft.yaml; scripts/launch_post_sft.sh does.
+model:
+  vocab_size: 65536          # same tokenizer and uint16 corpus as every run
+  max_seq_length: 4096
+  hidden_size: 768           # shape L is the configured shape, not the blueprint's 1024 (RUN2 row 0, 2026-10-25)
+  intermediate_size: 2304    # dense decoder MLP
+  moe_intermediate_size: 2304
+  num_layers: 8              # prelude layers
+  num_attention_heads: 12    # 3 kv heads (num_heads // 4)
+  head_dim: 64
+  dropout: 0.0
+  per_layer_embeddings_size: 32
+  num_mlp_experts: 32        # kept at 32 routed experts (RUN2 row 1, 2026-10-25); the expert count is a cost choice (expert_count_pilot.md)
+  num_attn_experts: 1
+  top_k: 2
+  n_loops: 3                 # depth 3, loop_count_sampling 0.3 below (RUN2 Scope)
+  num_ir_experts: 1
+  num_ir_entries: 256        # the pilot's selector table; config.yaml's 65536 entries are dropped (NEXT.md Decisions, learned IR table; RUN2 build item 2, 2026-10-25)
+  ir_dim: 384                # bge width, the external keys arrive at it
+  ir_num_clusters: 0         # exact full-table read as at pilot (RUN2 Model table): at 256 entries the two stage read buys nothing, and 0 divides any entry count; probe clusters below are inert
+  ir_probe_clusters: 4
+  ir_read_top_k: 32
+  ir_direct_read: true
+  evidence_encoder: true     # the encoder runs over all 8 prelude layers (RUN2 Model table)
+  mtp_num_extra_tokens: 2
+  lm_head_factor: 4
+
+training:                    # loss weights, read by train_step for every profile
+  batch_size: 2              # the local card: 2 x 4096 x accumulation 8 = 65,536 tokens per update; read the peak in minute one and raise to 4 if it fits
+  seq_length: 4096
+  lr: 1.0e-4                 # post-training: a quarter of the pretraining rate, one third of the bridge run's 3e-4 that erased every other ability (R5)
+  weight_decay: 0.1          # config.yaml has 0.02; the micro and pilot value every leak read ran under (RUN2 Schedule, Optimizer; build item 2)
+  grad_clip: 1.0
+  optimizer: adamw           # Muon dropped 2026-10-21
+  num_epochs: 1                        # pretrain.py only; the evidence trainer reads evidence: num_epochs below
+  lambda_mtp: 0.1
+  aux_loss_weight: 0.01      # inert under loss_free
+  moe_balancing: loss_free   # config.yaml has aux; R8, decided 2026-10-21 (RUN2 Scope, balancing)
+  moe_balance_bias_rate: 0.001
+  evidence_selection_weight: 0.1
+  groundedness_weight: 0.1   # the seed carries the head (migrate_groundedness_head.py); gated on labels
+  evidence_selection_weighting: segment # config.yaml has token; RUN2 row 2, decided 2026-10-25
+  evidence_contrastive_weight: 0.0   # no retriever term; bge keys the store (decided 2026-10-21, unchanged 2026-10-24)
+  evidence_contrastive_temperature: 0.07
+  evidence_contrastive_loops: [0]   # inert at weight 0; the 2026-10-24 default
+  evidence_contrastive_trunk_grad: 1.0
+  target_tokens: 400000000    # the local budget: about 4 hours at 25k tokens per second; the evidence trainer fits its cosine to the split instead
+  warmup_steps: 0
+  noise_anneal_tokens: 0
+  loop_ce_weights: [0.2, 0.3, 1.0]
+  loop_ce_subsample: 0.25
+  loop_count_sampling: 0.3
+  grad_accumulation_steps: 8
+  seed: 42
+  data_dir: "data/prepared_post_run2"
+  phase: "phase1"
+  checkpoint_every_tokens: 250000000
+  hf_upload_repo: ""         # off: compute nodes may have no internet; checkpoints stay on the project disk and weights are copied out with scripts/export_weights.py
+
+sft:
+  data_dir: "data/prepared_post_run2"
+  seq_length: 4096
+  dropout: 0.0
+  hf_upload_repo: ""
+
+evidence:
+  train_split: "post_sft_train"        # scripts/build_post_sft_mix.py --profile run2; every launch passes --train-split and --val-split
+  val_split: "post_sft_val"
+  fixed_split: "evidence_fixed"        # the held-out QA pass; the launcher links it into the data dir
+  fixed_eval_max_batches: 100
+  kill_tokens: 0                       # off: the kill rule is read by hand from the per save reads (scripts/reads/read_post_sft_save.sh)
+  kill_min_gain: 0.1
+  freeze_evidence_gate: true
+  lr: 1.0e-4
+  fresh_lr: 1.0e-4                     # nothing is fresh: the seed already carries the port
+  num_epochs: 1                        # the merged split is the token budget; the cosine fits one pass
+  weight_decay: 0.1
+  dropout: 0.0
+  batch_size: 2                        # see training: batch_size
+  grad_accumulation_steps: 8           # 2 x 4096 x 8 = 65,536 tokens per update
+  warmup_fraction: 0.02                # short: about 100 updates at 400M tokens
+  lr_min_factor: 0.1
+  seed: 1234
+  checkpoint_every_tokens: 250000000   # a read per save, the post-training budget being about 400M tokens
+  keep_local_checkpoints: 2            # inert with uploads off
+  keep_every_tokens: 0                 # keep every save: they are few
+  eval_every_tokens: 250000000
+  eval_max_batches: 40
+  conversation_loss_weighting: true    # on as for repair: a 5 token answer or an abstention counts as a conversation, not as 5 tokens next to a 4,000 token document
+  loss_weight_floor_tokens: 64
+  max_evidence_tokens: 4608            # per row; the mix's ratio is about 0.5 against seq 4096 (not the run's 9216)
+  cluster_refresh_tokens: 0
+  dead_quantile: 0.0

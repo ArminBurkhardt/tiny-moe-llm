@@ -49,7 +49,87 @@ def load_evidence_chunks(path: str) -> list[str]:
     return [c.strip() for c in chunks if c.strip()]
 
 
-def build_evidence_batch(model: TinyMoETransformer, tokenizer, chunks: list[str], device: str) -> EvidenceBatch:
+DEFAULT_RETRIEVAL_K = 4  # the buffer eval_store.py's pathway and edit reads attach (--buffer 4)
+
+
+class StoreRetriever:
+    """Per-question retrieval from a store, the way serving is read in ``eval_store.py --route bge``.
+
+    The question is embedded with ``build_store.QueryAwareEmbedder.encode_queries`` (bge query
+    instruction, CLS, unit norm: the recipe that wrote the store's ``query_keys_bge.npy``) and
+    scored by cosine against the store's raw bge keys, best chunk first. The embedder loads on the
+    first call, so constructing this costs only the store read.
+
+    Args:
+        store_dir: a store directory under ``data/index/``.
+        top_k: chunks attached per question.
+        device: where bge runs.
+    """
+
+    def __init__(self, store_dir: str, top_k: int = DEFAULT_RETRIEVAL_K, device: str = "cpu"):
+        from modules.data.store import load_store
+
+        if top_k < 1:
+            raise SystemExit("--retrieval-k must be at least 1")
+        self.store = load_store(store_dir)
+        self.top_k = top_k
+        self.device = device
+        self._embedder = None
+
+    def embed_question(self, question: str):
+        if self._embedder is None:
+            from scripts.build_store import QueryAwareEmbedder
+
+            self._embedder = QueryAwareEmbedder(device=self.device)
+        return self._embedder.encode_queries([question])[0]
+
+    def retrieve(self, question: str) -> list[int]:
+        """Chunk ids for ``question``, best first."""
+        from modules.data.store import top_k_chunks
+
+        ids, _ = top_k_chunks(self.embed_question(question), self.store.keys, self.top_k)
+        return [int(i) for i in ids]
+
+    def describe(self, chunk_ids: list[int], width: int = 80) -> str:
+        lines = []
+        for rank, cid in enumerate(chunk_ids, 1):
+            text = " ".join(self.store.chunks[cid]["text"].split())
+            lines.append(f"  [{rank}] chunk {cid}: {text[:width]}")
+        return "\n".join(lines)
+
+    def evidence_for(self, model, tokenizer, question: str, show: bool = False):
+        """Retrieve for one question and build the ``EvidenceBatch``.
+
+        Returns:
+            ``(evidence, chunk_ids, report)``; ``report`` is the printable retrieval listing, or ""
+            when ``show`` is off.
+        """
+        chunk_ids = self.retrieve(question)
+        texts = [self.store.chunks[c]["text"] for c in chunk_ids]
+        evidence = build_evidence_batch(
+            model, tokenizer, texts, self.device, keys=self.store.keys[chunk_ids].astype("float32"),
+        )
+        report = f"retrieved {len(chunk_ids)} chunk(s):\n{self.describe(chunk_ids)}" if show else ""
+        return evidence, chunk_ids, report
+
+
+def store_prompt_ids(tokenizer, question: str, history: list[dict] | None = None) -> list[int]:
+    """The answer-start prompt an evidence-trained model saw: ``evidence_prompt`` as the last user turn.
+
+    Reuses ``prepare_evidence_data.evidence_prompt`` (the corpus builder's own renderer; the passage
+    is absent from the prompt and arrives through the port) inside the chat template, with no system
+    turn, exactly as ``eval_store.question_prompt`` builds it. Earlier turns in ``history`` keep
+    their text; only the latest user message gets the evidence instruction.
+    """
+    from scripts.prepare_evidence_data import evidence_prompt
+
+    messages = list(history or [])
+    messages.append({"role": "user", "content": evidence_prompt(question)})
+    return ChatTemplate(tokenizer).encode_prompt(messages)
+
+
+def build_evidence_batch(model: TinyMoETransformer, tokenizer, chunks: list[str], device: str,
+                         keys=None) -> EvidenceBatch:
     """Attach a fixed list of chunks through the port for one interactive session.
 
     Single sequence (batch size 1, exactly what this CLI ever decodes), so the query side is one
@@ -69,9 +149,6 @@ def build_evidence_batch(model: TinyMoETransformer, tokenizer, chunks: list[str]
             "this checkpoint has no evidence port -- build one with scripts/migrate_evidence_port.py "
             "before passing --evidence"
         )
-    # loads bge-small-en-v1.5, so this import only happens when --evidence is actually used
-    from scripts.prepare_evidence_data import ChunkEmbedder
-
     ids: list[int] = []
     chunk_ids: list[int] = []
     for local_idx, text in enumerate(chunks):
@@ -81,8 +158,12 @@ def build_evidence_batch(model: TinyMoETransformer, tokenizer, chunks: list[str]
     if not ids:
         raise SystemExit(f"--evidence produced no usable chunks (every chunk tokenized to nothing)")
 
-    embedder = ChunkEmbedder(device=device)
-    keys = embedder.encode(chunks)
+    if keys is None:
+        # loads bge-small-en-v1.5, so this only happens when --evidence is actually used; a store
+        # hands over its own keys instead
+        from scripts.prepare_evidence_data import ChunkEmbedder
+
+        keys = ChunkEmbedder(device=device).encode(chunks)
 
     evidence_ids = torch.tensor([ids], dtype=torch.long, device=device)
     evidence_chunk_ids = torch.tensor([chunk_ids], dtype=torch.long, device=device)
@@ -325,7 +406,31 @@ def prepend_bos(tokenizer, ids: list[int]) -> list[int]:
     return ids
 
 
-def interactive_loop(model, tokenizer, args, device, evidence: EvidenceBatch | None = None):
+def answer_prompt(model, tokenizer, prompt: str, args, device, evidence: EvidenceBatch | None = None,
+                  retriever: StoreRetriever | None = None) -> str:
+    """Generate for one user prompt, retrieving from the store first when a retriever is given."""
+    if retriever is not None:
+        evidence, _, report = retriever.evidence_for(model, tokenizer, prompt, show=args.show_retrieval)
+        if report:
+            print(report, flush=True)
+        prompt_ids = store_prompt_ids(tokenizer, prompt)
+    else:
+        prompt_ids = build_prompt_ids(tokenizer, prompt, args)
+    out = []
+    for chunk in stream_generate(
+        model, tokenizer, prompt_ids, args.max_new_tokens, args.temperature, args.top_k, device,
+        repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
+        top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
+        use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
+        min_loops=args.min_loops, evidence=evidence,
+    ):
+        print(chunk, end="", flush=True)
+        out.append(chunk)
+    return "".join(out)
+
+
+def interactive_loop(model, tokenizer, args, device, evidence: EvidenceBatch | None = None,
+                     retriever: StoreRetriever | None = None):
     print("TinyMoE inference — type your prompt and press Enter. Ctrl-C or 'quit' to exit.\n")
     while True:
         try:
@@ -337,15 +442,7 @@ def interactive_loop(model, tokenizer, args, device, evidence: EvidenceBatch | N
             break
         if not prompt:
             continue
-        prompt_ids = build_prompt_ids(tokenizer, prompt, args)
-        for chunk in stream_generate(
-            model, tokenizer, prompt_ids, args.max_new_tokens, args.temperature, args.top_k, device,
-            repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
-            top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
-            use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
-            min_loops=args.min_loops, evidence=evidence,
-        ):
-            print(chunk, end="", flush=True)
+        answer_prompt(model, tokenizer, prompt, args, device, evidence=evidence, retriever=retriever)
         print("\n")
 
 
@@ -475,7 +572,31 @@ def main():
              "with --converge-tol, but is not bit-exact against --no-kv-cache once the reader is "
              "trained -- see stream_generate's docstring.",
     )
+    parser.add_argument(
+        "--store",
+        default=None,
+        help="Retrieve per prompt from a store directory (data/index/<name>/): the question is "
+             "embedded with bge as the store's query keys were, the top chunks by cosine go through "
+             "the port, and the prompt is the evidence QA template (chat tokens, no system turn). "
+             "Excludes --evidence.",
+    )
+    parser.add_argument(
+        "--retrieval-k",
+        type=int,
+        default=DEFAULT_RETRIEVAL_K,
+        help=f"Chunks retrieved per prompt with --store (default: {DEFAULT_RETRIEVAL_K}, the "
+             "eval_store.py buffer). Not --top-k, which is the sampling filter.",
+    )
+    parser.add_argument(
+        "--show-retrieval",
+        action="store_true",
+        help="With --store, print the retrieved chunk ids and their first 80 characters.",
+    )
     args = parser.parse_args()
+    if args.store and args.evidence:
+        raise SystemExit("--store and --evidence are exclusive")
+    if args.store and args.system:
+        print("note: --system is ignored with --store (evidence-trained models saw no system turn)")
 
     print(f"Loading tokenizer from {args.tokenizer} …")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -492,19 +613,18 @@ def main():
         evidence = build_evidence_batch(model, tokenizer, chunks, args.device)
         print(f"Attached {len(chunks)} evidence chunk(s) from {args.evidence}\n")
 
+    retriever = None
+    if args.store:
+        if not model.moe.evidence_port:
+            raise SystemExit("this checkpoint has no evidence port, --store cannot attach chunks")
+        retriever = StoreRetriever(args.store, args.retrieval_k, args.device)
+        print(f"Store {args.store}: {len(retriever.store.chunks):,} chunks, retrieving {args.retrieval_k} per prompt\n")
+
     if args.prompt is not None:
-        prompt_ids = build_prompt_ids(tokenizer, args.prompt, args)
-        for chunk in stream_generate(
-            model, tokenizer, prompt_ids, args.max_new_tokens, args.temperature, args.top_k, args.device,
-            repetition_penalty=args.repetition_penalty, no_repeat_ngram_size=args.no_repeat_ngram_size,
-            top_p=args.top_p, n_loops=args.n_loops, num_mtp_tokens=args.num_mtp_tokens,
-            use_kv_cache=not args.no_kv_cache, converge_tol=args.converge_tol,
-            min_loops=args.min_loops, evidence=evidence,
-        ):
-            print(chunk, end="", flush=True)
+        answer_prompt(model, tokenizer, args.prompt, args, args.device, evidence=evidence, retriever=retriever)
         print()
     else:
-        interactive_loop(model, tokenizer, args, args.device, evidence=evidence)
+        interactive_loop(model, tokenizer, args, args.device, evidence=evidence, retriever=retriever)
 
 
 if __name__ == "__main__":

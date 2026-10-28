@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # the per-save read set for one real run checkpoint (shape L), the read_pilot_save.sh set on the
-# run's corpus root. usage: bash scripts/reads/read_run2_save.sh CKPT TAG [CHAINS] [EXIT]
+# run's corpus root. usage: bash scripts/reads/read_run2_save.sh CKPT TAG [CHAINS] [EXIT] [BENCH]
 #   CKPT   the checkpoint file
 #   TAG    token count or "final", used in the output names
 #   CHAINS 1 (default) runs eval_chains.py too; 0 skips it
 #   EXIT   1 also reads the per exit CE on the clean slice (eval_exit.py, 40 batches of 4, no evidence); default 0
+#   BENCH  1 (default) also runs the 13-task suite (eval_benchmarks.py, default settings, the pilot ladder's); 0 skips it
 # outputs: ckpts/inject/${RUN}_${TAG}_rank_{none,gold,swapped,prompt}.{json,log},
-#          ckpts/inject/${RUN}_${TAG}_chains_{d123,hop4}.{json,log}, ${RUN}_${TAG}_exit_clean.{json,log} (RUN the run
+#          ckpts/inject/${RUN}_${TAG}_chains_{d123,hop4}.{json,log}, ${RUN}_${TAG}_exit_clean.{json,log},
+#          ${RUN}_${TAG}_bench.{json,log} (RUN the run
 #          name, default run2, so a control run never overwrites the main run's reads); every read is timed
 #          and skipped when its json exists, so a killed read set relaunches where it stopped. exit code 1 when any
 #          read failed (a nonzero exit of the read or no json written), 0 only when every read is there.
@@ -19,7 +21,7 @@
 # defaults are untested on the 80 GB card at width 768: lower them on an OOM, not the question counts.
 cd "${TINY_LLM_ROOT:-/mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm}" || exit 1
 source "${TINY_LLM_ENV_INIT:-env_init}"
-C=$1; TAG=$2; CHAINS=${3:-1}; EXIT=${4:-0}
+C=$1; TAG=$2; CHAINS=${3:-1}; EXIT=${4:-0}; BENCH=${5:-${BENCH:-1}}
 export TINY_LLM_CONFIG=${READ_CONFIG:-${TINY_LLM_CONFIG:-config_run2.yaml}}
 RUN=${RUN:-run2}
 FAILED=0
@@ -52,6 +54,13 @@ if [ "$CHAINS" = 1 ]; then
 fi
 if [ "$EXIT" = 1 ]; then
   run ${B}_exit_clean python scripts/eval_exit.py -c $C --data-dir $R --split inject_val_clean --max-batches 40 --batch-size 4
+fi
+if [ "$BENCH" = 1 ]; then
+  # runs last so a failed or slow suite never delays the reads the supervisor counts. the shards come from
+  # $HF_HOME/datasets when HF_HUB_OFFLINE=1 (stage-small); a per save cache dir keeps parallel reads from sharing copies.
+  BENCH_CACHE=${TMPDIR:-ckpts/inject}/bench_cache_${RUN}_${TAG}
+  run ${B}_bench python scripts/eval_benchmarks.py -c $C --cache-dir $BENCH_CACHE
+  rm -rf $BENCH_CACHE
 fi
 [ "$FAILED" = 0 ] || { echo "reads FAILED for $C"; exit 1; }
 echo "reads complete for $C"

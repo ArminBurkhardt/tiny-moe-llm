@@ -174,7 +174,7 @@ cache. Recipe in `scripts/slurm/README.md` ("The filler through the mirror"); in
 1. On the PC, once: `python scripts/mirror_sources.py list --out listing.json` (the plan flags as for
    the build; 444 GB in 1,127 files at the full plan, limit 2 TB) and `python scripts/mirror_sources.py
    stage-small --hf-home DIR` (tokenizer, bge, SQuAD, HotpotQA, smoltalk2, ultrachat, no_robots, NQ,
-   TriviaQA); copy `DIR` to `$HF_HOME` and `listing.json` to `$DATA_ROOT/listing.json` on the cluster.
+   TriviaQA, and the 13 benchmark task datasets of `eval_benchmarks.py` for the per save suite); copy `DIR` to `$HF_HOME` and `listing.json` to `$DATA_ROOT/listing.json` on the cluster.
    `python scripts/build_run2_corpus.py check-offline --offline-stage $HF_HOME` lists what a stage lacks.
 2. Cluster, the filler job (a whole node, 72 h jobs chained, resumable):
    `STAGES=filler CORPUS_ARGS="--mirror-inbox $DATA_ROOT/inbox --mirror-listing $DATA_ROOT/listing.json --offline-stage $HF_HOME" bash scripts/slurm/submit_chain.sh CORPUS 3`

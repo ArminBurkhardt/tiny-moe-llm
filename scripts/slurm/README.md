@@ -93,6 +93,7 @@ there means trying `BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3` (docker mode) b
    run passes `--plan-split run2_main_train` and, in the warm-up, `--max-epochs-this-split 1`, and the log line "warm split
    exhausted" ends the chain like a stop and asks for the switch decision).
    Read each save: `RUN=run2 PAIRS="ckptA:2B ckptB:4B" sbatch --job-name=run2_reads_run2 scripts/slurm/reads.sbatch`.
+   Each read set ends with the 13-task benchmark suite (`BENCH=1`, the default; `BENCH=0` skips it): language quality is read at every save, offline from `$HF_HOME/datasets` (staged by `stage-small`), output `ckpts/inject/run2_TAG_bench.json`. A failed suite fails the job but never the supervisor's read counting (`reads_done` keys on `rank_none`).
 9. The switch, once the criterion holds: `SPLIT=run2_main_train bash scripts/slurm/submit_chain.sh TRAIN 4` (a fresh
    chain: clears `STOP` and `HALT`, adds `--switch-split`).
 

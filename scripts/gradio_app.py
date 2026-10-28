@@ -16,7 +16,9 @@ import torch
 import gradio as gr
 from transformers import AutoTokenizer
 
-from scripts.inference import load_model, stream_generate, prepend_bos
+from scripts.inference import (
+    DEFAULT_RETRIEVAL_K, StoreRetriever, load_model, stream_generate, prepend_bos, store_prompt_ids,
+)
 from modules.data.chat import ChatTemplate
 from config import ModelConfig
 from utils import BASE_DIR, TOKENIZER_DIR
@@ -41,6 +43,19 @@ DEFAULT_SYSTEM_PROMPT = (
 # when the requested checkpoint/tokenizer/device actually changes -- is the right lifetime for a
 # multi-GB model. Per-session state would mean reloading it on every browser tab.
 _STATE = {"model": None, "tokenizer": None, "checkpoint": None, "tokenizer_dir": None, "device": None}
+
+# set by --store: the chat tab then retrieves from the store on every user turn
+_RETRIEVAL = {"retriever": None, "show": False}
+
+
+ANSWER_SEP = "\n\n---\n\n"
+
+
+def strip_retrieval_report(text: str) -> str:
+    """The answer alone from an assistant message that --show-retrieval prefixed with the report."""
+    if text.startswith("retrieved ") and ANSWER_SEP in text:
+        return text.split(ANSWER_SEP, 1)[1]
+    return text
 
 
 def discover_checkpoints() -> list[str]:
@@ -126,18 +141,37 @@ def run_chat(
     for turn in history:
         role = turn.get("role")
         if role in ("user", "assistant"):
-            messages.append({"role": role, "content": turn.get("content", "")})
-    messages.append({"role": "user", "content": message})
-    prompt_ids = template.encode_prompt(messages)
-
+            content = turn.get("content", "")
+            if role == "assistant":
+                content = strip_retrieval_report(content)
+            messages.append({"role": role, "content": content})
+    evidence = None
     partial = ""
+    if _RETRIEVAL["retriever"] is not None:
+        if not model.moe.evidence_port:
+            yield "This checkpoint has no evidence port, so --store cannot attach chunks. Load an evidence checkpoint."
+            return
+        # per user turn, on the latest message only; earlier turns keep their text, and the system
+        # prompt is dropped because evidence-trained models saw none
+        retriever = _RETRIEVAL["retriever"]
+        retriever.device = device
+        messages = [m for m in messages if m["role"] != "system"]
+        evidence, _, report = retriever.evidence_for(model, tokenizer, message, show=_RETRIEVAL["show"])
+        prompt_ids = store_prompt_ids(tokenizer, message, history=messages)
+        if report:
+            partial = report + ANSWER_SEP
+            yield partial
+    else:
+        messages.append({"role": "user", "content": message})
+        prompt_ids = template.encode_prompt(messages)
+
     for chunk in stream_generate(
         model, tokenizer, prompt_ids, int(max_new_tokens), float(temperature), int(top_k), device,
         repetition_penalty=float(repetition_penalty), no_repeat_ngram_size=int(no_repeat_ngram_size),
         top_p=float(top_p), n_loops=(None if int(n_loops) == 0 else int(n_loops)),
         num_mtp_tokens=int(num_mtp_tokens), use_kv_cache=bool(use_kv_cache),
         converge_tol=(None if float(converge_tol) <= 0 else float(converge_tol)),
-        min_loops=int(min_loops),
+        min_loops=int(min_loops), evidence=evidence,
     ):
         partial += chunk
         yield partial
@@ -232,7 +266,16 @@ def main():
     parser.add_argument("--host", default="127.0.0.1", help="Server bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
     parser.add_argument("--share", action="store_true", help="Create a public Gradio share link")
+    parser.add_argument("--store", default=None,
+                        help="Store directory (data/index/<name>/): the chat tab retrieves from it per user turn")
+    parser.add_argument("--retrieval-k", type=int, default=DEFAULT_RETRIEVAL_K,
+                        help=f"Chunks retrieved per turn with --store (default: {DEFAULT_RETRIEVAL_K})")
+    parser.add_argument("--show-retrieval", action="store_true",
+                        help="With --store, put the retrieved chunk ids and first 80 characters above each answer")
     args = parser.parse_args()
+    if args.store:
+        _RETRIEVAL["retriever"] = StoreRetriever(args.store, args.retrieval_k, DEFAULT_DEVICE)
+        _RETRIEVAL["show"] = args.show_retrieval
 
     demo = build_demo()
     demo.queue().launch(server_name=args.host, server_port=args.port, share=args.share)

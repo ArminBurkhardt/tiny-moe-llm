@@ -143,7 +143,7 @@ def slurm_checks():
     r = slurm_dry("scripts/slurm/corpus.sbatch", STAGES="bios_main,qa", DEVICE="cuda")
     assert "python scripts/build_run2_corpus.py build --data-root /data/x --stage bios_main,qa --device cuda" in r.stdout, r.stdout
     r = slurm_dry("scripts/slurm/reads.sbatch", CKPT="ckpts/x.pt", TAG="10B")
-    assert "RUN=run2 TINY_LLM_CONFIG=config_run2.yaml bash scripts/reads/read_run2_save.sh ckpts/x.pt 10B 1 0" in r.stdout, r.stdout
+    assert "RUN=run2 TINY_LLM_CONFIG=config_run2.yaml bash scripts/reads/read_run2_save.sh ckpts/x.pt 10B 1 0 1" in r.stdout, r.stdout
 
     # rank_exec.sh: rank variables from Slurm's, an exit code file, SIGTERM forwarded to the process
     d = tempfile.mkdtemp()

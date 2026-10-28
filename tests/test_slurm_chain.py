@@ -608,7 +608,7 @@ def main():
     # reads: four pairs one per GPU, exports on request, outputs named by the run
     r = slurm_dry("scripts/slurm/reads.sbatch", PAIRS="a.pt:10B b.pt:20B", EXPORT="1")
     assert r.returncode == 0, r.stderr
-    assert "CUDA_VISIBLE_DEVICES=1 RUN=run2 TINY_LLM_CONFIG=config_run2.yaml bash scripts/reads/read_run2_save.sh b.pt 20B 1 0" in r.stdout, r.stdout
+    assert "CUDA_VISIBLE_DEVICES=1 RUN=run2 TINY_LLM_CONFIG=config_run2.yaml bash scripts/reads/read_run2_save.sh b.pt 20B 1 0 1" in r.stdout, r.stdout
     assert ("CUDA_VISIBLE_DEVICES=0 TINY_LLM_CONFIG=config_run2.yaml python scripts/export_weights.py -c a.pt "
             "--out /data/x/exports/run2_10B.pt") in r.stdout
     r = slurm_dry("scripts/slurm/reads.sbatch", PAIRS="a.pt:10B", EXPORT="1", RUN="run2_control")
@@ -629,7 +629,7 @@ def main():
     r = slurm_dry("scripts/slurm/corpus.sbatch", STAGES="qa", SIF="/p/run2.sif", PATH=path)
     assert "run2.sif python scripts/build_run2_corpus.py" in r.stdout, r.stdout
     r = slurm_dry("scripts/slurm/reads.sbatch", CKPT="a.pt", TAG="1B", SIF="/p/run2.sif", PATH=path)
-    assert "run2.sif bash scripts/reads/read_run2_save.sh a.pt 1B 1 0" in r.stdout, r.stdout
+    assert "run2.sif bash scripts/reads/read_run2_save.sh a.pt 1B 1 0 1" in r.stdout, r.stdout
     assert "chain_mode presubmitted" in slurm_dry("scripts/slurm/train_job.sh", MODE="run").stdout
     assert "chain_mode self" in slurm_dry("scripts/slurm/train_job.sh", MODE="run", CHAIN_MODE="self").stdout
     assert slurm_dry("scripts/slurm/train_job.sh", MODE="run", STOP_AFTER="a.*").returncode == 2

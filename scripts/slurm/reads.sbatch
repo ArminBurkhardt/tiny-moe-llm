@@ -16,7 +16,7 @@
 # env: PAIRS (CKPT:TAG pairs, at most 4) or CKPT and TAG, RUN (default run2: the prefix of every output, reads
 #      ckpts/inject/RUN_TAG_*, exports $DATA_ROOT/exports/RUN_TAG.pt, so the control never overwrites the main run),
 #      READ_CONFIG (default config_run2.yaml: TINY_LLM_CONFIG of the reads and of the export), CHAINS (default 1),
-#      EXIT (default 0), EXPORT=1 (also write the weights export before each read), RANK_BS and CHAINS_BS (batch sizes
+#      EXIT (default 0), BENCH (default 1: also the 13-task suite, offline from $HF_HOME/datasets), EXPORT=1 (also write the weights export before each read), RANK_BS and CHAINS_BS (batch sizes
 #      of the read script; lower them on an out of memory), DRY_RUN=1.
 # each save is copied first to the node's temporary disk when one is set (the trainer's retention deletes rolling saves).
 # a read is skipped when its json exists, so a killed job is resubmitted with the same line. the job exits nonzero when
@@ -37,7 +37,7 @@ while read -r CK TG; do
   if [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ] && [ "${DRY_RUN:-0}" != 1 ]; then
     cp "$CK" "$TMPDIR/read_${RUN}_$TG.pt" && C=$TMPDIR/read_${RUN}_$TG.pt && COPIES="$COPIES $C"
   fi
-  CMD="CUDA_VISIBLE_DEVICES=$i RUN=$RUN TINY_LLM_CONFIG=$READ_CONFIG ${CTR}bash scripts/reads/read_run2_save.sh $C $TG ${CHAINS:-1} ${EXIT:-0}"
+  CMD="CUDA_VISIBLE_DEVICES=$i RUN=$RUN TINY_LLM_CONFIG=$READ_CONFIG ${CTR}bash scripts/reads/read_run2_save.sh $C $TG ${CHAINS:-1} ${EXIT:-0} ${BENCH:-1}"
   EXP="CUDA_VISIBLE_DEVICES=$i TINY_LLM_CONFIG=$READ_CONFIG ${CTR}python scripts/export_weights.py -c $C --out $DATA_ROOT/exports/${RUN}_$TG.pt"
   if [ "${DRY_RUN:-0}" = 1 ]; then
     [ "${EXPORT:-0}" = 1 ] && echo "$EXP"

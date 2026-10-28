@@ -208,6 +208,28 @@ def load_store(root: str) -> Store:
                  query_keys=query_keys, edits=edits)
 
 
+def top_k_chunks(query_key: np.ndarray, keys: np.ndarray, k: int):
+    """Top ``k`` chunk ids for one query by cosine, best first.
+
+    Args:
+        query_key: ``[D]`` query vector (normalized here, so a unit vector is not required).
+        keys: ``[N, D]`` chunk keys, any float dtype (normalized here as well).
+        k: how many chunks to return, capped at ``N``.
+
+    Returns:
+        ``(ids, scores)``: int64 ``[min(k, N)]`` row ids and their float32 cosines. Ties go to the
+        lower id.
+    """
+    keys = np.asarray(keys, dtype=np.float32)
+    query = np.asarray(query_key, dtype=np.float32).reshape(-1)
+    keys = keys / np.maximum(np.linalg.norm(keys, axis=1, keepdims=True), 1e-12)
+    query = query / max(float(np.linalg.norm(query)), 1e-12)
+    scores = keys @ query
+    k = max(0, min(int(k), scores.shape[0]))
+    order = np.lexsort((np.arange(scores.shape[0]), -scores))[:k]
+    return order.astype(np.int64), scores[order]
+
+
 _SENTENCE_BREAK = re.compile(
     r"(?:(?<=[.!?])|(?<=[.!?][\"')\]]))\s+(?=[A-Z0-9\"'(\[])|\n+")
 

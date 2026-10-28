@@ -405,6 +405,11 @@ def test_7_stage_small_and_offline_hub():
             "florin-hf/nq_open_gold": ["test_dataset.json", "train.json"],
             "mandarjoshi/trivia_qa": ["rc.wikipedia/validation-0.parquet", "rc.wikipedia/train-0.parquet"],
         }
+        for repo, rev, prefixes, _ in m.BENCH_DATASETS:
+            ext = "" if repo == "akariasai/PopQA" else ".parquet"
+            names.setdefault(repo, []).extend(p + ext for p in prefixes)
+            names[repo].append("README.md")
+        names["mandarjoshi/trivia_qa"].append("rc.nocontext/train-0.parquet")
         api = SimpleNamespace(dataset_info=lambda r: SimpleNamespace(sha="s_" + r),
                               list_repo_files=lambda r, repo_type=None, revision=None: names[r])
 
@@ -421,6 +426,10 @@ def test_7_stage_small_and_offline_hub():
         assert idx["datasets"]["hotpotqa/hotpot_qa"]["files"] == ["distractor/train-0.parquet", "distractor/validation-0.parquet"]
         assert idx["datasets"]["HuggingFaceTB/smoltalk2"]["files"] == ["SFT/a_no_think.parquet"]
         assert idx["datasets"]["florin-hf/nq_open_gold"]["files"] == ["test_dataset.json"]
+        trivia = idx["datasets"]["mandarjoshi/trivia_qa"]["files"]
+        assert trivia == ["rc.nocontext/validation.parquet", "rc.wikipedia/validation-0.parquet"], trivia
+        assert idx["datasets"]["ybisk/piqa"]["files"] == ["plain_text/validation.parquet"]
+        assert idx["datasets"]["akariasai/PopQA"]["files"] == ["test.tsv"]
         assert snaps == [m.BGE_REPO, m.TOKENIZER_REPO]
         hub = ModuleType("fake_hub")
         hub.HfApi = type("HfApi", (), {})
