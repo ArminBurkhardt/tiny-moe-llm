@@ -65,8 +65,21 @@ import numpy as np
 import torch
 from transformers import PreTrainedTokenizerBase
 
-from modules.data.sft_dataset import SFTDataset
+from modules.data.sft_dataset import SFTDataset, check_index_total
 from utils import logger
+
+
+def _index_lengths(path: str) -> np.ndarray:
+    """Per document lengths from a uint64 offset file as int32, differenced in place.
+
+    One uint64 read buffer plus one int32 copy, against the three int64 temporaries of
+    ``np.diff(...).astype(np.int64)``; a document is far below 2**31 tokens.
+    """
+    offsets = np.fromfile(path, dtype=np.uint64)
+    np.subtract(offsets[1:], offsets[:-1], out=offsets[:-1])
+    lengths = offsets[:-1].astype(np.int32)
+    del offsets
+    return lengths
 
 EMBED_DIM = 384
 
@@ -153,6 +166,8 @@ class EvidenceDataset(SFTDataset):
         if os.path.getsize(self.evchunk_path) != os.path.getsize(self.ev_path):
             raise ValueError(f"{split}.evchunk and {split}.ev disagree -- rebuild the corpus")
         n_chunks = os.path.getsize(self.evkey_path) // (EMBED_DIM * 2)
+        check_index_total(self.evidx_path, self.ev_path, os.path.getsize(self.ev_path) // 2)
+        check_index_total(self.evkeyidx_path, self.evkey_path, n_chunks)
 
         # the gold flag and the condition label are a later addition to the on-disk format. A corpus
         # built before they existed simply has neither file, and that has to be a warning, not a
@@ -209,13 +224,26 @@ class EvidenceDataset(SFTDataset):
 
         # a document the row limit rules out is dropped silently by the packer; naming the size of
         # that loss in a run's first lines is what lets a builder cap that disagrees with it show up
-        doc_lengths = np.diff(np.fromfile(self.idx_path, dtype=np.uint64)).astype(np.int64)
+        doc_lengths = _index_lengths(self.idx_path)
+        ev_lengths = _index_lengths(self.evidx_path)
         over = (doc_lengths > 0) & (doc_lengths + self.num_mtp_tokens > self.max_length - 1)
         logger.info(
             f"EvidenceDataset[{split}]: {int(over.sum()):,} documents, "
-            f"{int(doc_lengths[over].sum()):,} tokens over the evidence reader's row limit "
+            f"{int(doc_lengths[over].sum(dtype=np.int64)):,} tokens over the evidence reader's row limit "
             f"({self.max_length - 1} with {self.num_mtp_tokens} pads) will be skipped"
         )
+        # the packer also drops a document whose own evidence exceeds the row's evidence budget
+        # (one not already dropped for its length); counted here so a cap that disagrees with the
+        # corpus shows in the first lines instead of at the end of an iteration
+        over_ev = (doc_lengths > 0) & ~over & (ev_lengths > self.max_evidence_tokens)
+        self.startup_skipped_evidence = int(over_ev.sum())
+        logger.info(
+            f"EvidenceDataset[{split}]: {self.startup_skipped_evidence:,} further documents, "
+            f"{int(doc_lengths[over_ev].sum(dtype=np.int64)):,} prompt tokens and "
+            f"{int(ev_lengths[over_ev].sum(dtype=np.int64)):,} evidence tokens carry more evidence "
+            f"than max_evidence_tokens={self.max_evidence_tokens} and will be skipped"
+        )
+        del doc_lengths, ev_lengths, over, over_ev
 
     def _batch_iterator(self) -> Iterator[dict]:
         bin_mmap = np.memmap(self.bin_path, dtype=np.uint16, mode="r")

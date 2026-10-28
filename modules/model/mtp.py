@@ -290,7 +290,7 @@ def compute_mtp_loss(
             
             if pad_mask is not None:
                 source_is_pad = pad_mask[:, :-shift]
-                aux_labels[source_is_pad] = -100
+                aux_labels = aux_labels.masked_fill(source_is_pad, -100)
 
             # chunked LM head + CE, bounds the per head logit memory. the weights shift with the
             # labels (both index the token being predicted), and _chunked_linear_ce masks them by

@@ -6,6 +6,7 @@ GPU-free and builder-free: the driver imports no builder at module level.
 import contextlib
 import io
 import json
+import math
 import os
 import random
 import signal
@@ -76,9 +77,13 @@ def test_3_phase1_caps_and_supply():
     d = b.derive(plan)
     rows = {r["source"]: r for r in b.filler_supply(plan, d)}
     sup = b.physical_supply
-    assert rows["code_edu"]["need"] <= 0.95 * sup("code_edu") * 1.0001
-    assert rows["wikipedia"]["need"] <= 0.90 * sup("wikipedia") * 1.0001
-    assert rows["nemotron_math"]["need"] <= 0.65 * sup("nemotron_math") * 1.0001, "nemotron is a receiver up to 65%"
+    phases = b.filler_need_by_phase(d)
+    three = {src: sum(phases[ph].get(src, 0.0) for ph in ("phase1", "phase2", "ir")) for src in b.SOURCE_SUPPLY}
+    assert three["code_edu"] <= 0.95 * sup("code_edu") * 1.0001
+    assert three["wikipedia"] <= 0.90 * sup("wikipedia") * 1.0001
+    assert three["nemotron_math"] <= 0.65 * sup("nemotron_math") * 1.0001, "nemotron is a receiver up to 65%"
+    for src in ("code_edu", "wikipedia", "nemotron_math", "dclm", "finepdfs", "fineweb"):
+        assert rows[src]["need"] <= b.TAIL_CAP * sup(src) * 1.0001, f"{src}: the tail phase stays under the fresh supply"
     assert rows["fineweb"]["need"] > rows["fineweb"]["supply_default"], "one crawl cannot supply fineweb"
     assert rows["fineweb"]["need"] < 0.90 * rows["fineweb"]["supply_patched"]
     assert rows["smoltalk2"]["need"] + d["qa_arms"]["smoltalk2"] <= b.SMOLTALK2_SUPPLY * 1.001
@@ -135,7 +140,8 @@ def test_4_dry_run_every_stage_prints_its_flags():
     assert "--heldout" in text["heldout_qa"]
     assert "--prefix chains " in text["heldout_chains"] and "eval,heldout_tmpl,hop4" in text["heldout_chains"]
     assert text["prune_filler"].startswith("rm -f") and "phase1.bin" in text["prune_filler"]
-    assert "evidence_run2_train.ev" in text["prune_sources"] and "inject_val" not in text["prune_sources"]
+    assert "evidence_run2_train.ev" in text["prune_bios"] and "inject_val" not in text["prune_bios"]
+    assert "inject_val" not in text["prune_sources"] and "chains_run2_train.ev" in text["prune_sources"]
     assert "mirror" not in text["filler"] and "HF_HUB_OFFLINE" not in text["qa"]
     print("test 4 ok")
 
@@ -359,8 +365,8 @@ def test_12_disk_schedule_and_budgets():
     assert all(r["writes"] >= 0 and r["deletes"] >= 0 for r in sched["rows"])
     assert [r["stage"] for r in sched["rows"][:3]] == ["filler", "qa", "bios_main"]
     assert abs(sched["standing"] - sum(r["writes"] - r["deletes"] for r in sched["rows"])) < 1.0
-    assert sched["peak"] <= 3.4e12 and sched["standing"] <= 2.0e12, (sched["peak"], sched["standing"])
-    assert b.disk_problems(sched, 3.4e12, 2.0e12) == []
+    assert sched["peak"] <= 3.4e12 and sched["standing"] <= 2.6e12, (sched["peak"], sched["standing"])
+    assert b.disk_problems(sched, 3.4e12, 2.6e12) == []
     assert len(b.disk_problems(sched, 1e12, 1e12)) == 2
     sz = sched["sizes"]
     assert sz["bios_main"] < 0.9e12, "biography evidence is per rendering, not per token"
@@ -756,18 +762,21 @@ def test_22_heartbeat_keeps_a_silent_stage_talking():
 def test_23_rows_stage_commands_order_and_inputs():
     lines = dry_lines()
     cmds = stage_commands(lines)
-    assert b.STAGE_ORDER.index("rows") == b.STAGE_ORDER.index("merge_control") + 1 < b.STAGE_ORDER.index("prune_sources")
-    main_cmd, ctl_cmd = cmds["rows"]
+    assert b.STAGE_ORDER.index("rows") == b.STAGE_ORDER.index("merge_tail") + 1 < b.STAGE_ORDER.index("prune_sources")
+    main_cmd, ctl_cmd, tail_cmd = cmds["rows"]
     assert main_cmd.startswith("TINY_LLM_CONFIG=config_run2.yaml python scripts/sft.py --evidence --estimate-rows-only")
-    assert all("--estimate-world-sizes 1,2,4,8,16" in c for c in (main_cmd, ctl_cmd))
+    assert all("--estimate-world-sizes 1,2,4,8,16" in c for c in (main_cmd, ctl_cmd, tail_cmd))
+    assert tail_cmd.startswith("TINY_LLM_CONFIG=config_run2.yaml ") and "--train-split run2_tail_train" in tail_cmd
+    assert "--plan-split" not in tail_cmd, "the tail's own estimate, to check it against the rows the run needs"
     assert "--data-dir /data/run2/prepared_run2 --train-split run2_main_train --plan-split run2_main_train" in main_cmd
     assert ctl_cmd.startswith("TINY_LLM_CONFIG=config_run2_control.yaml ")
     assert "--train-split run2_control_train" in ctl_cmd and "--plan-split" not in ctl_cmd
     cfg = b.Cfg(data_root="/data/run2", plan=b.Plan())
     st = {s.name: s for s in b.build_stages(cfg)}["rows"]
     assert st.outputs == ["/data/run2/prepared_run2/run2_main_train.rows_estimate.json",
-                          "/data/run2/prepared_run2/run2_control_train.rows_estimate.json"]
-    assert set(st.requires) == {"merge_main", "merge_warm", "merge_control"}
+                          "/data/run2/prepared_run2/run2_control_train.rows_estimate.json",
+                          "/data/run2/prepared_run2/run2_tail_train.rows_estimate.json"]
+    assert set(st.requires) == {"merge_main", "merge_warm", "merge_control", "merge_tail"}
     assert st.needs_files == ["/data/run2/prepared_run2/run2_main_train.order.json"], "the estimate needs the order sidecar"
     with tempfile.TemporaryDirectory() as tmp:
         cfg = b.Cfg(data_root=tmp, plan=b.Plan(scale=0.001))
@@ -782,13 +791,18 @@ def test_23_rows_stage_commands_order_and_inputs():
     with tempfile.TemporaryDirectory() as tmp2:
         c2 = b.Cfg(data_root=tmp2, plan=b.Plan())
         os.makedirs(c2.run2)
-        assert len(b.rows_check(c2)) == 2, "missing jsons"
-        for split in (b.MAIN_SPLIT, b.CTL_SPLIT):
+        assert len(b.rows_check(c2)) == 3, "missing jsons"
+        for split in (b.MAIN_SPLIT, b.CTL_SPLIT, b.TAIL_SPLIT):
             json.dump({"key": {}, "rows": {"4": 1, "8": 1, "16": 1, "32": 1}}, open(os.path.join(c2.run2, split + ".rows_estimate.json"), "w"))
-        assert len(b.rows_check(c2)) == 2 and "16 ranks" in b.rows_check(c2)[0], "no entry for 16 ranks (64 workers)"
-        for split in (b.MAIN_SPLIT, b.CTL_SPLIT):
+        assert len(b.rows_check(c2)) == 3 and "16 ranks" in b.rows_check(c2)[0], "no entry for 16 ranks (64 workers)"
+        for split in (b.MAIN_SPLIT, b.CTL_SPLIT, b.TAIL_SPLIT):
             json.dump({"key": {}, "rows": {"4": 1, "8": 1, "16": 1, "32": 1, "64": 1}}, open(os.path.join(c2.run2, split + ".rows_estimate.json"), "w"))
         assert b.rows_check(c2) == []
+        for split, rows in ((b.MAIN_SPLIT, 1_000_000), (b.CTL_SPLIT, 1), (b.TAIL_SPLIT, 160_000)):
+            json.dump({"key": {}, "rows": {k: rows for k in ("4", "8", "16", "32", "64")}}, open(os.path.join(c2.run2, split + ".rows_estimate.json"), "w"))
+        assert b.rows_check(c2) == [], "the last 5% of 3 epochs of 1M rows is 150k; the tail has 160k"
+        json.dump({"key": {}, "rows": {k: 140_000 for k in ("4", "8", "16", "32", "64")}}, open(os.path.join(c2.run2, b.TAIL_SPLIT + ".rows_estimate.json"), "w"))
+        assert len(b.rows_check(c2)) == 5 and all("150,000" in x for x in b.rows_check(c2))
     cfgo = b.Cfg(data_root="/d", plan=b.Plan(), offline_stage="/hf", mirror_inbox="/in", mirror_listing="/l")
     assert "TINY_LLM_TOKENIZER=/hf/tokenizer" in {s.name: s for s in b.build_stages(cfgo)}["rows"].commands[0]
     sft = open(os.path.join(ROOT, "scripts", "sft.py"), encoding="utf-8").read()
@@ -986,6 +1000,296 @@ def test_30_qa_is_permuted_before_the_order_and_every_merge_reads_the_copy():
             assert b.main(["split-tokens", "--prefix", os.path.join(tmp, "s1"), "--plus", "1"]) == 0
         assert buf.getvalue().strip() == "10"
     print("test 30 ok")
+
+
+def test_31_tail_plan_shares_sources_and_stage_order():
+    plan = b.Plan()
+    d = b.derive(plan)
+    t = d["tail"]
+    assert t["tokens"] == 42e9 and t["read"] == 40e9 and abs(sum(t["shares"].values()) - 1.0) < 1e-9
+    assert abs(t["tokens"] / t["read"] - 1.05) < 1e-9, "a 5% surplus over what the run reads"
+    assert t["shares"] == {"text": 0.65, "main": 0.12, "qa": 0.15, "chains": 0.04, "bridge": 0.04}
+    assert t["qa_passes"] <= plan.tail_qa_passes and t["plain_passes"] <= plan.tail_chain_passes
+    assert t["bridge_passes"] <= plan.tail_chain_passes
+    assert abs(t["qa_passes"] - 6.3e9 / d["qa"]) < 1e-9
+    # the plain text: fresh files only, each source under what the three filler phases left of its supply
+    used = {r["source"]: r["after_tokens"] for r in d["phase1_rows"]}
+    by = {r["source"]: r for r in t["rows"]}
+    assert abs(sum(by[s]["after_tokens"] for s in by) - t["filler"]) < 1.0
+    for src, row in by.items():
+        assert row["after_tokens"] <= row["limit"] + 1.0, src
+        assert row["limit"] <= b.TAIL_CAP * b.physical_supply(src) - used[src] + 1.0, src
+    assert by["code_edu"]["capped"] and by["wikipedia"]["capped"], "nearly all of both went to the earlier filler phases"
+    assert by["dclm"]["after_tokens"] > by["dclm"]["before_tokens"], "the shortfall goes to the receivers"
+    assert abs(sum(t["weights"].values()) - 1.0) < 1e-9
+    # a quality order: the tail asks for far less fineweb than the filler's phase 1 (0.63)
+    assert t["weights"]["fineweb"] < 0.2 and t["weights"]["dclm"] > 0.3
+    try:
+        b.cap_tail(1e15, {})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a tail need beyond every receiver must be refused")
+    try:
+        b.derive(b.Plan(tail_shares={"text": 0.5, "main": 0.1, "qa": 0.1, "chains": 0.1, "bridge": 0.1}))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("shares that do not sum to 1 are refused")
+    # the tail phase joins the mirror listing as phase "late", after ir
+    need = b.filler_file_need(plan, d)
+    assert all("late" in v["need"] for v in need.values()) and need["dclm"]["need"]["late"] > 0
+    assert need["smoltalk2"]["need"]["late"] == 0
+    small = b.derive(b.Plan(scale=0.001))
+    assert abs(small["tail"]["tokens"] - 42e6) < 1.0 and not any(r["capped"] for r in small["tail"]["rows"])
+    # stage graph: the tail's inputs exist when its stages run, and no prune deletes them before
+    order = b.STAGE_ORDER
+    pos = {n: i for i, n in enumerate(order)}
+    assert pos["filler"] < pos["tail_text"] < pos["prune_filler"] < pos["chains_plain"]
+    assert pos["merge_control"] < pos["prune_bios"] < pos["merge_tail"] < pos["rows"] < pos["prune_sources"]
+    stages = {s.name: s for s in b.build_stages(b.Cfg(data_root="/data/run2", plan=plan))}
+    assert "tail_text" in stages["prune_filler"].requires
+    assert set(stages["prune_bios"].requires) >= {"merge_main", "merge_warm", "merge_control", "qa_shuffle"}
+    assert set(stages["merge_tail"].requires) >= {"merge_main", "tail_text", "qa_shuffle", "chains_plain", "chains_bridge", "prune_bios"}
+    assert set(stages["prune_sources"].requires) >= {"merge_tail", "merge_main", "merge_warm", "merge_control"}
+    assert set(stages["rows"].requires) >= {"merge_tail"}
+    pruned_by_bios = set(stages["prune_bios"].prune)
+    pruned_by_sources = set(stages["prune_sources"].prune)
+    for sl in stages["merge_tail"].commands[0].split(" --slice ")[1:]:
+        prefix = sl.split("=", 1)[1].split(":")[0]
+        assert not any(f.startswith(prefix + ".") for f in pruned_by_bios), prefix
+    assert any("tail_text.bin" in f for f in pruned_by_sources) and any("run2_qa_shuf_train" in f for f in pruned_by_sources)
+    assert not any("chains_run2_train" in f for f in pruned_by_bios), "the chain builds stay for the tail merge"
+    assert not any("run2_main_train" in f for f in pruned_by_bios | pruned_by_sources), "the main split is never pruned"
+    assert stages["qa"].pruned_by == "prune_bios" and stages["chains_plain"].pruned_by == "prune_sources"
+    assert stages["tail_text"].restart and b.RESUMABLE["tail_text"] is False and b.RESUMABLE["merge_tail"] is True
+    assert stages["tail_text"].pruned_by == "prune_sources" and stages["merge_tail"].check == "merge_tail"
+    print("test 31 ok")
+
+
+def test_32_tail_commands_and_disk_plan():
+    cmds = stage_commands(dry_lines())
+    assert len(cmds["filler"]) == 4, "phase 1, phase 2, ir, then the tail plain text as the fourth command"
+    late = cmds["filler"][3]
+    assert "--exclude-files-of phase1,phase2,ir" in late and "--manifest-key tail_prep" in late
+    assert "--data-dir /data/run2/prepared_tail --phases phase1" in late and "--phase1-weights dclm=" in late
+    assert late.startswith("python scripts/build_run2_corpus.py wrap-prepare-data --fineweb-prefix data/"), "the same wrapper"
+    assert "--manifest-key data_prep" not in late and "--manifest-key ir_prep" not in late
+    tt = cmds["tail_text"][0]
+    assert tt.startswith("python scripts/build_run2_corpus.py tail-text --src /data/run2/prepared_tail/phase1 ")
+    assert "--out /data/run2/prepared_tail/tail_text --target 28665000000" in tt and "--allow-repeat" not in tt
+    assert "--allow-repeat" in " ".join(stage_commands(dry_lines(["--allow-filler-repeat"]))["tail_text"])
+    mt = cmds["merge_tail"][0]
+    assert "--split run2_tail_train --target-tokens 42000000000 --seed 43" in mt and "--overwrite" in mt
+    assert "--order-prefix-from" not in mt and "--no-evidence" not in mt
+    for label, frag in (("text", "/data/run2/prepared_tail/tail_text:0.650000:1"),
+                        ("main", "/data/run2/prepared_run2/run2_main_train:0.120000:1"),
+                        ("qa", "/data/run2/prepared_run2/run2_qa_shuf_train:0.150000:5"),
+                        ("chains", "/data/run2/prepared/chains_run2_train:0.040000:2"),
+                        ("bridge", "/data/run2/prepared/chains_bridge_run2_train:0.040000:2")):
+        assert f"--slice {label}={frag}" in mt, (label, mt)
+    assert cmds["prune_bios"][0].startswith("rm -f") and "inject_retrieval_s15a50g1_train.ev" in cmds["prune_bios"][0]
+    assert "evidence_run2_train.ev" in cmds["prune_bios"][0] and "chains_run2_train" not in cmds["prune_bios"][0]
+    assert "prepared_tail/tail_text.bin" in cmds["prune_sources"][0]
+    # the disk plan: the tail adds a merge of its own, the peak stays under the budget
+    plan = b.Plan()
+    sched = b.disk_schedule(plan, b.derive(plan))
+    rows = {r["stage"]: r for r in sched["rows"]}
+    assert rows["merge_tail"]["writes"] > 0.5e12 and rows["prune_bios"]["deletes"] > 0.9e12
+    assert rows["merge_control"]["running"] > rows["merge_tail"]["running"] > rows["prune_sources"]["running"]
+    assert sched["peak"] <= 3.4e12 and sched["standing"] <= 2.6e12
+    assert sched["standing"] > 2.0e12, "the tail is standing data: the old 2.0 TB standing budget no longer holds"
+    assert rows["tail_text"]["writes"] < 0.1e12 and rows["prune_filler"]["deletes"] > rows["filler"]["writes"] - 1.0
+    hours = b.hours_plan(plan, b.derive(plan))
+    assert hours["tail_text"] > 0 and hours["merge_tail"] > 0 and b.long_stage_flags(hours) == []
+    sz = sched["sizes"]
+    assert 0.3 < sz["tail_ev_ratio"] < 0.6, sz["tail_ev_ratio"]
+    print("test 32 ok")
+
+
+def _write_phase(prefix, docs):
+    import numpy as np
+    toks = np.concatenate([np.asarray(d, dtype=np.uint16) for d in docs])
+    toks.tofile(prefix + ".bin")
+    np.concatenate([[0], np.cumsum([len(d) for d in docs])]).astype(np.uint64).tofile(prefix + ".idx")
+    return toks
+
+
+def test_33_tail_text_windows_mask_and_repeat():
+    import numpy as np
+    docs = [list(range(100, 100 + n)) for n in (5, 31, 32, 999, 1000, 1001, 1031, 1032, 2500, 40)]
+    with tempfile.TemporaryDirectory() as tmp:
+        src, out = os.path.join(tmp, "p"), os.path.join(tmp, "t")
+        _write_phase(src, docs)
+        # the biography build's rule: whole windows of 1000, the last under 32 dropped
+        want = []
+        for dd in docs:
+            for a in range(0, len(dd), 1000):
+                w = dd[a:a + 1000]
+                if len(w) >= 32:
+                    want.append(w)
+        total = sum(len(w) + 2 for w in want)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            assert b.cmd_tail_text(["--src", src, "--out", out, "--target", str(total + 10 ** 6), "--bos-id", "0", "--eos-id", "1"]) == 1
+        assert not any(os.path.exists(out + "." + x) for x in ("bin", "idx", "mask")), "a short input leaves nothing behind"
+        assert not [f for f in os.listdir(tmp) if f.endswith(".part")]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            assert b.cmd_tail_text(["--src", src, "--out", out, "--target", str(total + 10 ** 6), "--min-tokens", str(total + 1),
+                                    "--bos-id", "0", "--eos-id", "1"]) == 1, "under the merge's need still fails"
+        short_out = io.StringIO()
+        with contextlib.redirect_stdout(short_out):
+            assert b.cmd_tail_text(["--src", src, "--out", out, "--target", str(total + 10 ** 6), "--min-tokens", str(total),
+                                    "--bos-id", "0", "--eos-id", "1"]) == 0, "between the need and the target it warns and finishes"
+        assert "WARNING" in short_out.getvalue()
+        info = json.load(open(out + ".json"))
+        assert info["tokens"] == total and info["shortfall"] == 10 ** 6, info
+        for x in ("bin", "idx", "mask", "json"):
+            os.remove(out + "." + x)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.cmd_tail_text(["--src", src, "--out", out, "--target", str(total), "--bos-id", "0", "--eos-id", "1"]) == 0
+        ids = np.fromfile(out + ".bin", dtype=np.uint16)
+        mask = np.fromfile(out + ".mask", dtype=np.uint8)
+        idx = np.fromfile(out + ".idx", dtype=np.uint64)
+        assert len(ids) == len(mask) == total and idx[0] == 0 and idx[-1] == total and len(idx) == len(want) + 1
+        for i, w in enumerate(want):
+            lo, hi = int(idx[i]), int(idx[i + 1])
+            assert ids[lo] == 0 and ids[hi - 1] == 1 and list(ids[lo + 1:hi - 1]) == w, i
+            assert mask[lo] == 0 and mask[lo + 1:hi].all(), "mask 1 everywhere but on BOS"
+        info = json.load(open(out + ".json"))
+        assert info["windows"] == len(want) and info["tokens"] == total and not info["repeat"]
+        # a target inside the corpus stops at the first window that reaches it
+        out2 = os.path.join(tmp, "t2")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.cmd_tail_text(["--src", src, "--out", out2, "--target", "2000", "--bos-id", "0", "--eos-id", "1"]) == 0
+        idx2 = np.fromfile(out2 + ".idx", dtype=np.uint64)
+        assert idx2[-1] >= 2000 and idx2[-2] < 2000, "the first window that reaches the target ends the file"
+        # --allow-repeat cycles a short input (a smoke run) and says so
+        out3 = os.path.join(tmp, "t3")
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.cmd_tail_text(["--src", src, "--out", out3, "--target", str(2 * total + 5), "--allow-repeat",
+                                    "--bos-id", "0", "--eos-id", "1"]) == 0
+        assert json.load(open(out3 + ".json"))["repeat"] and np.fromfile(out3 + ".idx", dtype=np.uint64)[-1] >= 2 * total + 5
+    # the windowing equals prepare_injection_data.load_filler_windows
+    try:
+        import prepare_injection_data as pid
+    except Exception:
+        pid = None
+    if pid is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "p")
+            _write_phase(src, docs)
+            _, train, val = pid.load_filler_windows([(src + ".bin", src + ".idx")], 1000, 42, 0.0)
+            offsets = np.asarray(np.memmap(src + ".idx", dtype=np.uint64, mode="r"), dtype=np.int64)
+            got = [(int(a), int(l)) for blk in b.tail_text_blocks(offsets) for a, l in zip(*blk)]
+            assert got == [(int(r[1]), int(r[2])) for r in train], "the same windows as the biography build cuts"
+    print("test 33 ok")
+
+
+def test_34_tail_merge_check_and_restart_rules():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = b.Cfg(data_root=tmp, plan=b.Plan(scale=0.001))
+        os.makedirs(cfg.run2)
+        target = b.derive(cfg.plan)["tail"]["tokens"]
+        path = os.path.join(cfg.run2, b.TAIL_SPLIT + ".merge.json")
+        assert "missing" in b.check_tail_merge(cfg)[0]
+        sl = [{"label": l, "prompt_tokens": 1, "share_realised": 0.2, "share_target": 0.2, "passes": 1.0, "max_passes": 1,
+               "evidence_ratio": 0.0} for l in b.TAIL_LABELS]
+        meta = {"md5_by_slice": {l: "x" for l in b.TAIL_LABELS}, "prompt_tokens": int(target), "slices": sl}
+        json.dump(meta, open(path, "w"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.check_tail_merge(cfg) == []
+            assert b.check_merge(cfg, "merge_tail") == []
+        meta["prompt_tokens"] = int(0.985 * target)
+        json.dump(meta, open(path, "w"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert len(b.check_tail_merge(cfg)) == 1, "a gap over 1% (a slice ran out of documents) is refused"
+        meta["prompt_tokens"] = int(target)
+        del meta["md5_by_slice"]["bridge"]
+        json.dump(meta, open(path, "w"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert "no bridge" in b.check_tail_merge(cfg)[0]
+        # a killed merge_tail resumes (state file kept), a killed tail_text restarts clean
+        stages = {s.name: s for s in b.build_stages(cfg)}
+        os.makedirs(cfg.tail_dir)
+        partial = [os.path.join(cfg.tail_dir, "tail_text." + x) for x in ("bin", "idx", "mask", "json", "bin.part")]
+        keep = os.path.join(cfg.tail_dir, "phase1.bin")
+        for p in partial + [keep]:
+            open(p, "w").close()
+        with contextlib.redirect_stdout(io.StringIO()):
+            b.clean_partial(stages["tail_text"], print)
+        assert not any(os.path.exists(p) for p in partial[:4]) and os.path.exists(keep)
+        assert stages["merge_tail"].state_file.endswith("run2_tail_train.merge_state.json") and not stages["merge_tail"].restart
+        # tail_text and the filler stage skip once pruned (marker present, outputs gone)
+        os.makedirs(cfg.done)
+        for name in ("tail_text", "prune_sources", "filler", "prune_filler"):
+            open(b.marker_path(cfg, name), "w").write("{}")
+        os.remove(keep)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.run_stage(cfg, stages["tail_text"], dry=False, force=False)
+            assert b.run_stage(cfg, stages["filler"], dry=False, force=False)
+    print("test 34 ok")
+
+
+def test_35_skip_reruns_merge_check_and_tail_counts_whole_files():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = b.Cfg(data_root=tmp, plan=b.Plan(scale=0.001))
+        os.makedirs(cfg.run2)
+        os.makedirs(cfg.done)
+        target = b.derive(cfg.plan)["tail"]["tokens"]
+        path = os.path.join(cfg.run2, b.TAIL_SPLIT + ".merge.json")
+        sl = [{"label": l, "prompt_tokens": 1, "share_realised": 0.2, "share_target": 0.2, "passes": 1.0, "max_passes": 1,
+               "evidence_ratio": 0.0} for l in b.TAIL_LABELS]
+        meta = {"md5_by_slice": {l: "x" for l in b.TAIL_LABELS}, "prompt_tokens": int(target), "slices": sl}
+        json.dump(meta, open(path, "w"))
+        stage = {s.name: s for s in b.build_stages(cfg)}["merge_tail"]
+        for p in stage.outputs:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            if not os.path.exists(p):
+                open(p, "w").close()
+        open(b.marker_path(cfg, "merge_tail"), "w").write("{}")
+        stage.requires = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.run_stage(cfg, stage, dry=False, force=False), "a good output is skipped"
+            meta["prompt_tokens"] = int(0.9 * target)
+            json.dump(meta, open(path, "w"))
+            assert not b.run_stage(cfg, stage, dry=False, force=False), "a skipped merge is checked again"
+    # the tail's fresh supply counts every phase's last file whole
+    d = b.derive(b.Plan())
+    wiki = next(r for r in d["tail"]["rows"] if r["source"] == "wikipedia")
+    sup = b.SOURCE_SUPPLY["wikipedia"]
+    files = sum(math.ceil(need / sup["per_file"] - 1e-9) for need in (
+        d["phase1_weights"]["wikipedia"] * d["phase1"],
+        b.PHASE_WEIGHTS["phase2"]["wikipedia"] * d["phase2"] / sum(b.PHASE_WEIGHTS["phase2"].values()),
+        b.PHASE_WEIGHTS["ir"]["wikipedia"] * d["ir"] / sum(b.PHASE_WEIGHTS["ir"].values())))
+    assert abs(wiki["limit"] - (0.99 * b.physical_supply("wikipedia") - files * sup["per_file"])) < 1e3, wiki
+    print("test 35 ok")
+
+
+def test_36_qa_arm_check():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = b.Cfg(data_root=tmp, plan=b.Plan())
+        os.makedirs(cfg.prepared)
+        assert b.qa_arm_check(cfg) == [], "no state file: nothing to check"
+        target = b.QA_ARM_WEIGHTS["smoltalk2"] * cfg.plan.scaled("qa_target")
+        path = os.path.join(cfg.prepared, "_prepare_state_" + b.QA_PREFIX + ".json")
+        def write(frac):
+            json.dump({"sources": {"smoltalk2": {"tokens": int(frac * target)}}}, open(path, "w"))
+        write(1.0)
+        assert b.qa_arm_check(cfg) == []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            write(0.95)
+            assert b.qa_arm_check(cfg) == [] and "WARNING" in out.getvalue(), "under 100% warns"
+        write(0.8)
+        probs = b.qa_arm_check(cfg)
+        assert len(probs) == 1 and "lower" in probs[0], probs
+        cfg_small = b.Cfg(data_root=tmp, plan=b.Plan(scale=0.001))
+        json.dump({"sources": {"smoltalk2": {"tokens": 1}}}, open(path, "w"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert b.qa_arm_check(cfg_small) == [], "smoke scales only warn"
+        stages = {s_.name: s_ for s_ in b.build_stages(cfg)}
+        assert b.qa_arm_check in stages["qa"].post
+    print("test 36 ok")
 
 
 if __name__ == "__main__":

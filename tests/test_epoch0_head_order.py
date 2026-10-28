@@ -174,10 +174,10 @@ def test_order_memory_form_identical():
             rest = h + np.random.default_rng([seed, 0, 1]).permutation(n - h)
             want = np.concatenate([head, rest]).astype(np.int64, copy=False)
             got = epoch_order(seed, 0, n, h)
-            assert got.dtype == np.int64 and got.tobytes() == want.tobytes(), (n, h, seed)
+            assert got.dtype == np.int32 and got.astype(np.int64).tobytes() == want.tobytes(), (n, h, seed)
     # the plain path is the permutation itself, for epoch 0 without a head and every later epoch
-    assert epoch_order(42, 0, 50).tobytes() == np.random.default_rng([42, 0]).permutation(50).tobytes()
-    assert epoch_order(42, 2, 50, 10).tobytes() == np.random.default_rng([42, 2]).permutation(50).tobytes()
+    assert epoch_order(42, 0, 50).astype(np.int64).tobytes() == np.random.default_rng([42, 0]).permutation(50).tobytes()
+    assert epoch_order(42, 2, 50, 10).astype(np.int64).tobytes() == np.random.default_rng([42, 2]).permutation(50).tobytes()
 
 
 def test_switch_state():
@@ -396,9 +396,10 @@ def test_rows_cache():
         os.utime(os.path.join(d, "main.idx"), (1, 1))            # a copy keeps the bytes, not the mtime
         assert rows_cache_key(make(d, "main"), 4, 1) == key
         with open(os.path.join(d, "main.idx"), "r+b") as f:      # index rewritten
-            f.seek(-1, os.SEEK_END)
+            # the second to last offset, so the last still matches the token count
+            f.seek(-16, os.SEEK_END)
             last = f.read(1)
-            f.seek(-1, os.SEEK_END)
+            f.seek(-16, os.SEEK_END)
             f.write(bytes([last[0] ^ 1]))
         assert rows_cache_key(make(d, "main"), 4, 1) != key
         assert read_rows_cache(path, rows_cache_key(make(d, "main"), 4, 1), 4) is None

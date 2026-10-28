@@ -45,6 +45,46 @@ def main():
         ids, _ = top_k_chunks(unit(3), store.keys, 1)
         assert list(ids) == [3], ids
 
+    # 5. attach order: shuffle is fixed per question and keeps the set, best_first and best_last keep the rank
+    from scripts import inference
+    ids = [7, 3, 9, 1, 5, 2]
+    assert inference.order_chunks(ids, "best_first", "q") == ids
+    assert inference.order_chunks(ids, "best_last", "q") == ids[::-1]
+    a1, a2 = inference.order_chunks(ids, "shuffle", "who?"), inference.order_chunks(ids, "shuffle", "who?")
+    assert a1 == a2 and sorted(a1) == sorted(ids)
+    assert any(inference.order_chunks(ids, "shuffle", f"question {i}") != ids for i in range(20))
+    assert inference.DEFAULT_CHUNK_ORDER == "shuffle"
+    try:
+        inference.order_chunks(ids, "nope", "q"); raise SystemExit("accepted a bad order")
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory() as tmp:
+        chunks = [{"chunk_id": i, "text": f"chunk {i}", "source": "t", "doc_id": i, "title": ""} for i in range(5)]
+        write_store(tmp, chunks, keys, {"embedder": "fake"})
+        seen = {}
+        original = inference.build_evidence_batch
+        inference.build_evidence_batch = lambda model, tok, texts, device, keys=None: seen.setdefault("texts", texts)
+        try:
+            for order in inference.CHUNK_ORDERS:
+                seen.clear()
+                r = inference.StoreRetriever(tmp, 4, "cpu", chunk_order=order)
+                r.embed_question = lambda q: unit(2)
+                _, cids, report = r.evidence_for(None, None, "any question", show=True)
+                best = r.retrieve("any question")
+                assert seen["texts"] == [f"chunk {c}" for c in cids] and sorted(cids) == sorted(best), (order, cids, best)
+                if order == "best_first":
+                    assert cids == best
+                if order == "best_last":
+                    assert cids == best[::-1]
+                assert order in report and "[1]" in report
+            try:
+                inference.StoreRetriever(tmp, 4, "cpu", chunk_order="bad")
+                raise AssertionError("accepted a bad order")
+            except SystemExit:
+                pass
+        finally:
+            inference.build_evidence_batch = original
+
     print("test_inference_retrieval: ok")
 
 

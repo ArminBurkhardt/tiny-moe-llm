@@ -134,7 +134,7 @@ while :; do
   [ "$SIG" = 1 ] && [ "$r" -gt 128 ] && continue
   break
 done
-trap - USR1 USR2
+trap '' USR1 USR2
 for p in $WD $KILLER; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
 D=$(corpus_decide "$RC")
 [ "$STALLED" = 1 ] && D=stalled

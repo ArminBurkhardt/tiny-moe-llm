@@ -609,7 +609,19 @@ class LoopMixtureOfExperts(nn.Module):
         # formed in fp32: a bf16 sum of a bias of a few tenths is coarser than many probability
         # gaps and topk then breaks the ties toward low indices. with a zero bias the fp32 cast of
         # the bf16 scores is exact and order preserving, so the picked indices are unchanged
-        selection_scores = expert_scores.float() + self.balance_bias[bias_row].float()
+        # the fp32 shadow is the exact bias; the buffer is it rounded to bf16, which at |bias| near
+        # 0.25 steps by more than the update rate. used only while its stamp says it is in step
+        shadow = self._balance_bias_fp32
+        if (
+            shadow is not None
+            and getattr(self, "_balance_stamp", None)
+            == (self.balance_bias._version, self.balance_bias.data_ptr(), shadow.device)
+            and shadow.device == expert_scores.device
+        ):
+            bias_vec = shadow[bias_row]
+        else:
+            bias_vec = self.balance_bias[bias_row].float()
+        selection_scores = expert_scores.float() + bias_vec
         topk_indices = torch.topk(selection_scores, self.top_k, dim=-1).indices   # [batch_size, seq_len, top_k]
         topk_scores = expert_scores.gather(-1, topk_indices)                       # [batch_size, seq_len, top_k]
         load_balancing_loss = compute_aux_loss(topk_indices, expert_scores, self.num_experts, token_mask=token_mask)

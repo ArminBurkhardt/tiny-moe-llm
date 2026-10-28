@@ -24,7 +24,7 @@ accum_for() {
 
 # chain_decide RC FINAL STOP STALLS: what a finished job does next. RC is rank 0's exit code (255 when unknown),
 # FINAL and STOP are 1 when checkpoint_evidence_final.pt / the STOP file exist, STALLS the consecutive jobs that
-# made no new save. prints done | stop | fail | nofinal | resubmit. done needs the final checkpoint: rank 0 exit 0
+# made no new save (this one included). prints done | stop | fail | nofinal | resubmit. done needs the final checkpoint: rank 0 exit 0
 # without it is nofinal (the chain halts with that reason, it is never read as finished)
 chain_decide() {
   local rc=$1 final=$2 stop=$3 stalls=$4
@@ -32,9 +32,11 @@ chain_decide() {
   if [ "$rc" = 0 ]; then echo nofinal; return; fi
   if [ "$rc" = 10 ] || [ "$stop" = 1 ]; then echo stop; return; fi
   if [ "$rc" = 30 ]; then echo fail; return; fi
-  # rc 1 is a SystemExit with a message (seed mismatch, missing evidence_fixed, a refused head), rc 2 the missing rows
-  # cache or a bad argument: every rerun repeats them, so they halt at once
-  if [ "$rc" = 1 ] || [ "$rc" = 2 ]; then echo fail; return; fi
+  # rc 2 is the missing rows cache or a bad argument, rc 3 a deliberate refusal (SystemExit with a message: seed
+  # mismatch, missing evidence_fixed, a refused head, a wrong tokens per update): every rerun repeats them, so they halt
+  # at once. rc 1 is an uncaught exception, a crash that may be transient (a file system OSError, an Xid, a dead peer,
+  # an out of memory): it resubmits under the stall rule below, two jobs in a row with no new save halt
+  if [ "$rc" = 2 ] || [ "$rc" = 3 ]; then echo fail; return; fi
   if [ "$stalls" -ge 2 ]; then echo fail; return; fi
   echo resubmit
 }
@@ -58,12 +60,18 @@ chain_precheck() {
 
 # state_get FILE KEY / state_put FILE KEY VALUE: the chain's key=value state file
 state_get() { [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | tail -n 1; }
+# the read, change and rename run under flock on a sibling .lock file (the chain state is written by the running job and
+# by cancel_chain.sh at once), with a per process temporary name; without flock only the per process name protects it
 state_put() {
-  local f=$1 k=$2 v=$3
+  local f=$1 k=$2 v=$3 t="$1.tmp.$$"
   touch "$f"
-  grep -v "^$k=" "$f" > "$f.tmp" 2>/dev/null
-  echo "$k=$v" >> "$f.tmp"
-  mv "$f.tmp" "$f"
+  if command -v flock >/dev/null 2>&1; then
+    ( flock 8; grep -v "^$k=" "$f" > "$t" 2>/dev/null; echo "$k=$v" >> "$t"; mv "$t" "$f" ) 8>>"$f.lock"
+  else
+    grep -v "^$k=" "$f" > "$t" 2>/dev/null
+    echo "$k=$v" >> "$t"
+    mv "$t" "$f"
+  fi
 }
 
 # corpus_decide RC: what a corpus job does with the driver's exit code: done (0), resubmit (20, interrupted by
@@ -188,10 +196,11 @@ save_min_for() {
 
 # hist_append FILE JOBID STATE ELAPSED DECISION: one line per finished job, "JOBID STATE ELAPSED SHORT". STATE is
 # ok (rank 0 exit 0, 10 or 20, or a clean stop), failed, stalled or diverged; SHORT is 1 for a job that ended
-# in under 600 s without being done or stopped
+# in under 600 s without being done or stopped; an interrupted or cancelled job (DECISION interrupted or cancelled)
+# is never short, an early TERM is not a death
 hist_append() {
   local f=$1 job=$2 state=$3 el=$4 dec=$5 short=0
-  case "$dec" in done|stop) ;; *) [ "$el" -lt 600 ] && short=1;; esac
+  case "$dec" in done|stop|interrupted|cancelled) ;; *) [ "$el" -lt 600 ] && short=1;; esac
   echo "$job $state $el $short" >> "$f"
 }
 
@@ -264,6 +273,15 @@ require_site_values() {
     case "${!v}" in ''|*CHANGE*) bad="$bad $v";; esac
   done
   [ -z "$bad" ] || { echo "site values not filled in:$bad (copy scripts/slurm/mn5_env.local.sh.example to scripts/slurm/mn5_env.local.sh on the cluster and edit it)" >&2; return 1; }
+}
+
+# require_tokenizer: exit 1 unless TINY_LLM_TOKENIZER names a directory holding a tokenizer.json. no node has internet, so the tokenizer is staged into $HF_HOME/tokenizer beforehand
+# (mirror_sources.py stage-small); a job that reaches the trainer without it would fail on every rerun
+require_tokenizer() {
+  local d=${TINY_LLM_TOKENIZER:-}
+  if [ -n "$d" ] && [ -d "$d" ] && [ -f "$d/tokenizer.json" ]; then return 0; fi
+  echo "tokenizer missing: TINY_LLM_TOKENIZER='$d' holds no tokenizer.json (stage it with mirror_sources.py stage-small, copy hf_home/tokenizer into \$HF_HOME/tokenizer, or set TINY_LLM_TOKENIZER in mn5_env.local.sh)" >&2
+  return 1
 }
 
 # train_step_id JOBID: the job step of the training srun ("JOBID.0" unless squeue lists another non batch step)

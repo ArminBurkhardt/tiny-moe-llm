@@ -796,6 +796,15 @@ def hub_row_factory(spec: EvidenceSource, files: Sequence[str], scratch_dir: str
     return factory
 
 
+def ir_phase_hashes(manifest: dict) -> set:
+    """Hashes of the smoltalk2 conversations the ir filler phase drew (any manifest entry that recorded them)."""
+    out = set()
+    for entry in manifest.values():
+        if isinstance(entry, dict):
+            out.update(entry.get("smoltalk2_ir_hashes", []))
+    return out
+
+
 def local_document_factory(bin_path: str, idx_path: str) -> Callable:
     """factory(_, doc_idx) -> generator of (0, doc_idx, token id list) over a prepared corpus.
 
@@ -939,6 +948,18 @@ def build_corpus(
     # SQuAD question never gets a web text distractor, which would be off-distribution enough to be
     # rejectable on surface form alone and would teach nothing about selection.
     reservoirs = {entry["key"]: deque(maxlen=reservoir_size) for entry in source_entries}
+    # a resume continues the draws exactly: rng states, distractor reservoirs and the round robin credits ride in
+    # the state file (an older state file has none of them and restarts them as before)
+    saved = state.get("resume_rng")
+    swrr_saved = {}
+    if saved:
+        for name, rng in (("split", split_rng), ("cond", cond_rng), ("chunk", chunk_rng)):
+            version, internal, gauss = saved[name]
+            rng.setstate((version, tuple(internal), gauss))
+        for key, texts in saved.get("reservoirs", {}).items():
+            if key in reservoirs:
+                reservoirs[key].extend(texts)
+        swrr_saved = saved.get("swrr", {})
 
     active = {}
     for entry in source_entries:
@@ -951,7 +972,7 @@ def build_corpus(
             "entry": entry,
         }
 
-    swrr = {key: 0.0 for key in active}
+    swrr = {key: float(swrr_saved.get(key, 0.0)) for key in active}
     since_checkpoint = 0
 
     def total_tokens() -> int:
@@ -960,6 +981,12 @@ def build_corpus(
     def checkpoint() -> None:
         for writer in writers.values():
             writer.sync()
+        state["resume_rng"] = {
+            **{name: [rng.getstate()[0], list(rng.getstate()[1]), rng.getstate()[2]]
+               for name, rng in (("split", split_rng), ("cond", cond_rng), ("chunk", chunk_rng))},
+            "reservoirs": {key: list(res) for key, res in reservoirs.items()},
+            "swrr": dict(swrr),
+        }
         save_state_atomic(state_path, state)
 
     def live() -> List[str]:
@@ -1718,7 +1745,17 @@ def main():
             "manifest.json is gitignored, so a fresh clone never has it), or pass --ignore-holdout "
             "to build the replay arm without the exclusion."
         )
-    logger.info(f"smoltalk2 holdout: {len(holdout_hashes):,} conversations excluded")
+    # conversations the ir filler phase drew (any manifest entry that recorded them) are excluded as well, so
+    # the replay arm and the web text arm (which reads that same ir bin) do not repeat them
+    ir_hashes = ir_phase_hashes(manifest)
+    holdout_hashes |= ir_hashes
+    if not ir_hashes and not args.no_webtext and os.path.exists(os.path.join(args.data_dir, f"{args.webtext_phase}.bin")):
+        logger.warning(
+            f"{args.webtext_phase}.bin exists but no manifest entry has smoltalk2_ir_hashes (an ir build from before they were "
+            f"recorded): smoltalk2 conversations that phase drew may repeat in the replay arm and the web text arm"
+        )
+    logger.info(f"smoltalk2 holdout: {len(holdout_hashes):,} conversations excluded "
+                f"({len(ir_hashes):,} from the ir phase)")
 
     sources = [s for s in SOURCES if not (args.no_webtext and s.render == "webtext")]
     hf_api = HfApi(token=hf_token)

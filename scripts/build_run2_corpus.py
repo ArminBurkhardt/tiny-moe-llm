@@ -13,6 +13,10 @@ The derivation of every number is ``derive()``; ``python scripts/build_run2_corp
 it as tables (shares, the phase 1 mix, the disk schedule with its peak, the hours per stage, the
 transfer estimate) and ``docs/plans/RUN2_corpus.md`` carries them with their sources.
 
+The tail split (``run2_tail_train``, docs/plans/RUN2_corpus.md section 2b, RUN2.md row 16) is the run's last 5%: 42B prompt
+tokens for the 40B tokens from 760B, on a higher quality mix, ended by the trainer at the plan's last step
+(``sft.py --end-at-plan``), so the cosine, fitted to the 800B plan on the main split, is unchanged.
+
 The warm-up and control splits are prefixes of the main split in merge order: the main merge defines
 the document order and ``--order-prefix-from`` replays it until the smaller split reaches its token
 count, so the biography builds for the warm-up and the control are byte prefixes of a build (the
@@ -22,14 +26,17 @@ documents the warm-up covered).
 
 Stages, in order (``--stage NAME[,NAME]`` runs some, default all):
 
-    filler         prepare_data: phase1, phase2, ir (the manifest key rule: ir needs its own key)
+    filler         prepare_data: phase1, phase2, ir (the manifest key rule: ir needs its own key), then the tail's
+                   plain text as a fourth build into DATA_ROOT/prepared_tail (fresh files only, the higher quality mix)
     qa             prepare_evidence_data: SQuAD v2, HotpotQA, web text, chat replay
     bios_main      prepare_injection_data: arm retrieval, swap 0.15, gold-only support; writes the
                    shared outputs (inject_val, the card store)
     val_clean      prepare_clean_val: inject_val_clean (needs inject_val, so after bios_main)
     bios_full      prepare_injection_data: arm full, a prefix for the control
     bios_warm      prepare_injection_data: arm retrieval, swap 1.0, a prefix for the warm-up
-    prune_filler   delete the phase1, phase2 and ir bins once qa, val_clean and the three bios builds are done
+    tail_text      the tail's plain text cut into windows of at most 1000 tokens with BOS, EOS and a mask (numpy)
+    prune_filler   delete the phase1, phase2, ir and tail phase bins once qa, val_clean, the three bios builds and
+                   tail_text are done
     chains_plain   prepare_chain_data: hops 1 / 2 / 3 at 25 / 50 / 25
     chains_bridge  prepare_chain_data --bridge: hops 1 to 4 at 25 each
     qa_shuffle     merge_evidence_splits over the qa build alone: its documents in a seeded permutation
@@ -38,9 +45,13 @@ Stages, in order (``--stage NAME[,NAME]`` runs some, default all):
     merge_main     merge_evidence_splits --order-prefix-from the order file, over the whole order
     merge_warm     merge_evidence_splits --order-prefix-from main until warm_max tokens; then the epoch 0 order sidecar
     merge_control  merge_evidence_splits --no-evidence --order-prefix-from main until the control's tokens
-    rows           sft.py --estimate-rows-only on the main and control splits (CPU): the packed row counts
-                   that set total_steps; the main one needs the order sidecar merge_warm writes
-    prune_sources  delete the bios builds, the qa train build and its shuffled copy and the chain train builds once all three merges pass
+    prune_bios     delete the three biography builds and the raw QA build once the main, warm and control merges and the
+                   QA copy exist (the disk peak: the tail merge is written after this)
+    merge_tail     merge_evidence_splits, five slices (tail text, a seeded sample of the main split, the QA copy with its
+                   chat arms, both chain builds), its own seed: the tail split read for the run's last 40B tokens
+    rows           sft.py --estimate-rows-only on the main, control and tail splits (CPU): the packed row counts
+                   that set total_steps (main) and check the tail; the main one needs the order sidecar merge_warm writes
+    prune_sources  delete the chain train builds, the shuffled QA copy and the tail text once all four merges pass
     heldout_qa     prepare_evidence_data --heldout: evidence_dev, evidence_fixed
     heldout_chains prepare_chain_data: chains_eval, chains_heldout_tmpl, chains_hop4
     store_openqa   build_store: the A4 / A7 store; store_edit: its edit twin
@@ -131,6 +142,7 @@ TOKENS_PER_DOC = {"bios": 616.0, "qa": 349.0, "plain": PLAIN_TOKENS_PER_QUESTION
 # without (measured on a local disk with a warm cache; a parallel file system may be slower, update when timed)
 MERGE_DOCS_PER_SECOND = 37_000
 MERGE_DOCS_PER_SECOND_PLAIN = 118_000
+TAIL_TEXT_TOKENS_PER_SECOND = 10e6                      # assumed: the windowing copy of the tail's plain text, numpy, one process, sequential disk
 ORDER_DOCS_PER_SECOND = 400_000                          # assumed: one stable argsort of float64 keys, about 20 minutes at 480M documents
 INJECT_HOURS_PER_B = 1e9 / 2.07e6 / 3600                 # the landed builder: about 2.07M tokens per second, one process (plus 10 to 15 minutes of setup per start)
 CHAIN_HOURS_PER_B = (55 / 60) / 0.10466                  # 2M questions in about 55 minutes on cuda
@@ -143,7 +155,7 @@ FILLER_IDX_BYTES_PER_TOKEN = 0.01
 # the tool picks up; the merges always get --overwrite, which resumes with a valid state and starts clean
 # without one), or must the driver delete the stage's partial outputs and run it again from the start (False).
 RESUMABLE = {"filler": True, "qa": True, "qa_shuffle": True, "bios_main": True, "bios_full": True, "bios_warm": True,
-             "merge_main": True, "merge_warm": True, "merge_control": True,
+             "merge_main": True, "merge_warm": True, "merge_control": True, "merge_tail": True, "tail_text": False,
              "chains_plain": True, "chains_bridge": True,
              "val_clean": False, "order": False, "rows": False,
              "heldout_qa": False, "heldout_chains": False, "store_openqa": False, "store_edit": False}
@@ -162,6 +174,30 @@ QA_ARM_PER_PASS = {"squad_v2": 5_862_565, "hotpot_qa": 4_861_098}     # prompt t
 QA_ARM_SUPPLY = {"ultrachat": 242e6, "no_robots": 5.3e6}               # ultrachat: 1,163 tokens x 207k rows
 WINDOW_TOKENS = 721.0         # filler tokens per 4096 window after the short tail windows are dropped (the pilot's count)
 SMOLTALK2_SUPPLY = 1.8e9     # 24 no_think SFT files at about 75M tokens (the 16B manifest: 675M in 9 files)
+
+# the tail phase (decided 2026-10-28, docs/plans/RUN2.md row 16): the last 5% of the run, 40B tokens from 760B, on a higher
+# quality mix that is built with the corpus. The split is sized 5% over the 40B it is read for, so the run reaches its
+# planned step count on the cosine's floor before the split ends (sft.py --end-at-plan stops it there).
+TAIL_TOKENS = 42e9
+TAIL_READ = 40e9              # what the run reads of it: 800B minus the 760B stop
+# prompt token shares of the tail merge, by slice. "main" is a seeded sample of the main split's documents (biographies in
+# their main form: swap 0.15, gold only support, with the filler windows they were built with); "qa" is the evidence
+# QA build, whose chat arms (smoltalk2, ultrachat, no_robots) are a third of its tokens, so 0.15 of the tail is about 0.10
+# QA and 0.05 chat; the chains are the plain and bridge builds
+TAIL_SHARES = {"text": 0.65, "main": 0.12, "qa": 0.15, "chains": 0.04, "bridge": 0.04}
+TAIL_QA_PASSES = 5            # the qa build is read up to this many times (it holds 1.5B tokens, the tail takes 6.3B: 4.1)
+TAIL_CHAIN_PASSES = 2         # the chain builds (1.4B each) are read up to this many times (the tail takes 1.7B each: 1.2)
+TAIL_SEED = 43                # the tail merge's seed: its permutations differ from the main run's
+# the plain text of the tail by source, higher quality first. Fresh files only: the tail phase skips every file the filler's
+# three phases used (--exclude-files-of), so a source is held at its remaining supply (TAIL_CAP of the Hub's files) and the
+# shortfall goes to the receivers in order. code_edu and wikipedia are almost used up by the main filler, so they get what
+# is left, not what they weigh here
+TAIL_WEIGHTS = {"dclm": 0.38, "finepdfs": 0.25, "nemotron_math": 0.14, "code_edu": 0.08, "wikipedia": 0.03,
+                "fineweb": 0.12}
+TAIL_RECEIVERS = (("dclm", 0.99), ("finepdfs", 0.99), ("fineweb", 0.99))
+TAIL_CAP = 0.99
+TAIL_TEXT_FLOOR_MARGIN = 0.005   # the tail-text stage fails only below the merge's need times this (document granularity of the merge's slice)
+TAIL_TEXT_MARGIN = 0.05       # the plain text slice is built this much over its share (the merge takes a slice only up to its target; prepare_data does not move an exhausted source's share)
 
 # phase source weights as in scripts/prepare_data.SOURCES (raw, renormalized per phase at run time)
 PHASE_WEIGHTS = {
@@ -209,6 +245,9 @@ class Plan:
             supply is the limit, see the sheet).
         margin: extra filler built over the need (windows set aside for validation, the filler repeat).
         persons_per_tier: the biography tier structure (the pilot's tiers at 3x the persons: 10,800 persons, 486,000 renderings, about 1.7x lower sigma on the leak read).
+        tail_tokens: prompt tokens of the tail split (42B); tail_read: what the run reads of it (40B).
+        tail_shares: the tail's slice shares (TAIL_SHARES); tail_weights: its plain text source weights (TAIL_WEIGHTS).
+        tail_qa_passes, tail_chain_passes: the most times the tail merge reads the QA and the chain builds.
         scale: multiplies every token quantity above (smoke runs).
     """
     total: float = TOKEN_TARGET / EPOCHS
@@ -223,6 +262,12 @@ class Plan:
     ir_tokens: float = 2.5e9
     margin: float = 0.01
     persons_per_tier: str = "1000:300,100:1500,10:3000,1:6000"
+    tail_tokens: float = TAIL_TOKENS
+    tail_read: float = TAIL_READ
+    tail_shares: Dict[str, float] = field(default_factory=lambda: dict(TAIL_SHARES))
+    tail_weights: Dict[str, float] = field(default_factory=lambda: dict(TAIL_WEIGHTS))
+    tail_qa_passes: int = TAIL_QA_PASSES
+    tail_chain_passes: int = TAIL_CHAIN_PASSES
     scale: float = 1.0
     support_gold_only: bool = True
     val_windows: int = 2000
@@ -311,6 +356,42 @@ def cap_phase1(phase1: float, p2_need: Dict[str, float], ir_need: Dict[str, floa
     return weights, rows
 
 
+def cap_tail(tail_filler: float, used: Dict[str, float], weights: Optional[Dict[str, float]] = None,
+             cap: float = TAIL_CAP, receivers: Sequence = TAIL_RECEIVERS):
+    """The tail phase's token allocation per source, each held at what the earlier three phases left of the Hub.
+
+    The tail phase skips every file the filler's phases used, so a source can only give the part of its supply
+    (``cap`` of the files the Hub holds) that phase 1, phase 2 and ir did not take (``used``). The shortfall of a
+    capped source goes to the ``receivers`` in order, each up to its own remaining supply.
+
+    Returns:
+        ``(weights, rows)``: normalized weights for the tail phase, and a report row per source.
+    """
+    weights = dict(TAIL_WEIGHTS if weights is None else weights)
+    tot = sum(weights.values())
+    alloc = {s: v / tot * tail_filler for s, v in weights.items()}
+    limit = {s: max(0.0, cap * physical_supply(s) - used.get(s, 0.0)) for s in alloc}
+    before = dict(alloc)
+    excess, capped = 0.0, set()
+    for s in alloc:
+        if alloc[s] > limit[s] + 1e-6:
+            excess += alloc[s] - limit[s]
+            alloc[s] = limit[s]
+            capped.add(s)
+    for s, _ in receivers:
+        if s not in alloc:
+            continue
+        take = min(max(0.0, limit[s] - alloc[s]), excess)
+        alloc[s] += take
+        excess -= take
+    if excess > 1e-6:
+        raise ValueError("every receiver is at its supply cap: the tail's plain text needs more fresh files than the Hub holds")
+    out = {s: (v / tail_filler if tail_filler else 0.0) for s, v in alloc.items()}
+    rows = [{"source": s, "before_tokens": before[s], "after_tokens": alloc[s], "limit": limit[s], "capped": s in capped}
+            for s in alloc]
+    return out, rows
+
+
 def derive(plan: Plan) -> dict:
     """Every target of the pipeline from the plan, as one dict of plain numbers."""
     total = plan.scaled("total")
@@ -362,16 +443,43 @@ def derive(plan: Plan) -> dict:
     out["bios_stop_warm"] = int(min(out["injection_target"], out["warm_max"] * (1 + PREFIX_MARGIN)))
     out["bios_stop_control"] = int(min(out["injection_target"], out["control"] * (1 + PREFIX_MARGIN)))
     out["qa_val_fraction"] = 0.001
+    # the tail split: slice tokens, the plain text build behind its share and its source allocation
+    tail = plan.scaled("tail_tokens")
+    sh = dict(plan.tail_shares)
+    if abs(sum(sh.values()) - 1.0) > 1e-6:
+        raise ValueError(f"tail_shares sum to {sum(sh.values()):.4f}, not 1")
+    text_target = int(sh["text"] * tail * (1.0 + TAIL_TEXT_MARGIN))
+    tail_filler = text_target * margin
+    text_need = int(sh["text"] * tail * (1.0 + TAIL_TEXT_FLOOR_MARGIN))
+    # every earlier phase marks its partly used last file as used and the tail phase skips it, so each phase's use
+    # counts in whole files
+    def whole_files(src: str, tokens: float) -> float:
+        per_file = SOURCE_SUPPLY[src]["per_file"] * plan.scale
+        return math.ceil(tokens / per_file - 1e-9) * per_file if tokens > 0 else 0.0
+
+    used = {r["source"]: whole_files(r["source"], r["after_tokens"]) + whole_files(r["source"], p2_need.get(r["source"], 0.0))
+            + whole_files(r["source"], ir_need.get(r["source"], 0.0)) for r in p1_rows}
+    tail_w, tail_rows = cap_tail(tail_filler, used, plan.tail_weights)
+    out["tail"] = {
+        "tokens": tail, "read": plan.scaled("tail_read"), "shares": sh,
+        "slice_tokens": {k: sh[k] * tail for k in sh},
+        "text_target": text_target, "text_need": text_need, "filler": tail_filler, "weights": tail_w, "rows": tail_rows,
+        "qa_passes": sh["qa"] * tail / qa if qa else 0.0, "plain_passes": sh["chains"] * tail / plain if plain else 0.0,
+        "bridge_passes": sh["bridge"] * tail / bridge if bridge else 0.0,
+        "main_fraction": sh["main"] * tail / total,
+    }
     return out
 
 
 def filler_need_by_phase(d: dict) -> Dict[str, Dict[str, float]]:
-    """Tokens each source must supply in each filler phase, phase 1 at the capped weights."""
+    """Tokens each source must supply in each filler phase, phase 1 at the capped weights, then the tail phase."""
     out = {}
     for phase in ("phase1", "phase2", "ir"):
         w = d["phase1_weights"] if phase == "phase1" else PHASE_WEIGHTS[phase]
         tot = sum(w.values())
         out[phase] = {s: v / tot * d[phase] for s, v in w.items()}
+    tail = d["tail"]["weights"]
+    out["late"] = {s: v * d["tail"]["filler"] for s, v in tail.items()}      # the tail phase, after ir (listing phase name "late")
     return out
 
 
@@ -448,6 +556,30 @@ def build_sizes(plan: Plan, d: dict) -> Dict[str, float]:
     s["order"] = docs
     s["ev_tokens"] = bios_evtok + qa_ev + pl_ev + br_ev
     s["ev_ratio"] = s["ev_tokens"] / d["total"]
+    # the tail: its plain text phase (bin and idx), the windowed copy (bin, idx, mask) and the merge. Per token bytes
+    # of each slice come from the main run's own estimates above
+    t = d["tail"]
+    tt = t["slice_tokens"]
+    s["filler_tail"] = t["filler"] * (TOK_BYTES + FILLER_IDX_BYTES_PER_TOKEN)
+    text_docs = t["text_target"] / WINDOW_TOKENS
+    s["tail_text"] = plain(t["text_target"], text_docs)
+    chain_bytes = lambda total, docs: total - docs * CHAINS_JSONL_BYTES
+    per_tok = {
+        "main": merged / d["total"],
+        "qa": s["qa"] / qa_t if qa_t else 0.0,
+        "chains": chain_bytes(s["chains_plain"], pl_docs) / pl_t if pl_t else 0.0,
+        "bridge": chain_bytes(s["chains_bridge"], br_docs) / br_t if br_t else 0.0,
+    }
+    s["merge_tail"] = (plain(tt["text"], tt["text"] / WINDOW_TOKENS) + sum(tt[k] * per_tok[k] for k in per_tok)
+                       + tt["main"] / TOKENS_PER_DOC["bios"] * MERGE_DOC_BYTES)
+    tail_docs = (tt["text"] / WINDOW_TOKENS + tt["main"] / TOKENS_PER_DOC["bios"] + tt["qa"] / TOKENS_PER_DOC["qa"]
+                 + tt["chains"] / TOKENS_PER_DOC["plain"] + tt["bridge"] / TOKENS_PER_DOC["bridge"])
+    s["docs_tail"] = tail_docs
+    tail_ev = (tt["qa"] * QA_EVTOK_PER_TOKEN + tt["chains"] * PLAIN_EVTOK_PER_TOKEN
+               + tt["bridge"] / TOKENS_PER_DOC["bridge"] * BRIDGE_EVTOK_PER_QUESTION
+               + tt["main"] * s["ev_tokens"] / d["total"])
+    s["tail_ev_tokens"] = tail_ev
+    s["tail_ev_ratio"] = tail_ev / t["tokens"] if t["tokens"] else 0.0
     return s
 
 
@@ -457,16 +589,19 @@ def disk_schedule(plan: Plan, d: dict, window_bytes: Optional[float] = None,
     s = build_sizes(plan, d)
     small = SMALL_STAGE_BYTES
     scratch = window_bytes if window_bytes else FILLER_SCRATCH_BYTES
-    sources = s["bios_main"] + s["bios_full"] + s["bios_warm"] + 2 * s["qa"] + s["chains_plain"] + s["chains_bridge"]
+    bios_sources = s["bios_main"] + s["bios_full"] + s["bios_warm"] + s["qa"]
+    sources = s["qa"] + s["chains_plain"] + s["chains_bridge"] + s["tail_text"]
     steps = [
-        ("filler", s["filler"], 0.0, scratch), ("qa", s["qa"], 0.0, 0.0),
+        ("filler", s["filler"] + s["filler_tail"], 0.0, scratch), ("qa", s["qa"], 0.0, 0.0),
         ("bios_main", s["bios_main"] + small["bios_shared"], 0.0, 0.0), ("val_clean", small["val_clean"], 0.0, 0.0),
         ("bios_full", s["bios_full"], 0.0, 0.0), ("bios_warm", s["bios_warm"], 0.0, 0.0),
-        ("prune_filler", 0.0, s["filler"], 0.0),
+        ("tail_text", s["tail_text"], 0.0, 0.0),
+        ("prune_filler", 0.0, s["filler"] + s["filler_tail"], 0.0),
         ("chains_plain", s["chains_plain"], 0.0, 0.0), ("chains_bridge", s["chains_bridge"], 0.0, 0.0),
         ("qa_shuffle", s["qa"], 0.0, 0.0),
         ("order", s["order"], 0.0, 0.0), ("merge_main", s["merge_main"], 0.0, 0.0), ("merge_warm", s["merge_warm"], 0.0, 0.0),
-        ("merge_control", s["merge_control"], 0.0, 0.0), ("rows", 1e6, 0.0, 0.0),
+        ("merge_control", s["merge_control"], 0.0, 0.0),
+        ("prune_bios", 0.0, bios_sources, 0.0), ("merge_tail", s["merge_tail"], 0.0, 0.0), ("rows", 1e6, 0.0, 0.0),
         ("prune_sources", 0.0, sources, 0.0),
         ("heldout_qa", small["heldout_qa"], 0.0, 0.0), ("heldout_chains", small["heldout_chains"], 0.0, 0.0),
         ("store_openqa", small["store_openqa"], 0.0, 0.0), ("store_edit", small["store_edit"], 0.0, 0.0),
@@ -510,6 +645,8 @@ def hours_plan(plan: Plan, d: dict) -> Dict[str, Optional[float]]:
     hours["merge_main"] = docs / MERGE_DOCS_PER_SECOND / 3600
     hours["merge_warm"] = hours["merge_main"] * d["warm_max"] / d["total"]
     hours["merge_control"] = docs * d["control"] / d["total"] / MERGE_DOCS_PER_SECOND_PLAIN / 3600
+    hours["tail_text"] = d["tail"]["text_target"] / TAIL_TEXT_TOKENS_PER_SECOND / 3600
+    hours["merge_tail"] = s["docs_tail"] / MERGE_DOCS_PER_SECOND / 3600
     return hours
 
 
@@ -553,7 +690,7 @@ class Cfg:
     mirror_window_gb: float = 120.0
     allow_filler_repeat: bool = False
     disk_budget: float = 3.4e12
-    standing_budget: float = 2.0e12
+    standing_budget: float = 2.6e12
 
     @property
     def prepared(self) -> str:
@@ -576,6 +713,11 @@ class Cfg:
         return os.path.join(self.data_root, "run2_done")
 
     @property
+    def tail_dir(self) -> str:
+        """Where the tail's plain text phase is built (the same phase machinery as the filler, its own state files)."""
+        return os.path.join(self.data_root, "prepared_tail")
+
+    @property
     def bios_store(self) -> str:
         return os.path.join(self.index, "run2_bios")
 
@@ -589,6 +731,9 @@ BRIDGE_PREFIX = "chains_bridge_run2"
 WARM_SPLIT = "run2_warm_train"
 MAIN_SPLIT = "run2_main_train"
 CTL_SPLIT = "run2_control_train"
+TAIL_SPLIT = "run2_tail_train"
+TAIL_TEXT = "tail_text"
+TAIL_LABELS = ("text", "main", "qa", "chains", "bridge")
 SLICE_LABELS = ("bios", "qa", "chains", "bridge")
 # slices whose documents the order stage must not read in storage order: the QA builder draws its rows by
 # smooth weighted round robin over its arms, so a storage prefix holds the finite extractive sources
@@ -643,7 +788,7 @@ class Stage:
     pre: List[Callable] = field(default_factory=list)      # hooks run before the commands (not on a skip)
 
 
-ENV_STAGES = ("rows", "filler", "qa", "bios_main", "val_clean", "bios_full", "bios_warm", "chains_plain", "chains_bridge",
+ENV_STAGES = ("rows", "filler", "qa", "bios_main", "val_clean", "bios_full", "bios_warm", "tail_text", "chains_plain", "chains_bridge",
               "heldout_qa", "heldout_chains", "store_openqa", "store_edit")
 
 
@@ -654,7 +799,8 @@ ROWS_NUM_DATA_WORKERS = 4       # sft.NUM_DATA_WORKERS: the cache is keyed by wo
 def rows_check(cfg: Cfg) -> List[str]:
     """Each rows estimate json exists and holds an entry for every rank count in ROWS_WORLD_SIZES."""
     problems = []
-    for split in (MAIN_SPLIT, CTL_SPLIT):
+    found = {}
+    for split in (MAIN_SPLIT, CTL_SPLIT, TAIL_SPLIT):
         path = os.path.join(cfg.run2, split + ".rows_estimate.json")
         try:
             with open(path) as f:
@@ -662,9 +808,23 @@ def rows_check(cfg: Cfg) -> List[str]:
         except (OSError, ValueError, AttributeError) as e:
             problems.append(f"{path} unreadable: {e}")
             continue
+        found[split] = rows
         for w in ROWS_WORLD_SIZES.split(","):
             if str(ROWS_NUM_DATA_WORKERS * int(w)) not in rows:
                 problems.append(f"{path} has no entry for {w} ranks")
+    # the tail must hold the rows of the last stretch of the run (the stop at tail_read tokens before the planned end),
+    # or the split would end before the cosine reaches its floor
+    d = derive(cfg.plan)
+    if MAIN_SPLIT in found and TAIL_SPLIT in found:
+        share = cfg.plan.tail_read / cfg.plan.run_tokens
+        for key, main_rows in found[MAIN_SPLIT].items():
+            tail_rows = found[TAIL_SPLIT].get(key)
+            if tail_rows is None:
+                continue
+            need = share * d["epochs"] * float(main_rows)
+            if float(tail_rows) < need:
+                problems.append(f"{TAIL_SPLIT} has {float(tail_rows):,.0f} packed rows at {key} workers, the last "
+                                f"{share:.1%} of the run needs about {need:,.0f}: the split would end before the plan does")
     return problems
 
 
@@ -728,9 +888,19 @@ def build_stages(cfg: Cfg) -> List[Stage]:
           f"--manifest-key data_prep --seed {plan.seed}")
     ir = (f"{base} --exclude-files-of phase1,phase2 -- "
           f"--data-dir {q(P)} --phases ir --ir-tokens {int(d['ir'])} --manifest-key ir_prep --seed {plan.seed}")
+    # the tail's plain text: one more phase 1 style build into its own directory (own state files, own bins), from files
+    # none of the three phases used, at the higher quality source weights of cap_tail. It runs as the filler's fourth
+    # command so the mirror's listing, its consumption order and its end mark cover it with no other change
+    tail_w = ",".join(f"{k}={v:.6f}" for k, v in d["tail"]["weights"].items())
+    late = (f"{base} --exclude-files-of phase1,phase2,ir --phase1-weights {tail_w} -- "
+            f"--data-dir {q(cfg.tail_dir)} --phases phase1 --phase1-tokens {int(d['tail']['filler'])} "
+            f"--manifest-key tail_prep --seed {plan.seed}")
     filler_outputs = [os.path.join(P, f"{ph}.{s}") for ph in ("phase1", "phase2", "ir") for s in ("bin", "idx")]
-    stages.append(Stage("filler", [p1, p2, ir], filler_outputs,
-                        "prepare_data; HF_TOKEN needed for the gated nemotron_math (or the mirror)",
+    tail_filler_outputs = [os.path.join(cfg.tail_dir, f"phase1.{s}") for s in ("bin", "idx")]
+    filler_outputs += tail_filler_outputs
+    stages.append(Stage("filler", [p1, p2, ir, late], filler_outputs,
+                        "prepare_data x4: phase 1, 2, ir, then the tail's plain text (fresh files, higher quality mix); "
+                        "HF_TOKEN needed for the gated nemotron_math (or the mirror)",
                         pruned_by="prune_filler",
                         pre=[clear_inbox_done] if cfg.mirror_inbox else [],
                         post=[write_inbox_done] if cfg.mirror_inbox else []))
@@ -747,7 +917,7 @@ def build_stages(cfg: Cfg) -> List[Stage]:
                  f"--val-fraction {d['qa_val_fraction']} --seed {plan.seed} --device {cfg.device}")
     stages.append(Stage("qa", [qa], split_files(os.path.join(P, QA_PREFIX + "_train"), EVIDENCE_FILES),
                         "reads the ir bin (web text) and manifest.json data_prep.smoltalk2_holdout_hashes (written by the "
-                        "phase2 build)", requires=["filler"], pruned_by="prune_sources"))
+                        "phase2 build)", requires=["filler"], pruned_by="prune_bios", post=[qa_arm_check]))
 
     def inject(arms: str, swap: float, suffix: str, stop: Optional[int] = None, shared: bool = True) -> str:
         extra = f" --stop-after-tokens {stop}" if stop else ""
@@ -765,7 +935,7 @@ def build_stages(cfg: Cfg) -> List[Stage]:
     stages.append(Stage("bios_main", [inject("retrieval", 0.15, MAIN_SUFFIX)],
                         split_files(os.path.join(R, main_name), EVIDENCE_FILES) + val,
                         "swap 0.15, anonymization 0.5, gold card only supports a span; writes inject_val and the card store",
-                        requires=["filler"], pruned_by="prune_sources", post=[filler_repeat_check]))
+                        requires=["filler"], pruned_by="prune_bios", post=[filler_repeat_check]))
 
     val_state = os.path.join(P, "_prepare_state_" + QA_PREFIX + ".json")
     stages.append(Stage("val_clean", [f"{py}prepare_clean_val.py --out-dir {q(R)} --filler-dir {q(filler_dir)} "
@@ -778,16 +948,27 @@ def build_stages(cfg: Cfg) -> List[Stage]:
     stages.append(Stage("bios_full", [inject("full", 0.15, MAIN_SUFFIX, d["bios_stop_control"], False)],
                         split_files(os.path.join(R, full_name), PLAIN_FILES),
                         f"a prefix of the full form build, {d['bios_stop_control']:,} tokens: the control's biographies",
-                        requires=["filler", "bios_main"], pruned_by="prune_sources", post=[filler_repeat_check]))
+                        requires=["filler", "bios_main"], pruned_by="prune_bios", post=[filler_repeat_check]))
     stages.append(Stage("bios_warm", [inject("retrieval", 1.0, WARM_SUFFIX, d["bios_stop_warm"], False)],
                         split_files(os.path.join(R, warm_name), EVIDENCE_FILES),
                         f"swap 1.0, a prefix of {d['bios_stop_warm']:,} tokens: the warm-up form",
-                        requires=["filler", "bios_main"], pruned_by="prune_sources", post=[filler_repeat_check]))
+                        requires=["filler", "bios_main"], pruned_by="prune_bios", post=[filler_repeat_check]))
+
+    tail_text_prefix = os.path.join(cfg.tail_dir, TAIL_TEXT)
+    repeat = " --allow-repeat" if (cfg.allow_filler_repeat or cfg.link_filler_from) else ""
+    stages.append(Stage("tail_text", [f"{me} tail-text --src {q(os.path.join(cfg.tail_dir, 'phase1'))} "
+                                      f"--out {q(tail_text_prefix)} --target {d['tail']['text_target']} "
+                                      f"--min-tokens {d['tail']['text_need']}{repeat}"],
+                        split_files(tail_text_prefix, PLAIN_FILES),
+                        "the tail's plain text cut into windows of at most 1000 tokens with BOS and EOS, the way the "
+                        "biography build cuts its filler (numpy; the merge permutes the documents); the source of the tail "
+                        "merge's text slice", requires=["filler"], pruned_by="prune_sources"))
 
     pruned_filler = list(filler_outputs)
     stages.append(Stage("prune_filler", [f"rm -f {' '.join(q(p) for p in pruned_filler)}"], [],
-                        "the filler bins are only read by qa, val_clean and the bios builds; the manifest and the state "
-                        "files stay", requires=["filler", "qa", "val_clean", "bios_main", "bios_full", "bios_warm"],
+                        "the filler bins are only read by qa, val_clean, the bios builds and tail_text; the manifest and the "
+                        "state files stay", requires=["filler", "qa", "val_clean", "bios_main", "bios_full", "bios_warm",
+                                                      "tail_text"],
                         prune=pruned_filler))
 
     def chain(prefix: str, questions: int, bridge: bool) -> str:
@@ -853,28 +1034,59 @@ def build_stages(cfg: Cfg) -> List[Stage]:
                         requires=["merge_main", "bios_full"], check="merge_control",
                         state_file=os.path.join(R, CTL_SPLIT + ".merge_state.json")))
 
+    # the tail merge reads a seeded sample of the main split (the biographies in their main form with the filler windows they
+    # were built with), the permuted QA copy (its chat arms are the tail's chat), both chain builds and the tail's plain
+    # text. The biography builds and the raw QA build are not needed any more once the three first merges are done, so
+    # they are deleted before the tail merge writes (the disk peak: docs/plans/RUN2_corpus.md section 3)
+    pruned_bios = []
+    for name in (main_name, full_name, warm_name):
+        pruned_bios += split_files(os.path.join(R, name), EVIDENCE_FILES + ("factspan",))
+    pruned_bios += split_files(os.path.join(P, QA_PREFIX + "_train"), EVIDENCE_FILES + ("evhop", "chains.jsonl"))
+    stages.append(Stage("prune_bios", [f"rm -f {' '.join(q(p) for p in pruned_bios)}"], [],
+                        "the three biography builds and the raw QA build: the main, warm and control merges and the QA copy "
+                        "hold them; the tail merge samples the main split instead",
+                        requires=["merge_main", "merge_warm", "merge_control", "qa_shuffle"], prune=pruned_bios))
+    tail_in = {"text": tail_text_prefix, "main": os.path.join(R, MAIN_SPLIT), "qa": os.path.join(R, SHUFFLED_SLICES["qa"]),
+               "chains": os.path.join(P, PLAIN_PREFIX + "_train"), "bridge": os.path.join(P, BRIDGE_PREFIX + "_train")}
+    tail_passes = {"text": 1, "main": 1, "qa": plan.tail_qa_passes, "chains": plan.tail_chain_passes,
+                   "bridge": plan.tail_chain_passes}
+    tail_slices = [f"{l}={tail_in[l]}:{share(d['tail']['shares'][l])}:{tail_passes[l]}" for l in TAIL_LABELS]
+    tail_cmd = (f"{py}merge_evidence_splits.py --out-dir {q(R)} --split {TAIL_SPLIT} --target-tokens {int(d['tail']['tokens'])} "
+                f"--seed {TAIL_SEED} --max-evidence-tokens 4608 --overwrite "
+                + " ".join(f"--slice {q(x)}" for x in tail_slices))
+    stages.append(Stage("merge_tail", [tail_cmd],
+                        split_files(os.path.join(R, TAIL_SPLIT), EVIDENCE_FILES + ("slice", "merge.json")),
+                        "the tail split (the last 5% of the run, read from the 760B stop): plain text from the higher "
+                        "quality tail phase, a sample of the main split, the QA build with its chat arms, both chain builds; "
+                        "its own seed, so its permutations differ from the main run's",
+                        requires=["merge_main", "tail_text", "qa_shuffle", "chains_plain", "chains_bridge", "prune_bios"],
+                        check="merge_tail", state_file=os.path.join(R, TAIL_SPLIT + ".merge_state.json")))
+
     main_rows = os.path.join(R, MAIN_SPLIT + ".rows_estimate.json")
     ctl_rows = os.path.join(R, CTL_SPLIT + ".rows_estimate.json")
+    tail_rows = os.path.join(R, TAIL_SPLIT + ".rows_estimate.json")
     estimate = (f"{py}sft.py --evidence --estimate-rows-only --estimate-world-sizes {ROWS_WORLD_SIZES} "
                 f"--data-dir {q(R)} --train-split ")
     stages.append(Stage("rows", [f"TINY_LLM_CONFIG=config_run2.yaml {estimate}{MAIN_SPLIT} --plan-split {MAIN_SPLIT}",
-                                 f"TINY_LLM_CONFIG=config_run2_control.yaml {estimate}{CTL_SPLIT}"],
-                        [main_rows, ctl_rows],
-                        "the packed row estimate of the main and control splits (sets total_steps and the cosine), "
-                        "CPU only; the main estimate depends on the order sidecar the warm merge writes",
-                        requires=["merge_main", "merge_warm", "merge_control"],
+                                 f"TINY_LLM_CONFIG=config_run2_control.yaml {estimate}{CTL_SPLIT}",
+                                 f"TINY_LLM_CONFIG=config_run2.yaml {estimate}{TAIL_SPLIT}"],
+                        [main_rows, ctl_rows, tail_rows],
+                        "the packed row estimate of the main, control and tail splits (the main one sets total_steps and "
+                        "the cosine; the tail's is checked against the rows the last stretch of the run needs), CPU only; "
+                        "the main estimate depends on the order sidecar the warm merge writes",
+                        requires=["merge_main", "merge_warm", "merge_control", "merge_tail"],
                         needs_files=[os.path.join(R, MAIN_SPLIT + ".order.json")], post=[rows_check]))
 
     pruned_sources = []
-    for name in (main_name, full_name, warm_name):
-        pruned_sources += split_files(os.path.join(R, name), EVIDENCE_FILES + ("factspan",))
-    for prefix in (QA_PREFIX, PLAIN_PREFIX, BRIDGE_PREFIX):
+    for prefix in (PLAIN_PREFIX, BRIDGE_PREFIX):
         pruned_sources += split_files(os.path.join(P, prefix + "_train"), EVIDENCE_FILES + ("evhop", "chains.jsonl"))
     for path in shuf.values():
         pruned_sources += split_files(path, EVIDENCE_FILES + ("slice", "merge.json"))
+    pruned_sources += split_files(tail_text_prefix, PLAIN_FILES + ("json",))
     stages.append(Stage("prune_sources", [f"rm -f {' '.join(q(p) for p in pruned_sources)}"], [],
-                        "the build outputs the three merges copied; inject_val, the card store and the val splits stay",
-                        requires=["merge_main", "merge_warm", "merge_control"], prune=pruned_sources))
+                        "the chain builds, the permuted QA copy and the tail's plain text, which the four merges copied; "
+                        "inject_val, the card store and the val splits stay",
+                        requires=["merge_main", "merge_warm", "merge_control", "merge_tail"], prune=pruned_sources))
 
     stages.append(Stage("heldout_qa", [offline(f"prepare_evidence_data.py --heldout --data-dir {q(P)} "
                                               f"--max-evidence-tokens 4608{held} --device {cfg.device}")],
@@ -896,6 +1108,7 @@ def build_stages(cfg: Cfg) -> List[Stage]:
     restart_clean = {
         "val_clean": [esc(os.path.join(R, "inject_val_clean")) + ".*"],
         "order": [esc(order_slice) + "*", esc(order_info) + "*"],
+        "tail_text": [esc(tail_text_prefix) + ".*"],
         "heldout_qa": [esc(os.path.join(P, "evidence_dev")) + ".*", esc(os.path.join(P, "evidence_fixed")) + ".*"],
         "heldout_chains": [esc(os.path.join(P, f"chains_{n}")) + ".*" for n in ("eval", "heldout_tmpl", "hop4")],
         "store_openqa": [esc(os.path.join(I, "openqa"))],
@@ -913,8 +1126,9 @@ def build_stages(cfg: Cfg) -> List[Stage]:
     return stages
 
 
-STAGE_ORDER = ["filler", "qa", "bios_main", "val_clean", "bios_full", "bios_warm", "prune_filler",
-               "chains_plain", "chains_bridge", "qa_shuffle", "order", "merge_main", "merge_warm", "merge_control", "rows", "prune_sources",
+STAGE_ORDER = ["filler", "qa", "bios_main", "val_clean", "bios_full", "bios_warm", "tail_text", "prune_filler",
+               "chains_plain", "chains_bridge", "qa_shuffle", "order", "merge_main", "merge_warm", "merge_control",
+               "prune_bios", "merge_tail", "rows", "prune_sources",
                "heldout_qa", "heldout_chains", "store_openqa", "store_edit"]
 
 
@@ -990,6 +1204,8 @@ def check_merge(cfg: Cfg, stage: str, deep: bool = True) -> List[str]:
     one (md5 compared), reach its token target, and (``deep``) hold the same non-biography
     documents as the main split's first documents.
     """
+    if stage == "merge_tail":
+        return check_tail_merge(cfg)
     problems = []
     split = {"merge_warm": WARM_SPLIT, "merge_main": MAIN_SPLIT, "merge_control": CTL_SPLIT}[stage]
     path = os.path.join(cfg.run2, split + ".merge.json")
@@ -1035,6 +1251,70 @@ def check_merge(cfg: Cfg, stage: str, deep: bool = True) -> List[str]:
     for label, value in md5.items():
         print(f"  md5_by_slice {split} {label} {value}")
     return problems
+
+
+TAIL_GAP_TOLERANCE = 0.01
+
+
+def check_tail_merge(cfg: Cfg) -> List[str]:
+    """The tail split holds its five slices, reached its token target and read no slice past its pass cap.
+
+    A slice that ran out of documents leaves a gap to the target (the merge prints it and writes the tokens it got): a gap
+    over 1% means the run would reach the end of the split with the cosine not yet at its floor, so it is refused here.
+    """
+    path = os.path.join(cfg.run2, TAIL_SPLIT + ".merge.json")
+    if not os.path.exists(path):
+        return [f"{path} missing"]
+    with open(path) as f:
+        meta = json.load(f)
+    problems = []
+    md5 = meta.get("md5_by_slice", {})
+    for label in TAIL_LABELS:
+        if label not in md5:
+            problems.append(f"{TAIL_SPLIT}: md5_by_slice has no {label}")
+    target = derive(cfg.plan)["tail"]["tokens"]
+    tokens = meta.get("prompt_tokens", 0)
+    if tokens < (1.0 - TAIL_GAP_TOLERANCE) * target:
+        passes = [(st["label"], round(st["passes"], 2), st["max_passes"]) for st in meta.get("slices", [])]
+        problems.append(f"{TAIL_SPLIT}: {tokens:,} tokens, {target - tokens:,.0f} under the target {int(target):,} "
+                        f"(a slice ran out of documents or of passes: {passes})")
+    for st in meta.get("slices", []):
+        print(f"  {TAIL_SPLIT} {st['label']}: {st['prompt_tokens']:,} tokens, share {st['share_realised']:.3f} "
+              f"(target {st['share_target']:.3f}), {st['passes']:.2f} passes of its input (cap {st['max_passes']}), "
+              f"evidence ratio {st['evidence_ratio']:.3f}")
+    for label, value in md5.items():
+        print(f"  md5_by_slice {TAIL_SPLIT} {label} {value}")
+    return problems
+
+
+QA_SMOLTALK2_FAIL = 0.90
+
+
+def qa_arm_check(cfg: Cfg) -> List[str]:
+    """The smoltalk2 replay arm reached its target: a short arm is not an error in the builder (the round robin gives its
+    share to the other arms), so the stage checks the realized tokens in the builder's state file.
+
+    Fails under 90% of the arm's target and warns under 100% (smoke scales only warn: the supply scales with the plan, the
+    real files do not).
+    """
+    path = os.path.join(cfg.prepared, "_prepare_state_" + QA_PREFIX + ".json")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        state = json.load(f)
+    got = state.get("sources", {}).get("smoltalk2", {}).get("tokens")
+    if got is None:
+        return []
+    target = QA_ARM_WEIGHTS["smoltalk2"] * cfg.plan.scaled("qa_target")
+    frac = got / target if target else 1.0
+    if frac >= 1.0:
+        return []
+    msg = (f"the smoltalk2 replay arm realized {got:,} of {target:,.0f} tokens ({frac:.0%}): the supply left after phase 2 and ir "
+           f"is short; lower QA_ARM_WEIGHTS['smoltalk2'] (the arm's share) or the qa target, or phase 2 / ir smoltalk2 tokens, and rebuild qa")
+    if frac < QA_SMOLTALK2_FAIL and cfg.plan.scale >= 1.0:
+        return [msg]
+    print(f"!!! WARNING {msg}", flush=True)
+    return []
 
 
 def qa_shuffle_check(cfg: Cfg) -> List[str]:
@@ -1234,7 +1514,10 @@ def _run_stage(cfg: Cfg, stage: Stage, dry: bool, force: bool, tag: str = "") ->
     pruned = bool(stage.pruned_by) and os.path.exists(marker_path(cfg, stage.pruned_by))
     if os.path.exists(marker) and (present or pruned) and not force:
         say(tag, f"=== stage {stage.name}: done before ({'pruned by ' + stage.pruned_by if pruned and not present else 'marker and ' + str(len(stage.outputs)) + ' outputs present'}), skipped")
-        problems = [p for hook in stage.post for p in hook(cfg)]
+        # the merge checks run again on a skip (md5 of the .slice files, token totals; not the deep document
+        # comparison, which ran when the stage finished), unless the stage's outputs were pruned away
+        problems = check_merge(cfg, stage.check, deep=False) if stage.check and present else []
+        problems += [p for hook in stage.post for p in hook(cfg)]
         for p in problems:
             say(tag, f"!!! stage {stage.name}: {p}")
         return not problems
@@ -1405,6 +1688,12 @@ def link_filler(cfg: Cfg) -> None:
             dst = os.path.join(cfg.prepared, f"{phase}.{s}")
             if not os.path.lexists(dst):
                 os.symlink(os.path.abspath(os.path.join(cfg.link_filler_from, f"{phase}.{s}")), dst)
+    # the tail's plain text phase: the local ir bins stand in (the smoke has no fresh files to read)
+    os.makedirs(cfg.tail_dir, exist_ok=True)
+    for s in ("bin", "idx"):
+        dst = os.path.join(cfg.tail_dir, f"phase1.{s}")
+        if not os.path.lexists(dst):
+            os.symlink(os.path.abspath(os.path.join(cfg.link_filler_from, f"ir.{s}")), dst)
 
 
 def inbox_done_path(cfg: Cfg) -> str:
@@ -1624,7 +1913,7 @@ def gb(x: float) -> str:
 
 
 def print_plan(plan: Plan, window_bytes: Optional[float] = None, disk_budget: float = 3.4e12,
-               standing_budget: float = 2.0e12, parallel: Sequence[str] = ()) -> List[str]:
+               standing_budget: float = 2.6e12, parallel: Sequence[str] = ()) -> List[str]:
     d = derive(plan)
     sched = disk_schedule(plan, d, window_bytes, parallel)
     hours = hours_plan(plan, d)
@@ -1643,11 +1932,27 @@ def print_plan(plan: Plan, window_bytes: Optional[float] = None, disk_budget: fl
     for r in d["phase1_rows"]:
         print(f"  {r['source']:14s} {r['before_share']:8.4f} {r['after_share']:8.4f} {r['before_tokens'] / 1e9:10.2f} "
               f"{r['after_tokens'] / 1e9:10.2f} {r['limit'] / 1e9:10.2f}{'  capped' if r['capped'] else ''}")
-    print("filler need against supply (all three phases)")
+    print("filler need against supply (all four phases: phase 1, phase 2, ir, the tail's plain text)")
     for r in filler_supply(plan, d):
         print(f"  {r['source']:14s} need {r['need'] / 1e9:8.2f}B  files {r['files_needed']:5d}  supply "
               f"{r['supply_patched'] / 1e9:8.2f}B (one crawl for fineweb {r['supply_default'] / 1e9:.2f}B)")
     sz = build_sizes(plan, d)
+    tl = d["tail"]
+    print(f"tail split {TAIL_SPLIT}: {tl['tokens']:,.0f} prompt tokens, the run reads {tl['read']:,.0f} of them from the stop at "
+          f"{(plan.run_tokens - plan.tail_read) / 1e9:,.0f}B (a surplus of {tl['tokens'] / max(tl['read'], 1) - 1:.1%})")
+    for k in TAIL_LABELS:
+        extra = {"qa": f"  {tl['qa_passes']:.2f} passes of the QA build (cap {plan.tail_qa_passes}); its chat arms are about a third",
+                 "chains": f"  {tl['plain_passes']:.2f} passes of the plain chain build (cap {plan.tail_chain_passes})",
+                 "bridge": f"  {tl['bridge_passes']:.2f} passes of the bridge chain build (cap {plan.tail_chain_passes})",
+                 "main": f"  {tl['main_fraction']:.2%} of the main split's documents, a seeded sample"}.get(k, "")
+        print(f"  {k:7s} {tl['slice_tokens'][k]:>18,.0f} tokens  share {tl['shares'][k]:.2f}{extra}")
+    print(f"  tail plain text build: {tl['text_target']:,} tokens from {tl['filler']:,.0f} filler tokens of fresh files "
+          f"(skipping every file of phase 1, 2 and ir); evidence ratio of the tail about {sz['tail_ev_ratio']:.3f} per prompt token "
+          f"(the main run's {sz['ev_ratio']:.3f})")
+    print(f"  {'source':14s} {'asked B':>9s} {'got B':>9s} {'fresh limit B':>14s}")
+    for r in tl["rows"]:
+        print(f"  {r['source']:14s} {r['before_tokens'] / 1e9:9.2f} {r['after_tokens'] / 1e9:9.2f} {r['limit'] / 1e9:14.2f}"
+              f"{'  capped' if r['capped'] else ''}")
     print(f"evidence tokens {sz['ev_tokens']:,.0f} (bios {d['bio_renders'] * BIOS_EVTOK_PER_RENDER:,.0f} from "
           f"{d['bio_renders']:,} renderings), evidence ratio {sz['ev_ratio']:.4f} per prompt token")
     print(f"chain questions: plain {d['plain_questions']:,}  bridge {d['bridge_questions']:,}")
@@ -1677,6 +1982,11 @@ def print_plan(plan: Plan, window_bytes: Optional[float] = None, disk_budget: fl
           f"(at {BYTES_PER_FILLER_TOKEN} bytes per token, an estimate; limit 2 TB): "
           + ", ".join(f"{k} {v['files']}" for k, v in t.items()))
     problems = disk_problems(sched, disk_budget, standing_budget)
+    for label, need, cap in (("qa", tl["qa_passes"], plan.tail_qa_passes), ("chains", tl["plain_passes"], plan.tail_chain_passes),
+                             ("bridge", tl["bridge_passes"], plan.tail_chain_passes)):
+        if need > cap + 1e-9:
+            problems.append(f"the tail's {label} slice needs {need:.2f} passes of its build, the cap is {cap}: raise the cap "
+                            f"or lower the share")
     for k in long_stage_flags(hours):
         problems.append(f"stage {k} is estimated over {LONG_STAGE_HOURS:.0f} hours and cannot resume")
     for pr in problems:
@@ -1736,6 +2046,144 @@ def cmd_order(argv: Sequence[str]) -> int:
         json.dump(info, f, indent=1)
     os.replace(a.info + ".tmp", a.info)
     print(f"order: {info['total_docs']:,} documents, {info['total_tokens']:,} tokens, {len(order):,} bytes in {a.out}")
+    return 0
+
+
+TAIL_WINDOW = 1000       # the biography build's filler window: min(1000, seq_length - 24)
+TAIL_MIN_WINDOW = 32     # prepare_injection_data.MIN_WINDOW: a document's last window under this is dropped
+TAIL_BLOCK_WINDOWS = 400_000
+
+
+def tail_text_blocks(offsets, window: int = TAIL_WINDOW, min_window: int = TAIL_MIN_WINDOW, docs_per_chunk: int = 1 << 20):
+    """Yield ``(starts, lengths)`` of the windows of each run of documents, in storage order.
+
+    A document is cut from its first token in windows of ``window`` tokens, the last one dropped when under
+    ``min_window``: the biography build's rule (``load_filler_windows``), so the tail's plain text has the same shape
+    as the main run's filler.
+    """
+    import numpy as np
+    n = len(offsets) - 1
+    for lo in range(0, n, docs_per_chunk):
+        starts = offsets[lo:min(lo + docs_per_chunk, n)]
+        ends = offsets[lo + 1:lo + 1 + len(starts)]
+        counts = (np.maximum(ends - starts, 0) + window - 1) // window
+        total = int(counts.sum())
+        if not total:
+            continue
+        doc_of = np.repeat(np.arange(len(starts)), counts)
+        first = np.cumsum(counts) - counts
+        w = starts[doc_of] + (np.arange(total) - first[doc_of]) * window
+        length = np.minimum(window, ends[doc_of] - w)
+        keep = length >= min_window
+        yield w[keep], length[keep]
+
+
+def tail_text_assemble(tokens, starts, lengths, bos: int, eos: int):
+    """``[BOS] window [EOS]`` for each window, concatenated: ``(ids, mask, document end offsets)``.
+
+    The mask is 1 everywhere but on BOS, as the biography build writes its filler documents.
+    """
+    import numpy as np
+    lens = lengths + 2
+    offs = np.cumsum(lens) - lens
+    ids = np.empty(int(lens.sum()), dtype=np.uint16)
+    body_first = np.cumsum(lengths) - lengths
+    within = np.arange(int(lengths.sum())) - np.repeat(body_first, lengths)
+    ids[np.repeat(offs + 1, lengths) + within] = tokens[np.repeat(starts, lengths) + within]
+    ids[offs] = bos
+    ids[offs + lens - 1] = eos
+    mask = np.ones(len(ids), dtype=np.uint8)
+    mask[offs] = 0
+    return ids, mask, np.cumsum(lens)
+
+
+def cmd_tail_text(argv: Sequence[str]) -> int:
+    """``tail-text``: the tail phase's documents cut into windows, as a plain split (``bin idx mask``).
+
+    Reads ``SRC.bin`` and ``SRC.idx`` (a ``prepare_data`` phase: raw documents with no BOS or EOS), writes ``OUT.bin``,
+    ``OUT.idx``, ``OUT.mask`` and ``OUT.json``, stopping at the first window that reaches ``--target`` tokens (BOS and
+    EOS counted). The documents stay in the phase's order (its sources interleaved by weight); the tail merge permutes
+    them. With fewer tokens than the target it cycles the input under ``--allow-repeat`` (smoke runs); otherwise it fails
+    only below ``--min-tokens`` (what the merge needs; default the target), and between that and the target it warns
+    loudly and writes what it has, recording ``shortfall`` in ``OUT.json``.
+    """
+    import numpy as np
+    p = argparse.ArgumentParser(prog="build_run2_corpus.py tail-text")
+    p.add_argument("--src", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--target", type=int, required=True)
+    p.add_argument("--min-tokens", type=int, default=None)
+    p.add_argument("--allow-repeat", action="store_true")
+    p.add_argument("--bos-id", type=int, default=None)
+    p.add_argument("--eos-id", type=int, default=None)
+    a = p.parse_args(argv)
+    bos, eos = a.bos_id, a.eos_id
+    if bos is None or eos is None:
+        sys.path.insert(0, REPO)
+        from transformers import AutoTokenizer
+        from utils import TOKENIZER_DIR
+        tok = AutoTokenizer.from_pretrained(TOKENIZER_DIR)
+        bos, eos = tok.bos_token_id, tok.eos_token_id
+    tokens = np.memmap(a.src + ".bin", dtype=np.uint16, mode="r")
+    offsets = np.asarray(np.memmap(a.src + ".idx", dtype=np.uint64, mode="r"), dtype=np.int64)
+    min_tokens = a.target if a.min_tokens is None else min(a.min_tokens, a.target)
+    short = False
+    written = windows = 0
+    passes = 0
+    tmp = {s: a.out + f".{s}.part" for s in ("bin", "idx", "mask")}
+    files = {s: open(path, "wb") for s, path in tmp.items()}
+    files["idx"].write(np.array([0], dtype=np.uint64).tobytes())
+    t0 = time.time()
+    done = False
+    while not done:
+        got = 0
+        for starts, lengths in tail_text_blocks(offsets):
+            for lo in range(0, len(starts), TAIL_BLOCK_WINDOWS):
+                st, ln = starts[lo:lo + TAIL_BLOCK_WINDOWS], lengths[lo:lo + TAIL_BLOCK_WINDOWS]
+                cum = np.cumsum(ln + 2)
+                if written + int(cum[-1]) >= a.target:
+                    cut = int(np.searchsorted(cum, a.target - written, side="left")) + 1
+                    st, ln = st[:cut], ln[:cut]
+                    done = True
+                ids, mask, ends = tail_text_assemble(tokens, st, ln, bos, eos)
+                files["bin"].write(ids.tobytes())
+                files["mask"].write(mask.tobytes())
+                files["idx"].write((ends + written).astype(np.uint64).tobytes())
+                written += len(ids)
+                windows += len(st)
+                got += len(st)
+                if done:
+                    break
+            if done:
+                break
+        passes += 1
+        print(f"tail-text: pass {passes}: {windows:,} windows, {written:,} tokens ({time.time() - t0:.0f}s)", flush=True)
+        if not done:
+            if (not a.allow_repeat or not got) and written >= min_tokens:
+                short = True
+                print(f"tail-text: WARNING the input holds only {written:,} tokens of windows, {a.target - written:,} under the "
+                      f"target {a.target:,} but over the merge's need {min_tokens:,}: continuing; the tail's text slice will "
+                      f"be that much smaller than planned, check the per source realized counts of tail_prep", flush=True)
+                break
+            if not a.allow_repeat or not got:
+                for f in files.values():
+                    f.close()
+                for path in tmp.values():
+                    os.remove(path)
+                print(f"tail-text: the input holds {written:,} tokens of windows, under the merge's need {min_tokens:,} (target {a.target:,})", file=sys.stderr)
+                return 1
+            print(f"tail-text: input exhausted at {written:,} tokens, cycling it (pass {passes + 1}; --allow-repeat)", flush=True)
+    for f in files.values():
+        f.flush()
+        os.fsync(f.fileno())
+        f.close()
+    for s, path in tmp.items():
+        os.replace(path, f"{a.out}.{s}")
+    info = {"src": a.src, "windows": windows, "tokens": written, "target": a.target, "input_passes": passes,
+            "repeat": passes > 1, "min_tokens": min_tokens, "shortfall": max(0, a.target - written) if short else 0, "bos": bos, "eos": eos, "window": TAIL_WINDOW}
+    with open(a.out + ".json", "w") as f:
+        json.dump(info, f, indent=1)
+    print(f"tail-text: {windows:,} windows, {written:,} tokens (target {a.target:,}), repeat {'yes' if passes > 1 else 'no'}")
     return 0
 
 
@@ -1824,6 +2272,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return cmd_order_total(argv[1:])
     if argv and argv[0] == "split-tokens":
         return cmd_split_tokens(argv[1:])
+    if argv and argv[0] == "tail-text":
+        return cmd_tail_text(argv[1:])
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mode", choices=["plan", "build"])
@@ -1844,7 +2294,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--mirror-window-gb", type=float, default=120.0, help="the inbox size bound, counted in the disk plan")
     p.add_argument("--offline-stage", default=None, help="no internet: HF_HOME staged by mirror_sources stage-small")
     p.add_argument("--disk-budget", type=float, default=3.4e12)
-    p.add_argument("--standing-budget", type=float, default=2.0e12)
+    p.add_argument("--standing-budget", type=float, default=2.6e12)
     p.add_argument("--parallel", default="", help="comma separated independent stages to run as concurrent processes "
                    "(one node, several CPU jobs); each keeps its log and marker")
     p.add_argument("--tokenizer-dir", default=None)

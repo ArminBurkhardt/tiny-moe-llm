@@ -17,4 +17,4 @@ export SIF=/gpfs/projects/CHANGE_PROJECT/run2.sif            # empty = the venv 
 # export NCCL_DEBUG=WARN
 # export SLURM_CPU_BIND=none                                 # when srun fails to bind the 20 cpus per task
 # export BIND_EXTRA=/gpfs/projects/CHANGE_PROJECT/models     # more bind mounts
-# export TINY_LLM_TOKENIZER=/path/to/tokenizer               # only when the default location under the checkout is not used
+# export TINY_LLM_TOKENIZER=/path/to/tokenizer               # default $HF_HOME/tokenizer (where mirror_sources.py stage-small puts it)

@@ -18,6 +18,7 @@ are pushed in from outside, checkpoints are pulled out from outside. Inbound ssh
 | `train_job.sh` | one job: precheck, the srun line, the watchdog, the exit decision, the chain state |
 | `watchdog.sh` | sidecar of the training job: stalls, divergence (no GPU) |
 | `submit_chain.sh` | `TRAIN\|CONTROL\|CORPUS N`: N jobs chained with `afterany` from the login node |
+| `cancel_chain.sh` | `[RUN]`: the only supported way to end a chain by hand (marks it cancelled, then scancels its jobs) |
 | `rank_exec.sh` | one training process per GPU: rank variables, SIGTERM forwarding, its exit code to a file |
 | `corpus.sbatch` | the corpus driver for given stages, with a stall watchdog |
 | `reads.sbatch` | up to 4 `(CKPT, TAG)` pairs, one per GPU of one node, optional weight export |
@@ -35,8 +36,11 @@ On the cluster, once: `cp scripts/slurm/mn5_env.local.sh.example scripts/slurm/m
 `acc_debug` cannot hold a 71:50 job, such a job pends for ever), `SIF`, the `module load singularity` line,
 `SLURM_CPU_BIND=none` if binding fails. That file is gitignored and `push_code.sh` never sends it, so a push does not
 overwrite it; the tracked `mn5_env.sh` holds no site value. A job or a submit with a `CHANGE` placeholder left exits 2 and
-says which. `BIND` and `CTR` are rebuilt in every shell (a job gets its own `$TMPDIR` in the bind list) and are never taken
-from the login shell. A `SIF` with no `singularity` or `apptainer` on PATH exits 2 (no host python by accident).
+says which. `BIND` and `CTR` are rebuilt in every shell (the node's `$TMPDIR` goes into the bind list only when it exists on
+that node, so a login node path carried by `--export=ALL` is dropped) and are never taken from the login shell.
+`TINY_LLM_TOKENIZER` defaults to `$HF_HOME/tokenizer`, where `mirror_sources.py stage-small` puts the tokenizer; singularity
+passes the host environment into the container and `$HF_HOME` is bound. A training or reads job without a tokenizer there
+stops before the trainer (the training chain halts with the reason). A `SIF` with no `singularity` or `apptainer` on PATH exits 2 (no host python by accident).
 `scripts/ops/ops.env` (copy `ops.env.example`, on the PC): user, project paths, the two socket paths,
 `TRANSFER_BUDGET_GB`, optionally `HF_EXPORT_REPO`. Submit with `submit_chain.sh`, which sources the environment and
 creates `logs` itself.
@@ -81,13 +85,25 @@ there means trying `BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3` (docker mode) b
    (polled every 10 steps; the trainer saves and exits 10, the chain ends as `stop`, no HALT). Then the same with
    `GPUS_PER_NODE=1 RUN=run2_chk1` (STOP after the same number of steps). Compare the loss lines and the per rank counts.
    The watchdog cannot kill this: its save limit is derived from the GPU count (`SAVE_MIN` 386 minutes at 2 GPUs, plus 30
-   for the first save; a 1B save takes about 2 hours there) and the step limit (15 minutes between step lines, 30 at startup)
+   for the first save; a 1B save takes about 2 hours there) and the step limit (30 minutes between step lines, 30 at startup)
    is far above the seconds a step takes. Do not shorten `SAVE_MIN` by hand for this check.
+5a. Memory at the worst case, before the warm-up: on one node at batch 8 run `sft.py --probe-peak` (one synthetic worst case
+   evidence batch; it prints the peak in GB per rank) through the same container and `TINY_LLM_CONFIG=config_run2.yaml`, and
+   compare with the 64 GB of an H100. If the peak is above about 58 GB, lower `max_evidence_tokens` in `config_run2.yaml` (and
+   rebuild nothing: the cap only closes rows earlier) before any warm-up job; an out of memory in hour 20 costs a job.
+5b. One real planned stop: start a short job (the 2 GPU check's line is enough), wait for step lines, then `scancel
+   --signal=TERM JOBID.0` on its step by hand. Confirm every rank logs a save and exits 20, `logs/rc_JOBID.rank0` holds 20, and
+   the chain decides `resubmit`. This is the path the 20 minute time limit stop and every interruption take.
+5c. Run `python scripts/ops/supervise.py` on the PC without `--act` until the first chain has started and its first poll
+   reads sensibly (one action seen in `squeue` is the Day 1 test of `--act`, after that); then turn `--act` on.
 6. The 10B control: `bash scripts/slurm/submit_chain.sh CONTROL 1` (about 4 hours at 8 GPUs).
 7. Corpus stages if built on the cluster (each job takes a whole node: exclusive, all memory, 80 CPUs): `STAGES=... bash
    scripts/slurm/submit_chain.sh CORPUS 3` per stage group, in this order: filler (only through the mirror, "The filler through the mirror" below: no login node has internet), qa, bios_main (with the
-   chains in parallel), val_clean, bios_full, bios_warm, prune_filler, qa_shuffle (after the chains), order, merges, rows (CPU only, after merge_control),
-   prune_sources, the held-out stages, stores.
+   chains in parallel), val_clean, bios_full, bios_warm, tail_text, prune_filler, qa_shuffle (after the chains), order, merges
+   (main, warm, control), prune_bios, merge_tail, rows (CPU only, after merge_tail), prune_sources, the held-out stages, stores.
+   The filler stage also builds the tail phase's plain text (its fourth command, fresh files at the higher quality mix), so
+   the mirror pushes about 490 GB instead of 444 GB; `tail_text` windows it, `merge_tail` writes `run2_tail_train` (the last 5%
+   of the run, RUN2_corpus.md section 2b). `prune_bios` must run before `merge_tail` (the disk peak), `prune_sources` after it.
 8. Warm-up: `STOP_AFTER='4000M' bash scripts/slurm/submit_chain.sh TRAIN 4` (the watcher drops `STOP` after the first save
    at or past 4B: saves land a log step past their grid point, `tok4003M`, so the rule is numeric, never an exact tag; the
    run passes `--plan-split run2_main_train` and, in the warm-up, `--max-epochs-this-split 1`, and the log line "warm split
@@ -95,7 +111,19 @@ there means trying `BASE_IMAGE=nvcr.io/nvidia/pytorch:25.10-py3` (docker mode) b
    Read each save: `RUN=run2 PAIRS="ckptA:2B ckptB:4B" sbatch --job-name=run2_reads_run2 scripts/slurm/reads.sbatch`.
    Each read set ends with the 13-task benchmark suite (`BENCH=1`, the default; `BENCH=0` skips it): language quality is read at every save, offline from `$HF_HOME/datasets` (staged by `stage-small`), output `ckpts/inject/run2_TAG_bench.json`. A failed suite fails the job but never the supervisor's read counting (`reads_done` keys on `rank_none`).
 9. The switch, once the criterion holds: `SPLIT=run2_main_train bash scripts/slurm/submit_chain.sh TRAIN 4` (a fresh
-   chain: clears `STOP` and `HALT`, adds `--switch-split`).
+   chain: clears `STOP` and `HALT`, adds `--switch-split`). On the main split `STOP_AFTER` defaults to `760000M`: the chain
+   stops by itself after the first save at or past 760B (the start of the tail phase) and waits for the tail switch below;
+   `STOP_AFTER=''` (set and empty) turns that stop off, any other tag moves it. The stop is recorded in the chain state
+   (`stop_after`, `split`), so a chain the supervisor resubmits (`START_INDEX=1`) keeps it.
+10. **The tail switch** (the last 5%: 40B tokens from 760B, on `run2_tail_train`). At the 760B stop the chain ends with
+   `STOP` kept and the supervisor alerts "tail switch due" (a decision for you, not a failure; it never resubmits past it).
+   To go on: `rm ckpts/evidence_run2/STOP`, then `SPLIT=run2_tail_train bash scripts/slurm/submit_chain.sh TRAIN 3`. The fresh
+   chain adds `--switch-split --switch-from-start --end-at-plan` and no stop: the trainer reads the tail from its first
+   document in the main split's last epoch, the optimizer, the one cosine (step count), the token count and the RNG carry on,
+   and the run ends on its own at the plan's last step (the tail holds a 5% surplus), with a final save and exit 0. Refused with
+   exit 30 (the chain halts with the reason) unless the checkpoint is in the last epoch and was planned on `run2_main_train`,
+   or when the tail holds fewer optimizer steps than the plan has left (a switch far too early). The tail's row estimate
+   (`rows` stage, 8 ranks) must exist, as the main one does. A tail run that is stopped and resumed later is a plain resume.
 
 Day 1 checks that the jobs depend on (none was ever run under real Slurm):
 
@@ -105,8 +133,8 @@ Day 1 checks that the jobs depend on (none was ever run under real Slurm):
   nothing, wait for step lines, then `scancel --signal=TERM JOBID.0` by hand: each rank must log its save and exit 20, rank 0's
   code must be in `logs/rc_JOBID.rank0`, and a `singularity exec` wrapper must forward the TERM (`rank_exec.sh` forwards it
   to the container process). `squeue -s -j JOBID` must list the step as `JOBID.0`.
-- **GPU visibility.** `srun` passes `--gpus-per-node=N --gpu-bind=none`: every task sees the node's GPUs and `LOCAL_RANK`
-  picks one. Print `CUDA_VISIBLE_DEVICES` per task once.
+- **GPU visibility.** `srun` passes `--gres=gpu:N --gpu-bind=none` (the same gres style as the `#SBATCH` lines; a step mixing
+  gres and `--gpus-per-node` is rejected on some Slurm versions): every task sees the node's GPUs and `LOCAL_RANK` picks one. Print `CUDA_VISIBLE_DEVICES` per task once.
 - **flock on the project disk.** A job takes `ckpts/evidence_RUN/.trainer.lock` (and a corpus job
   `$DATA_ROOT/slurm_state/<stages>.lock`) with `flock`; a file system without it makes every job exit 2 at once.
 - **The transfer socket**, below.
@@ -139,23 +167,28 @@ Two trainers on one run directory is the failure the chain is built against: eve
 (`submit_chain.sh` creates it, the first job writes it into `chain_state`), a job of another chain exits at once, a job takes
 `flock` on the run directory before it touches any state, `submit_chain.sh` refuses while `squeue -n NAME` lists a job of that
 name or when squeue fails, and `supervise.py` exits 2 without acting when squeue failed. Job names are explicit and matched
-exactly: the run name (`run2`, `run2_control`, `RUN=...`), `run2_corpus_<stages>`, `run2_reads_<run>`. **Never `scancel` one
-job of a chain** (its successor would start the next job straight away): cancel the whole chain (`scancel $(squeue -h -n run2
--o %i)`), or drop `STOP`. A cancelled job still writes its history line and asks the ranks to save; a cancel with more than
-5 minutes of the limit left also writes `ended=cancelled` (the afterany successors then exit at once) and `supervise.py` never
-resubmits such a chain: it alerts, and a person who wants it restarted clears it on the login node:
+exactly: the run name (`run2`, `run2_control`, `RUN=...`), `run2_corpus_<stages>`, `run2_reads_<run>`. **End a chain by hand
+only with `bash scripts/slurm/cancel_chain.sh [RUN]`** (or drop `STOP`). It writes `ended=cancelled` and a history line into the
+run's `chain_state` first, then scancels every job of that name, pending and running. A bare `scancel` of a job is not read as
+a cancel: a TERM reaching a job (time limit, node failure, admin kill, requeue, a hand scancel) is an interruption, the job
+writes an `interrupted` history line, asks the ranks to save, and the next afterany job of the chain goes on. A chain
+marked cancelled makes the running job save and the afterany successors exit at once, and `supervise.py` never
+resubmits it: it alerts, and a person who wants it restarted clears it on the login node:
 `sed -i '/^ended=cancelled$/d' ckpts/evidence_RUN/chain_state && sed -i '$ s/^\([0-9]*\) cancelled /\1 ok /' ckpts/evidence_RUN/chain_history`.
-A failure every rerun would repeat (the environment: no container runtime, a bad `STOP_AFTER`, unfilled site values, a lock
-that cannot be taken; the trainer's exit 1, a refusal, or exit 2, a missing rows cache) writes `HALT` with the reason, and
-the supervisor reports it. A chain that ends writes
+A failure every rerun would repeat (the environment: no container runtime, no tokenizer, a bad `STOP_AFTER`, unfilled site
+values, a lock that cannot be taken; the trainer's exit 3, a deliberate refusal, or exit 2, a missing rows cache or a bad
+argument) writes `HALT` with the reason, and the supervisor reports it. The trainer's exit 1 is an uncaught exception, a crash
+that may be transient (a file system error, an Xid, a dead peer, an out of memory): the chain resubmits, and halts after two
+jobs in a row without a new save (or by the crash loop rule below). A chain that ends writes
 `ended=...` into `chain_state` (done, stop, halted, max-jobs, stalled, warm-exhausted) and, for any end that is not a done run
 or a STOP, a `HALT` with the reason; `supervise.py` never resubmits a chain that names an end. The trainer's own kill rule
 (exit 10 with no STOP file) halts the chain with the `KILL:` line, exit 30 halts with the trainer's last error line, and rank 0
 exit 0 without `checkpoint_evidence_final.pt` halts (never read as finished). A watchdog that cannot start (its temporary file
 lives in `logs/`) stops the job before the trainer starts.
 
-Per job, in the batch shell (no GPU): a **progress watchdog** every 60 s (`watchdog.sh`): no new step line for `STALL_MIN` (15,
-doubled while the log's last line is not a step line, 30 during startup), or no new save for `SAVE_MIN` (derived by
+Per job, in the batch shell (no GPU): a **progress watchdog** every 60 s (`watchdog.sh`): no new step line for `STALL_MIN` (30, enough for the
+longest eval, since the trainer prints an eval only when it ends; doubled while the log's last line is not a step line, 30
+during startup), or no new save for `SAVE_MIN` (derived by
 `train_job.sh`: max(45, ceil(2.5 x save interval / (GPUs x 54k tokens per second) / 60)) minutes, so 49 at 16 GPUs, 97 at 8,
 386 at 2; plus the startup allowance for the job's first save; stored in `chain_state` and reported by `status.py`, so
 `supervise.py` judges by the same number) -> SIGTERM to the ranks, kill after 3 minutes, the job is marked `stalled`;

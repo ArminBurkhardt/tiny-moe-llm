@@ -47,7 +47,7 @@ def fake_repo():
         '#!/usr/bin/env bash\n'
         'case "$*" in\n'
         '  *" -s "*|"-s "*) echo "$SLURM_JOB_ID.batch"; echo "$SLURM_JOB_ID.0";;\n'
-        '  *"-n "*) [ -n "$FAKE_SQUEUE_OUT" ] && echo "$FAKE_SQUEUE_OUT"; exit ${FAKE_SQUEUE_RC:-0};;\n'
+        '  *"-n "*) [ -n "$FAKE_SQUEUE_OUT" ] && [ ! -s "$FAKE_BIN/scancel.log" ] && echo "$FAKE_SQUEUE_OUT"; exit ${FAKE_SQUEUE_RC:-0};;\n'
         '  *) echo ${FAKE_LEFT:-UNLIMITED};;\n'
         'esac\n'))
     write_exe(os.path.join(fb, "scancel"), (
@@ -75,6 +75,8 @@ def fake_repo():
         'echo $$ > "$FAKE_PIDFILE"\n'
         'case "$FAKE_MODE" in\n'
         '  ok20) echo "INFO: Checkpoint saved at x/checkpoint_evidence_tok1M_loss3.0000.pt" >> "$FAKE_LOG"; echo $RANDOM > "$FAKE_RUNDIR/run_state.json"; exit 20;;\n'
+        '  tailstop) echo "INFO: Checkpoint saved at x/checkpoint_evidence_tok760003M_loss3.0000.pt" >> "$FAKE_LOG"; echo $RANDOM > "$FAKE_RUNDIR/run_state.json"; '
+        'until [ -e "$FAKE_RUNDIR/STOP" ]; do sleep 0.2; done; exit 10;;\n'
         '  exit0) exit 0;;\n'
         '  exit0final) touch "$FAKE_RUNDIR/checkpoint_evidence_final.pt"; exit 0;;\n'
         '  exit10kill) echo "INFO: KILL: fixed-target gain 0.0 under the bar" >> "$FAKE_LOG"; exit 10;;\n'
@@ -82,6 +84,9 @@ def fake_repo():
         '  exit30) echo "ERROR: resume verification failed: offset behind" >> "$FAKE_LOG"; exit 30;;\n'
         '  term) trap \'echo saved > "$FAKE_RUNDIR/saved_on_term"; exit 20\' TERM; while true; do sleep 0.2; done;;\n'
         '  exit2) echo "ERROR: rows cache missing: run the corpus rows stage" >> "$FAKE_LOG"; exit 2;;\n'
+        '  exit1) echo "Traceback (most recent call last): OSError: stale file handle" >> "$FAKE_LOG"; exit 1;;\n'
+        '  termcrash) trap "exit 1" TERM; while true; do sleep 0.2; done;;\n'
+        '  exit3) echo "ERROR: refused: seed mismatch" >> "$FAKE_LOG"; exit 3;;\n'
         '  rise) for i in $(seq 1 25); do echo "Epoch 0 | Step $i | Loss: 3 | Loss (CE): 3.0 | Tokens/sec: 1" >> "$FAKE_LOG"; sleep 0.3; done; '
         'while true; do echo "Epoch 0 | Step 99 | Loss: 5 | Loss (CE): 5.0 | Tokens/sec: 1" >> "$FAKE_LOG"; sleep 0.3; done;;\n'
         '  diverge) while true; do echo "Epoch 0 | Step 1 | Loss: nan | Loss (CE): nan | Tokens/sec: 1" >> "$FAKE_LOG"; sleep 0.3; done;;\n'
@@ -90,18 +95,22 @@ def fake_repo():
 
 
 def job_env(tmp, repo, data, fb, **kw):
+    tok = os.path.join(tmp, "tokenizer")
+    os.makedirs(tok, exist_ok=True)
+    open(os.path.join(tok, "tokenizer.json"), "w").close()
     log = os.path.join(repo, "ckpts", "inject", "run2.log")
     e = dict(REPO=repo, DATA_ROOT=data, SBATCH_ACCOUNT="acct", SLURM_SUBMIT_DIR=repo, SLURM_JOB_ID="777",
              SLURM_JOB_NUM_NODES="1", SLURM_NTASKS_PER_NODE="1", SLURM_JOB_NODELIST="n1", SLURM_JOB_NAME="run2",
              SLURM_PROCID="0", SLURM_NTASKS="1", SLURM_LOCALID="0", FAKE_BIN=fb, FAKE_PIDFILE=os.path.join(tmp, "pid"),
              FAKE_LOG=log, FAKE_RUNDIR=os.path.join(repo, "ckpts", "evidence_run2"), WD_CHECK_S="0.3", POLL="1",
-             KILL_AFTER_S="2", PATH=fb + os.pathsep + os.environ["PATH"], TMPDIR=tmp)
+             KILL_AFTER_S="2", PATH=fb + os.pathsep + os.environ["PATH"], TMPDIR=tmp, TINY_LLM_TOKENIZER=tok)
     e.update(kw)
     return e
 
 
-def run_job(tmp, repo, data, fb, script="source scripts/slurm/train_job.sh", trigger=None, timeout=60, **kw):
-    """Run a job script like sbatch does (one bash process); trigger = (signal, seconds, wait for the pid file)."""
+def run_job(tmp, repo, data, fb, script="source scripts/slurm/train_job.sh", trigger=None, timeout=60, before=None, **kw):
+    """Run a job script like sbatch does (one bash process); trigger = (signal, seconds, wait for the pid file);
+    before = a callable(env) run once the trainer is up, ahead of the signal."""
     env = clean_env(**job_env(tmp, repo, data, fb, **kw))
     out = os.path.join(tmp, "job.out")
     with open(out, "w") as fh:
@@ -112,6 +121,8 @@ def run_job(tmp, repo, data, fb, script="source scripts/slurm/train_job.sh", tri
             while time.time() < end and not os.path.exists(env["FAKE_PIDFILE"]):
                 time.sleep(0.1)
             time.sleep(wait_pid)
+            if before:
+                before(env)
             p.send_signal(sig)
         try:
             p.wait(timeout=timeout)
@@ -193,10 +204,19 @@ def test_env_overlay_and_bind():
     r = bash(f"source {sd}/mn5_env.sh; echo $REPO $DATA_ROOT $SBATCH_ACCOUNT; require_site_values", REPO="", DATA_ROOT="", SBATCH_ACCOUNT="")
     assert r.returncode == 0 and "/p/repo /p/data acct" in r.stdout, (r.stdout, r.stderr)
     # BIND and CTR are rebuilt from this shell's environment, never taken from a login shell's exported value
-    r = bash(f"source {sd}/mn5_env.sh; echo \"$BIND\"; echo \"[$CTR]\"", BIND="/login/only", CTR="stale ", TMPDIR="/job/tmp")
+    jt = os.path.join(d, "jobtmp")
+    os.makedirs(jt)
+    r = bash(f"source {sd}/mn5_env.sh; echo \"$BIND\"; echo \"[$CTR]\"; echo \"$TINY_LLM_TOKENIZER\"", BIND="/login/only", CTR="stale ", TMPDIR=jt,
+             TINY_LLM_TOKENIZER="")
     lines = r.stdout.splitlines()
-    assert lines[0] == "/p/repo,/p/data,/job/tmp,/p/data/hf_home", lines
+    assert lines[0] == f"/p/repo,/p/data,{jt},/p/data/hf_home", lines
     assert lines[1] == "[]", lines
+    assert lines[2] == "/p/data/hf_home/tokenizer", lines
+    # a TMPDIR that does not exist on this node (the login node's, carried by --export=ALL) is not bound
+    r = bash(f"source {sd}/mn5_env.sh; echo \"$BIND\"", TMPDIR="/login/only/tmp")
+    assert r.stdout.splitlines()[0] == "/p/repo,/p/data,/p/data/hf_home", r.stdout
+    r = bash(f"source {sd}/mn5_env.sh; echo \"$TINY_LLM_TOKENIZER\"", TINY_LLM_TOKENIZER="/elsewhere/tok")
+    assert r.stdout.strip() == "/elsewhere/tok", r.stdout
     # SIF without a runtime: CTR_FAIL, and a job script refuses (exit 2) instead of running host python
     r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", SIF="/p/run2.sif", PATH="/usr/bin:/bin")
     assert r.returncode == 2 and "no singularity or apptainer" in r.stderr, (r.returncode, r.stderr)
@@ -267,6 +287,24 @@ def test_train_job():
     d, st = state_of(repo)
     assert st.get("ended") == "done" and not os.path.exists(os.path.join(d, "HALT")), (out, st)
 
+    # the main split stops by itself after the first save at or past 760B (the start of the tail phase): STOP is dropped by the
+    # stop watcher, the trainer exits 10, the chain ends on purpose with STOP kept and the stop recorded in the chain state
+    tmp, repo, data, fb = fake_repo()
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="tailstop", SPLIT="run2_main_train", CHAIN_INDEX="0", CHAIN_ID="c1")
+    d, st = state_of(repo)
+    assert rc == 0 and st.get("ended") == "stop" and st.get("stop_after") == "760000M" and st.get("split") == "run2_main_train", (out, st)
+    assert os.path.exists(os.path.join(d, "STOP")) and not os.path.exists(os.path.join(d, "HALT")), out
+    assert "STOP dropped" in read(env["FAKE_LOG"]) and "after a save at or past 760000M" in read(env["FAKE_LOG"])
+    # a later job of that chain does not run past the stop; a fresh chain (index 0) clears STOP for the tail. the stop
+    # watcher's last sleep (5 s poll) still holds the run directory lock for a moment after the job ended
+    time.sleep(6)
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="ok20", SPLIT="run2_tail_train", CHAIN_INDEX="1", CHAIN_ID="c1")
+    assert "not running" in out and "(stop)" in out, out
+    tmp, repo, data, fb = fake_repo()
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="ok20", SPLIT="run2_tail_train", CHAIN_INDEX="0", CHAIN_ID="c2")
+    d, st = state_of(repo)
+    assert st.get("split") == "run2_tail_train" and st.get("stop_after", "") == "" and "ended" not in st, (out, st)
+
     # the trainer's own kill rule (exit 10, no STOP file) is a failed run, not a stop on purpose
     tmp, repo, data, fb = fake_repo()
     rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="exit10kill", CHAIN_INDEX="0", CHAIN_ID="c1")
@@ -300,7 +338,7 @@ def test_train_job():
     rc, out, env = run_job(tmp, repo, data, fb, trigger=(signal.SIGTERM, 0.5), FAKE_MODE="term", CHAIN_INDEX="0", CHAIN_ID="c1")
     d, st = state_of(repo)
     hist = read(os.path.join(d, "chain_history")).splitlines()
-    assert len(hist) == 1 and hist[0].split()[:2] == ["777", "cancelled"], hist
+    assert len(hist) == 1 and hist[0].split()[:2] == ["777", "ok"] and hist[0].split()[3] == "0", hist
     assert os.path.exists(os.path.join(d, "saved_on_term")), out
 
     # M3: a diverged loss kills the step with no save (SIGKILL through scancel on the step), then halts
@@ -373,17 +411,97 @@ def test_train_job():
     assert st.get("ended") == "halted" and "rows cache missing" in read(os.path.join(d, "HALT")) \
         and "--estimate-rows-only" in read(os.path.join(d, "HALT")), (out, st)
 
-    # a user's scancel (much of the limit left) ends the chain as cancelled; the time limit's TERM does not
+    # a bare TERM (node failure, admin kill, a hand scancel, with much of the limit left or not) is an interruption: a
+    # history line "interrupted", the ranks save, the chain goes on (no ended mark)
+    for left in ("00:20:00", "00:02:00"):
+        tmp, repo, data, fb = fake_repo()
+        rc, out, env = run_job(tmp, repo, data, fb, trigger=(signal.SIGTERM, 0.5), FAKE_MODE="term", FAKE_LEFT=left,
+                               CHAIN_INDEX="0", CHAIN_ID="c1")
+        d, st = state_of(repo)
+        hist = read(os.path.join(d, "chain_history")).splitlines()
+        assert "ended" not in st and len(hist) == 1 and hist[0].split()[:2] == ["777", "ok"] and hist[0].split()[3] == "0", (out, st, hist)
+        assert "interrupted (SIGTERM" in out, out
+        assert os.path.exists(os.path.join(d, "saved_on_term")) and "the chain goes on" in out, out
+    # cancel_chain.sh is the way to end a chain: it marks ended=cancelled and a history line first, then scancels the
+    # chain's jobs by name; the running job's TERM handler reads the mark
     tmp, repo, data, fb = fake_repo()
-    rc, out, env = run_job(tmp, repo, data, fb, trigger=(signal.SIGTERM, 0.5), FAKE_MODE="term", FAKE_LEFT="00:20:00",
+    cc = os.path.join(ROOT, "scripts", "slurm", "cancel_chain.sh")
+    seen = {}
+    def do_cancel(env):
+        seen["r"] = subprocess.run(["bash", cc, "run2"], cwd=repo, env=dict(env, FAKE_SQUEUE_OUT="555\n556"), capture_output=True, text=True)
+    rc, out, env = run_job(tmp, repo, data, fb, trigger=(signal.SIGTERM, 0.5), before=do_cancel, FAKE_MODE="term", FAKE_LEFT="00:20:00",
                            CHAIN_INDEX="0", CHAIN_ID="c1")
     d, st = state_of(repo)
+    assert seen["r"].returncode == 0, seen["r"].stderr
     assert st.get("ended") == "cancelled" and read(os.path.join(d, "chain_history")).split()[1] == "cancelled", (out, st)
+    assert "555 556" in read(os.path.join(fb, "scancel.log")) and "cancelled by hand" in out, (out, read(os.path.join(fb, "scancel.log")))
+    assert os.path.exists(os.path.join(d, "saved_on_term")), out
+    # a pending chain (no run directory yet): the mark and a history line are written, the jobs cancelled
     tmp, repo, data, fb = fake_repo()
-    rc, out, env = run_job(tmp, repo, data, fb, trigger=(signal.SIGTERM, 0.5), FAKE_MODE="term", FAKE_LEFT="00:02:00",
-                           CHAIN_INDEX="0", CHAIN_ID="c1")
+    env = clean_env(**job_env(tmp, repo, data, fb, FAKE_SQUEUE_OUT="7"))
+    r = subprocess.run(["bash", cc, "run2"], cwd=repo, env=env, capture_output=True, text=True)
     d, st = state_of(repo)
-    assert "ended" not in st, (out, st)
+    assert r.returncode == 0 and st.get("ended") == "cancelled" and read(os.path.join(d, "chain_history")).split()[:2] == ["0", "cancelled"], (r.stderr, st)
+    assert read(os.path.join(fb, "scancel.log")).split() == ["7"], read(os.path.join(fb, "scancel.log"))
+    # a TERM followed by a crash (rc 1) leaves a failed line, not an interrupted one, and it is not a short job
+    tmp, repo, data, fb = fake_repo()
+    rc, out, env = run_job(tmp, repo, data, fb, trigger=(signal.SIGTERM, 0.5), FAKE_MODE="termcrash", CHAIN_INDEX="0", CHAIN_ID="c1")
+    d, st = state_of(repo)
+    hist = read(os.path.join(d, "chain_history")).splitlines()
+    assert len(hist) == 1 and hist[0].split()[:2] == ["777", "failed"] and hist[0].split()[3] == "0", (out, hist)
+    # a failing scancel is reported, nonzero, with the jobs still listed; the mark stays
+    tmp, repo, data, fb = fake_repo()
+    bad = os.path.join(fb, "scancel_bad")
+    write_exe(bad, "#!/usr/bin/env bash\nexit 1\n")
+    env = clean_env(**job_env(tmp, repo, data, fb, FAKE_SQUEUE_OUT="9", SCANCEL_CMD=bad))
+    r = subprocess.run(["bash", cc, "run2"], cwd=repo, env=env, capture_output=True, text=True)
+    d, st = state_of(repo)
+    assert r.returncode == 1 and "WARNING" in r.stderr and "still listed: 9" in r.stderr and st.get("ended") == "cancelled", (r.stdout, r.stderr)
+    # a second consecutive crash (rc 1) without a new save halts the chain; the first resubmits
+    tmp, repo, data, fb = fake_repo()
+    d = os.path.join(repo, "ckpts", "evidence_run2")
+    os.makedirs(d)
+    with open(os.path.join(d, "chain_state"), "w") as f:
+        f.write("chain_id=c1\nlast_marker=none\nstalls=0\n")
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="exit1", CHAIN_INDEX="1", CHAIN_ID="c1")
+    d, st = state_of(repo)
+    assert st.get("ended") == "halted" and "trainer exit 1" in read(os.path.join(d, "HALT")), (out, st)
+    # state_put under two concurrent writers keeps every key
+    sf = os.path.join(tempfile.mkdtemp(), "state")
+    loop = "source scripts/slurm/lib.sh; for i in $(seq 1 40); do state_put %s k%s$i v$i; done"
+    ps = [subprocess.Popen(["bash", "-c", loop % (sf, n)], cwd=ROOT) for n in "ab"]
+    for p_ in ps:
+        assert p_.wait(timeout=60) == 0
+    keys = {l.split("=")[0] for l in read(sf).splitlines()}
+    assert len(keys) == 80, len(keys)
+    # squeue failing changes nothing
+    tmp, repo, data, fb = fake_repo()
+    env = clean_env(**job_env(tmp, repo, data, fb, FAKE_SQUEUE_RC="1"))
+    r = subprocess.run(["bash", cc, "run2"], cwd=repo, env=env, capture_output=True, text=True)
+    assert r.returncode == 1 and "squeue failed" in r.stderr and not os.path.exists(os.path.join(repo, "ckpts", "evidence_run2")), r.stderr
+    # a trainer exit 1 is a crash that resubmits (the first job without a new save), exit 3 a refusal that halts at once
+    tmp, repo, data, fb = fake_repo()
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="exit1", CHAIN_INDEX="0", CHAIN_ID="c1")
+    d, st = state_of(repo)
+    assert "ended" not in st and not os.path.exists(os.path.join(d, "HALT")) and "decision resubmit" in out, (out, st)
+    tmp, repo, data, fb = fake_repo()
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="exit3", CHAIN_INDEX="0", CHAIN_ID="c1")
+    d, st = state_of(repo)
+    assert st.get("ended") == "halted" and "exit 3" in read(os.path.join(d, "HALT")) and "seed mismatch" in read(os.path.join(d, "HALT")), (out, st)
+    # the tokenizer must be staged before the trainer starts
+    tmp, repo, data, fb = fake_repo()
+    rc, out, env = run_job(tmp, repo, data, fb, FAKE_MODE="ok20", TINY_LLM_TOKENIZER=os.path.join(tmp, "nothing"))
+    d, st = state_of(repo)
+    assert rc == 2 and "tokenizer missing" in read(os.path.join(d, "HALT")) and "start:" not in out, out
+    # the trainer is told the tokens per update it must give, and the step asks for gres like the allocation
+    src = read(os.path.join(ROOT, "scripts", "slurm", "train_job.sh"))
+    assert "--expect-tokens-per-update $TOKENS_PER_UPDATE" in src and "--gres=gpu:$GPN" in src and "--gpus-per-node" not in src
+    assert "trap '' USR1 USR2" in read(os.path.join(ROOT, "scripts", "slurm", "corpus.sbatch"))
+    # rank_exec.sh: a command that does not exist is recorded as 127, a real exit code as itself
+    d = tempfile.mkdtemp()
+    for cmd, want in (("/nonexistent/python x", "127"), ("bash -c 'exit 7'", "7")):
+        bash(f"bash scripts/slurm/rank_exec.sh {d}/rc {cmd}", SLURM_PROCID="0", SLURM_NTASKS="1", SLURM_LOCALID="0")
+        assert read(f"{d}/rc.rank0").strip() == want, (cmd, read(f"{d}/rc.rank0"))
 
     # the chain state carries the first job id, the watchdog limits; the sidecars are killed with the signals ignored
     tmp, repo, data, fb = fake_repo()
@@ -502,9 +620,10 @@ def main():
     assert dv(["25.1", "30.0"]) == "ok"
     assert dv(["25.1", "3.0", "99.0"]) == "ok"
 
-    # chain_decide: rc 1 and 2 are deterministic failures, the rest as before
-    for rc_, want in (("1", "fail"), ("2", "fail"), ("30", "fail"), ("20", "resubmit"), ("255", "resubmit"), ("0", "nofinal")):
+    # chain_decide: rc 2 and 3 are deterministic failures, rc 1 a crash that resubmits under the stall rule
+    for rc_, want in (("1", "resubmit"), ("2", "fail"), ("3", "fail"), ("30", "fail"), ("20", "resubmit"), ("255", "resubmit"), ("0", "nofinal")):
         assert fn(f"chain_decide {rc_} 0 0 0")[1] == want, rc_
+    assert fn("chain_decide 1 0 0 2")[1] == "fail"
     assert fn("chain_decide 2 0 1 0")[1] == "stop" and fn("chain_decide 1 1 0 0")[1] == "done"
 
     # ce_median, rise_check, save_min_for

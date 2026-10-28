@@ -11,13 +11,20 @@ P=$!
 TERMED=0
 trap 'TERMED=1; kill -TERM $P 2>/dev/null' TERM
 # a trapped signal makes wait return at once with 128+N whether or not the process ended; wait again then, which
-# returns the process's own status even when it ended in between (the exit code is never the trap's 143)
+# returns the process's own status even when it ended in between (the exit code is never the trap's 143).
+# wait returns 127 for "no such child" too, so a 127 with the child still alive or never seen is told from a real 127
+# of the command (python or singularity not found) by whether the child is gone: a real 127 is recorded as 127
 rc=255
 while :; do
   TERMED=0
   wait $P
   r=$?
-  [ "$r" = 127 ] && break
+  if [ "$r" = 127 ]; then
+    if kill -0 "$P" 2>/dev/null; then continue; fi
+    echo "rank_exec: the command exited 127 (not found: python or singularity missing on this node?): $*" >&2
+    rc=127
+    break
+  fi
   rc=$r
   [ "$TERMED" = 1 ] && [ "$r" -gt 128 ] && continue
   break

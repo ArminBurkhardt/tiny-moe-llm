@@ -7,13 +7,17 @@ On a machine with internet:
     python scripts/mirror_sources.py list --out listing.json [--fineweb-prefix data/] [--margin 0.10] \\
         [the driver's plan flags: --scale --total --chain-tokens --qa-target --phase2-tokens ...]
     python scripts/mirror_sources.py push --listing listing.json --remote USER@HOST:/path/inbox \\
-        --window-gb 120 [--scratch DIR] [--transfer-limit-gb 2000]
+        --window-gb 120 [--scratch DIR] [--transfer-limit-gb 2000] [--ledger FILE]
     python scripts/mirror_sources.py stage-small --hf-home DIR
 
 ``list`` reads every filler source's files at one pinned revision with the filters and the sort
 order ``prepare_data.py`` uses, records their sizes, and works out how many files each source needs
 for the plan (the driver's token yields per file, plus a margin). ``push`` downloads those files in
-consumption order and rsyncs them into the cluster's inbox. ``stage-small`` snapshots the small
+consumption order and rsyncs them into the cluster's inbox, through the transfer host's ssh master socket
+when it is open (the options of ``scripts/ops/ops_lib.sh``), a partial file kept out of its final name. Every file sent is
+appended to the one transfer ledger of the ops scripts (``OPS_LEDGER``, default the repo root's
+``ops_transfer_ledger.tsv``) and the budget (``--transfer-limit-gb``, default ``TRANSFER_BUDGET_GB`` or 2000) is checked
+against that ledger's total, so the pushes of code and corpus and this one share one allowance. ``stage-small`` snapshots the small
 repos the other stages read (question sets, the replay chat sets, bge, the tokenizer) into one
 directory to copy across once.
 
@@ -25,7 +29,8 @@ listing.json`` uses ``MirrorListing``, ``FakeHfApi`` and ``InboxFetcher`` below 
 Consumption order. ``prepare_data`` lists each source sorted, a phase takes files from the front
 until its token target, and the next phase skips the files the earlier ones used (the wrapper's
 ``--exclude-files-of``), so per source the sorted list is consumed front to back across phase1,
-phase2 and ir. A source's partly used last file counts as used by its phase. The sources run in
+phase2, ir and the driver's tail phase (listing name ``late``: the tail split's plain text, fresh files at the
+higher quality source weights). A source's partly used last file counts as used by its phase. The sources run in
 lockstep inside a phase (smooth weighted round robin), and one source blocked on a missing file
 blocks all of them, so ``push`` is demand driven: a source gets a new file only while fewer than
 its cap (``source_cap``: the tail the consumer keeps plus a little lookahead) of its files sit in
@@ -68,6 +73,7 @@ MAX_PRESENT = TAIL_FILES + 1 + AHEAD_FILES     # the cap of a repo whose files a
 ROW_TOKENS_ASSUMED = 3000      # tokens per document, high on purpose: it sets the shortest file's estimated rows
 DONE_MARK = ".filler_done"     # the driver's filler stage drops it in the inbox when the consumer is finished
 TRANSFER_LIMIT_BYTES = 2e12
+LEDGER_HEADER = "time\tdirection\twhat\tbytes\n"
 STAGE_INDEX = "index.json"
 
 # repo, path prefixes (the builders' own), suffixes, substring a file must contain
@@ -183,7 +189,9 @@ def build_listing(specs, api, plan: Dict[str, dict], margin: float, fineweb_pref
             raise RuntimeError(f"no files matched {spec.key} under {spec.file_prefix!r}")
         p = plan[spec.key]
         phase_files, cum = [], 0.0
-        for phase in ("phase1", "phase2", "ir"):
+        # the driver's tail phase ("late", after ir: fresh files of the same sorted list) joins when the plan has it
+        phases = ("phase1", "phase2", "ir") + (("late",) if any("late" in v["need"] for v in plan.values()) else ())
+        for phase in phases:
             cum += p["need"].get(phase, 0.0)
             phase_files.append(int(math.ceil(cum * (1.0 + margin) / p["per_file"])) if cum else 0)
         short = phase_files[-1] > len(names)
@@ -241,11 +249,11 @@ def consumption_order(listing: dict) -> List[dict]:
 
 def print_listing_summary(listing: dict, limit: float = TRANSFER_LIMIT_BYTES) -> int:
     sizes = total_bytes(listing)
-    print(f"{'source':14s} {'files':>6s} {'needed':>7s} {'p1/p2/ir':>14s} {'GB':>9s}")
+    print(f"{'source':14s} {'files':>6s} {'needed':>7s} {'p1/p2/ir[/tail]':>16s} {'GB':>9s}")
     for key, src in listing["sources"].items():
         pf = "/".join(str(n) for n in src["phase_files"])
         flag = "  SHORT: the source has fewer files than the plan needs" if src["short"] else ""
-        print(f"{key:14s} {len(src['files']):6d} {src['needed']:7d} {pf:>14s} {sizes[key] / 1e9:9.1f}{flag}")
+        print(f"{key:14s} {len(src['files']):6d} {src['needed']:7d} {pf:>16s} {sizes[key] / 1e9:9.1f}{flag}")
     total = sum(sizes.values())
     print(f"transfer {total / 1e9:,.1f} GB of {limit / 1e9:,.0f} GB allowed ({total / limit:.0%})"
           + ("  OVER THE LIMIT" if total > limit else ""))
@@ -253,6 +261,68 @@ def print_listing_summary(listing: dict, limit: float = TRANSFER_LIMIT_BYTES) ->
 
 
 # ------------------------------------------------------------------------------------ push
+
+def is_temp(rel: str) -> bool:
+    """A path with a dotted component: an rsync partial dir or temp file, never a finished inbox file."""
+    return any(part.startswith(".") for part in rel.split("/"))
+
+
+def ops_settings() -> dict:
+    """The ops settings: the process environment over scripts/ops/ops.env (read the way supervise.py reads it)."""
+    env = {}
+    try:
+        sys.path.insert(0, os.path.join(SCRIPT_DIR, "ops"))
+        import supervise
+        env.update(supervise.load_env_file(os.path.join(SCRIPT_DIR, "ops", "ops.env")))
+    except ImportError:
+        pass
+    env.update(os.environ)
+    return env
+
+
+def default_ledger(env: Optional[dict] = None) -> str:
+    """The ledger path of ops_lib.sh: OPS_LEDGER (or LEDGER), else the repo root's ops_transfer_ledger.tsv; absolute."""
+    env = ops_settings() if env is None else env
+    root = os.path.dirname(SCRIPT_DIR)
+    path = env.get("OPS_LEDGER") or env.get("LEDGER") or os.path.join(root, "ops_transfer_ledger.tsv")
+    return path if os.path.isabs(path) else os.path.join(root, path)
+
+
+def ledger_total(path: str) -> int:
+    """Bytes in and out so far (column 4 of the ledger)."""
+    total = 0
+    try:
+        with open(path) as f:
+            for i, line in enumerate(f):
+                parts = line.rstrip("\n").split("\t")
+                if i > 0 and len(parts) >= 4 and parts[3].isdigit():
+                    total += int(parts[3])
+    except OSError:
+        pass
+    return total
+
+
+def ledger_append(path: str, direction: str, what: str, nbytes: int) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    new = not os.path.exists(path)
+    with open(path, "a") as f:
+        if new:
+            f.write(LEDGER_HEADER)
+        f.write("%s\t%s\t%s\t%d\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), direction, what, nbytes))
+
+
+def ssh_opts(env: Optional[dict] = None) -> List[str]:
+    """ssh options as in ops_lib.sh ops_ssh_opts: BatchMode, timeouts, and the transfer host's master socket when it is open."""
+    env = ops_settings() if env is None else env
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=30", "-o", "ServerAliveInterval=30"]
+    sock = os.path.expanduser(env.get("SSH_SOCK_TRANSFER") or "~/.ssh/mn5-transfer.sock")
+    if os.path.exists(sock):
+        opts += ["-o", "ControlPath=" + sock]
+    else:
+        print(f"mirror: no transfer master socket {sock} (open it, README Supervision); trying a plain BatchMode connection",
+              file=sys.stderr)
+    return opts
+
 
 class Pusher:
     """Demand driven, resumable mirror of the listing's files into a remote inbox.
@@ -264,16 +334,20 @@ class Pusher:
         send: ``send(local_path, relpath, size)`` puts it in the inbox and returns when complete.
         remote_ls: ``() -> {relpath: size}`` every file in the inbox, rsync temp files included.
         window_bytes: bound on the inbox's bytes.
-        transfer_limit: bound on the total bytes sent over all runs.
+        transfer_limit: bound on the total bytes sent over all runs; with ``ledger_path`` the bound is on the ledger's
+            total (every script's transfers, both directions), without it on this pusher's own count.
         max_present: ``None`` takes each source's cap from the listing (tail + 1 + lookahead); an
             integer replaces it for every source and must exceed every tail + 1.
         remove: deletes a local file.
         log: line printer.
+        ledger_path: the shared transfer ledger; each file sent is appended to it.
     """
 
     def __init__(self, listing: dict, state_path: str, fetch: Callable, send: Callable,
                  remote_ls: Callable, window_bytes: float, transfer_limit: float = TRANSFER_LIMIT_BYTES,
-                 max_present: Optional[int] = None, remove: Callable = os.remove, log: Callable = print):
+                 max_present: Optional[int] = None, remove: Callable = os.remove, log: Callable = print,
+                 ledger_path: Optional[str] = None):
+        self.ledger_path = ledger_path
         self.listing, self.state_path = listing, state_path
         self.fetch, self.send, self.remote_ls = fetch, send, remote_ls
         self.window, self.limit = window_bytes, transfer_limit
@@ -330,7 +404,7 @@ class Pusher:
         used = sum(present.values())
         counts: Dict[str, int] = {}
         for rel in present:
-            if os.path.basename(rel).startswith("."):
+            if is_temp(rel):
                 continue
             counts[rel.split("/", 1)[0]] = counts.get(rel.split("/", 1)[0], 0) + 1
         eligible = []
@@ -366,11 +440,28 @@ class Pusher:
         starved = ekey == earliest and all(k > earliest for k in present_keys)
         if used + row["size"] > self.window and used > 0 and not starved:
             return "wait"
-        if self.state["pushed_bytes"] + row["size"] > self.limit:
+        spent = ledger_total(self.ledger_path) if self.ledger_path else self.state["pushed_bytes"]
+        if spent + row["size"] > self.limit:
             raise RuntimeError(f"transfer limit {self.limit:,.0f} bytes reached after "
-                               f"{self.state['pushed_bytes']:,.0f}; {rel} not sent")
+                               f"{spent:,.0f}; {rel} not sent")
         local = self.fetch(row)
-        self.send(local, rel, row["size"])
+        try:
+            self.send(local, rel, row["size"])
+        except BaseException as e:
+            if self.ledger_path:
+                # a failed or interrupted send still used allowance: the partial's size in the inbox when it can be read, else
+                # the full file size as a conservative bound
+                moved = int(row["size"])
+                try:
+                    partial = [s for r, s in self.remote_ls().items() if is_temp(r) and os.path.basename(r) == os.path.basename(rel)]
+                    if partial:
+                        moved = int(max(partial))
+                except Exception:
+                    pass
+                ledger_append(self.ledger_path, "in", f"mirror {rel} FAILED {type(e).__name__} (partial or upper bound)", moved)
+            raise
+        if self.ledger_path:
+            ledger_append(self.ledger_path, "in", f"mirror {rel}", int(row["size"]))
         try:
             self.remove(local)
         except OSError:
@@ -407,10 +498,10 @@ def split_remote(remote: str):
     return host, path
 
 
-def ssh_remote_ls(host: str, path: str) -> Callable:
+def ssh_remote_ls(host: str, path: str, opts: Optional[List[str]] = None) -> Callable:
     def ls() -> Dict[str, int]:
         cmd = f"find {shlex.quote(path)} -type f -printf '%P\\t%s\\n' 2>/dev/null; true"
-        out = subprocess.run(["ssh", host, cmd], capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(["ssh"] + (opts or []) + [host, cmd], capture_output=True, text=True, check=True).stdout
         res = {}
         for line in out.splitlines():
             name, _, size = line.rpartition("\t")
@@ -420,11 +511,16 @@ def ssh_remote_ls(host: str, path: str) -> Callable:
     return ls
 
 
-def rsync_send(host: str, path: str) -> Callable:
+def rsync_send(host: str, path: str, opts: Optional[List[str]] = None) -> Callable:
+    """Send one file; an interrupted transfer waits in .rsync-partial, never under the final name (a plain --partial leaves
+    a truncated file there, which the consumer would read as a finished file)."""
+    opts = opts or []
+
     def send(local: str, rel: str, size: int) -> None:
         dest = f"{path.rstrip('/')}/{rel}"
-        subprocess.run(["ssh", host, f"mkdir -p {shlex.quote(os.path.dirname(dest))}"], check=True)
-        subprocess.run(["rsync", "-a", "--partial", local, f"{host}:{dest}"], check=True)
+        subprocess.run(["ssh"] + opts + [host, f"mkdir -p {shlex.quote(os.path.dirname(dest))}"], check=True)
+        subprocess.run(["rsync", "-a", "--partial-dir=.rsync-partial", "-e", "ssh " + " ".join(shlex.quote(o) for o in opts),
+                        local, f"{host}:{dest}"], check=True)
     return send
 
 
@@ -560,8 +656,9 @@ class InboxFetcher:
         out = []
         for dirpath, _, files in os.walk(root):
             for name in files:
-                if not name.startswith("."):
-                    out.append(os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/"))
+                rel = os.path.relpath(os.path.join(dirpath, name), root).replace(os.sep, "/")
+                if not is_temp(rel):
+                    out.append(rel)
         return out
 
     def drop_below(self, repo_id: str, limit: int) -> None:
@@ -719,7 +816,7 @@ STAGE_NEEDS = {
     "filler": ["listing", "inbox", "tokenizer"],
     "qa": ["squad_train", "hotpot_train", "smoltalk2", "ultrachat", "no_robots", "bge", "tokenizer"],
     "bios_main": ["bge", "tokenizer"], "bios_warm": ["bge", "tokenizer"], "bios_full": ["tokenizer"],
-    "val_clean": ["tokenizer"], "rows": ["tokenizer"],
+    "val_clean": ["tokenizer"], "rows": ["tokenizer"], "tail_text": ["tokenizer"],
     "chains_plain": ["bge", "tokenizer"], "chains_bridge": ["bge", "tokenizer"],
     "heldout_qa": ["squad_val", "hotpot_val", "bge", "tokenizer"],
     "heldout_chains": ["bge", "tokenizer"],
@@ -807,9 +904,14 @@ def cmd_push(a) -> int:
     scratch = a.scratch or os.path.join(os.path.dirname(os.path.abspath(a.listing)), "mirror_scratch")
     os.makedirs(scratch, exist_ok=True)
     state = a.state or a.listing + ".pushed.json"
-    p = Pusher(listing, state, hub_fetch(scratch, os.environ.get("HF_TOKEN")), rsync_send(host, path),
-               ssh_remote_ls(host, path), a.window_gb * 1e9, a.transfer_limit_gb * 1e9)
-    print_listing_summary(listing, a.transfer_limit_gb * 1e9)
+    env = ops_settings()
+    ledger = a.ledger or default_ledger(env)
+    limit_gb = a.transfer_limit_gb if a.transfer_limit_gb is not None else float(env.get("TRANSFER_BUDGET_GB") or 2000)
+    opts = ssh_opts(env)
+    p = Pusher(listing, state, hub_fetch(scratch, os.environ.get("HF_TOKEN")), rsync_send(host, path, opts),
+               ssh_remote_ls(host, path, opts), a.window_gb * 1e9, limit_gb * 1e9, ledger_path=ledger)
+    print(f"transfer ledger {ledger}: {ledger_total(ledger) / 1e9:,.1f} GB of {limit_gb:,.0f} GB used")
+    print_listing_summary(listing, limit_gb * 1e9)
     p.run(poll_seconds=a.poll_seconds)
     print("all needed files pushed")
     return 0
@@ -844,7 +946,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     s.add_argument("--listing", required=True)
     s.add_argument("--remote", required=True)
     s.add_argument("--window-gb", type=float, default=120.0)
-    s.add_argument("--transfer-limit-gb", type=float, default=TRANSFER_LIMIT_BYTES / 1e9)
+    s.add_argument("--transfer-limit-gb", type=float, default=None,
+                   help="allowance in GB (default TRANSFER_BUDGET_GB of ops.env, else 2000)")
+    s.add_argument("--ledger", default=None, help="the shared transfer ledger (default OPS_LEDGER, else the repo root's)")
     s.add_argument("--scratch", default=None)
     s.add_argument("--state", default=None)
     s.add_argument("--poll-seconds", type=float, default=60.0)

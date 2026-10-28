@@ -55,7 +55,7 @@ training:                    # loss weights, read by train_step for every profil
   evidence_contrastive_trunk_grad: 1.0
   target_tokens: 800000000000 # 800B (decided 2026-10-27 for the 4,500 GPU hour grant, was 280B); the evidence trainer's budget is num_epochs x the split, see evidence: num_epochs
   warmup_steps: 1000         # 0.52B tokens (RUN2 Schedule, Optimizer); the evidence profile reads warmup_fraction below
-  noise_anneal_tokens: 1000000000 # router noise annealed over 1B tokens (RUN2 Schedule, Optimizer)
+  noise_anneal_tokens: 1000000000 # not read by sft.py: router noise is zero under it (RUN2 Schedule, Optimizer; corrected 2026-10-28)
   loop_ce_weights: [0.2, 0.3, 1.0]
   loop_ce_subsample: 0.25
   loop_count_sampling: 0.3
@@ -97,6 +97,6 @@ evidence:
   eval_max_batches: 40
   conversation_loss_weighting: false   # plain per-token CE: this is pretraining, not policy
   loss_weight_floor_tokens: 64
-  max_evidence_tokens: 9216            # per row, about 9k (RUN2 Schedule, Batch); set from the packing line in minute one
+  max_evidence_tokens: 9216            # per row, about 9k (RUN2 Schedule, Batch); set once from the day 1 sft.py --probe-peak read (lower it if the peak is above about 58 GB on the 64 GB card) and the packing line, before the warm-up; a change after the first save is refused on resume (exit 3 unless --allow-plan-change)
   cluster_refresh_tokens: 0
   dead_quantile: 0.0

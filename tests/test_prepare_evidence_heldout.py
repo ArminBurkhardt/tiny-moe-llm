@@ -34,13 +34,16 @@ from modules.data.chat import ChatTemplate
 from scripts import prepare_evidence_data as ped
 from scripts.prepare_evidence_data import (
     CONDITIONS, EMBED_DIM, FIXED_CONDITIONS, QA_CONDITIONS, EvidenceRow, apply_condition,
-    build_heldout,
+    build_heldout, QA_CONDITIONS,
 )
 from utils import TOKENIZER_DIR
 
 
 class FakeEmbedder:
     """Deterministic unit vectors from the text, so equal texts get equal keys."""
+
+    cache_hits = 0
+    embedded = 0
 
     def encode(self, texts):
         out = np.zeros((len(texts), EMBED_DIM), dtype=np.float32)
@@ -264,6 +267,50 @@ def main():
         assert rng_new_after.random() == rng_old_after.random(), seed
     assert redrawn and min(redrawn) >= 1
     print(f"8. training path excludes the row's gold ({sum(redrawn)} draws redrawn)  PASS")
+
+    # 9. a build killed mid way and resumed is byte identical to the uninterrupted build
+    def entries(limit=None):
+        count = {"n": 0}
+
+        def factory_for(rows):
+            def factory(file_idx, row_idx):
+                for i in range(row_idx, len(rows)):
+                    if limit is not None and count["n"] >= limit:
+                        raise RuntimeError("simulated kill")
+                    count["n"] += 1
+                    yield 0, i, rows[i]
+            return factory
+        cw = QA_CONDITIONS
+        return [{"key": "squad_v2", "weight": 0.5, "render": "squad_v2", "condition_weights": cw,
+                 "row_factory": factory_for(squad_rows(30, 3)), "qa": True, "holdout": False, "repeat": False},
+                {"key": "hotpot_qa", "weight": 0.5, "render": "hotpot_qa", "condition_weights": cw,
+                 "row_factory": factory_for(hotpot_rows(40)), "qa": True, "holdout": False, "repeat": False}]
+
+    def build(out_dir, **kw):
+        return ped.build_corpus(entries(kw.pop("limit", None)), 10 ** 9, template, FakeEmbedder(), out_dir,
+                                os.path.join(out_dir, "state.json"), max_evidence_tokens=4608, render_batch=4,
+                                checkpoint_docs=6, val_fraction=0.2, seed=5, reservoir_size=16, **kw)
+
+    full_dir, cut_dir = tempfile.mkdtemp(prefix="resume_full_"), tempfile.mkdtemp(prefix="resume_cut_")
+    try:
+        build(full_dir)
+        try:
+            build(cut_dir, limit=70)
+            raise AssertionError("the simulated kill did not fire")
+        except RuntimeError:
+            pass
+        build(cut_dir)
+        for split in ("evidence_train", "evidence_val"):
+            a, b = read_split(full_dir, split), read_split(cut_dir, split)
+            assert a and a == b, f"{split}: resumed build differs ({len(a)} against {len(b)} documents)"
+            for suffix in ("bin", "mask", "ev", "evchunk", "evgold", "cond", "ans"):
+                fa = open(os.path.join(full_dir, f"{split}.{suffix}"), "rb").read()
+                fb = open(os.path.join(cut_dir, f"{split}.{suffix}"), "rb").read()
+                assert fa == fb, f"{split}.{suffix} differs after a resume"
+    finally:
+        shutil.rmtree(full_dir, ignore_errors=True)
+        shutil.rmtree(cut_dir, ignore_errors=True)
+    print("9. killed and resumed build is byte identical to the uninterrupted one  PASS")
     print("all held-out checks passed")
 
 

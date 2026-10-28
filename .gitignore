@@ -20,5 +20,6 @@ scripts/ops/ops.env
 scripts/ops/relay/relay.env
 ops_state/
 ops_transfer_ledger.tsv
+run2_pulled/
 *.sif
 scripts/slurm/mn5_env.local.sh

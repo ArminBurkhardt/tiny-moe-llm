@@ -484,6 +484,65 @@ def test_9_earliest_file_is_sent_when_later_lookahead_fills_the_window():
     print("test 9 ok")
 
 
+def test_10_shared_ledger_ssh_options_and_partial_dir():
+    import subprocess
+    with tempfile.TemporaryDirectory() as tmp:
+        led = os.path.join(tmp, "shared.tsv")
+        m.ledger_append(led, "in", "code worktree", 1_500_000_000)
+        m.ledger_append(led, "out", "exports", 600_000_000)
+        assert m.ledger_total(led) == 2_100_000_000
+        assert m.default_ledger({"OPS_LEDGER": led}) == led
+        assert os.path.isabs(m.default_ledger({})) and m.default_ledger({}).endswith("ops_transfer_ledger.tsv")
+        # the budget is checked against the ledger's total, so another script's transfers count
+        lst = make_listing()
+        remote = FakeRemote()
+        p = m.Pusher(lst, os.path.join(tmp, "s.json"), fetch=lambda row: "/local/" + row["name"], send=remote.send,
+                     remote_ls=remote.ls, window_bytes=1e9, transfer_limit=2_100_000_005, max_present=5,
+                     remove=lambda f: None, log=lambda *a: None, ledger_path=led)
+        try:
+            p.step()
+            raise AssertionError("expected the shared budget to refuse a 10 byte file")
+        except RuntimeError as e:
+            assert "transfer limit" in str(e)
+        p.limit = 5e12
+        assert p.step() == "pushed"
+        rows = open(led).read().splitlines()
+        assert rows[-1].split("	")[1] == "in" and rows[-1].split("	")[2].startswith("mirror ") and rows[-1].split("	")[3] == "10", rows
+        # a failed send is counted too: the partial's size in the inbox, else the full size
+        remote.files["a__web/.rsync-partial/b.parquet"] = 4
+
+        def broken(local, rel, size):
+            raise OSError("connection dropped")
+        p.send = broken
+        before = m.ledger_total(led)
+        try:
+            p.step()
+            raise AssertionError("expected the failed send to raise")
+        except OSError:
+            pass
+        assert m.ledger_total(led) > before and "FAILED" in open(led).read().splitlines()[-1]
+        p.send = remote.send
+        # the rsync goes through the ops ssh options and a partial dir, never a plain --partial
+        sock = os.path.join(tmp, "t.sock")
+        open(sock, "w").close()
+        opts = m.ssh_opts({"SSH_SOCK_TRANSFER": sock})
+        assert "BatchMode=yes" in opts and "ControlPath=" + sock in opts
+        seen = []
+        real = subprocess.run
+        subprocess.run = lambda cmd, **kw: (seen.append(cmd), SimpleNamespace(stdout=""))[1]
+        try:
+            m.rsync_send("u@h", "/inbox", opts)("/local/f", "repo/f", 1)
+            m.ssh_remote_ls("u@h", "/inbox", opts)()
+        finally:
+            subprocess.run = real
+        rs = [c for c in seen if c[0] == "rsync"][0]
+        assert "--partial-dir=.rsync-partial" in rs and "--partial" not in rs and "BatchMode=yes" in rs[rs.index("-e") + 1], rs
+        assert all("BatchMode=yes" in c for c in seen if c[0] == "ssh"), seen
+        # a partial file under .rsync-partial is not a finished inbox file
+        assert m.is_temp("repo/.rsync-partial/x.parquet") and not m.is_temp("repo/data/x.parquet")
+    print("test 10 ok")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

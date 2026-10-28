@@ -47,7 +47,7 @@ if [ "${DRY_RUN:-0}" != 1 ]; then
   if [ -n "$QOUT" ]; then
     echo "submit_chain: refusing, jobs named $JOBNAME are already in the queue (a chain is alive or pending):" >&2
     echo "$QOUT" >&2
-    echo "scancel the whole chain first (squeue -n $JOBNAME), or wait; never cancel a single job of a chain" >&2
+    echo "end it first with bash scripts/slurm/cancel_chain.sh $JOBNAME, or wait; never cancel a single job of a chain" >&2
     exit 1
   fi
 fi

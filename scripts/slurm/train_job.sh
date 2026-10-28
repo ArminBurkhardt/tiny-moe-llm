@@ -11,17 +11,21 @@
 # and rank 0 exit code whether the chain goes on or ends (chain_state ended=..., HALT with the reason).
 # env (all optional; Slurm's own values win inside a job):
 #   NODES, GPUS_PER_NODE  4 and 4 outside Slurm (the dry run); the job gets them from the allocation
-#   SPLIT       train split (run: run2_warm_train; main: run2_main_train adds --switch-split; control: run2_control_train)
+#   SPLIT       train split (run: run2_warm_train; main: run2_main_train adds --switch-split; the tail: run2_tail_train adds
+#               --switch-split --switch-from-start --end-at-plan; control: run2_control_train)
 #   RUN         run name (default run2 or run2_control); a different name makes a separate run directory (the 2 GPU check)
 #   SEED        seed checkpoint (default ckpts/inject/seed_run2_grounded.pt)
 #   STOP_AFTER  the token tag after whose first save at or past it STOP is dropped (warm-up reads): 4000M, 4B or a number
-#               of tokens, as stop_after_save_run2.sh (numeric, a save lands a log step past its grid point)
+#               of tokens, as stop_after_save_run2.sh (numeric, a save lands a log step past its grid point). on the main
+#               split (run2_main_train) it defaults to 760000M, the start of the tail phase: the chain ends there on its own
+#               (STOP stays, the supervisor reports "tail switch due") and waits for the switch to run2_tail_train;
+#               STOP_AFTER='' (set and empty) turns that stop off
 #   MAX_JOBS    chain length cap (default 20)
 #   CPUS_PER_TASK  default 20 (80 cores over 4 GPUs)
 #   TRAIN_EXTRA extra sft.py flags, appended as given. PLAN_SPLIT_FLAG and WARM_EPOCH_FLAG name the two flags every run launch passes
 #               (--plan-split run2_main_train; the warm-up also --max-epochs-this-split 1)
 #   CHAIN_MODE  presubmitted (default) or self (this job queues its successor before it starts)
-#   STALL_MIN 15, SAVE_MIN (derived: max(45, 2.5 save intervals at 54k tokens per second per GPU), 49 at 16 GPUs, 97 at 8),
+#   STALL_MIN 30 (the trainer prints an eval only at its end), SAVE_MIN (derived: max(45, 2.5 save intervals at 54k tokens per second per GPU), 49 at 16 GPUs, 97 at 8),
 #   STARTUP_MIN 30, LOSS_CEILING 20, DIVERGE_K 3, RISE_K 30, RISE_MARGIN 1.0, RISE_POLLS 5, RISE_MIN 15: the progress
 #   watchdog (watchdog.sh); CKPT_EVERY_TOKENS overrides the save interval read from the config (1B)
 #   DRY_RUN=1   print the plan and the srun line, touch nothing
@@ -37,6 +41,9 @@ if [ "$MODE" = control ]; then
   RUN=${RUN:-run2_control}; CONFIG=config_run2_control.yaml; SPLIT=${SPLIT:-run2_control_train}; KV=""
 else
   RUN=${RUN:-run2}; CONFIG=config_run2.yaml; SPLIT=${SPLIT:-run2_warm_train}; KV=" --reader-kv"
+  # the last 5% of the run (40B tokens from 760B) is read from its own split, built with the corpus: the main split's chain
+  # stops by itself after the first save at or past 760B and waits for the user's switch
+  [ "$SPLIT" = run2_main_train ] && STOP_AFTER=${STOP_AFTER-760000M}
 fi
 # a failure that every later job of the chain would repeat (the environment, a bad variable, a missing cache) writes a
 # HALT with the reason before it exits, so the chain's next jobs skip at once (the precheck honours HALT) and the
@@ -76,6 +83,9 @@ export STARTUP_MIN=${STARTUP_MIN:-30}
 # user's and the trainer honours it (exit 10) instead of clearing it
 EXTRA=" --keep-stop"
 [ "$MODE" != control ] && [ "$SPLIT" != run2_warm_train ] && EXTRA="$EXTRA --switch-split"
+# the tail split starts at its first document in the main split's last epoch and ends the run at the plan's last step
+# (the split holds a 5% surplus); both are harmless on a later resume that needs no switch
+[ "$MODE" != control ] && [ "$SPLIT" = run2_tail_train ] && EXTRA="$EXTRA ${TAIL_FLAGS---switch-from-start --end-at-plan}"
 # the trainer review's contracts: every launch of the main run spans the LR schedule over the whole run (--plan-split), a
 # warm-up launch stops at its split's epoch end instead of wrapping (--max-epochs-this-split, log line "warm split
 # exhausted"); the control passes neither. flag names are overridable until sft.py's are final
@@ -93,10 +103,12 @@ MAXJOBS=${MAX_JOBS:-20}
 CHAIN_MODE=${CHAIN_MODE:-presubmitted}
 HIST=$RUNDIR/chain_history
 STATE=$RUNDIR/chain_state
-TRAIN="${CTR}python scripts/sft.py --evidence$KV -c $SEED --run-name $RUN --data-dir $D --train-split $SPLIT --val-split inject_val --grad-accumulation-steps $ACCUM$EXTRA"
+# the trainer refuses (exit 3) when its own batch, sequence length and accumulation do not give this many tokens per update
+TOKENS_PER_UPDATE=${TOKENS_PER_UPDATE:-$(( BATCH_PER_GPU * SEQ_LEN * GPUS * ACCUM ))}
+TRAIN="${CTR}python scripts/sft.py --evidence$KV -c $SEED --run-name $RUN --data-dir $D --train-split $SPLIT --val-split inject_val --grad-accumulation-steps $ACCUM --expect-tokens-per-update $TOKENS_PER_UPDATE$EXTRA"
 # one task per GPU; --gpu-bind=none so every task sees the node's 4 GPUs and LOCAL_RANK picks the device (a site default
 # that binds one GPU per task would leave LOCAL_RANK 1 to 3 without a device)
-SRUN="srun --nodes=$NODES --ntasks=$GPUS --ntasks-per-node=$GPN --gpus-per-node=$GPN --gpu-bind=none --cpus-per-task=$CPUS --wait=300 -u --output=$RUNLOG --open-mode=append bash scripts/slurm/rank_exec.sh $LOGDIR/rc_$JOBID $TRAIN"
+SRUN="srun --nodes=$NODES --ntasks=$GPUS --ntasks-per-node=$GPN --gres=gpu:$GPN --gpu-bind=none --cpus-per-task=$CPUS --wait=300 -u --output=$RUNLOG --open-mode=append bash scripts/slurm/rank_exec.sh $LOGDIR/rc_$JOBID $TRAIN"
 
 if [ "${DRY_RUN:-0}" = 1 ]; then
   echo "mode $MODE run $RUN nodes $NODES gpus $GPUS accum $ACCUM chain_index $INDEX"
@@ -109,6 +121,7 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   exit 0
 fi
 SITE_ERR=$(require_site_values 2>&1) || { halt_early "$SITE_ERR"; exit 2; }
+TOK_ERR=$(require_tokenizer 2>&1) || { halt_early "$TOK_ERR"; exit 2; }
 
 say() { echo "[$(date -Is)] job $JOBID: $*" | tee -a "$RUNLOG"; }
 mkdir -p "$LOGDIR" ckpts/inject "$RUNDIR"
@@ -216,6 +229,8 @@ rm -f "$LOGDIR/wd_$JOBID"
 KILLER=""
 SRUN_PID=""
 CANCELLED=0
+TERM_KIND=""
+USR1_SEEN=0
 # the save path never signals srun: srun treats SIGTERM as a forced termination and may SIGKILL the step (no save, no
 # rc file). scancel --signal=TERM on the step reaches every task rank_exec.sh, which forwards it to the trainer
 terminate() {
@@ -226,7 +241,7 @@ hard_kill() {
   timeout 30 scancel --signal=KILL "$(train_step_id "$JOBID")" 2>/dev/null
   [ -n "$SRUN_PID" ] && kill -KILL "$SRUN_PID" 2>/dev/null
 }
-on_usr1() { say "time limit near: SIGTERM to the trainer through the step, it saves and exits 20"; terminate; }
+on_usr1() { USR1_SEEN=1; say "time limit near: SIGTERM to the trainer through the step, it saves and exits 20"; terminate; }
 on_usr2() {
   local v
   v=$(cut -d' ' -f1 "$LOGDIR/wd_$JOBID" 2>/dev/null)
@@ -240,23 +255,22 @@ on_usr2() {
     KILLER=$!
   fi
 }
-# a cancelled or limit killed job still leaves its history line; Slurm gives KillWait seconds, so the line is written
+# a TERM reaches the batch shell from the time limit, an admin kill, a node failure or a requeue, and from a hand scancel.
+# only scripts/slurm/cancel_chain.sh ends a chain by hand: it writes ended=cancelled into the chain state first, then
+# cancels. a TERM with no such mark is an interruption: the history line says interrupted, the ranks are asked to save,
+# and the afterany successor goes on as after a time limit stop. Slurm gives KillWait seconds, so the line is written
 # first and the ranks asked to save after
 on_term() {
   CANCELLED=1
-  # a TERM with much of the time limit left is a user's scancel: the chain ends (ended=cancelled, so the afterany
-  # successors exit at once and the supervisor, which never restarts a chain a person stopped, only alerts). a TERM in
-  # the last minutes is the time limit, and the chain goes on. an unreadable squeue leaves the chain state alone
-  local left
-  if [ "$JOBID" != 0 ]; then
-    left=$(slurm_time_left_seconds "$(timeout 30 squeue -h -j "$JOBID" -o %L 2>/dev/null)") || left=""
-    if [ -n "$left" ] && [ "$left" -gt "${CANCEL_MIN_LEFT_S:-300}" ]; then
-      state_put "$STATE" ended cancelled
-      say "cancelled by hand ($left s of the limit left): the chain ends and is not resubmitted"
-    fi
+  if [ "$(state_get "$STATE" ended)" = cancelled ]; then
+    TERM_KIND=cancelled
+    hist_append "$HIST" "$JOBID" cancelled "$(( $(date +%s) - T0 ))" cancelled
+    say "cancelled by hand (chain state ended=cancelled): the chain ends and is not resubmitted; SIGTERM to the ranks (save, exit 20)"
+  else
+    TERM_KIND=interrupted
+    hist_append "$HIST" "$JOBID" interrupted "$(( $(date +%s) - T0 ))" interrupted
+    say "interrupted (SIGTERM to the batch shell: time limit, node failure, admin kill or a bare scancel): history line written, SIGTERM to the ranks (save, exit 20), the chain goes on; use scripts/slurm/cancel_chain.sh to end a chain"
   fi
-  hist_append "$HIST" "$JOBID" cancelled "$(( $(date +%s) - T0 ))" cancelled
-  say "SIGTERM to the batch shell (scancel or the limit): history line written, SIGTERM to the ranks (save, exit 20)"
   terminate
 }
 trap on_usr1 USR1
@@ -277,8 +291,13 @@ if [ "${WATCHDOG:-1}" = 1 ] && [ "$JOBID" != 0 ]; then
   fi
 fi
 
-$SRUN &
-SRUN_PID=$!
+# a TERM or the limit signal that came before the step existed (terminate found no step) must not be followed by a trainer start
+if [ -n "$TERM_KIND" ] || [ "$USR1_SEEN" = 1 ]; then
+  say "signalled before the step was launched: the trainer is not started"
+else
+  $SRUN &
+  SRUN_PID=$!
+fi
 # a save timer for a site that does not honour --signal: the time left comes from squeue
 TIMER=""
 if [ "$JOBID" != 0 ]; then
@@ -288,7 +307,7 @@ if [ "$JOBID" != 0 ]; then
     TIMER=$!
   fi
 fi
-while kill -0 "$SRUN_PID" 2>/dev/null; do wait "$SRUN_PID"; done
+while [ -n "$SRUN_PID" ] && kill -0 "$SRUN_PID" 2>/dev/null; do wait "$SRUN_PID"; done
 # ignored, not reset: a signal arriving while the sidecars are killed must not take the default action (kill the shell)
 trap '' USR1 USR2
 for p in $WD $TIMER $KILLER; do kill "$p" 2>/dev/null; done
@@ -314,21 +333,34 @@ if [ "$RC" = 30 ]; then
   LASTERR=$(echo "$NEWLOG" | grep -i -E 'error|refus|verify|mismatch' | tail -n 1 | cut -c1-200)
   REASON="exit 30 (a refused resume or switch): ${LASTERR:-see $RUNLOG}"
 fi
-# exit 2 is the trainer refusing to start (a missing rows cache, a bad argument): every rerun would repeat it, so the
-# chain halts at once instead of burning the crash loop allowance
-if { [ "$RC" = 1 ] || [ "$RC" = 2 ]; } && [ "$DECISION" = fail ]; then
-  LASTERR=$(echo "$NEWLOG" | grep -i -E 'error|rows cache|refus|not found|missing|mismatch' | tail -n 1 | cut -c1-200)
+# exit 2 (a missing rows cache, a bad argument) and exit 3 (a deliberate refusal) would be repeated by every rerun, so the
+# chain halts at once; exit 1 is a crash that may be transient and resubmits, and halts here only after two jobs in a
+# row without a new save
+if { [ "$RC" = 1 ] || [ "$RC" = 2 ] || [ "$RC" = 3 ]; } && [ "$DECISION" = fail ]; then
+  LASTERR=$(echo "$NEWLOG" | grep -i -E 'error|rows cache|refus|not found|missing|mismatch|Traceback' | tail -n 1 | cut -c1-200)
   if [ "$RC" = 2 ]; then
     REASON="trainer exit 2, rows cache missing: run the rows stage (scripts/sft.py --evidence --estimate-rows-only --estimate-world-sizes $GPUS ...); deterministic, not rerun: ${LASTERR:-see $RUNLOG}"
+  elif [ "$RC" = 3 ]; then
+    REASON="trainer exit 3 (a deliberate refusal such as a seed mismatch, a missing evidence_fixed, a refused head or a wrong tokens per update; deterministic, not rerun): ${LASTERR:-see $RUNLOG}"
   else
-    REASON="trainer exit 1 (a refusal such as a seed mismatch, a missing evidence_fixed or a refused head; deterministic, not rerun): ${LASTERR:-see $RUNLOG}"
+    REASON="trainer exit 1 (a crash) in $STALLS1 jobs in a row without a new save: ${LASTERR:-see $RUNLOG}"
   fi
 fi
 [ "$WDV" = diverged ] && DECISION=diverged
+# a chain cancel_chain.sh ended: the save of this job was the last act, no crash loop rule or halt applies to it
+[ "$DECISION" = resubmit ] && [ "$(state_get "$STATE" ended)" = cancelled ] && DECISION=cancelled
 ELAPSED=$(( $(date +%s) - T0 ))
 JSTATE=$(job_state "$RC" "$WDV")
 [ "$DECISION" = nofinal ] && JSTATE=failed
-[ "$CANCELLED" = 1 ] || hist_append "$HIST" "$JOBID" "$JSTATE" "$ELAPSED" "$DECISION"
+if [ "$CANCELLED" = 1 ]; then
+  # the line written at the TERM is replaced by one that carries the job's real outcome (a crash after the TERM counts in
+  # the crash loop rule); a hand cancelled job keeps the state cancelled for the supervisor
+  grep -v "^$JOBID " "$HIST" > "$HIST.tmp.$$" 2>/dev/null; mv "$HIST.tmp.$$" "$HIST"
+  [ "$TERM_KIND" = cancelled ] && JSTATE=cancelled
+  hist_append "$HIST" "$JOBID" "$JSTATE" "$ELAPSED" "$TERM_KIND"
+else
+  hist_append "$HIST" "$JOBID" "$JSTATE" "$ELAPSED" "$DECISION"
+fi
 state_put "$STATE" last_job_state "$JSTATE"
 say "trainer rank 0 exit $RC after ${ELAPSED}s, new save: $([ "$M1" != "$M0" ] && echo yes || echo no), watchdog $WDV, decision $DECISION"
 if [ "$DECISION" = resubmit ]; then
@@ -339,6 +371,7 @@ fi
 echo "$JOBID $GPUS $ELAPSED $(awk -v g=$GPUS -v s=$ELAPSED 'BEGIN{printf "%.1f", g*s/3600}') rc=$RC $DECISION" >> "ckpts/inject/${RUN}_gpu_hours.log"
 case "$DECISION" in
   resubmit) ;;
+  cancelled) [ -n "$NEXT" ] && timeout 30 scancel "$NEXT"; say "chain ends: cancelled by hand";;
   fail) halt_chain "${REASON:-rank 0 exit $RC, $STALLS1 job(s) without a new save}";;
   nofinal) halt_chain "rank 0 exited 0 but $FINALF does not exist (not finished)";;
   diverged) halt_chain "diverged: $(cut -d' ' -f2- "$LOGDIR/wd_$JOBID")";;

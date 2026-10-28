@@ -17,7 +17,7 @@ import gradio as gr
 from transformers import AutoTokenizer
 
 from scripts.inference import (
-    DEFAULT_RETRIEVAL_K, StoreRetriever, load_model, stream_generate, prepend_bos, store_prompt_ids,
+    CHUNK_ORDERS, DEFAULT_CHUNK_ORDER, DEFAULT_RETRIEVAL_K, StoreRetriever, load_model, stream_generate, prepend_bos, store_prompt_ids,
 )
 from modules.data.chat import ChatTemplate
 from config import ModelConfig
@@ -270,11 +270,13 @@ def main():
                         help="Store directory (data/index/<name>/): the chat tab retrieves from it per user turn")
     parser.add_argument("--retrieval-k", type=int, default=DEFAULT_RETRIEVAL_K,
                         help=f"Chunks retrieved per turn with --store (default: {DEFAULT_RETRIEVAL_K})")
+    parser.add_argument("--chunk-order", choices=CHUNK_ORDERS, default=DEFAULT_CHUNK_ORDER,
+                        help="With --store, the order the chunks are attached in: shuffle (default, a fixed shuffle per question as in training), best_first, best_last")
     parser.add_argument("--show-retrieval", action="store_true",
                         help="With --store, put the retrieved chunk ids and first 80 characters above each answer")
     args = parser.parse_args()
     if args.store:
-        _RETRIEVAL["retriever"] = StoreRetriever(args.store, args.retrieval_k, DEFAULT_DEVICE)
+        _RETRIEVAL["retriever"] = StoreRetriever(args.store, args.retrieval_k, DEFAULT_DEVICE, args.chunk_order)
         _RETRIEVAL["show"] = args.show_retrieval
 
     demo = build_demo()

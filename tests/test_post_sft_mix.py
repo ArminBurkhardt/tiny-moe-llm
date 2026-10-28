@@ -129,6 +129,11 @@ with tempfile.TemporaryDirectory() as d:
     sl = np.fromfile(os.path.join(out, "mix.slice"), dtype=np.uint8)
     rr = m.check_eos_supervised(os.path.join(out, "mix"), ASSISTANT, EOS, doc_ids=np.flatnonzero(sl == 0))
     assert rr["bad"] == 0 and rr["documents"] == int((sl == 0).sum()) and rr["turns"] >= rr["documents"], rr
+    sup = m.supervised_token_shares(os.path.join(out, "mix"), ["chat", "bios"])
+    mk = np.fromfile(os.path.join(out, "mix.mask"), dtype=np.uint8)
+    ix = np.fromfile(os.path.join(out, "mix.idx"), dtype=np.uint64).astype(np.int64)
+    want = [int(sum(mk[ix[i]:ix[i + 1]].sum() for i in np.flatnonzero(sl == k))) for k in (0, 1)]
+    assert [sup["chat"][0], sup["bios"][0]] == want and abs(sup["chat"][1] + sup["bios"][1] - 1) < 1e-9, (sup, want)
 
 # 5
 assert eval_chat.has_repeated_ngram([1, 2, 3, 4, 9, 1, 2, 3, 4]) is True

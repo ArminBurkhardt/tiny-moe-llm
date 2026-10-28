@@ -96,6 +96,35 @@ def read_epoch0_head_docs(path: str, num_docs: int):
     return head
 
 
+def read_last_index(path: str) -> int:
+    """The last uint64 entry of an index file (the total it indexes), by one seek."""
+    size = os.path.getsize(path)
+    if size < 8 or size % 8:
+        raise ValueError(f"{path} has {size:,} bytes, not a whole number of uint64 entries")
+    with open(path, "rb") as f:
+        f.seek(size - 8)
+        return int(np.frombuffer(f.read(8), dtype=np.uint64)[0])
+
+
+def check_index_total(index_path: str, indexed_path: str, entries: int) -> None:
+    """Raise when an index's last entry is not the entry count of the file it indexes.
+
+    A transfer that truncates a data file and its pair together passes every size comparison
+    between them and only fails later, as an IndexError in a worker or as silently short data.
+
+    Args:
+        index_path: the ``.idx``-style file (uint64 offsets, one more than the documents).
+        indexed_path: the data file the index offsets point into, named in the error.
+        entries: how many entries (tokens, rows) that data file holds.
+    """
+    last = read_last_index(index_path)
+    if last != entries:
+        raise ValueError(
+            f"{index_path} ends at {last:,} but {indexed_path} holds {entries:,} entries -- "
+            f"a truncated or mismatched copy, re-transfer or rebuild it"
+        )
+
+
 def epoch_order(seed: int, epoch: int, num_docs: int, head_docs=None) -> np.ndarray:
     """One epoch's document permutation.
 
@@ -110,13 +139,18 @@ def epoch_order(seed: int, epoch: int, num_docs: int, head_docs=None) -> np.ndar
         num_docs: documents in the split.
         head_docs: size of the head, None for the plain permutation.
     """
+    # int32 while the ids fit: ``Generator.permutation(n)`` is ``shuffle(arange(n))`` and the shuffle
+    # draws the same stream whatever the element type, so the values equal the int64 permutation's
+    # at half the memory (3.8 GB against 1.9 GB per worker at 479M documents)
+    dtype = np.int32 if num_docs < 2**31 else np.int64
     if head_docs is None or epoch != 0:
-        return np.random.default_rng([seed, epoch]).permutation(num_docs)
+        out = np.arange(num_docs, dtype=dtype)
+        np.random.default_rng([seed, epoch]).shuffle(out)
+        return out
     if not 0 < head_docs <= num_docs:
         raise ValueError(f"head_docs {head_docs} is outside [1, {num_docs}]")
-    # in place on one int64 array: ``Generator.permutation(n)`` is ``shuffle(arange(n))``, so this
-    # is byte identical to permuting the two parts apart and joining them, at one array of memory
-    out = np.arange(num_docs, dtype=np.int64)
+    # in place on one array: byte identical to permuting the two parts apart and joining them
+    out = np.arange(num_docs, dtype=dtype)
     np.random.default_rng([seed, 0]).shuffle(out[:head_docs])
     np.random.default_rng([seed, 0, 1]).shuffle(out[head_docs:])
     return out
@@ -201,6 +235,7 @@ class SFTDataset(IterableDataset):
                 f"{self.mask_path} has {os.path.getsize(self.mask_path):,} entries but "
                 f"{self.bin_path} has {n_tokens:,} tokens -- the pair is out of sync, rebuild it"
             )
+        check_index_total(self.idx_path, self.bin_path, n_tokens)
         logger.info(
             f"SFTDataset[{split}]: {self.num_docs:,} conversations, {n_tokens:,} tokens, "
             f"shuffle={shuffle}"
@@ -228,7 +263,7 @@ class SFTDataset(IterableDataset):
         with no cross-worker coordination and no state to checkpoint beyond those two numbers.
         """
         if not self.shuffle:
-            return np.arange(num_docs, dtype=np.int64)
+            return np.arange(num_docs, dtype=np.int32 if num_docs < 2**31 else np.int64)
         return epoch_order(self.seed, self.epoch, num_docs, self.epoch0_head_docs)
 
     def _batch_iterator(self) -> Iterator[dict]:

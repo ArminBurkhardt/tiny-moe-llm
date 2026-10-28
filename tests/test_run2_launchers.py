@@ -29,8 +29,8 @@ SLURM_VARS = ("SLURM_JOB_ID", "SLURM_SUBMIT_DIR", "SLURM_JOB_NUM_NODES", "SLURM_
               "CKPT", "TAG", "STAGES", "DEVICE", "SIF", "BIND", "CHAIN_MODE", "PAIRS", "WATCHDOG", "START_INDEX", "EXPORT",
               "STALL_MIN", "SAVE_MIN", "STARTUP_MIN", "NOW", "ONCE", "FROM", "LOG", "RUNDIR", "SBATCH_CMD", "TMPDIR",
               "CHAIN_ID", "CHAIN_FIRST", "CTR_FAIL", "READ_CONFIG", "TRAIN_EXTRA", "PLAN_SPLIT_FLAG", "WARM_EPOCH_FLAG",
-              "SQUEUE_CMD", "MIRROR_WAIT_MAX", "WD_POLL_S", "KILL_AFTER_S", "WD_CHECK_S", "SLURM_PROCID", "SLURM_NTASKS",
-              "SLURM_LOCALID", "SLURM_JOB_NAME", "BIND_EXTRA")
+              "SQUEUE_CMD", "TAIL_FLAGS", "MIRROR_WAIT_MAX", "WD_POLL_S", "KILL_AFTER_S", "WD_CHECK_S", "SLURM_PROCID", "SLURM_NTASKS",
+              "SLURM_LOCALID", "SLURM_JOB_NAME", "BIND_EXTRA", "TINY_LLM_TOKENIZER", "HF_HOME")
 
 
 def clean_env(**env):
@@ -100,7 +100,9 @@ def slurm_checks():
     # chain_decide RC FINAL STOP STALLS
     cases = [("0", 0, 0, 0, "nofinal"), ("0", 1, 0, 0, "done"), ("20", 1, 0, 0, "done"), ("20", 0, 0, 0, "resubmit"), ("20", 0, 0, 1, "resubmit"),
              ("20", 0, 0, 2, "fail"), ("10", 0, 0, 0, "stop"), ("20", 0, 1, 0, "stop"), ("30", 0, 0, 0, "fail"),
-             ("255", 0, 0, 0, "resubmit"), ("255", 0, 0, 2, "fail"), ("1", 0, 0, 1, "fail"), ("2", 0, 0, 0, "fail"), ("143", 0, 0, 2, "fail")]
+             ("255", 0, 0, 0, "resubmit"), ("255", 0, 0, 2, "fail"), ("1", 0, 0, 0, "resubmit"), ("1", 0, 0, 1, "resubmit"),
+             ("1", 0, 0, 2, "fail"), ("1", 0, 1, 0, "stop"), ("1", 1, 0, 0, "done"), ("2", 0, 0, 0, "fail"), ("3", 0, 0, 0, "fail"),
+             ("3", 0, 0, 1, "fail"), ("143", 0, 0, 2, "fail")]
     for rc, final, stop, stalls, want in cases:
         assert fn(f"chain_decide {rc} {final} {stop} {stalls}")[1] == want, (rc, final, stop, stalls, want)
     # chain_precheck FINAL STOP HALT MARKER LAST STALLS INDEX MAXJOBS
@@ -125,11 +127,25 @@ def slurm_checks():
             "--train-split run2_warm_train --val-split inject_val --grad-accumulation-steps 2") in srun, srun
     assert "--switch-split" not in srun and "--output=ckpts/inject/run2.log --open-mode=append" in srun, srun
     assert srun.endswith("--plan-split run2_main_train --max-epochs-this-split 1"), srun
-    assert "--gpus-per-node=4 --gpu-bind=none" in srun, srun
+    assert "--gres=gpu:4 --gpu-bind=none" in srun and "--gpus-per-node" not in srun, srun
+    assert "--grad-accumulation-steps 2 --expect-tokens-per-update 524288 --keep-stop" in srun, srun
     r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="2", SPLIT="run2_main_train", STOP_AFTER="4000M")
     srun = srun_line(r)
-    assert "accum 2" in r.stdout and "--ntasks=8 " in srun and srun.endswith("--grad-accumulation-steps 2 --keep-stop --switch-split --plan-split run2_main_train"), r.stdout
+    assert "accum 2" in r.stdout and "--ntasks=8 " in srun and srun.endswith("--grad-accumulation-steps 2 --expect-tokens-per-update 524288 --keep-stop --switch-split --plan-split run2_main_train"), r.stdout
     assert "stop_after_save_run2.sh run2 '4000M'" in r.stdout
+    # the main split of a chain stops at 760B by default; STOP_AFTER set and empty turns that off; the tail adds its flags
+    r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="2", SPLIT="run2_main_train")
+    assert "stop_after_save_run2.sh run2 '760000M'" in r.stdout and srun_line(r).endswith("--keep-stop --switch-split --plan-split run2_main_train")
+    r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="2", SPLIT="run2_main_train", STOP_AFTER="")
+    assert "stop_after_save_run2.sh" not in r.stdout, r.stdout
+    r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="2", SPLIT="run2_tail_train")
+    assert r.returncode == 0 and "stop_after_save_run2.sh" not in r.stdout, r.stdout + r.stderr
+    assert srun_line(r).endswith("--keep-stop --switch-split --switch-from-start --end-at-plan --plan-split run2_main_train"), srun_line(r)
+    assert "--max-epochs-this-split" not in srun_line(r)
+    r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="2")
+    assert "stop_after_save_run2.sh" not in r.stdout, "the warm-up has no default stop"
+    r = slurm_dry("scripts/slurm/train_job.sh", MODE="control", NODES="2", SPLIT="run2_main_train")
+    assert "stop_after_save_run2.sh" not in r.stdout, "the control never takes the tail stop"
     r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="1", GPUS_PER_NODE="2", RUN="run2_chk2")
     assert "gpus 2 accum 8" in r.stdout and "--run-name run2_chk2 " in r.stdout, r.stdout
     r = slurm_dry("scripts/slurm/train_job.sh", MODE="run", NODES="3")
@@ -217,6 +233,24 @@ def main():
     assert "--num_processes 2 " in cmd and "--data-dir /data/x/prepared_run2 --train-split run2_main_train" in cmd, cmd
     assert cmd.endswith("--grad-accumulation-steps 8 --switch-split --plan-split run2_main_train --upload-repo org/repo"), cmd
     assert any(l.startswith("bash scripts/reads/stop_after_save_run2.sh run2 '4000M'") for l in lines), lines
+
+    # the tail phase: the main launch stops by itself after the first save at or past 760B, the tail launch switches
+    cmd, lines = dry("launch_run2.sh", SPLIT="run2_main_train")
+    assert any(l.startswith("bash scripts/reads/stop_after_save_run2.sh run2 '760000M'") for l in lines), lines
+    assert cmd.endswith("--switch-split --plan-split run2_main_train") and "--switch-from-start" not in cmd, cmd
+    cmd, lines = dry("launch_run2.sh", SPLIT="run2_main_train", STOP_AFTER="")
+    assert not any("stop_after_save_run2.sh" in l for l in lines), "STOP_AFTER set and empty turns the stop off"
+    cmd, lines = dry("launch_run2.sh", SPLIT="run2_main_train", STOP_AFTER="3B")
+    assert any("stop_after_save_run2.sh run2 '3B'" in l for l in lines), lines
+    cmd, lines = dry("launch_run2.sh", SPLIT="run2_tail_train", NPROC="4", DATA_ROOT="/data/x")
+    assert "--data-dir /data/x/prepared_run2 --train-split run2_tail_train" in cmd and "--grad-accumulation-steps 4" in cmd, cmd
+    assert cmd.endswith("--switch-split --plan-split run2_main_train --switch-from-start --end-at-plan"), cmd
+    assert "--max-epochs-this-split" not in cmd, "the tail ends the run (exit 0 and a final save), not on exit 10"
+    assert not any("stop_after_save_run2.sh" in l for l in lines), "no automatic stop on the tail"
+    cmd, lines = dry("launch_run2.sh", SPLIT="run2_warm_train")
+    assert not any("stop_after_save_run2.sh" in l for l in lines) and "--switch-from-start" not in cmd
+    cmd, lines = dry("launch_run2.sh", SPLIT="run2_tail_train", TAIL_FLAGS="--switch-from-start")
+    assert cmd.endswith("--switch-split --plan-split run2_main_train --switch-from-start"), cmd
 
     bad = subprocess.run(["bash", os.path.join(ROOT, "scripts", "launch_run2.sh"), "--dry-run"], cwd=ROOT,
                          env=clean_env(NPROC="3"), capture_output=True, text=True)

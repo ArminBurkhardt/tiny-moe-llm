@@ -299,9 +299,59 @@ Restructured 2026-10-24 after the repository review.
   corpus, trainer) left no high issue in the corpus and the trainer, the Slurm review's two highs and
   every medium and low fixed, and a detached Sonnet review of the trainer fixes found no high or
   medium issue. Nothing has run under real Slurm. The user's steps: `docs/plans/RUN2_handover.md`.
+- **Reviewed and fixed 2026-10-28 (uncommitted):** an 8 agent Opus review of the run 2 launch path, then
+  fixes by Sonnet fixers, each slice read by a detached Sonnet reviewer with its findings folded in.
+  The main finding: Slurm's `scancel --signal=TERM` on a step signals every process in the step,
+  which killed the DataLoader workers and crashed the run with no save at every planned stop (never
+  exercised, local stops used STOP files); the workers now ignore SIGTERM, SIGUSR1, SIGUSR2 and
+  SIGINT. Trainer (`scripts/sft.py`): exit 3 (`EXIT_REFUSED`) for a deliberate refusal, 1 for any
+  crash; `--probe-peak` (with `--probe-chunk-tokens`, `--probe-conversations`) runs two synthetic
+  worst case layouts, QA like and chain like, prints the per rank peak in GB, exits 0, saves
+  nothing; a resume refuses (exit 3) a changed `max_evidence_tokens`, sequence length or MTP token
+  count unless `--allow-plan-change`; `--expect-tokens-per-update`; the ETA from cumulative tokens
+  over scheduler steps; multi GPU eval skips unsupervised batches as the single GPU path does.
+  `sft.py` keeps router noise at zero (it never read `noise_anneal_tokens`; every recorded arm ran
+  with zero noise; RUN2's line "router noise annealed over 1B" was wrong and is corrected).
+  Data and model: int32 epoch order (identical order), startup tail checks of the index files, a
+  startup count of documents over the evidence cap, `mtp.py` masked_fill (no host sync), loss-free
+  routing reads the fp32 balance bias shadow when its stamp is current (routing changes only at
+  large bias; a resume routes with the bf16 buffer until the first update, as the saved buffer was
+  always bf16). Slurm (`scripts/slurm/`): `TINY_LLM_TOKENIZER` exported from `$HF_HOME/tokenizer`
+  with a fail fast check; `chain_decide`: exit 1 resubmits under the stall rule, 2 and 3 halt;
+  `cancel_chain.sh` is the only hand cancel (writes ended=cancelled, then scancels, verifies), any
+  other TERM is an interruption and the chain continues; `state_put` under flock; srun `--gres`;
+  watchdog step line stall 30 minutes; a TERM before srun skips the launch; the stop watcher back to
+  5 s with incremental reads. Ops: the supervisor resubmits only a started chain, carrying its
+  split, `STOP_AFTER` and nodes, never past a reached `STOP_AFTER`; one absolute transfer ledger
+  (`OPS_LEDGER`) including the mirror pusher (the PC and the relay VM still keep separate ledgers:
+  budget them together); the relay uploads only verified exports, hash grace 2 hours, refuses a
+  public repo, `HF_PYTHON`, a daily heartbeat (`HEARTBEAT_HOURS`), logs every `LOG_UPLOAD_HOURS`,
+  stable alert keys, ntfy recorded only on success; `export_weights.py` writes a temp file,
+  strict-load checks (refuses without CUDA unless `--no-verify`), renames, writes the sha256 last.
+  Corpus and post-SFT: the ir phase's smoltalk2 hashes recorded (`smoltalk2_ir_hashes`) and excluded
+  by the QA replay (the supply exactly covers 300M, zero slack); the tail filler plan counts whole
+  files with `TAIL_TEXT_MARGIN` 0.05, the tail target 28.665B of text (was 28.119B); the merge checks
+  rerun on a skipped stage; the QA builder's resume restores rngs and reservoirs; the bridge
+  build's 4-hop rows mean the hop4 read is not unseen depth; `config_run2_postsft.yaml`
+  `conversation_loss_weighting: false`; the post-SFT kill verdict reads 2000 examples with paired z
+  at or under -3 on gold EM, an abstention kill (non-abstain rate z at or over +3 and 0.02 or more
+  under none or distractors), a missing baseline exits 4, a local SQuAD directory, the bridge
+  retention read reported only; serving `--chunk-order` defaults to shuffle seeded per question
+  (`best_first` kept for the pending chunk-order read). Memory: RUN2's worst case sum (about 72 GB)
+  was written for an 80 GB card, and MareNostrum cards are H100 64 GB; the selection and retrieval
+  tensors add about 10 GB on a chain dense batch at `max_evidence_tokens` 9216, so day 1 runs
+  `--probe-peak` at batch 8 and lowers `max_evidence_tokens` before the warm-up if the peak is above
+  about 58 GB; after that the value is frozen (the resume refusal). Accepted, not changed: pad equal
+  to eos excludes real EOS from the counts; the lockstep epoch end drop; the 0.01% unreachable
+  resume cursor edge; refusals such as a missing `evidence_fixed` now halt the chain rather than
+  retry. Nothing has run under real Slurm.
 - **Next, in order:** the user's cluster access and day 1 (`scripts/slurm/README.md` "Day 1": the
-  `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU
-  against 1-GPU check stopped after about 100 steps, the first hour's rate against 54k per GPU), the
+  `module` command in a non-interactive shell, `sft.py --probe-peak` at batch 8 with
+  `max_evidence_tokens` lowered before the warm-up if the peak is above about 58 GB, a real
+  `scancel --signal=TERM` test of a short job (the planned stop path never ran under Slurm), the
+  supervisor run without `--act` until a chain exists and then one action seen in `squeue`, hand
+  cancels only through `cancel_chain.sh`, the 2-GPU against 1-GPU check stopped after about 100
+  steps, the first hour's rate against 54k per GPU), the
   corpus build, the 10B control, then the warm-up with `STOP_AFTER='4000M'` and the switch
   decision; during the run table B of `docs/plans/RUN2.md`.
 - **Open for the user:** the control's exposure (at 10B it sees about 3.75% of each person's
@@ -332,7 +382,7 @@ Mirrored in both "Now" sections; a row leaves when it is done.
 | the goal's reasoning clause reworded | closed: decided 2026-10-25 (the user, RUN2.md row 4), open since 2026-10-17, on R9 (composes in written tokens, not in the loop): "facts in the store through the retrieval pathway, reasoning in written tokens, the looped trunk as computation per token"; the original "reasoning in the looped trunk" kept as the original goal and the aspiration to revisit after the real run (NEXT.md "The goal") | none | nothing |
 | 6f, reasoning post-training | planned; its reasoning form written tokens (R9, 2026-10-24), with multi-hop rows at the serving depth; its mix carries the pretraining slices beside the bridge rows at a lower LR than the pilot's continuation, the A gates and the clean-slice CE read at every save under a kill rule (R5, 2026-10-25: chain-only bridge SFT lost every other gate) | the A3 generation re-read (weak, 2026-10-24) and A4's edit half (fails on generation, 2026-10-24); decode with evidence through a KV cache | the real run |
 | 6a throughput, 6c corpus on the rented cluster, 6d run spec | 6d decided 2026-10-25 (the user, every row of `docs/plans/RUN2.md`'s first table on the recommended option; drafted the same evening: recipe by rung, cost table for the application, build list; the draft found the plan's 2.5k-hour figure was for the blueprint width 1024 while `config.yaml` is width 768, the evidence trainer single GPU, the real corpus builder unbuilt with the staircase visibility unresolved under the key/value reader); 6c and the rest of the spec's build list next, in RUN2.md's order; 6a after the spec (2026-10-21), carrying the deferred eval-pass rewrite | none | the build list (R5 read 2026-10-25) |
-| the real run's launch | built 2026-10-26 (launch path L1 to L5, RUN2.md) and 2026-10-27 for MareNostrum 5 at 800B on 8 H100, 2 nodes of 4 at accumulation 2, about 413 hours (RUN2.md rows 14 and 15 and "Built 2026-10-27"): the corpus driver at 800B with resumable builders and the filler mirror, the trainer additions for chained jobs, the Slurm job chain with its watchdog, the PC-side ops and supervisor, the weight export; the final reviews left no high issue; the user's steps in `docs/plans/RUN2_handover.md` | day 1 on the cluster (`scripts/slurm/README.md`): the `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU against 1-GPU check (STOP after about 100 steps; cannot be bit-exact, the loss and the per-rank counts agree within noise), the first hour's rate against the 54k floor (about 67k expected at RUN2's ratio, about 93k at the corpus's 0.045) | the user's cluster access; the user's four calls (the control's exposure, a 12B warm-up read, where the corpus is built, whether the 8 GPU cap is per job or concurrent) |
+| the real run's launch | built 2026-10-26 (launch path L1 to L5, RUN2.md) and 2026-10-27 for MareNostrum 5 at 800B on 8 H100, 2 nodes of 4 at accumulation 2, about 413 hours (RUN2.md rows 14 and 15 and "Built 2026-10-27"): the corpus driver at 800B with resumable builders and the filler mirror, the trainer additions for chained jobs, the Slurm job chain with its watchdog, the PC-side ops and supervisor, the weight export; the final reviews left no high issue; the user's steps in `docs/plans/RUN2_handover.md` | day 1 on the cluster (`scripts/slurm/README.md`): the `module` command in a non-interactive shell, one supervisor action seen in `squeue`, the 2-GPU against 1-GPU check (STOP after about 100 steps; cannot be bit-exact, the loss and the per-rank counts agree within noise), the first hour's rate against the 54k floor (about 67k expected at RUN2's ratio, about 93k at the corpus's 0.045); reviewed and fixed 2026-10-28 (State), so day 1 adds `sft.py --probe-peak` at batch 8 on a 64 GB card (lower `max_evidence_tokens` before the warm-up if above about 58 GB, then frozen), a real `scancel --signal=TERM` test of a short job, the supervisor without `--act` until a chain exists, and `cancel_chain.sh` for hand cancels | the user's cluster access; the user's four calls (the control's exposure, a 12B warm-up read, where the corpus is built, whether the 8 GPU cap is per job or concurrent) |
 
 **The design page moves with the architecture and the plan.** Any change to the architecture (a
 tensor, a module, a loss term, an invariant) or to the plan (NEXT.md, this section, a decision, a
@@ -886,6 +936,19 @@ record is [r0b_micro_pilot.md](docs/measurements/r0b_micro_pilot.md).
   time about 413 hours (17 days) in about 6 to 8 jobs, the control about 4 hours; the 16 GPU, 206
   hour and accumulation 1 figures above are the plan before the cap.
 
+- **2026-10-28: the run 2 launch path reviewed and fixed** (uncommitted; the State block's "Reviewed and
+  fixed 2026-10-28" bullet has the full list). An 8 agent Opus review, Sonnet fixers, a detached
+  Sonnet review per slice. Main finding: `scancel --signal=TERM` on a step reaches the DataLoader
+  workers, which died and crashed the run with no save at every planned stop; the workers now ignore
+  the four signals. Also: trainer exit 3 for refusals and 1 for crashes, `--probe-peak`, the resume
+  shape freeze (`--allow-plan-change`), `--expect-tokens-per-update`; router noise is zero under
+  `sft.py` (RUN2's annealed noise line corrected); int32 epoch order, tail checks, the fp32 balance
+  shadow read by loss-free routing; the Slurm chain's exit code rules and `cancel_chain.sh`; the
+  supervisor, relay, ledger and export hardening; the tail filler target 28.665B (was 28.119B), the
+  ir smoltalk2 hashes excluded by the QA replay; the post-SFT kill verdict and weighting off; the
+  memory budget corrected to the 64 GB card (the probe on day 1). Accepted: pad equal to eos in the
+  counts, the lockstep epoch end drop, the 0.01% resume cursor edge.
+
 - **The former "Next, in order" list, closed 2026-10-24** (items 1 to 4 done or closed, item 5
   moved to the Open items table; the full ladder with its done steps is in NEXT.md):
   1. Done 2026-10-09 (spec) and 2026-10-17 (verdicts): the pilot spec, with the copy-first warm-up requirement, swap rate 0.15 and no further lever
@@ -1132,7 +1195,7 @@ scripts/
   reads/              the per-save read and ladder scripts, tracked (pilot copies verbatim, read_run2_save.sh, stop_after_save_run2.sh)
   mirror_sources.py   the cluster has no internet: list the filler shards, stage the small Hub inputs into an HF_HOME, push the shards from the PC through a transfer node into the build's inbox
   export_weights.py   bf16 weights only (about 0.67 GB at shape L) from a checkpoint, with a sha256 and a strict load check
-  slurm/              MareNostrum 5 job chain for the real run, the control, the corpus stages and the reads (submit_chain.sh, train_job.sh, watchdog.sh, status.py, container/); runbook README.md
+  slurm/              MareNostrum 5 job chain for the real run, the control, the corpus stages and the reads (submit_chain.sh, train_job.sh, watchdog.sh, status.py, cancel_chain.sh (the only hand cancel: writes ended=cancelled, scancels, verifies), container/); runbook README.md
   ops/                PC side, in WSL over ssh master sockets: push_code.sh, push_corpus.sh, pull_exports.sh (2 TB transfer ledger), supervise.py (polled by a local /loop under SUPERVISOR.md)
   build_store.py      retrieval stores (NQ, TriviaQA, HotpotQA) and edit stores -> data/index/<name>/
   init_scratch_seed.py       random-init seed for a from-scratch sft.py run (TINY_LLM_CONFIG picks the shape)
@@ -1224,7 +1287,7 @@ plus `test_prepare_data`, `test_sft_dataset`, `test_dataset_packing`, `test_toke
 `test_config_override`, `test_chain_generator`, `test_store`, `test_popqa`, `test_eval_exit`,
 `test_evidence_contrastive` (tests 1 to 6; 7 to 11 skip without CUDA and TE), `test_muon_optimizer`,
 `test_eval_chains_bridge`, `test_merge_evidence_splits`, `test_dataset_real`, `test_dataset_resume`,
-`test_accelerate_batch`, `test_prepare_clean_val`, `test_run2_config`, `test_run2_launchers`, `test_build_run2_corpus`, `test_sft_multigpu_logic` (its CPU logic; the rest of the file needs TE through `sft.py`) (`test_loss_free_balancing`,
+`test_accelerate_batch`, `test_prepare_clean_val`, `test_run2_config`, `test_run2_launchers`, `test_build_run2_corpus`, `test_export_weights`, `test_data_integrity_2026_10_28` (CPU, but its routing test imports `modules.model.moe`, so WSL), `test_sft_multigpu_logic` (its CPU logic; the rest of the file needs TE through `sft.py`) (`test_loss_free_balancing`,
 `test_evidence_gate_skip`, `test_efficiency_2026_10_24`, `test_sft_smoke` and `test_ir_inner_attn_drop` need the GPU; `test_eval_chains`,
 `test_evidence_pack_layout`, `test_mtp_alignment`, `test_chunked_ce_fp32` and
 `test_packed_rows_estimate` run on the CPU but import TE through `eval_abstention.py`, `mtp.py` or
@@ -1376,7 +1439,13 @@ Detail in [moe.md](docs/moe.md) and [architecture.md](docs/architecture.md).
   The masked branch counts in fp32 since 2026-10-20: bf16 counts saturate at 256, so every aux
   value logged on the mask path before that date is a constant, not a load read, and the aux
   term of those runs balanced nothing.
-- Router noise is scaled by 0.3 and annealed to 0 over `noise_anneal_tokens`.
+- Router noise is scaled by 0.3 and annealed to 0 over `noise_anneal_tokens` in `pretrain.py` only;
+  `sft.py` sets it to zero and never reads `noise_anneal_tokens` (warns if the yaml sets it), so
+  every recorded evidence arm and Run 2 train with zero router noise (found 2026-10-28).
+- Loss-free routing (2026-10-28): the top-k selection reads the fp32 balance bias shadow while its
+  stamp (`_version`, `data_ptr`, device) is current, else the bf16 buffer upcast; the two differ
+  only at large bias (the buffer steps by more than the update rate near 0.25); a resume routes
+  with the bf16 buffer until the first update, as the saved buffer was always bf16.
 - Trackers guard recompute double counting (`begin_forward(expected_updates)`), sample every 8th
   forward, never sync in `update()`. IR entropy is logged as `IR E/ln32` (1.0 = uniform).
 
@@ -1639,10 +1708,19 @@ prompt. `--target-tokens` counts prompt tokens.
   `EOS + (num_mtp_tokens - 1)` pads; BOS prepended if absent.
 - `SFTDataset`: `.mask`, conversations never split across rows, per-epoch `(seed, epoch)`
   permutation (changing `sft.seed` mid-run is a hard error). `EvidenceDataset` adds the evidence
-  stream, packs to `max_length - 1`, caps at `max_evidence_tokens`, logs fill.
+  stream, packs to `max_length - 1`, caps at `max_evidence_tokens`, logs fill. Since 2026-10-28 the
+  epoch order is int32 (the same order as before), the index files get startup tail checks
+  (`check_index_total`), and the documents over the evidence cap are counted at startup.
 - `modules/runtime/` stays GPU-free. Exit codes: `0` complete, `10` user stop, `20` preempted,
   `30` resume verification failed; `run_training.py` restarts on all but 10 and 30 (change both
-  sides and the runbook table together). Signal handlers only set flags. Upload failures never
+  sides and the runbook table together). `sft.py --evidence` adds (2026-10-28): `1` any uncaught
+  exception (a crash that may be transient), `2` a missing rows cache or a bad argument, `3`
+  (`EXIT_REFUSED`) a deliberate refusal (`SystemExit` with a message: a changed row shape without
+  `--allow-plan-change`, `--expect-tokens-per-update` not met, a seed mismatch, a missing
+  `evidence_fixed`). The Slurm chain (`chain_decide`) resubmits on 1 under the stall rule (two jobs
+  in a row with no new save halt it), halts at once on 2, 3 and 30, stops on 10 or a STOP file, and
+  is done only with `checkpoint_evidence_final.pt`. Signal handlers only set flags; the DataLoader
+  workers ignore SIGTERM, SIGUSR1, SIGUSR2 and SIGINT. Upload failures never
   propagate. `run_training.py` starts at `resume_phase_index`. **Crossing a phase resets
   offset/epoch/step but keeps `token_count`.** `verify_resume` aborts (30) when more than
   `2 * checkpoint_every_tokens` behind `run_state.json`.
@@ -1683,6 +1761,17 @@ prompt. `--target-tokens` counts prompt tokens.
   leaves the others at a barrier until the 30-minute timeout (the cluster launch is detached and
   SIGTERM is handled); the 2-GPU against 1-GPU check runs in the cluster's first hour and cannot be
   bit-exact. Tests: `test_sft_multigpu_logic` (CPU logic), `test_sft_smoke` (GPU), the resume tests.
+- **Run 2 hardening (2026-10-28).** The DataLoader workers ignore SIGTERM, SIGUSR1, SIGUSR2 and
+  SIGINT (Slurm's `scancel --signal=TERM` on a step signals every process in it, which killed the
+  workers and crashed the run with no save at every planned stop). Exit 3 (`EXIT_REFUSED`) is a
+  deliberate refusal, 1 any crash. `--probe-peak` (`--probe-chunk-tokens`, `--probe-conversations`)
+  runs one optimizer step on a QA like and a chain like synthetic worst case layout, prints the per
+  rank peak GB, exits 0, saves nothing. A resume refuses (exit 3) a changed `max_evidence_tokens`,
+  sequence length or MTP token count unless `--allow-plan-change`, so the cap is set once from the
+  day 1 probe, before the warm-up, and frozen after the first save. `--expect-tokens-per-update N`
+  refuses a launch whose batch x ranks x accumulation x length differs. The ETA is cumulative tokens
+  over scheduler steps; multi GPU eval skips unsupervised batches as one GPU does; router noise is
+  zero (Model invariants).
 - Every parameter gets an fp32 master (bf16 ulp is ~3x the AdamW step at 3e-5); since 2026-10-24
   the masters are saved in the payload (`fp32_masters`, about 0.4 GB at 99M) and restored when
   present, and the depth-sampling and CUDA RNG states are saved and restored; an older checkpoint
@@ -1747,5 +1836,8 @@ prompt. `--target-tokens` counts prompt tokens.
 - The append-only evidence buffer and the "evidence still arriving" depth criterion are unbuilt.
 - `eval_benchmarks.py` / `eval_calibration.py` / `eval_stage0.py` cannot attach evidence.
 - Token counts can be inflated by tens of tokens per batch.
+- Accepted 2026-10-28, unchanged: pad equals eos, so real EOS tokens drop out of the counts; the
+  lockstep loaders drop a few trailing batches per epoch; about 0.01% of resume cursors fall on an
+  unreachable edge.
 - `evidence_from_batch` flattens with boolean mask indexing in the per-step path: one host sync
   per micro step, accepted for the 10M evidence run; for the real run it is a 6a item (the host syncs per micro step number 7 to 8, not one).

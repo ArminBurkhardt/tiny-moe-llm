@@ -67,7 +67,7 @@ import json
 import argparse
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -151,6 +151,34 @@ def realised_shares(meta: dict) -> Dict[str, float]:
     """Prompt token share per slice label from a ``merge.json``."""
     total = sum(s["prompt_tokens"] for s in meta["slices"])
     return {s["label"]: s["prompt_tokens"] / max(total, 1) for s in meta["slices"]}
+
+
+def supervised_token_shares(prefix: str, labels: Sequence[str], chunk_docs: int = 200_000) -> Dict[str, Tuple[int, float]]:
+    """Supervised (mask 1) tokens and their share per slice, from a merged split's ``.mask``, ``.idx`` and ``.slice``.
+
+    The share of supervised tokens, not of prompt tokens, sets how hard a slice pulls on the loss when the loss is a plain token
+    mean (conversation loss weighting off).
+
+    Args:
+        prefix: path prefix of the merged split.
+        labels: slice labels in merge order (the ``.slice`` byte is the index into them).
+        chunk_docs: documents per pass over the mask.
+
+    Returns:
+        ``{label: (supervised tokens, share of all supervised tokens)}``.
+    """
+    idx = np.fromfile(prefix + ".idx", dtype=np.uint64).astype(np.int64)
+    which = np.fromfile(prefix + ".slice", dtype=np.uint8)
+    mask = np.memmap(prefix + ".mask", dtype=np.uint8, mode="r")
+    counts = np.zeros(len(labels), dtype=np.int64)
+    for d0 in range(0, len(which), chunk_docs):
+        d1 = min(d0 + chunk_docs, len(which))
+        base = idx[d0]
+        cs = np.concatenate([[0], np.cumsum(np.asarray(mask[base:idx[d1]]) != 0, dtype=np.int64)])
+        per_doc = cs[idx[d0 + 1:d1 + 1] - base] - cs[idx[d0:d1] - base]
+        counts += np.bincount(which[d0:d1], weights=per_doc, minlength=len(labels)).astype(np.int64)
+    total = max(int(counts.sum()), 1)
+    return {label: (int(counts[i]), counts[i] / total) for i, label in enumerate(labels)}
 
 
 def share_problems(meta: dict, targets: Dict[str, float], tol: float = 0.03) -> List[str]:
@@ -364,6 +392,12 @@ def cmd_verify(a, slices, shares):
         for s in meta["slices"]:
             print(f"  {s['label']:<7} {s['documents']:>9,} docs {s['prompt_tokens']:>12,} tokens  share {real[s['label']]:.3f}"
                   f"  evidence ratio {s['evidence_ratio']:.3f}")
+        if os.path.exists(prefix + ".slice") and os.path.exists(prefix + ".mask"):
+            sup = supervised_token_shares(prefix, [s["label"] for s in meta["slices"]])
+            for s in meta["slices"]:
+                n_sup, sup_share = sup[s["label"]]
+                print(f"  {s['label']:<7} supervised tokens {n_sup:>12,}  share {sup_share:.3f} (prompt token share {real[s['label']]:.3f}; "
+                      f"the supervised share sets the pull on a token mean loss)")
         tgt = normalise({s.label: s.share for s in slices})
         if split == TRAIN_SPLIT:
             problems = share_problems(meta, tgt)

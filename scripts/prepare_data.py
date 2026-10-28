@@ -454,6 +454,23 @@ def split_train_val(data_dir: str, phase: str, val_tokens: int) -> dict:
 DEFAULT_MANIFEST_KEY = "data_prep"
 
 
+def holdout_source_for(phase: str) -> Optional[str]:
+    """The source whose conversation hashes a phase records: smoltalk2 in phase 2 and in ir."""
+    return "smoltalk2" if phase in ("phase2", "ir") else None
+
+
+def record_holdout_hashes(data_prep: dict, phase: str, final_state: dict) -> None:
+    """Store a finished phase's smoltalk2 hashes in its manifest entry.
+
+    Phase 2 writes ``smoltalk2_holdout_hashes`` (what the sft builder reads); ir writes ``smoltalk2_ir_hashes``, kept apart
+    so the first key keeps its meaning.
+    """
+    if phase == "phase2":
+        data_prep["smoltalk2_holdout_hashes"] = final_state.get("holdout_hashes", [])
+    if phase == "ir":
+        data_prep["smoltalk2_ir_hashes"] = final_state.get("holdout_hashes", [])
+
+
 def check_manifest_key(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Resolve ``--manifest-key``; it is required whenever the ir phase is built.
 
@@ -568,7 +585,7 @@ def main():
         t0 = time.time()
         final_state = run_phase(
             phase, source_entries, target_tokens, tokenizer, args.data_dir, state_path,
-            holdout_source_key="smoltalk2" if phase == "phase2" else None,
+            holdout_source_key=holdout_source_for(phase),
             checkpoint_docs=args.checkpoint_docs, tokenize_batch=args.tokenize_batch,
         )
         logger.info(f"[{phase}] wrote {final_state['tokens_written']:,} tokens / {final_state['doc_count']:,} docs in {time.time() - t0:.0f}s")
@@ -591,8 +608,7 @@ def main():
             "doc_count": final_state["doc_count"],
             "per_source": per_source,
         }
-        if phase == "phase2":
-            data_prep["smoltalk2_holdout_hashes"] = final_state.get("holdout_hashes", [])
+        record_holdout_hashes(data_prep, phase, final_state)
         if args.val_tokens > 0:
             data_prep[phase]["split"] = split_train_val(args.data_dir, phase, args.val_tokens)
 

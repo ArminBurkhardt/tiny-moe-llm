@@ -97,6 +97,17 @@ estimate, ``total_steps`` and so the LR schedule (warmup length and cosine) come
 of the training split; the job scripts pass the main split on every launch of the main run, warm
 and main, so the schedule spans the whole run from step 0 and the switch changes nothing in the
 plan. It is saved in the checkpoint (``plan_split``) and a resume under another one warns.
+
+**Tail switch (run notes).** The last stretch of the run is read from its own split (the tail, built with the
+corpus): the main launch stops after a save at a set token count (``stop_after_save_run2.sh``), and the next launch is
+``--train-split TAIL --plan-split MAIN --switch-split --switch-from-start --end-at-plan``. ``--switch-from-start`` lets
+the switch land in the checkpoint's last epoch (the main split's epoch ``num_epochs - 1``, the only one the tail
+replaces) and reads the new split from its first document in that epoch: the position and the step within the epoch
+restart at zero, the optimizer, the scheduler (one cosine, step count carried), the token count and the RNG states carry
+over. It is refused unless the checkpoint is in epoch ``num_epochs - 1`` and was planned on the same ``--plan-split``.
+``--end-at-plan`` ends the run (final validation, a ``_final.pt``, exit 0) at the first log step on or past the plan's
+``total_steps`` instead of at the end of the split, so a split with a surplus never trains at the cosine's floor past the
+plan; a split that ends first ends the run as before. A later resume on the tail split is a plain resume.
 ``--max-epochs-this-split N`` (warm launches pass 1): on reaching the end of epoch N - 1 the run
 saves at that epoch, logs "warm split exhausted" and exits 10, never entering the next epoch of the
 warm split. ``--switch-split`` is then checked against the checkpoint and refused with exit 30
@@ -109,7 +120,9 @@ parameters; ``--estimate-rows-only`` (CPU, exit 0, ``--estimate-world-sizes 8,16
 a launch of more than one rank with no valid cache for its rank count exits 2 instead of computing
 it. The kill check (``kill_tokens``) may run during the warm-up and
 ``kill_checked`` then carries across the switch, by design. Every exit path of a multi process run
-destroys the process group.
+destroys the process group. A deliberate refusal (``SystemExit("message")``: a bad flag, a changed
+row shape without ``--allow-plan-change``, ``--expect-tokens-per-update`` not met) exits 3; an
+uncaught exception exits 1. ``--probe-peak`` runs one synthetic worst case step and exits 0.
 """
 import os
 import re
@@ -120,6 +133,7 @@ import math
 import random
 import argparse
 import hashlib
+import functools
 from collections import deque
 from datetime import timedelta
 
@@ -194,6 +208,47 @@ PRETRAINED_DIR = os.path.join(BASE_DIR, "ckpts", "pretrained")
 DEFAULT_HUB_CHECKPOINT = "checkpoints/final/checkpoint_phase2_final.pt"
 NUM_DATA_WORKERS = 4
 LOG_INTERVAL = 10
+# signals the main process turns into a stop request; a data worker must not die of them
+WORKER_IGNORED_SIGNALS = ("SIGTERM", "SIGUSR1", "SIGUSR2", "SIGINT")
+
+
+def ignore_stop_signals_in_worker(worker_id: int, then=None) -> None:
+    """``worker_init_fn`` for a DataLoader: ignore the stop signals in this worker.
+
+    A scheduler that signals every process of a step (``scancel --signal=TERM``) reaches the
+    workers too. Torch's own worker handler exits quietly only for a signal the parent sent, so an
+    unguarded worker dies and the main process raises from its SIGCHLD handler before it can save.
+    The parent stops its workers through the queue, not through signals, so ignoring them here
+    costs nothing at a normal exit.
+
+    Args:
+        worker_id: the worker's index, as the DataLoader passes it.
+        then: another ``worker_init_fn`` to run after the signals are set.
+    """
+    import signal
+    for name in WORKER_IGNORED_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, signal.SIG_IGN)
+    if then is not None:
+        then(worker_id)
+
+
+def build_train_loader(dataset, num_workers: int, **kwargs) -> DataLoader:
+    """The training ``DataLoader`` with workers that survive a step wide stop signal.
+
+    Args:
+        dataset: the iterable dataset (batches come out whole, ``batch_size=None``).
+        num_workers: worker processes; with 0 no init function is installed.
+        **kwargs: passed to ``DataLoader``; a ``worker_init_fn`` given here runs after the signals
+            are ignored.
+    """
+    if num_workers > 0:
+        existing = kwargs.pop("worker_init_fn", None)
+        kwargs["worker_init_fn"] = functools.partial(ignore_stop_signals_in_worker, then=existing)
+    else:
+        kwargs.pop("prefetch_factor", None)
+    return DataLoader(dataset, batch_size=None, num_workers=num_workers, **kwargs)
 # fraction of the exact top-k the two stage candidate set must contain, measured at every cluster
 # refresh. Below this the centroid stage is dropping entries the read wanted, and the fix is more
 # probed clusters, not more training (docs/plans/NEXT.md Phase 3).
@@ -452,6 +507,8 @@ def estimate_packed_rows(idx_path: str, max_length: int, num_mtp_tokens: int,
 ROWS_CACHE_SUFFIX = ".rows_estimate.json"
 ROWS_CACHE_VERSION = 2
 EXIT_NO_ROWS_CACHE = 2
+# a deliberate refusal raised as SystemExit("message"): the chain must halt, not resubmit
+EXIT_REFUSED = 3
 FINGERPRINT_BYTES = 1 << 20
 
 
@@ -811,6 +868,30 @@ def check_switch_state(saved_epoch, saved_offset, saved_num_docs, new_num_docs, 
             f"warm split is not a head of the new one (missing or stale sidecar).")
 
 
+def check_tail_switch(saved_epoch, num_epochs, saved_plan_split, plan_split):
+    """Whether a ``--switch-from-start`` resume may restart the checkpoint's last epoch on the new split.
+
+    The tail split replaces the end of the run's last epoch of the plan split, so the checkpoint must be in that epoch
+    and its schedule must be the plan this launch continues.
+
+    Args:
+        saved_epoch: the checkpoint's epoch.
+        num_epochs: epochs of the profile.
+        saved_plan_split: the ``plan_split`` the checkpoint recorded (None when none).
+        plan_split: this launch's ``--plan-split`` (None when none).
+
+    Returns:
+        None when the switch is sound, else the message to log before exiting 30.
+    """
+    if saved_epoch != num_epochs - 1:
+        return (f"--switch-from-start refused: the checkpoint is at epoch {saved_epoch} of {num_epochs}; the "
+                f"tail replaces the end of epoch {num_epochs - 1} only, and an earlier epoch would be cut short.")
+    if not plan_split or saved_plan_split != plan_split:
+        return (f"--switch-from-start refused: the checkpoint was planned on {saved_plan_split!r} and this launch "
+                f"names --plan-split {plan_split!r}; the tail must continue the same cosine.")
+    return None
+
+
 def final_checkpoint_data(path: str) -> dict:
     """The data fields a finished run's final checkpoint recorded, read without loading tensors.
 
@@ -948,6 +1029,27 @@ def plan_changed(saved: dict, current: dict) -> list:
                                                               "world_size",
                                                               "grad_accumulation_steps",
                                                               "plan_split")
+            if saved.get(key) is not None and saved[key] != current.get(key)]
+
+
+RUN_SHAPE_KEYS = ("max_evidence_tokens", "seq_length", "mtp_tokens")
+
+
+def run_shape_changes(saved: dict, current: dict) -> list:
+    """The row shape fields a resume would change, as ``(name, saved, current)`` triples.
+
+    These set how documents pack into rows, so a different value changes the row count and the
+    cosine's length under a run that already began it. A field the checkpoint does not record
+    (written before they were saved) is never a change.
+
+    Args:
+        saved: the resume state, carrying ``max_evidence_tokens``, ``seq_length`` and ``mtp_tokens``.
+        current: the same fields for this launch.
+
+    Returns:
+        The differing fields, empty when the shape is the checkpoint's.
+    """
+    return [(key, saved[key], current.get(key)) for key in RUN_SHAPE_KEYS
             if saved.get(key) is not None and saved[key] != current.get(key)]
 
 
@@ -1534,6 +1636,9 @@ def load_sft_checkpoint(model, optimizer, scheduler, path, expected_phase=SFT_PH
         "epoch0_head_docs": sft_extra.get("epoch0_head_docs"),
         "num_docs": sft_extra.get("num_docs"),
         "plan_split": sft_extra.get("plan_split"),
+        "max_evidence_tokens": sft_extra.get("max_evidence_tokens"),
+        "seq_length": sft_extra.get("seq_length"),
+        "mtp_tokens": sft_extra.get("mtp_tokens"),
     }
 
 
@@ -1727,8 +1832,7 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
             the gold flag and ``condition_ids``; silently absent without them.
         rank, world_size, gather: data parallel evaluation. Every rank iterates the same full
             stream and evaluates the batches whose index is ``rank`` modulo ``world_size``, among
-            the first ``max_batches`` (a batch with no supervised token costs its slot, where one
-            process would read on), then ``gather`` (``state -> [state per rank]``, rank order)
+            the first ``max_batches`` that carry a supervised token (the set one process reads), then ``gather`` (``state -> [state per rank]``, rank order)
             hands every rank all the accumulators and each computes the same result through
             ``merge_eval_states``. One process (the default) is the old pass, byte for byte.
     """
@@ -1755,10 +1859,16 @@ def evaluate(model, dataset: SFTDataset, device: str, pad_token_id: int, max_bat
     grounded_scores, grounded_labels, grounded_has_evidence = [], [], []
     selector_sink = {}
 
-    for batch_index, batch in enumerate(dataset):
+    counted_batches = 0
+    for batch in dataset:
         if world_size > 1:
-            if batch_index >= max_batches:
+            # the same batch set as one process reads: only batches with a supervised token count
+            # toward the cap, decided from the labels on the host before any forward
+            if int((batch["labels"][:, 1:] != -100).sum().item()) == 0:
+                continue
+            if counted_batches >= max_batches:
                 break
+            batch_index, counted_batches = counted_batches, counted_batches + 1
             if batch_index % world_size != rank:
                 continue
         elif n_batches >= max_batches:
@@ -2047,6 +2157,168 @@ def cli_overrides(args) -> dict:
     return overrides
 
 
+PROBE_CONVERSATIONS = 4
+PROBE_CHAIN_CHUNKS = 12
+
+
+def build_probe_batch(batch_size: int, seq_length: int, evidence_tokens: int, chunk_tokens: int,
+                      vocab_size: int, pad_token_id: int, conversations: int = PROBE_CONVERSATIONS,
+                      seed: int = 0) -> dict:
+    """A synthetic worst case micro batch for ``--probe-peak``, in the dataloader's batch layout.
+
+    Every row is full, split into ``conversations`` equal conversations, and carries
+    ``evidence_tokens`` of evidence cut into chunks of ``chunk_tokens`` (the smallest realistic
+    chunk gives the most chunks, which is what the selection and groundedness terms scale with).
+    The first chunk of each conversation is gold, the second half of each conversation is
+    supervised and answerable, so every loss term is active.
+
+    Args:
+        batch_size: rows.
+        seq_length: tokens per row (the trainer's row width, ``cfg.Seq_length``).
+        evidence_tokens: evidence tokens per row, normally ``max_evidence_tokens``.
+        chunk_tokens: tokens per evidence chunk.
+        vocab_size: token ids are drawn below it.
+        pad_token_id: never drawn, so no query token reads as padding.
+        conversations: conversations per row; each owns an equal share of the evidence.
+        seed: generator seed.
+
+    Returns:
+        The batch dict ``evidence_from_batch`` and the train step read (CPU tensors).
+    """
+    g = torch.Generator().manual_seed(seed)
+    low = min(1000, vocab_size // 2)
+    ids = torch.randint(low, vocab_size, (batch_size, seq_length), generator=g)
+    ids[ids == pad_token_id] = low
+    conv_len = seq_length // conversations
+    positions = torch.arange(seq_length)
+    slot_q = torch.clamp(positions // conv_len, max=conversations - 1)
+    doc_ids = slot_q.unsqueeze(0).expand(batch_size, -1).contiguous()
+    supervised = (positions % conv_len) >= conv_len // 2
+    labels = torch.where(supervised.unsqueeze(0), ids, torch.full_like(ids, -100))
+    n_chunks = max(1, evidence_tokens // chunk_tokens)
+    ev_len = n_chunks * chunk_tokens
+    ev_pos = torch.arange(ev_len)
+    chunk_of_token = ev_pos // chunk_tokens
+    chunks_per_slot = max(1, n_chunks // conversations)
+    chunk_slot = torch.clamp(torch.arange(n_chunks) // chunks_per_slot, max=conversations - 1)
+    token_slot = chunk_slot[chunk_of_token]
+    gold = (torch.arange(n_chunks) % chunks_per_slot == 0).to(torch.uint8)
+    keys = torch.nn.functional.normalize(
+        torch.randn(batch_size, n_chunks, 384, generator=g), dim=-1)
+    return {
+        "input_ids": ids,
+        "document_ids": doc_ids,
+        "labels": labels,
+        "loss_weights": torch.ones(batch_size, seq_length),
+        "answerable_ids": torch.ones(batch_size, seq_length, dtype=torch.long),
+        "evidence_ids": torch.randint(low, vocab_size, (batch_size, ev_len), generator=g),
+        "evidence_chunk_ids": chunk_of_token.unsqueeze(0).expand(batch_size, -1).contiguous(),
+        "evidence_doc_slot": token_slot.unsqueeze(0).expand(batch_size, -1).contiguous(),
+        "chunk_keys": keys,
+        "chunk_slot": chunk_slot.unsqueeze(0).expand(batch_size, -1).contiguous(),
+        "chunk_gold": gold.unsqueeze(0).expand(batch_size, -1).contiguous(),
+    }
+
+
+def run_peak_probe(args, cfg, model, optimizer, scheduler, master_pairs, accelerator, tokenizer,
+                   device, rank, log, hf) -> int:
+    """``--probe-peak``: one optimizer step on each of two synthetic worst case batches (QA like,
+    chain like), print both memory peaks and their max.
+
+    Runs the real train step (every loss term active, full loop depth) for one accumulation window
+    so the optimizer step and its states are included, prints ``max_memory_allocated`` and
+    ``max_memory_reserved`` per rank, and returns without saving anything or touching run_state.
+
+    Args:
+        args: parsed arguments (``probe_chunk_tokens``, ``probe_conversations``).
+        cfg: the profile class after the overrides.
+        model, optimizer, scheduler, master_pairs, accelerator: the trainer's objects as built.
+        tokenizer: for the vocab size and pad id.
+        device: this rank's device.
+        rank: this process's rank.
+        log: the rank log.
+        hf: the uploader, closed on the way out.
+
+    Returns:
+        ``EXIT_OK``.
+    """
+    unwrapped = accelerator.unwrap_model(model)
+    max_ev = getattr(cfg, "max_evidence_tokens", 0)
+    chunk_tokens = int(args.probe_chunk_tokens)
+    n_chain = int(args.probe_conversations)
+    layouts = (
+        ("qa", PROBE_CONVERSATIONS, max_ev),
+        ("chain", n_chain, min(max_ev, n_chain * PROBE_CHAIN_CHUNKS * chunk_tokens)),
+    )
+    peaks = []
+    for name, conversations, evidence_tokens in layouts:
+        batch = build_probe_batch(
+            cfg.Batch_size, cfg.Seq_length, evidence_tokens, chunk_tokens,
+            tokenizer.vocab_size, tokenizer.pad_token_id, conversations=conversations)
+        log.info(f"--probe-peak {name}: {cfg.Batch_size} rows x {cfg.Seq_length} tokens, "
+                 f"{conversations} conversations per row, {batch['evidence_ids'].shape[1]:,} "
+                 f"evidence tokens per row in {batch['chunk_slot'].shape[1]} chunks of "
+                 f"{chunk_tokens}, {cfg.grad_accumulation_steps} micro step(s)")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        input_ids = batch["input_ids"].to(device)
+        cu_seqlens, max_seqlen = cu_seqlens_from_doc_ids(batch["document_ids"].to(device))
+        pad_mask = input_ids == tokenizer.pad_token_id
+        for _ in range(max(cfg.grad_accumulation_steps, 1)):
+            train_step(
+                model, input_ids, cu_seqlens, max_seqlen, batch["labels"].to(device), pad_mask,
+                accelerator=accelerator, optimizer=optimizer, scheduler=scheduler,
+                no_decay_master_pairs=master_pairs, collect_metrics=True,
+                n_loops=ModelConfig.Params["n_loops"],
+                loss_weights=(batch["loss_weights"].to(device)
+                              if cfg.conversation_loss_weighting else None),
+                evidence=evidence_from_batch(unwrapped, batch, cu_seqlens),
+                token_mask=~pad_mask,
+                answerable=batch["answerable_ids"].to(device),
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            gb = 1024 ** 3
+            peaks.append((name, torch.cuda.max_memory_allocated() / gb,
+                          torch.cuda.max_memory_reserved() / gb))
+        del batch, input_ids, cu_seqlens, pad_mask
+    if peaks:
+        line = ", ".join(f"{n} allocated {a:.2f} GB reserved {r:.2f} GB" for n, a, r in peaks)
+        print(f"[probe-peak rank {rank}] {line}; max allocated "
+              f"{max(a for _, a, _ in peaks):.2f} GB, max reserved "
+              f"{max(r for _, _, r in peaks):.2f} GB", flush=True)
+    hf.close()
+    return EXIT_OK
+
+
+def check_tokens_per_update(expected, batch_size: int, seq_length: int, world_size: int,
+                            accumulation: int) -> int:
+    """Refuse a launch whose global batch is not the one the caller expects.
+
+    Args:
+        expected: the tokens per optimizer update the launcher computed, None to skip the check.
+        batch_size: rows per GPU per micro step.
+        seq_length: tokens per row.
+        world_size: processes.
+        accumulation: micro steps per update.
+
+    Returns:
+        batch_size x seq_length x world_size x accumulation.
+
+    Raises:
+        SystemExit: ``expected`` is given and differs, naming every factor.
+    """
+    actual = batch_size * seq_length * world_size * accumulation
+    if expected is not None and actual != expected:
+        raise SystemExit(
+            f"tokens per update are {actual:,} (batch {batch_size} x seq {seq_length} x "
+            f"{world_size} processes x accumulation {accumulation}) but --expect-tokens-per-update "
+            f"says {expected:,}"
+        )
+    return actual
+
+
 def estimate_rows_only(args, cfg, log) -> int:
     """Compute the plan split's row estimate for the given rank counts, write the cache, exit 0.
 
@@ -2128,6 +2400,10 @@ def _sft_impl(args):
     if overrides:
         cfg = type(cfg.__name__, (cfg,), overrides)
         log.info(f"data overrides: {overrides}")
+    check_tokens_per_update(getattr(args, "expect_tokens_per_update", None), cfg.Batch_size,
+                            cfg.Seq_length, world_size, cfg.grad_accumulation_steps)
+    if getattr(args, "probe_peak", False) and not args.evidence:
+        raise SystemExit("--probe-peak only applies to --evidence")
     if getattr(args, "estimate_rows_only", False):
         return estimate_rows_only(args, cfg, log)
     ceiling_by_source, ceiling_all = {}, None
@@ -2223,8 +2499,7 @@ def _sft_impl(args):
         # on-disk order, never shuffled: the split is written question-major, so the first N
         # batches hold every condition of the same questions and the gap is paired
         fixed_dataset = make_dataset(data_dir, fixed_split, tokenizer, cfg, shuffle=False)
-    dataloader = DataLoader(train_dataset, batch_size=None, num_workers=NUM_DATA_WORKERS,
-                            prefetch_factor=2)
+    dataloader = build_train_loader(train_dataset, NUM_DATA_WORKERS, prefetch_factor=2)
 
     # the schedule is fitted to the plan split when one is named (the main split on every launch of
     # the main run, warm-up included), else to the training split as before
@@ -2306,6 +2581,11 @@ def _sft_impl(args):
     model._token_tracker.pad_token_id = tokenizer.pad_token_id
     # router exploration noise is fully annealed by ~1B pretraining tokens; SFT is not exploration
     model.moe.set_router_noise(0.0)
+    if getattr(TrainingConfig, "noise_anneal_tokens", 0):
+        log.warning(
+            f"noise_anneal_tokens is {TrainingConfig.noise_anneal_tokens:,} in the config but sft.py "
+            f"never reads it: router noise stays at zero for the whole run"
+        )
     # counted in every mode so the step line reads the load under the aux term too; the rate
     # train_step passes is zero outside loss-free, so the bias never moves there
     model.moe.set_balance_tracking(True)
@@ -2380,6 +2660,8 @@ def _sft_impl(args):
         return EXIT_RESUME_FAILED
     plan = {"total_steps": total_steps, "rows_per_epoch": rows_per_epoch, "world_size": world_size,
             "grad_accumulation_steps": cfg.grad_accumulation_steps, "plan_split": plan_split}
+    run_shape = {"max_evidence_tokens": getattr(cfg, "max_evidence_tokens", None),
+                 "seq_length": cfg.Seq_length, "mtp_tokens": mtp_tokens}
     head_docs = getattr(train_dataset, "epoch0_head_docs", None)
     data_fields_saved = {"epoch0_head_docs": head_docs,
                          "num_docs": getattr(train_dataset, "num_docs", None)}
@@ -2388,6 +2670,16 @@ def _sft_impl(args):
                  f"({train_dataset.order_path})")
     if found is not None:
         _, state = found
+        shape_moved = run_shape_changes(state, run_shape)
+        if shape_moved:
+            detail = "; ".join(f"{key} {old!r} -> {new!r}" for key, old, new in shape_moved)
+            if not getattr(args, "allow_plan_change", False):
+                raise SystemExit(
+                    f"the row shape differs from the checkpoint's ({detail}): the rows pack "
+                    f"differently and the cosine was fitted to the old shape. Restore the old "
+                    f"values, or pass --allow-plan-change to resume on the new ones."
+                )
+            log.warning(f"--allow-plan-change: resuming on a different row shape ({detail})")
         moved = plan_changed(state, plan)
         if moved:
             log.warning(
@@ -2442,16 +2734,54 @@ def _sft_impl(args):
                     f"{'matches the checkpoint' if saved_docs is not None else 'not recorded'})"
                 )
             if changes:
-                refusal = None if "train_split" not in {c[0] for c in changes} else (
-                    check_switch_state(state["epoch"], state["global_offset"], state.get("num_docs"),
-                                       getattr(train_dataset, "num_docs", 0), head_docs))
+                from_start = (getattr(args, "switch_from_start", False)
+                              and "train_split" in {c[0] for c in changes})
+                if "train_split" not in {c[0] for c in changes}:
+                    refusal = None
+                elif from_start:
+                    refusal = check_tail_switch(state["epoch"], cfg.num_epochs, state.get("plan_split"), plan_split)
+                else:
+                    refusal = check_switch_state(state["epoch"], state["global_offset"], state.get("num_docs"),
+                                                 getattr(train_dataset, "num_docs", 0), head_docs)
                 if refusal is not None:
                     log.error(refusal)
                     return EXIT_RESUME_FAILED
+                if from_start:
+                    # the new split must hold the rest of the plan: a switch too early (the checkpoint far from the
+                    # plan's end) or a tail too short would end the run before the cosine reaches its floor
+                    tail_rows, how = resolve_rows_estimate(
+                        rows_cache_path(data_dir, cfg.train_split),
+                        rows_cache_key(train_dataset, cfg.Seq_length, mtp_tokens), world_size,
+                        lambda workers: compute_rows_estimate(train_dataset, cfg.Seq_length, mtp_tokens, workers),
+                        write_on_compute=is_main)
+                    if how == "refused":
+                        log.error(f"--switch-from-start: no row estimate for {cfg.train_split!r} at {world_size} ranks in "
+                                  f"{rows_cache_path(data_dir, cfg.train_split)}: run the rows stage (`scripts/sft.py "
+                                  f"--evidence --estimate-rows-only --data-dir {cfg.data_dir} --train-split "
+                                  f"{cfg.train_split} --estimate-world-sizes {world_size}`) first")
+                        return EXIT_NO_ROWS_CACHE
+                    tail_steps = plan_total_steps(tail_rows, 1, cfg.Batch_size, cfg.grad_accumulation_steps, world_size)
+                    steps_left = total_steps - int(state["optimizer_steps"])
+                    if tail_steps < steps_left:
+                        log.error(f"--switch-from-start refused: {cfg.train_split!r} holds about {tail_steps:,} optimizer "
+                                  f"steps and the plan has {steps_left:,} left ({int(state['optimizer_steps']):,} of "
+                                  f"{total_steps:,} done): the run would end on the split before the cosine reaches its "
+                                  f"floor. Switch later, or rebuild the tail larger.")
+                        return EXIT_RESUME_FAILED
+                    log.info(f"--switch-from-start: {cfg.train_split!r} holds about {tail_steps:,} optimizer steps, the "
+                             f"plan has {steps_left:,} left")
+                    log.warning(
+                        "--switch-from-start: the new split is read from its first document in epoch "
+                        f"{start_epoch} (the checkpoint was at position {start_doc_idx:,}, step {step_offset:,} "
+                        f"of that epoch on {state['data'].get('train_split')!r}); optimizer, scheduler and "
+                        "token count carry over"
+                    )
+                    start_doc_idx, step_offset = 0, 0
                 log.warning(
                     "--switch-split: resuming on other data than the checkpoint's: "
                     + "; ".join(f"{key} {old!r} -> {new!r}" for key, old, new in changes)
-                    + ". The document position carries over unchanged."
+                    + (". The position restarts at the new split's first document." if from_start
+                       else ". The document position carries over unchanged.")
                 )
             elif getattr(args, "switch_split", False):
                 log.info("--switch-split passed but the data match the checkpoint's")
@@ -2637,6 +2967,8 @@ def _sft_impl(args):
     last_local_total = last_token_count
     gather_eval = all_gather_states(world_size) if world_size > 1 else None
     max_epochs_this_split = int(getattr(args, "max_epochs_this_split", 0) or 0)
+    end_at_plan = bool(getattr(args, "end_at_plan", False))
+    plan_reached = False
 
     def synced_token_count(count, local_total):
         # the end of epoch count, as the final save reads it: the ranks left their last chunk
@@ -2677,6 +3009,7 @@ def _sft_impl(args):
             sft_fields["cuda_rng_state"] = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
             # the plan the cosine was fitted to, compared on the next resume
             sft_fields.update(plan)
+            sft_fields.update(run_shape)
             sft_fields.update(data_fields_saved)
             # the masters and the weights are identical on every rank after a reduced step
             save_sft_checkpoint(
@@ -2909,6 +3242,12 @@ def _sft_impl(args):
                         + ", ".join(norms))
         return probe
 
+    if getattr(args, "probe_peak", False):
+        return run_peak_probe(
+            args, cfg, model, optimizer, scheduler, master_pairs, accelerator, tokenizer, device,
+            rank, log, hf,
+        )
+
     if keep_stop:
         stop_at_start = torch.tensor([1.0 if (is_main and os.path.exists(control.sentinel_path))
                                       else 0.0], device=device)
@@ -3072,11 +3411,12 @@ def _sft_impl(args):
                 tokens_per_sec = (token_count - last_token_count) / interval_s
                 last_token_count, last_log_time = token_count, now
 
-                if target_tokens is None and step > 0:
-                    # tokens/step is only knowable once training has run: packing density depends
-                    # on the corpus, not the config. Anchors the ETA, never the LR schedule.
-                    target_tokens = int(sft_tokens / max(step, 1) * total_steps
-                                        * cfg.grad_accumulation_steps)
+                if target_tokens is None and int(scheduler.last_epoch) > 0:
+                    # tokens per update is only knowable once training has run: packing density
+                    # depends on the corpus, not the config. Both counts are cumulative over the
+                    # run (the per epoch micro step counter is not), so a resume reads right.
+                    # Anchors the ETA, never the LR schedule.
+                    target_tokens = int(sft_tokens / int(scheduler.last_epoch) * total_steps)
 
                 if args.ir:
                     # anneal the retrieval temperature on MICRO-step progress, not on tokens: the
@@ -3327,7 +3667,16 @@ def _sft_impl(args):
                     # not one cadence past it: a coarse log step must not walk the grid
                     next_checkpoint = next_grid_point(sft_tokens, cfg.checkpoint_every_tokens)
 
-            if stop_training:
+                if end_at_plan and int(scheduler.last_epoch) >= total_steps:
+                    # decided at a log step on every rank from the scheduler's step count, which is the same on every
+                    # rank, so all of them leave the loop together (the loaders are in lockstep)
+                    plan_reached = True
+                    log.info(f"--end-at-plan: the plan's {total_steps:,} optimizer steps are done (step "
+                             f"{int(scheduler.last_epoch):,}) at {(token_count - start_token_count) / 1e6:.1f}M "
+                             f"{phase} tokens; ending the run here with the cosine at its floor")
+                    break
+
+            if stop_training or plan_reached:
                 break
 
             if max_epochs_this_split and epoch + 1 >= max_epochs_this_split:
@@ -3440,6 +3789,17 @@ def main():
                              "warm-up to main run passes the main split on every launch, so the "
                              "schedule spans the whole run from step 0 and the switch changes "
                              "nothing in the plan. Saved in the checkpoint")
+    parser.add_argument("--switch-from-start", action="store_true",
+                        help="with --switch-split: the new split is read from its first document in the "
+                             "checkpoint's epoch (position and step within the epoch restart at zero; "
+                             "optimizer, scheduler, token count and RNG carry over). Allowed only in the "
+                             "epoch num_epochs - 1 of a checkpoint planned on the same --plan-split; "
+                             "the switch to the tail split. Harmless on a resume that needs no switch")
+    parser.add_argument("--end-at-plan", action="store_true",
+                        help="end the run (final validation and save, exit 0) at the first log step "
+                             "on or past total_steps of the plan, instead of at the end of the split. "
+                             "The tail launch passes it so a split with a surplus does not train at "
+                             "the cosine's floor past the plan")
     parser.add_argument("--keep-stop", action="store_true",
                         help="honour a STOP sentinel already present at startup: after the setup "
                              "every rank exits 10 before the first step, saving nothing and leaving "
@@ -3461,6 +3821,24 @@ def main():
                              "fixed: per GPU batch x accumulation x GPUs). total_steps and the "
                              "cosine follow it; a resume under another value warns that the plan "
                              "moved")
+    parser.add_argument("--expect-tokens-per-update", type=int, default=None,
+                        help="refuse (exit 3) unless batch x seq_length x processes x accumulation "
+                             "equals this, after every override; the launcher passes the global "
+                             "batch it computed its accumulation from")
+    parser.add_argument("--allow-plan-change", action="store_true",
+                        help="resume even though max_evidence_tokens, seq_length or the mtp token "
+                             "count differ from the checkpoint's (refused with exit 3 otherwise)")
+    parser.add_argument("--probe-peak", action="store_true",
+                        help="--evidence only: after setup run one optimizer step on a synthetic "
+                             "worst case batch (every row full of evidence in small chunks, every "
+                             "loss term active), print the peak GPU memory per rank and exit 0 "
+                             "without saving")
+    parser.add_argument("--probe-conversations", type=int, default=40,
+                        help="with --probe-peak: conversations per row of the chain like layout "
+                             "(about 12 chunks each, up to max_evidence_tokens); the QA like layout "
+                             "with 4 always runs too and both peaks are printed")
+    parser.add_argument("--probe-chunk-tokens", type=int, default=25,
+                        help="with --probe-peak: tokens per evidence chunk of the synthetic batch")
     parser.add_argument("--ceiling-json", default=None,
                         help="--evidence only: the in-context ceiling file written by "
                              "scripts/evidence_ceiling_probe.py --fixed-split; each source's gold "
@@ -3482,5 +3860,31 @@ def main():
     return sft(parser.parse_args())
 
 
+def exit_code_for(code) -> int:
+    """The process exit code for a ``SystemExit`` payload.
+
+    Args:
+        code: ``SystemExit.code``. A string is a deliberate refusal: it is printed to stderr and
+            becomes ``EXIT_REFUSED``. An int passes through and None is 0.
+
+    Returns:
+        The exit code.
+    """
+    if code is None:
+        return EXIT_OK
+    if isinstance(code, int):
+        return code
+    print(code, file=sys.stderr, flush=True)
+    return EXIT_REFUSED
+
+
+def run_cli() -> int:
+    """``main`` with refusals mapped to ``EXIT_REFUSED``; an uncaught exception still exits 1."""
+    try:
+        return exit_code_for(main())
+    except SystemExit as e:
+        return exit_code_for(e.code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run_cli())

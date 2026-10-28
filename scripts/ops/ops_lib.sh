@@ -14,7 +14,14 @@ SSH_SOCK=${SSH_SOCK:-$HOME/.ssh/mn5.sock}
 #   ssh -M -S ~/.ssh/mn5-transfer.sock -o ControlPersist=yes USER@transfer1.bsc.es
 SSH_SOCK_TRANSFER=${SSH_SOCK_TRANSFER:-$HOME/.ssh/mn5-transfer.sock}
 TRANSFER_BUDGET_GB=${TRANSFER_BUDGET_GB:-2000}
-LEDGER=${LEDGER:-ops_transfer_ledger.tsv}
+# one transfer ledger for every script and every cwd: an absolute path (a relative OPS_LEDGER is taken from the repo root).
+# default is the repo root's ops_transfer_ledger.tsv (gitignored). push_code, push_corpus, pull_exports and
+# mirror_sources.py push all read and append this file, so the allowance is counted once per machine. a relay VM keeps its
+# own copy of the repo and so its own ledger: its pulls count there (see SUPERVISOR.md)
+OPS_REPO_ROOT=$(cd "$OPS_DIR/../.." && pwd)
+LEDGER=${OPS_LEDGER:-${LEDGER:-$OPS_REPO_ROOT/ops_transfer_ledger.tsv}}
+case "$LEDGER" in /*) ;; *) LEDGER=$OPS_REPO_ROOT/$LEDGER;; esac
+mkdir -p "$(dirname "$LEDGER")" 2>/dev/null
 
 # ops_ssh_opts: ssh options for rsync and ssh to the transfer host: through its own master socket when alive, never a
 # prompt (BatchMode). without the socket it warns and goes on (key authentication only)
@@ -31,7 +38,7 @@ ops_ssh_opts() {
 # ledger_total_bytes: bytes in and out so far (column 4 of the ledger)
 ledger_total_bytes() {
   [ -f "$LEDGER" ] || { echo 0; return; }
-  awk -F'\t' 'NR > 1 && $4 ~ /^[0-9]+$/ { s += $4 } END { printf "%d\n", s }' "$LEDGER"
+  awk -F'\t' 'NR > 1 && $4 ~ /^[0-9]+$/ { s += $4 } END { printf "%.0f\n", s }' "$LEDGER"
 }
 
 # ledger_append DIRECTION WHAT BYTES: one line, direction is in or out (relative to the cluster)
@@ -109,4 +116,31 @@ crlf_head() {
   done < "$tmp"
   rm -f "$tmp"
   return $bad
+}
+
+# HF_PYTHON: the python that has huggingface_hub (the one the hf CLI uses; on a VM where hf lives in its own venv, that
+# venv's python). default python3
+HF_PYTHON=${HF_PYTHON:-python3}
+
+# hf_repo_is_private REPO: the Hub's visibility of the model repo (huggingface_hub, the token of `hf auth login`).
+# `hf repo create --private --exist-ok` leaves an existing public repo public, so every upload checks first. returns 0
+# private, 3 public, 4 huggingface_hub cannot be imported by $HF_PYTHON, 5 the lookup failed (network, token, no such repo);
+# HF_PRIV_WHY holds the cause. only 0 allows an upload
+hf_repo_is_private() {
+  HF_PRIV_WHY=$("$HF_PYTHON" -c 'import sys
+try:
+    from huggingface_hub import HfApi
+except ImportError as e:
+    print("huggingface_hub is not importable by this python: %s" % e); sys.exit(4)
+try:
+    private = HfApi().repo_info(sys.argv[1], repo_type="model").private
+except Exception as e:
+    print("visibility lookup failed: %s: %s" % (type(e).__name__, str(e)[:150])); sys.exit(5)
+print("the repo is public" if not private else "private"); sys.exit(0 if private else 3)' "$1" 2>&1)
+  return $?
+}
+
+# hf_python_check: exit 0 when $HF_PYTHON can import huggingface_hub; otherwise prints the cause
+hf_python_check() {
+  "$HF_PYTHON" -c 'import huggingface_hub' 2>&1 || { echo "HF_PYTHON=$HF_PYTHON cannot import huggingface_hub (set HF_PYTHON in ops.env to the python of the hf CLI)"; return 1; }
 }

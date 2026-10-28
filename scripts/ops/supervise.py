@@ -9,8 +9,8 @@ when the socket is dead. One poll is one ssh command (``scripts/slurm/status.sh`
 Exit code 0 ok, 1 attention needed, 2 cannot reach the cluster or the queue could not be read (squeue failed: no
 action is taken on a queue that was not seen). The last line printed is ``notify: ...``, one line for a phone push.
 ``--summary`` prints three human lines instead of the full verdict. ``--act`` performs the safe actions only: resubmit
-a broken chain (``START_INDEX=1`` so STOP, HALT and the stall rules still apply; never when the chain state names an
-end, and at most once an hour), hard link the milestone saves (the first save at or past each multiple of
+a broken chain (only once the chain has started, with its recorded split, nodes and STOP_AFTER; ``START_INDEX=1`` so STOP,
+HALT and the stall rules still apply; never when the chain state names an end, and at most once an hour), hard link the milestone saves (the first save at or past each multiple of
 ``--pin-every-m``, the retention rule) into ``$DATA_ROOT/pinned``, submit one batched reads job (with weight exports)
 for kept saves not yet read, once four are due, the oldest has waited 12 hours or the run is over; a read is attempted
 once, one that ran and left no result is reported and never retried by itself (a submission that failed is retried).
@@ -21,7 +21,7 @@ turns an overlapping poll into a no-op.
 
 Args:
     --host, --user, --sock, --repo: where the run lives (env MN5_LOGIN_HOST, MN5_USER, SSH_SOCK, REMOTE_REPO).
-    --run: the run name. --kind: TRAIN or CONTROL (what a resubmit queues). --chain-n: jobs per resubmitted chain.
+    --run: the run name. --kind: TRAIN or CONTROL (what a resubmit queues; default CONTROL for a run named *_control). --chain-n: jobs per resubmitted chain.
     --target-tokens, --budget-gpu-hours, --min-rate-per-gpu, --save-stale-min, --disk-frac: the rule limits.
     --history, --ops-log, --attempted: local files, one JSON line per poll, one text line per poll, the reads
     already attempted. They default to ops_state/RUN_history.jsonl, RUN_ops.log, RUN_attempted.json (per run name).
@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import re
+import shlex
 import time
 
 try:
@@ -45,6 +46,8 @@ FINISHED = ("COMPLETED", "CANCELLED", "FAILED", "TIMEOUT", "NODE_FAIL", "OUT_OF_
 BAD_REASON = re.compile(r"QOSMax|QOSGrp|QOSUsage|AssocGrp|AssocMax|Held|PartitionTimeLimit|InvalidQOS|InvalidAccount|"
                         r"BadConstraints|PartitionConfig|NonZeroExitCode|ReqNodeNotAvail.*Reserved", re.I)
 BAD_STATE = ("REQUEUE_HOLD", "SPECIAL_EXIT", "SUSPENDED", "STOPPED")
+
+SAFE_VALUE = re.compile(r"^[A-Za-z0-9_.,:-]+$")
 
 SAFE_SSH = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15"]
 
@@ -119,6 +122,34 @@ def parse_status(stdout):
     raise ValueError("no JSON line in the status output")
 
 
+# the figures of an alert that drift while its condition stands; everything else (exit codes, save tags, job ids) stays in
+# the key, so two different alerts are never one
+DRIFT = [
+    (re.compile(r"rate \d+ tokens/s per GPU under \d+ for \d+ minutes"), "rate #"),
+    (re.compile(r"no new save in \d+ minutes"), "no new save in # minutes"),
+    (re.compile(r"CE rose [\d.]+ between polls \([\d.]+ to [\d.]+\)"), "CE rose #"),
+    (re.compile(r"CE [\d.]+ is [\d.]+ above the best [\d.]+"), "CE above best #"),
+    (re.compile(r"projected .* GPU hours over the .* budget; the token target that fits is \d+B"), "projected over budget #"),
+    (re.compile(r"pending for \d+ hours"), "pending for # hours"),
+    (re.compile(r"watchdog silent for \d+ minutes"), "watchdog silent for # minutes"),
+    (re.compile(r"disk at \d+%"), "disk at #%"),
+    (re.compile(r"\d+ step line\(s\)"), "# step line(s)"),
+    (re.compile(r"\(\d+ read\(s\)"), "(# read(s)"),
+]
+
+
+def alert_key(text):
+    """A stable id of an alert: its text with the drifting figures wiped (the relay pushes a persistent condition once per
+    window and a different alert at once)."""
+    for rx, sub in DRIFT:
+        text = rx.sub(sub, text)
+    return text[:200]
+
+
+def default_kind(run):
+    return "CONTROL" if run.endswith("_control") else "TRAIN"
+
+
 def tag_label(tag_m):
     return "%dB" % (tag_m // 1000)
 
@@ -138,6 +169,37 @@ def job_kind(j):
     if name.startswith("run2_corpus"):
         return "corpus"
     return "train"
+
+
+def stop_after_m(text):
+    """The token tag (millions) a STOP_AFTER value names (scripts/slurm/lib.sh stop_after_m): 760000M, 760B or a number
+    of tokens (7 or more digits) or of millions; None when it is empty or not one of those."""
+    t = (text or "").strip()
+    m = re.match(r"^(\d+)([BbMm]?)$", t)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if m.group(2) in ("B", "b"):
+        return n * 1000
+    if m.group(2) in ("M", "m"):
+        return n
+    return n // 1000000 if len(t) >= 7 else n
+
+
+def ls_tag_m(st):
+    ls = st.get("last_save") or {}
+    return ls.get("tag_m") if ls.get("tag_m") is not None else -1
+
+
+def tail_switch_due(st, chain, active):
+    """The main run reached its planned stop (the first save at or past STOP_AFTER, 760B by default) and waits for the
+    user's switch to the tail split: the chain ended on the STOP file, the main split is the chain's split, the last
+    save is at or past the planned stop, and no job is queued or running. A decision for the user, not a failure."""
+    if active or chain.get("split") != "run2_main_train" or not st.get("stop"):
+        return False
+    stop_m = stop_after_m(chain.get("stop_after"))
+    ls = st.get("last_save") or {}
+    return bool(stop_m) and ls.get("tag_m") is not None and ls["tag_m"] >= stop_m
 
 
 def kept_saves(saves, every_m):
@@ -196,6 +258,14 @@ def evaluate(st, history, cfg, now, attempted=None):
                       ((": " + last_err[:160]) if last_err else ""))
     elif done:
         notes.append("run finished")
+    elif tail_switch_due(st, chain, active):
+        alerts.append("tail switch due: the main run stopped after the save at tok%dM (the planned stop at %s, "
+                      "STOP_AFTER); the last 5%% of the run is read from the tail split, and the switch is the user's "
+                      "decision. The chain ended on purpose and is never resubmitted by the supervisor. To go on: "
+                      "rm ckpts/evidence_%s/STOP, then SPLIT=run2_tail_train bash scripts/slurm/submit_chain.sh TRAIN <n> "
+                      "(scripts/slurm/README.md, Tail switch)" % (st["last_save"]["tag_m"],
+                                                                  tag_label(stop_after_m(chain.get("stop_after"))),
+                                                                  cfg.get("run", "run2")))
     elif ended:
         if ended == "stop" and st.get("stop"):
             notes.append("STOP file present, chain ended on purpose")
@@ -207,12 +277,31 @@ def evaluate(st, history, cfg, now, attempted=None):
     elif st.get("stop") and not active:
         notes.append("STOP file present, chain ended on purpose")
     elif not active:
-        alerts.append("chain broken: no job pending or running and the run is not done")
-        recent = [h for h in history if now - h.get("t", 0) <= 3600 and "resubmit" in (h.get("acted") or [])]
-        if recent:
-            alerts.append("the chain was already resubmitted within the hour; not again (look at the log)")
+        # a chain exists only once a job of it has started (the first job writes chain_id into the chain state and the
+        # run saves): before the first launch, during the corpus build or the control, no train job is normal
+        started = bool(chain.get("chain_id")) or bool(st.get("saves")) or bool(st.get("last_save"))
+        if not started:
+            notes.append("chain not started: no train job, no chain state and no save of %s yet" % cfg.get("run", "run2"))
         else:
-            actions.append({"kind": "resubmit"})
+            alerts.append("chain broken: no job pending or running and the run is not done")
+            recent = [h for h in history if now - h.get("t", 0) <= 3600 and "resubmit" in (h.get("acted") or [])]
+            split = chain.get("split")
+            if recent:
+                alerts.append("the chain was already resubmitted within the hour; not again (look at the log)")
+            elif stop_after_m(chain.get("stop_after")) and ls_tag_m(st) >= stop_after_m(chain.get("stop_after")):
+                alerts.append("the chain's planned stop (STOP_AFTER %s) was reached at the save tok%dM and nothing is "
+                              "queued: a switch decision for the user, not resubmitted (a resubmit with that STOP_AFTER "
+                              "would stop again at once)" % (chain.get("stop_after"), ls_tag_m(st)))
+            elif not split or not SAFE_VALUE.match(split):
+                alerts.append("the chain state records no usable split: not resubmitting by itself (a resubmit without "
+                              "the recorded split would restart the warm-up from the seed)")
+            else:
+                act = {"kind": "resubmit", "split": split}
+                for key in ("stop_after", "nodes"):
+                    val = chain.get(key)
+                    if val and SAFE_VALUE.match(val):
+                        act[key] = val
+                actions.append(act)
 
     for j in jobs:
         if j.get("state") == "PENDING":
@@ -380,14 +469,18 @@ def perform(actions, cfg, runner):
     head = "cd %s || exit 97; source scripts/slurm/mn5_env.sh >/dev/null; " % repo
     for a in actions:
         if a["kind"] == "resubmit":
-            cmd = head + "START_INDEX=1 RUN=%s bash scripts/slurm/submit_chain.sh %s %d" % (run, kind, cfg["chain_n"])
+            carried = "".join(" %s=%s" % (env_name, shlex.quote(a[key])) for key, env_name in
+                              (("split", "SPLIT"), ("stop_after", "STOP_AFTER"), ("nodes", "NODES")) if a.get(key))
+            cmd = head + "START_INDEX=1 RUN=%s%s bash scripts/slurm/submit_chain.sh %s %d" % (run, carried, kind, cfg["chain_n"])
         elif a["kind"] == "pin":
             cmd = head + ("[ -n \"$DATA_ROOT\" ] || exit 98; mkdir -p $DATA_ROOT/pinned && "
                           "( ln -f %s $DATA_ROOT/pinned/ || cp -n %s $DATA_ROOT/pinned/ )") % (a["file"], a["file"])
         elif a["kind"] == "reads":
             pairs = " ".join("%s:%s" % p for p in a["pairs"])
-            cmd = head + ("mkdir -p logs && RUN=%s PAIRS='%s' EXPORT=1 sbatch --parsable "
-                          "--job-name=run2_reads_%s scripts/slurm/reads.sbatch") % (run, pairs, run)
+            read_config = cfg.get("read_config")
+            cfg_env = (" READ_CONFIG=%s" % shlex.quote(read_config)) if read_config else ""
+            cmd = head + ("mkdir -p logs && RUN=%s%s PAIRS='%s' EXPORT=1 sbatch --parsable "
+                          "--job-name=run2_reads_%s scripts/slurm/reads.sbatch") % (run, cfg_env, pairs, run)
         else:
             continue
         rc, so, se = runner(cmd)
@@ -463,7 +556,8 @@ def main(argv=None):
     p.add_argument("--sock", default=os.path.expanduser(env.get("SSH_SOCK", "~/.ssh/mn5.sock")))
     p.add_argument("--repo", default=env.get("REMOTE_REPO", ""))
     p.add_argument("--run", default="run2")
-    p.add_argument("--kind", default="TRAIN", choices=["TRAIN", "CONTROL"])
+    p.add_argument("--kind", default=None, choices=["TRAIN", "CONTROL"],
+                   help="what a resubmit queues (default: CONTROL for a run name ending in _control, else TRAIN)")
     p.add_argument("--chain-n", type=int, default=4)
     p.add_argument("--target-tokens", type=float, default=800e9)
     p.add_argument("--budget-gpu-hours", type=float, default=4500.0)
@@ -487,6 +581,7 @@ def main(argv=None):
         print("set --user and --repo (or MN5_USER and REMOTE_REPO, in the environment or in %s)" % a.env_file, file=sys.stderr)
         print("notify: supervise not configured: set MN5_USER and REMOTE_REPO")
         return 2
+    a.kind = a.kind or default_kind(a.run)
     a.history = a.history or "ops_state/%s_history.jsonl" % a.run
     a.ops_log = a.ops_log or "ops_state/%s_ops.log" % a.run
     a.attempted = a.attempted or "ops_state/%s_attempted.json" % a.run
@@ -494,7 +589,8 @@ def main(argv=None):
            "chain_n": a.chain_n, "min_rate": a.min_rate_per_gpu, "save_stale_min": a.save_stale_min,
            "startup_min": a.startup_min, "pending_hours": a.pending_hours, "ce_rise_poll": a.ce_rise_poll,
            "ce_rise_best": a.ce_rise_best, "reads_wait_hours": a.reads_wait_hours,
-           "disk_frac": a.disk_frac, "pin_every_m": a.pin_every_m}
+           "disk_frac": a.disk_frac, "pin_every_m": a.pin_every_m,
+           "read_config": "config_run2_control.yaml" if a.kind == "CONTROL" else None}
     for path in (a.history, a.ops_log, a.attempted):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     lock = take_lock(os.path.join(os.path.dirname(os.path.abspath(a.history)), "%s_supervise.lock" % a.run))
@@ -579,6 +675,8 @@ def main(argv=None):
             print("action %s: %s" % ("done" if a.act else "recommended", json.dumps(act)))
         for r in results:
             print("result: " + r)
+    if attn:
+        print("keys: " + " | ".join(alert_key(x) for x in verdict["alerts"]))
     print("notify: " + notify)
     return 1 if attn else 0
 

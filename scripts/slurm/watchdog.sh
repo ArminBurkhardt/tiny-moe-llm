@@ -5,7 +5,7 @@
 # and signals the batch shell (USR2), whose trap sends SIGTERM to the ranks and kills them after three minutes.
 # every poll it rewrites RUNDIR/watchdog_last: "epoch|verdict|detail|step_age_s|save_age_s" (status.sh reads it).
 # env: LOG RUNDIR JOBID LOGDIR START (epoch) FROM (log byte offset at job start) BATCH_PID
-#      STALL_MIN (15) SAVE_MIN (45) STARTUP_MIN (30) LOSS_CEILING (20) DIVERGE_K (3) POLL (60)
+#      STALL_MIN (30: the trainer prints an eval only at its end, so the step line gap must cover the longest eval) SAVE_MIN (45) STARTUP_MIN (30) LOSS_CEILING (20) DIVERGE_K (3) POLL (60)
 #      RISE_K (30 step lines per window median) RISE_MARGIN (1.0 nats) RISE_POLLS (5 polls in a row) RISE_MIN (15
 #      window medians before the rule can fire, so a job's first quarter hour is grace)
 # the relative divergence rule: every poll that saw new step lines appends the median CE of the last RISE_K step lines
@@ -16,7 +16,7 @@
 # and deletes nothing: the saves already on disk stay for the recovery
 #      ONCE=1 one poll, then exit without signalling (tests); NOW overrides the clock (tests)
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-STALL_S=$(( ${STALL_MIN:-15} * 60 )); SAVE_S=$(( ${SAVE_MIN:-45} * 60 )); STARTUP_S=$(( ${STARTUP_MIN:-30} * 60 ))
+STALL_S=$(( ${STALL_MIN:-30} * 60 )); SAVE_S=$(( ${SAVE_MIN:-45} * 60 )); STARTUP_S=$(( ${STARTUP_MIN:-30} * 60 ))
 OFF=${FROM:-0}; LAST_STEP=0
 # the temporary file lives in LOGDIR (a project disk path), never in an inherited TMPDIR that may not exist: a watchdog
 # that cannot create it must not run silently without divergence detection, so it says so, marks watchdog_last dead

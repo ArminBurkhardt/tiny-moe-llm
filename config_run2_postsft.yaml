@@ -89,7 +89,7 @@ evidence:
   keep_every_tokens: 0                 # keep every save: they are few
   eval_every_tokens: 250000000
   eval_max_batches: 40
-  conversation_loss_weighting: true    # on as for repair: a 5 token answer or an abstention counts as a conversation, not as 5 tokens next to a 4,000 token document
+  conversation_loss_weighting: false   # off as in pretraining: with it on a 4,093 token replay document weighs as much as a 64 token chat answer, so the replay share (a prompt token share) pulled far less on the loss than the mix says; the per slice supervised token shares are printed by build_post_sft_mix.py
   loss_weight_floor_tokens: 64
   max_evidence_tokens: 4608            # per row; the mix's ratio is about 0.5 against seq 4096 (not the run's 9216)
   cluster_refresh_tokens: 0

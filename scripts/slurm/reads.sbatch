@@ -29,7 +29,7 @@ source scripts/slurm/lib.sh
 RUN=${RUN:-run2}
 READ_CONFIG=${READ_CONFIG:-config_run2.yaml}
 PAIR_LINES=$(expand_read_pairs) || exit 2
-[ "${DRY_RUN:-0}" = 1 ] || require_site_values || exit 2
+[ "${DRY_RUN:-0}" = 1 ] || { require_site_values && require_tokenizer; } || exit 2
 mkdir -p logs "$DATA_ROOT/exports"
 i=0; PIDS=""; COPIES=""
 while read -r CK TG; do

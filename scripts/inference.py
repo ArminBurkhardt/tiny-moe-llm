@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import hashlib
+import random
 import argparse
 from typing import Iterator
 
@@ -50,6 +52,26 @@ def load_evidence_chunks(path: str) -> list[str]:
 
 
 DEFAULT_RETRIEVAL_K = 4  # the buffer eval_store.py's pathway and edit reads attach (--buffer 4)
+CHUNK_ORDERS = ("shuffle", "best_first", "best_last")
+DEFAULT_CHUNK_ORDER = "shuffle"  # training put the gold chunk at a random place among the passages
+
+
+def order_chunks(chunk_ids: list[int], order: str, question: str) -> list[int]:
+    """Attach order for retrieved chunks given best first.
+
+    ``shuffle`` is a fixed permutation per question (seeded by a hash of the question text), because
+    training shuffled the gold among whole passages; ``best_first`` and ``best_last`` keep the
+    retrieval rank, the second putting the top chunk next to the query under the prefix rotation.
+    """
+    ids = [int(c) for c in chunk_ids]
+    if order == "best_first":
+        return ids
+    if order == "best_last":
+        return ids[::-1]
+    if order != "shuffle":
+        raise ValueError(f"chunk order {order!r} is not one of {CHUNK_ORDERS}")
+    random.Random(int.from_bytes(hashlib.sha1(question.encode("utf-8")).digest()[:8], "big")).shuffle(ids)
+    return ids
 
 
 class StoreRetriever:
@@ -64,13 +86,19 @@ class StoreRetriever:
         store_dir: a store directory under ``data/index/``.
         top_k: chunks attached per question.
         device: where bge runs.
+        chunk_order: ``shuffle`` (default, a fixed shuffle per question, as training placed the gold),
+            ``best_first`` or ``best_last`` (see ``order_chunks``).
     """
 
-    def __init__(self, store_dir: str, top_k: int = DEFAULT_RETRIEVAL_K, device: str = "cpu"):
+    def __init__(self, store_dir: str, top_k: int = DEFAULT_RETRIEVAL_K, device: str = "cpu",
+                 chunk_order: str = DEFAULT_CHUNK_ORDER):
         from modules.data.store import load_store
 
         if top_k < 1:
             raise SystemExit("--retrieval-k must be at least 1")
+        if chunk_order not in CHUNK_ORDERS:
+            raise SystemExit(f"--chunk-order must be one of {CHUNK_ORDERS}")
+        self.chunk_order = chunk_order
         self.store = load_store(store_dir)
         self.top_k = top_k
         self.device = device
@@ -90,9 +118,10 @@ class StoreRetriever:
         ids, _ = top_k_chunks(self.embed_question(question), self.store.keys, self.top_k)
         return [int(i) for i in ids]
 
-    def describe(self, chunk_ids: list[int], width: int = 80) -> str:
+    def describe(self, chunk_ids: list[int], width: int = 80, ranks: dict | None = None) -> str:
         lines = []
-        for rank, cid in enumerate(chunk_ids, 1):
+        for pos, cid in enumerate(chunk_ids, 1):
+            rank = ranks[cid] if ranks else pos
             text = " ".join(self.store.chunks[cid]["text"].split())
             lines.append(f"  [{rank}] chunk {cid}: {text[:width]}")
         return "\n".join(lines)
@@ -104,12 +133,15 @@ class StoreRetriever:
             ``(evidence, chunk_ids, report)``; ``report`` is the printable retrieval listing, or ""
             when ``show`` is off.
         """
-        chunk_ids = self.retrieve(question)
+        best_first = self.retrieve(question)
+        ranks = {cid: r for r, cid in enumerate(best_first, 1)}
+        chunk_ids = order_chunks(best_first, self.chunk_order, question)
         texts = [self.store.chunks[c]["text"] for c in chunk_ids]
         evidence = build_evidence_batch(
             model, tokenizer, texts, self.device, keys=self.store.keys[chunk_ids].astype("float32"),
         )
-        report = f"retrieved {len(chunk_ids)} chunk(s):\n{self.describe(chunk_ids)}" if show else ""
+        report = (f"retrieved {len(chunk_ids)} chunk(s), attached {self.chunk_order} (retrieval rank in brackets):\n"
+                  f"{self.describe(chunk_ids, ranks=ranks)}") if show else ""
         return evidence, chunk_ids, report
 
 
@@ -588,6 +620,14 @@ def main():
              "eval_store.py buffer). Not --top-k, which is the sampling filter.",
     )
     parser.add_argument(
+        "--chunk-order",
+        choices=CHUNK_ORDERS,
+        default=DEFAULT_CHUNK_ORDER,
+        help="With --store, the order the retrieved chunks are attached in: shuffle (default; a fixed "
+             "shuffle per question, as training placed the gold among whole passages), best_first, or "
+             "best_last (the top chunk nearest the query under the prefix rotation).",
+    )
+    parser.add_argument(
         "--show-retrieval",
         action="store_true",
         help="With --store, print the retrieved chunk ids and their first 80 characters.",
@@ -617,7 +657,7 @@ def main():
     if args.store:
         if not model.moe.evidence_port:
             raise SystemExit("this checkpoint has no evidence port, --store cannot attach chunks")
-        retriever = StoreRetriever(args.store, args.retrieval_k, args.device)
+        retriever = StoreRetriever(args.store, args.retrieval_k, args.device, args.chunk_order)
         print(f"Store {args.store}: {len(retriever.store.chunks):,} chunks, retrieving {args.retrieval_k} per prompt\n")
 
     if args.prompt is not None:

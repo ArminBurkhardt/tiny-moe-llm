@@ -44,6 +44,9 @@ fi
 # models and the tokenizer the jobs need (bge, the DeepSeek tokenizer) must already sit in these, fetched
 # on a login node with ONLINE=1:
 export HF_HOME=${HF_HOME:-$DATA_ROOT/hf_home}
+# the tokenizer is staged beside them (mirror_sources.py stage-small writes $HF_HOME/tokenizer); utils.TOKENIZER_DIR
+# reads this variable, and singularity passes the host environment into the container
+export TINY_LLM_TOKENIZER=${TINY_LLM_TOKENIZER:-$HF_HOME/tokenizer}
 
 [ -n "$SLURM_CPU_BIND" ] && export SLURM_CPU_BIND   # set to none when srun fails to bind the 20 cpus per task
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
@@ -53,7 +56,10 @@ export PYTHONUNBUFFERED=1
 # shell's values, and a login shell has no $TMPDIR of the job: reads.sbatch copies a save there and the container
 # could not see it). not exported. BIND_EXTRA (local overlay) adds site mounts.
 source "$_MN5_HERE/lib.sh"
-BIND=$REPO,$DATA_ROOT${TMPDIR:+,$TMPDIR},$HF_HOME${BIND_EXTRA:+,$BIND_EXTRA}
+# the node's temporary disk is bound only when it exists on this node (--export=ALL can carry the login node's TMPDIR)
+_MN5_TMP=""
+[ -n "$TMPDIR" ] && [ -d "$TMPDIR" ] && _MN5_TMP=$TMPDIR
+BIND=$REPO,$DATA_ROOT${_MN5_TMP:+,$_MN5_TMP},$HF_HOME${BIND_EXTRA:+,$BIND_EXTRA}
 CTR_FAIL=""
 CTR=$(container_prefix) || { CTR=""; CTR_FAIL=1; }
 if [ -n "$CTR" ]; then CTR="$CTR "; fi

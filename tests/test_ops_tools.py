@@ -217,9 +217,10 @@ def test_rules():
     v = sup.evaluate(base_status(), [], CFG, now)
     assert v["alerts"] == [] and v["actions"] == []
     # chain broken: no job, not done -> alert and resubmit; never twice within the hour
-    v = sup.evaluate(base_status(jobs=[]), [], CFG, now)
-    assert any("chain broken" in a for a in v["alerts"]) and v["actions"] == [{"kind": "resubmit"}]
-    v = sup.evaluate(base_status(jobs=[]), [{"t": now - 600, "acted": ["resubmit"]}], CFG, now)
+    began = {"chain_id": "1-2", "split": "run2_main_train"}
+    v = sup.evaluate(base_status(jobs=[], chain_state=began), [], CFG, now)
+    assert any("chain broken" in a for a in v["alerts"]) and v["actions"] == [{"kind": "resubmit", "split": "run2_main_train"}]
+    v = sup.evaluate(base_status(jobs=[], chain_state=began), [{"t": now - 600, "acted": ["resubmit"]}], CFG, now)
     assert v["actions"] == [] and any("already resubmitted" in a for a in v["alerts"])
     # a pending job counts as an active chain
     v = sup.evaluate(base_status(jobs=[{"name": "run2", "state": "PENDING", "elapsed": "0:00", "reason": "Priority"}]), [], CFG, now)
@@ -244,6 +245,31 @@ def test_rules():
     assert v["alerts"] == [] and v["actions"] == [] and v["notes"]
     v = sup.evaluate(base_status(jobs=[], chain_state={"ended": "warm-exhausted"}), [], CFG, now)
     assert v["actions"] == [] and any("warm split" in a for a in v["alerts"])
+    # the tail phase: the main chain stops after the first save at or past 760B and waits for the user's switch. That is a
+    # decision for the user (an alert that says so), never a failure and never resubmitted
+    main_stop = {"ended": "stop", "split": "run2_main_train", "stop_after": "760000M"}
+    v = sup.evaluate(base_status(jobs=[], stop=True, chain_state=main_stop, last_save={"tag_m": 760003, "age_s": 600, "file": "x"}),
+                     [], CFG, now)
+    assert v["actions"] == [] and len(v["alerts"]) == 1 and v["alerts"][0].startswith("tail switch due"), v
+    assert "tok760003M" in v["alerts"][0] and "760B" in v["alerts"][0] and "run2_tail_train" in v["alerts"][0], v
+    assert "chain broken" not in v["alerts"][0] and "never resubmitted" in v["alerts"][0]
+    # before the planned stop, with the STOP file a person dropped, it is the ordinary on purpose note
+    v = sup.evaluate(base_status(jobs=[], stop=True, chain_state=main_stop, last_save={"tag_m": 500000, "age_s": 600, "file": "x"}),
+                     [], CFG, now)
+    assert v["alerts"] == [] and v["actions"] == [] and v["notes"], v
+    # the warm-up's own stop (4000M on the warm split) is not the tail switch
+    v = sup.evaluate(base_status(jobs=[], stop=True, chain_state={"ended": "stop", "split": "run2_warm_train", "stop_after": "4000M"},
+                                 last_save={"tag_m": 4003, "age_s": 600, "file": "x"}), [], CFG, now)
+    assert v["alerts"] == [] and v["notes"], v
+    # a job queued or running (the user already started the tail chain) clears it; a finished run is just finished
+    v = sup.evaluate(base_status(stop=True, chain_state=main_stop, last_save={"tag_m": 760003, "age_s": 600, "file": "x"}),
+                     [], CFG, now)
+    assert not any("tail switch" in a for a in v["alerts"]), v
+    v = sup.evaluate(base_status(jobs=[], stop=True, final_exists=True, chain_state=main_stop,
+                                 last_save={"tag_m": 800001, "age_s": 600, "file": "x"}), [], CFG, now)
+    assert v["alerts"] == [], v
+    assert [sup.stop_after_m(x) for x in ("760000M", "760B", "760000000000", "4000M", "4B", "", "a.*")] == \
+        [760000, 760000, 760000, 4000, 4000, None, None]
     v = sup.evaluate(base_status(jobs=[], chain_state={"ended": "done"}), [], CFG, now)
     assert v["alerts"] == [] and v["actions"] == []
     # C3: a failed squeue says nothing about the queue: alert, no action (the supervisor exits 2)
@@ -384,7 +410,7 @@ def test_main_paths():
         # a chain broken with the queue read fine: one resubmit, recorded; the next poll will not repeat it
         calls[:] = []
         payload.clear()
-        payload.update(base_status(jobs=[]))
+        payload.update(base_status(jobs=[], chain_state={"chain_id": "1-2", "split": "run2_main_train"}))
         assert sup.main(args) == 1
         assert any("submit_chain.sh TRAIN" in c for c in calls), calls
         hist = [json.loads(line) for line in open(args[args.index("--history") + 1])]
@@ -489,7 +515,9 @@ def test_ledger_and_transfers():
     # L9: a pulled .pt without its .sha256 is refused (and never uploaded)
     local = os.path.join(d, "pulled")
     r = sh("bash scripts/ops/pull_exports.sh %s" % local, **env)
-    assert r.returncode == 1 and "has no .sha256" in r.stderr, (r.returncode, r.stdout, r.stderr)
+    assert r.returncode == 0 and "waiting" in r.stderr, (r.returncode, r.stdout, r.stderr)
+    r = sh("bash scripts/ops/pull_exports.sh %s" % local, MISSING_SHA_GRACE_MIN="0", **env)
+    assert r.returncode == 5 and "has no .sha256" in r.stderr, (r.returncode, r.stdout, r.stderr)
     r = sh("bash scripts/ops/pull_exports.sh %s" % local, FAKE_SHA="1", **env)
     assert r.returncode == 0 and "pulled to" in r.stdout, (r.stdout, r.stderr)
     # H5: push_code never sends the cluster site overlay
@@ -617,7 +645,263 @@ def test_review_fixes():
     assert "'run2*.log'" in pe and "run2*.out" in pe and "'run2_*.log'" not in pe
 
 
+def test_second_review_fixes():
+    now = int(time.time())
+    started = {"chain_id": "1-2", "split": "run2_main_train", "stop_after": "760000M", "nodes": "2"}
+    # a chain that never started (before the first launch, during the corpus build or the control) is not broken
+    v = sup.evaluate(base_status(jobs=[], saves=[], last_save=None, chain_state={}), [], CFG, now)
+    assert v["alerts"] == [] and v["actions"] == [] and any("chain not started" in n for n in v["notes"]), v
+    # started: a resubmit carries the chain's recorded split, stop and node count
+    v = sup.evaluate(base_status(jobs=[], chain_state=started), [], CFG, now)
+    assert v["actions"] == [{"kind": "resubmit", "split": "run2_main_train", "stop_after": "760000M", "nodes": "2"}], v
+    cmds = []
+    sup.perform(v["actions"], CFG, lambda c: cmds.append(c) or (0, "", ""))
+    assert "START_INDEX=1 RUN=run2 SPLIT=run2_main_train STOP_AFTER=760000M NODES=2 bash scripts/slurm/submit_chain.sh TRAIN 4" in cmds[0], cmds
+    # started but with no recorded split: alert, never a resubmit that would restart from the seed
+    v = sup.evaluate(base_status(jobs=[], chain_state={"chain_id": "1-2"}), [], CFG, now)
+    assert v["actions"] == [] and any("no usable split" in a for a in v["alerts"]), v
+    v = sup.evaluate(base_status(jobs=[], chain_state=dict(started, split="x; rm -rf /")), [], CFG, now)
+    assert v["actions"] == [], v
+    # the hand cancel (cancel_chain.sh leaves ended=cancelled): never a resubmit, with or without a pending job left over
+    v = sup.evaluate(base_status(jobs=[], chain_state=dict(started, ended="cancelled")), [], CFG, now)
+    assert v["actions"] == [] and any("cancelled by hand" in a for a in v["alerts"]), v
+    v = sup.evaluate(base_status(jobs=[{"name": "run2", "state": "PENDING", "elapsed": "0:00", "reason": "Priority"}],
+                                 chain_state=dict(started, ended="cancelled")), [], CFG, now)
+    assert v["actions"] == [], v
+    # the control run: kind and the reads config follow the run name
+    assert sup.default_kind("run2_control") == "CONTROL" and sup.default_kind("run2") == "TRAIN"
+    cmds = []
+    ctl = dict(CFG, run="run2_control", kind="CONTROL", read_config="config_run2_control.yaml")
+    sup.perform([{"kind": "resubmit", "split": "run2_control_train"}, {"kind": "reads", "pairs": [("/r/c.pt", "10B")]}], ctl,
+                lambda c: cmds.append(c) or (0, "", ""))
+    assert "submit_chain.sh CONTROL 4" in cmds[0] and "RUN=run2_control SPLIT=run2_control_train" in cmds[0], cmds
+    assert "READ_CONFIG=config_run2_control.yaml" in cmds[1] and "RUN=run2_control" in cmds[1], cmds
+
+    # one ledger for every cwd: absolute, from the repo root by default, OPS_LEDGER wins; the byte sum does not clamp at 2^31
+    r = sh("cd /; source %s/scripts/ops/ops_lib.sh; echo $LEDGER" % ROOT, OPS_LEDGER="", LEDGER="")
+    assert r.stdout.strip() == ROOT + "/ops_transfer_ledger.tsv" or r.stdout.strip().endswith("/ops_transfer_ledger.tsv"), r
+    assert r.stdout.strip().startswith("/"), r
+    d = tempfile.mkdtemp()
+    led = os.path.join(d, "shared.tsv")
+    r = sh("cd /; source %s/scripts/ops/ops_lib.sh; ledger_append in a 3000000000; ledger_append out b 4000000000; "
+           "ledger_total_bytes" % ROOT, OPS_LEDGER=led)
+    assert r.stdout.split()[-1] == "7000000000" and os.path.exists(led), r
+    # push_code never ships the pulled folder, weights or hashes; the folder is gitignored
+    r = sh("eval \"$(grep '^LOCALONLY=' scripts/ops/push_code.sh)\"; printf 'a.pt\\nrun2_pulled/x.json\\nok.py\\nx.pt.sha256\\nckpts/a\\n' | grep -vE \"$LOCALONLY\"")
+    assert r.stdout.split() == ["ok.py"], r
+    assert "run2_pulled/" in open(os.path.join(ROOT, ".gitignore")).read().replace("\r", "").split("\n")
+
+    # a hash mismatch deletes the pair so the next pull refetches it
+    fb = os.path.join(d, "bin")
+    os.makedirs(fb)
+    write_exe(os.path.join(fb, "rsync"), (
+        '#!/usr/bin/env bash\n'
+        'case "$*" in *--dry-run*) echo "Total transfer size: 5 bytes"; exit 0;; esac\n'
+        'last=${@: -1}\n'
+        'case "$*" in *"--include=*.pt"*) mkdir -p "$last"; echo w > "$last/run2_1B.pt"; '
+        'echo "0000000000000000000000000000000000000000000000000000000000000000  run2_1B.pt" > "$last/run2_1B.pt.sha256";; esac\n'
+        'echo "Total bytes received: 5"\n'))
+    local = os.path.join(d, "pulled")
+    r = sh("bash scripts/ops/pull_exports.sh %s" % local, PATH=fb + os.pathsep + os.environ["PATH"], OPS_LEDGER=led, HOME=d)
+    assert r.returncode == 5 and "sha256 problem" in r.stderr, (r.stdout, r.stderr)
+    assert not os.path.exists(os.path.join(local, "exports", "run2_1B.pt")), "a corrupt export must not stay"
+    assert not os.path.exists(os.path.join(local, "exports", "run2_1B.pt.sha256"))
+
+
+def run_relay(cwd, bindir, env, n=1):
+    out = None
+    for _ in range(n):
+        out = subprocess.run(["bash", os.path.join(ROOT, "scripts", "ops", "relay", "relay_poll.sh")], cwd=cwd,
+                             env=dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], **env),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=120)
+    return out
+
+
+def test_relay_poll():
+    d = tempfile.mkdtemp()
+    bindir = os.path.join(d, "bin")
+    os.makedirs(bindir)
+    os.makedirs(os.path.join(d, "scripts", "ops"))
+    log = os.path.join(d, "calls.log")
+    write_exe(os.path.join(bindir, "curl"), '#!/usr/bin/env bash\necho "curl $*" >> "$CALLS"\n[ -n "$FAKE_CURL_FAIL" ] && exit 22\nexit 0\n')
+    write_exe(os.path.join(bindir, "hf"), '#!/usr/bin/env bash\necho "hf $*" >> "$CALLS"\nexit 0\n')
+    write_exe(os.path.join(bindir, "python3"), (
+        '#!/usr/bin/env bash\n'
+        'case "$1" in\n'
+        '  scripts/ops/supervise.py) echo "notify: $FAKE_NOTE"; [ -n "$FAKE_KEYS" ] && echo "keys: $FAKE_KEYS"; exit ${FAKE_RC:-0};;\n'
+        '  -c) case "$2" in *HfApi*) exit ${FAKE_PRIVATE_RC:-0};; *) exit ${FAKE_IMPORT_RC:-0};; esac;;\n'
+        'esac\nexit 0\n'))
+    write_exe(os.path.join(d, "scripts", "ops", "pull_exports.sh"), '#!/usr/bin/env bash\necho "pull" >> "$CALLS"\nexit ${FAKE_PULL_RC:-0}\n')
+    env = dict(CALLS=log, NTFY_TOPIC="t", RELAY_LOCAL_DIR=os.path.join(d, "pulled"), HF_EXPORT_REPO="me/r", FAKE_RC="1",
+               FAKE_NOTE="ATTN run2 RUNNING: 10.0B of 800B tokens | rate 50000 tokens/s per GPU under 54000 for 55 minutes",
+               FAKE_KEYS="rate #",
+               HEARTBEAT_HOURS="24", LOG_UPLOAD_HOURS="6", FAKE_CURL_FAIL="", FAKE_PULL_RC="0", FAKE_PRIVATE_RC="0")
+
+    def calls():
+        return open(log).read().splitlines() if os.path.exists(log) else []
+    # a drifting number is the same alert: one push per window, and the heartbeat goes out once
+    r = run_relay(d, bindir, env)
+    assert r.returncode == 0, r.stderr
+    attn1 = [c for c in calls() if c.startswith("curl") and "attention" in c]
+    assert len(attn1) == 1, calls()
+    env2 = dict(env, FAKE_KEYS="rate #", FAKE_NOTE="ATTN run2 RUNNING: 11.5B of 800B tokens | rate 49000 tokens/s per GPU under 54000 for 61 minutes")
+    run_relay(d, bindir, env2)
+    assert len([c for c in calls() if c.startswith("curl") and "attention" in c]) == 1, calls()
+    assert len([c for c in calls() if "heartbeat" in c]) == 1, calls()
+    assert "Priority: low" in [c for c in calls() if "heartbeat" in c][0]
+    # a different alert pushes at once
+    run_relay(d, bindir, dict(env, FAKE_KEYS="HALT: # failed", FAKE_NOTE="ATTN run2 RUNNING: 12B | HALT: 3 failed or stalled jobs"))
+    assert len([c for c in calls() if c.startswith("curl") and "attention" in c]) == 2, calls()
+    # the logs go up with the first upload only (6 hour window); the second upload excludes them
+    ups = [c for c in calls() if c.startswith("hf upload-large-folder")]
+    assert "*.log" not in ups[0] and all("*.log" in u for u in ups[1:]), ups
+    # a milestone is sent on its own while an alert is in force, once
+    ms = dict(env, FAKE_NOTE="ATTN run2 RUNNING: 100B | HALT: x | milestone: 100B tokens reached")
+    run_relay(d, bindir, ms, n=2)
+    assert len([c for c in calls() if "Title: MN5 run: milestone" in c]) == 1, calls()
+    # a failed send is not recorded: the next poll sends it
+    d2 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d2, "scripts", "ops"))
+    shutil_copy = lambda s, t: open(t, "wb").write(open(s, "rb").read())
+    shutil_copy(os.path.join(d, "scripts", "ops", "pull_exports.sh"), os.path.join(d2, "scripts", "ops", "pull_exports.sh"))
+    os.chmod(os.path.join(d2, "scripts", "ops", "pull_exports.sh"), 0o755)
+    open(log, "w").close()
+    e3 = dict(env, RELAY_LOCAL_DIR=os.path.join(d2, "pulled"), FAKE_CURL_FAIL="1")
+    run_relay(d2, bindir, e3)
+    assert not os.path.exists(os.path.join(d2, "ops_state", "relay_last_attn")), "a failed send must not start the quiet window"
+    assert not os.path.exists(os.path.join(d2, "ops_state", "relay_last_heartbeat"))
+    run_relay(d2, bindir, dict(e3, FAKE_CURL_FAIL=""))
+    assert os.path.exists(os.path.join(d2, "ops_state", "relay_last_attn")) and os.path.exists(os.path.join(d2, "ops_state", "relay_last_heartbeat"))
+    # no upload after a failed pull, nor to a repo that is not private
+    open(log, "w").close()
+    d3 = tempfile.mkdtemp()
+    os.makedirs(os.path.join(d3, "scripts", "ops"))
+    shutil_copy(os.path.join(d, "scripts", "ops", "pull_exports.sh"), os.path.join(d3, "scripts", "ops", "pull_exports.sh"))
+    os.chmod(os.path.join(d3, "scripts", "ops", "pull_exports.sh"), 0o755)
+    e4 = dict(env, RELAY_LOCAL_DIR=os.path.join(d3, "pulled"), FAKE_RC="0", FAKE_NOTE="OK run2 RUNNING", FAKE_PULL_RC="1")
+    run_relay(d3, bindir, e4)
+    assert not [c for c in calls() if c.startswith("hf ")], calls()
+    run_relay(d3, bindir, dict(e4, FAKE_PULL_RC="0", FAKE_PRIVATE_RC="3"))
+    assert not [c for c in calls() if c.startswith("hf upload")], calls()
+    assert any("PUBLIC" in c for c in calls()), calls()
+
+
+def test_third_review_fixes():
+    now = int(time.time())
+    # alert keys: the drifting figures are wiped, identities (exit codes, save tags) are not
+    k = sup.alert_key
+    assert k("rate 50000 tokens/s per GPU under 54000 for 55 minutes") == k("rate 49000 tokens/s per GPU under 54000 for 61 minutes")
+    assert k("last job exited 30 (resume or switch verification failed)") != k("last job exited 20 (resume or switch verification failed)")
+    a = "reads for 1000B were attempted and left no result: see the reads job log"
+    assert k(a) != k(a.replace("1000B", "2000B"))
+    assert k("CE 3.900 is 0.60 above the best 3.300 of the log tail: a finite divergence?") == \
+        k("CE 3.950 is 0.65 above the best 3.300 of the log tail: a finite divergence?")
+    assert k("projected 4800.0 GPU hours over the 4500.0 budget; the token target that fits is 700B") == \
+        k("projected 4900.0 GPU hours over the 4500.0 budget; the token target that fits is 690B")
+    # a recorded STOP_AFTER already reached: no resubmit, an alert that says why
+    chain = {"chain_id": "1-2", "split": "run2_warm_train", "stop_after": "4000M"}
+    v = sup.evaluate(base_status(jobs=[], chain_state=chain, last_save={"tag_m": 4003, "age_s": 600, "file": "x"}), [], CFG, now)
+    assert v["actions"] == [] and any("planned stop" in x and "not resubmitted" in x for x in v["alerts"]), v
+    v = sup.evaluate(base_status(jobs=[], chain_state=chain, last_save={"tag_m": 3003, "age_s": 600, "file": "x"}), [], CFG, now)
+    assert [x["kind"] for x in v["actions"]] == ["resubmit"], v
+    # the keys line is printed with an alert
+    d = tempfile.mkdtemp()
+    real = sup.ssh_run
+    payload = base_status(jobs=[], chain_state={"chain_id": "1"}, final_exists=False)
+    sup.ssh_run = lambda cfg, c, timeout=0: (0, json.dumps(payload) + "\n", "")
+    import io
+    import contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            sup.main(["--user", "u", "--repo", "/r", "--sock", os.path.join(d, "s"), "--env-file", os.path.join(d, "none"),
+                      "--history", os.path.join(d, "h.jsonl"), "--ops-log", os.path.join(d, "o.log"), "--attempted", os.path.join(d, "a.json")])
+    finally:
+        sup.ssh_run = real
+    assert any(line.startswith("keys: ") for line in buf.getvalue().splitlines()), buf.getvalue()
+    # push_code: the head and bundle modes refuse tracked weights, hashes and the pulled folder
+    pc = open(os.path.join(ROOT, "scripts", "ops", "push_code.sh")).read()
+    assert "BADTRACKED" in pc and 'MODE" != worktree' in pc
+    r = sh("printf 'a/b.pt\\nc.sha256\\nrun2_pulled/x\\nok.py\\n' | grep -E '\\.pt$|\\.sha256$|^run2_pulled/'")
+    assert r.stdout.split() == ["a/b.pt", "c.sha256", "run2_pulled/x"], r
+    # hf visibility: an import failure and a lookup failure are not "not private"
+    fb = os.path.join(d, "bin")
+    os.makedirs(fb)
+    write_exe(os.path.join(fb, "py"), "#!/usr/bin/env bash\necho \"huggingface_hub is not importable by this python: x\"; exit 4\n")
+    r = sh("source scripts/ops/ops_lib.sh; HF_PYTHON=%s/py; hf_repo_is_private me/r; echo rc=$? why=$HF_PRIV_WHY" % fb)
+    assert "rc=4" in r.stdout and "not importable" in r.stdout, r
+    r = sh("source scripts/ops/ops_lib.sh; HF_PYTHON=%s/nonexistent; hf_python_check; echo rc=$?" % fb)
+    assert "rc=1" in r.stdout and "cannot import huggingface_hub" in r.stdout, r
+
+
+def test_relay_poll_third():
+    d = tempfile.mkdtemp()
+    bindir = os.path.join(d, "bin")
+    os.makedirs(bindir)
+    os.makedirs(os.path.join(d, "scripts", "ops"))
+    log = os.path.join(d, "calls.log")
+    write_exe(os.path.join(bindir, "curl"), '#!/usr/bin/env bash\necho "curl $*" >> "$CALLS"\n[ -n "$FAKE_CURL_FAIL" ] && exit 22\nexit 0\n')
+    write_exe(os.path.join(bindir, "hf"), '#!/usr/bin/env bash\necho "hf $*" >> "$CALLS"\nexit 0\n')
+    write_exe(os.path.join(bindir, "python3"), (
+        '#!/usr/bin/env bash\n'
+        'case "$1" in\n'
+        '  scripts/ops/supervise.py) echo "notify: $FAKE_NOTE"; [ -n "$FAKE_KEYS" ] && echo "keys: $FAKE_KEYS"; exit ${FAKE_RC:-0};;\n'
+        '  -c) case "$2" in *HfApi*) exit ${FAKE_PRIVATE_RC:-0};; *) echo "no module named huggingface_hub"; exit ${FAKE_IMPORT_RC:-0};; esac;;\n'
+        'esac\nexit 0\n'))
+    write_exe(os.path.join(d, "scripts", "ops", "pull_exports.sh"), '#!/usr/bin/env bash\necho "pull" >> "$CALLS"\nexit ${FAKE_PULL_RC:-0}\n')
+    local = os.path.join(d, "pulled")
+    env = dict(CALLS=log, NTFY_TOPIC="t", RELAY_LOCAL_DIR=local, HF_EXPORT_REPO="me/r", FAKE_RC="1", FAKE_KEYS="",
+               FAKE_NOTE="ATTN run2 RUNNING: 10B | last job exited 20", HEARTBEAT_HOURS="0", LOG_UPLOAD_HOURS="6",
+               FAKE_CURL_FAIL="", FAKE_PULL_RC="0", FAKE_PRIVATE_RC="0", FAKE_IMPORT_RC="0")
+
+    def calls():
+        return open(log).read().splitlines() if os.path.exists(log) else []
+
+    def attn():
+        return [c for c in calls() if "Title: MN5 run: attention" in c]
+    # exit 20 and exit 30 are different alerts: each pushes; the same key again does not
+    run_relay(d, bindir, dict(env, FAKE_KEYS="last job exited 20"))
+    run_relay(d, bindir, dict(env, FAKE_KEYS="last job exited 30", FAKE_NOTE="ATTN run2 RUNNING: 11B | last job exited 30"))
+    assert len(attn()) == 2, calls()
+    run_relay(d, bindir, dict(env, FAKE_KEYS="last job exited 30", FAKE_NOTE="ATTN run2 RUNNING: 12B | last job exited 30"))
+    assert len(attn()) == 2, calls()
+    # a pending milestone survives a failed send and goes out at the next poll, once
+    ms = dict(env, FAKE_RC="0", FAKE_KEYS="", FAKE_NOTE="OK run2 RUNNING: 100B | milestone: 100B tokens reached")
+    run_relay(d, bindir, dict(ms, FAKE_CURL_FAIL="1"))
+    assert "100B tokens reached" in open(os.path.join(d, "ops_state", "relay_milestones_pending.txt")).read()
+    run_relay(d, bindir, dict(ms, FAKE_NOTE="OK run2 RUNNING: 101B"), n=2)
+    assert len([c for c in calls() if "Title: MN5 run: milestone" in c]) == 2, calls()   # the failed try and the one that worked
+    assert open(os.path.join(d, "ops_state", "relay_milestones_pending.txt")).read().strip() == ""
+    # an export without its hash is held back from the upload, the rest goes up (pull exit 5 = a hash problem elsewhere)
+    os.makedirs(os.path.join(local, "exports"))
+    open(os.path.join(local, "exports", "run2_1B.pt"), "w").close()
+    open(os.path.join(local, "exports", "run2_2B.pt"), "w").close()
+    open(os.path.join(local, "exports", "run2_2B.pt.sha256"), "w").close()
+    open(log, "w").close()
+    run_relay(d, bindir, dict(env, FAKE_RC="0", FAKE_NOTE="OK run2", FAKE_PULL_RC="5"))
+    up = [c for c in calls() if c.startswith("hf upload-large-folder")]
+    assert up and "--exclude exports/run2_1B.pt" in up[0] and "exports/run2_2B.pt" not in up[0], calls()
+    # a failed pull (exit 1) uploads nothing
+    open(log, "w").close()
+    run_relay(d, bindir, dict(env, FAKE_RC="0", FAKE_NOTE="OK run2", FAKE_PULL_RC="1"))
+    assert not [c for c in calls() if c.startswith("hf upload")], calls()
+    # huggingface_hub missing in HF_PYTHON: one alert with the real cause, no upload, no misleading "not private"
+    open(log, "w").close()
+    run_relay(d, bindir, dict(env, FAKE_RC="0", FAKE_NOTE="OK run2", FAKE_IMPORT_RC="1"), n=2)
+    assert not [c for c in calls() if c.startswith("hf upload")], calls()
+    hfs = [c for c in calls() if "Title: relay: HF setup" in c]
+    assert len(hfs) == 1 and "cannot import huggingface_hub" in hfs[0] and not any("not private" in c for c in calls()), calls()
+    # a lookup failure names its cause (FAKE rc 5 prints nothing, so only the class of the message is checked)
+    open(log, "w").close()
+    run_relay(d, bindir, dict(env, FAKE_RC="0", FAKE_NOTE="OK run2", FAKE_PRIVATE_RC="5"))
+    assert any("visibility check failed" in c for c in calls()) and not any("PUBLIC" in c for c in calls()), calls()
+
+
 def main():
+    test_third_review_fixes()
+    test_relay_poll_third()
+    test_second_review_fixes()
+    test_relay_poll()
     test_review_fixes()
     test_status_parsers()
     test_status_collect_pieces()

@@ -179,6 +179,31 @@ def test_holdout_hashes_recorded_for_designated_source():
     shutil.rmtree(d)
 
 
+def test_ir_smoltalk2_hashes_recorded_and_excluded_by_replay():
+    from scripts.prepare_data import (doc_hash, holdout_source_for, record_holdout_hashes, render_pretrain_chat)
+    from scripts import prepare_evidence_data as ped
+    assert holdout_source_for("ir") == "smoltalk2" and holdout_source_for("phase2") == "smoltalk2"
+    assert holdout_source_for("phase1") is None
+    msgs = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    ir_state = {"holdout_hashes": [doc_hash(render_pretrain_chat(msgs))]}
+    p2_state = {"holdout_hashes": ["phase2hash"]}
+    ir_prep, data_prep = {}, {}
+    record_holdout_hashes(ir_prep, "ir", ir_state)
+    record_holdout_hashes(data_prep, "phase2", p2_state)
+    assert ir_prep == {"smoltalk2_ir_hashes": ir_state["holdout_hashes"]}, ir_prep
+    assert data_prep == {"smoltalk2_holdout_hashes": ["phase2hash"]}, data_prep
+    assert ped.ir_phase_hashes({"data_prep": data_prep, "ir_prep": ir_prep}) == set(ir_state["holdout_hashes"])
+    assert ped.ir_phase_hashes({"data_prep": data_prep}) == set()
+    entry = {"key": "smoltalk2", "render": "messages", "holdout": True}
+    state = {"skipped": {"smoltalk2": {"holdout": 0, "unrenderable": 0}}}
+    kw = dict(num_distractors=3, many_distractors=(16, 32), chunk_tokens=128, max_doc_tokens=4093, webtext_held_tokens=384)
+    row = {"messages": msgs}
+    assert ped._render_row(row, entry, None, state, [], None, None, holdout_hashes=ped.ir_phase_hashes({"ir_prep": ir_prep}), **kw) is None
+    assert state["skipped"]["smoltalk2"]["holdout"] == 1
+    assert ped._render_row(row, entry, None, state, [], None, None, holdout_hashes={"other"}, **kw) is not None
+    print("[ok] the ir phase's smoltalk2 hashes are recorded under smoltalk2_ir_hashes and excluded by the replay arm")
+
+
 def test_shard_seed_is_pure_across_processes():
     import subprocess
     code = ("import sys; sys.path.insert(0, %r); "
@@ -254,6 +279,7 @@ if __name__ == "__main__":
     test_interrupt_and_resume_no_gap_no_repeat()
     test_truncate_to_state_drops_uncommitted_tail()
     test_holdout_hashes_recorded_for_designated_source()
+    test_ir_smoltalk2_hashes_recorded_and_excluded_by_replay()
     test_shard_seed_is_pure_across_processes()
     test_manifest_key_required_for_ir()
     print("\nPREPARE_DATA CHECKS PASSED")

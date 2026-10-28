@@ -47,6 +47,7 @@ decided on the option the draft recommended; the consequence column is the draft
 | 13 | chat replay share | **held at the supply limit** (about 0.5B unique non-holdout chat, so the 20% line is unreachable and the share goes to the filler), decided by the main thread 2026-10-26 as routine, pending the user's confirmation | at supply: smoltalk2 binds (phase 2 and ir take 1.5B, the QA replay arm 0.3B), the 18.5 points go to the biography slice. At 20%: needs a chat source that does not exist at this size (RUN2_corpus.md section 1) |
 | 14 | the token target on the granted allocation | **800B tokens** (the user, 2026-10-27): 266.67B unique prompt tokens per split x 3 epochs, on 16 H100 (4 nodes of 4 at accumulation 1; the GPU count and the wall time superseded 2026-10-27 by row 15: 8 H100, 2 nodes of 4 at accumulation 2, about 413 hours), for the MareNostrum 5 allocation (5,000 GPU hours applied, 4,500 targeted) | 800B: about 3,300 H100 hours at the expected 67k tokens per second per GPU (about 2,400 at 93k, the corpus's evidence ratio 0.045), about 206 hours of wall time at 16 GPUs, at least 3 chained 72 hour jobs; the floor is about 54k per GPU (about 4,100 hours for the run, the rest of the 4,500 for the corpus build and the control). The split, the chains (absolute 2.8B), the persons (3x the pilot's) and the filler (phase 1 about 260B) are resized in [RUN2_corpus.md](RUN2_corpus.md); 280B (rows 6 and 11) would have used about 1,160 of the 4,500 hours at the same rate |
 | 15 | the GPU count | **8 GPUs, the allocation's cap** (the user, 2026-10-27: the MareNostrum 5 allocation's "maximum number of GPUs" is 8): 8 H100, 2 nodes of 4, gradient accumulation 2 (the job scripts pass `16 / GPUs`; `scripts/slurm/train_run2.sbatch`, `train_run2_control.sbatch` and `train_job.sh` default to 2 nodes); the global batch stays 524,288 tokens per update (8 per GPU x 4096 x accumulation 2 x 8 GPUs), so the LR schedule, the warmup, the kill, the evals and the QA per update are unchanged | 8: the GPU hours unchanged (about 3,302 at 67.3k tokens per second per GPU, about 2,400 at 93k, about 4,100 at the floor of 54k), the wall time doubled: about 413 hours (17 days) at 67.3k, about 21 days at the floor, about 6 to 8 chained 72 hour jobs plus queue waits; the 10B control about 4 hours; the watchdog's no-save limit 97 minutes (49 at 16 GPUs); a save every 1B about 31 minutes at 8 x 67k. Open for the user: whether the cap is per job or concurrent; if concurrent, the 4-GPU reads jobs and any corpus job cannot run beside an 8-GPU training job, so reads run only in the gaps between chained training jobs (batched four to a node) or move to the PC on exported bf16 weights. 16 (row 14 as first written): about 206 hours, at least 3 jobs, accumulation 1 |
+| 16 | a tail phase at the end of the run | **the last 5% of the run, 40B tokens from 760B to 800B, on a higher quality mix** (the user, 2026-10-28; built with the corpus, days 1 to 5, not mid-run): the main chain stops by itself after the first save at or past 760B (`STOP_AFTER` defaults to `760000M` on `run2_main_train`), the supervisor reports "tail switch due" and nothing runs past it until the user switches (`SPLIT=run2_tail_train`: `--switch-split --switch-from-start --end-at-plan`); the cosine is unchanged (one schedule fitted to the 800B plan from step 0) | the split `run2_tail_train` is 42B prompt tokens (5% over the 40B read, so the run reaches its last step before the split ends; `--end-at-plan` ends the run there, final save, exit 0). Mix by prompt tokens: 65% plain text from fresh files of dclm, finepdfs, nemotron_math, code_edu, wikipedia and a little fineweb (a fourth filler phase, [RUN2_corpus.md](RUN2_corpus.md) section 2b; code and wikipedia are almost used up by the main filler, so they get 1.1B and 0.45B), 12% a seeded sample of the main split (biographies in their main form, same swap and masking, so the leak reads stay comparable), 15% the evidence QA build with its chat arms (about 10% QA and 5% chat; 4.1 passes of the build), 8% the chains (1.2 passes of each build). Evidence ratio about 0.44 against 0.045, so about 10% slower per token (about 12 GPU hours, an estimate), disk peak 3.15 TB, standing 2.32 TB of the 4 TB quota. Deviations from the request: the chat is a third of the QA build, so its repeat factor is the QA slice's (4.1, not about 2), and the QA slice repeats 4.1 times, not about 3 |
 
 ## Question, and what it decides
 
@@ -132,6 +133,10 @@ evidence ([16B]), and the evidence axis adds about 0.61 MiB per evidence token (
 30 GB at batch 8 and ratio 1.55, so about 60 GB on an 80 GB card (mean estimate); the per-row cap of about 9k gives a worst case of 8 x 9k x 0.61 MiB = 43 GB plus 29 GB, about 72 GB on 80 GB. Neither expert count
 binds.
 
+**Memory on the 64 GB card (corrected 2026-10-28).** The sums above were written for an 80 GB card; the MareNostrum 5 cards are H100 64 GB, so a worst case of about 72 GB does not fit, and the selection and retrieval tensors add about 10 GB more on a chain dense batch at `max_evidence_tokens` 9216. Day 1 therefore measures instead of estimating: `sft.py --probe-peak` at batch 8 (`--probe-chunk-tokens`, `--probe-conversations`) runs one optimizer step on two synthetic worst case layouts, QA like and chain like, prints the per rank peak in GB, exits 0 and saves nothing. If the peak is above about 58 GB, `max_evidence_tokens` is lowered in `config_run2.yaml` before the warm-up (the cap only closes rows earlier; no corpus is rebuilt). After the first save the value is frozen: a resume with another `max_evidence_tokens`, sequence length or MTP token count exits 3 unless `--allow-plan-change`.
+
+The probe's first read, 2026-10-28, on the 5090 at shape L with the run 2 seed, `max_evidence_tokens` 9216 (9,200 evidence tokens per row in 368 chunks of 25), batch 1 and batch 2 (batch 8 spills there): allocated 9.05 / 16.25 GB on the QA layout and 11.51 / 18.71 GB on the chain layout (reserved 11.62 / 19.05 GB), so about 7.2 GB per row on either layout and an intercept of about 4.3 GB on the chain layout. Extrapolated linearly to batch 8: about 62 GB allocated and about 64 GB reserved on the chain layout, about 59 GB on the QA layout, both over the 58 GB bar, so 9216 at batch 8 is not expected to fit the 64 GB card on a chain dense batch. At about 0.78 MiB per evidence token in a full row, the bar is met near 8,000 evidence tokens per row. An extrapolation from another card, not a measurement on the H100; the day 1 probe at batch 8 decides.
+
 ## Corpus
 
 **Launch version, 2026-10-26:** the corpus the run trains on is the pilot recipe at scale on the
@@ -155,8 +160,8 @@ first about 28B of the main order and the control the first 10B (no evidence fil
 biography arm), both byte prefixes in slice order checked by the driver; epoch 0 of the main split
 starts with the warm split's documents in the warm split's order (`run2_main_train.order.json`,
 `epoch0_head_docs`), so the switch continues the stream rather than repeating it. Disk peak about
-3.06 TB, standing about 1.55 TB, in a 4 TB project quota. The tail curriculum (phase T below) is not
-built.
+3.06 TB, standing about 1.55 TB, in a 4 TB project quota (3.15 TB and 2.32 TB with the tail split of row 16, which is a fifth
+merge, `run2_tail_train`, built beside them: [RUN2_corpus.md](RUN2_corpus.md) sections 2b and 3).
 
 100B unique tokens at up to 4 epochs (decided, [6b]); at 280B the run sees each token about 2.8
 times. Built on the cluster (decided 2026-10-21) by the pilot builder mode at scale ([6c]), which
@@ -175,9 +180,10 @@ evidence-free case.
   and HotpotQA (CLAUDE.md, data prep); with NQ and TriviaQA at 2 passes the slice is well under 1B
   tokens (estimate), under 0.4% of the run. The design's 15% goes to the web slice unless a
   question generator over store chunks is built (not in this spec).
-- **The tail** (the last 15%, reasoning weighted as the 16B run's phase 2, [16B]): shares are a
-  design choice with no rung; chains hops 1 to 4 at 25 / 25 / 25 / 25 (4-hop is the serving depth
-  the eval reads; R9 composed only the hops it trained, [bridge]).
+- **The tail** (the last 5%, 40B tokens, decided 2026-10-28, row 16; the earlier design was the last
+  15% with reasoning weighted as the 16B run's phase 2, [16B]): the shares are in row 16 and
+  [RUN2_corpus.md](RUN2_corpus.md) section 2b; the chains stay at the main corpus's hops (1 to 3 plain, 1 to 4 bridge),
+  4-hop being the serving depth the eval reads (R9 composed only the hops it trained, [bridge]). Note (2026-10-28): the bridge build carries 4-hop rows, so the hop4 read on this corpus is not unseen depth.
 - **Span weights.** Entities, numbers and dates tagged; supported when the span occurs in a visible
   chunk (weight 1, chunk gold), else weight 0; MTP targets carry the same weight. The A1 claim is
   restricted to entity-valued relations (NEXT.md, what must be proven).
@@ -200,9 +206,12 @@ From a fresh seed (`init_scratch_seed.py` under `config_run2.yaml`, then
 **At 800B, 2026-10-27** (row 14; `config_run2.yaml`): W runs on `run2_warm_train` (at most about 28B)
 with `--max-epochs-this-split 1`, launched with `STOP_AFTER='4000M'` (the watcher drops STOP after
 the first save at or past 4B; whether to read again at 12B is open for the user), then the switch
-decision; M is three epochs of `run2_main_train` to 800B; phase T does not exist in the launch
-version (the tail curriculum is not built). Every launch passes `--plan-split run2_main_train`, so
-the cosine spans the 800B plan from step 0 and the switch changes nothing in it; `warmup_fraction`
+decision; M is `run2_main_train` to 760B, the main chain stopping by itself after the first save
+at or past 760B (`STOP_AFTER` defaults to `760000M` there); T is the tail (row 16, decided 2026-10-28): the
+last 40B tokens on `run2_tail_train`, a higher quality mix, started by the user after the stop
+(`SPLIT=run2_tail_train`, which adds `--switch-split --switch-from-start --end-at-plan`) and ended by the
+trainer at the plan's last step. Every launch passes `--plan-split run2_main_train`, so
+the cosine spans the 800B plan from step 0 and neither switch changes anything in it; `warmup_fraction`
 0.000655 is 1000 steps of about 1,525,900 (about 1.1k in practice, the plan derived from the packed
 row estimate); accumulation 2 at 8 GPUs (row 15; accumulation 1 at 16 GPUs as first planned; the
 job scripts pass `16 / GPUs`, so the update stays 524,288 tokens); saves every 1B (about 31 minutes
@@ -220,8 +229,8 @@ the paired leak read), kill off. The control's exposure is open for the user: at
 | phase | tokens | corpus form | ends when |
 |---|---|---|---|
 | W, warm-up | expected 2B to 5B (estimate) | warm-up form | the switch criterion holds, read every 2B from 2B; stop and decide if unmet by 28B |
-| M, main | to 238B (85%) | main form, swap 0.15 | the token count |
-| T, tail | to 280B (decided 2026-10-25) | tail shares | the token count; the cosine continues |
+| M, main | to 760B (95%) | main form, swap 0.15 | the first save at or past 760B (`STOP_AFTER`, a stop the user answers) |
+| T, tail | 760B to 800B (40B, row 16, decided 2026-10-28) | `run2_tail_train`: 65% plain text from fresh files of the best sources, 12% a sample of the main split, 15% evidence QA and chat, 8% chains | the plan's last optimizer step (`--end-at-plan`): the cosine at its floor, final save, exit 0 |
 | control (row 8) | 10B | the same stream, no evidence, fact spans in the loss | the token count |
 | 6e | a few B each | context extension 8k to 16k with retrieval; consolidation SFT | NEXT.md 6e |
 | 6f | unmeasured | reasoning SFT with the bridge rows beside the pretraining slices (the 6f mix rule below), at an LR under the pilot continuation's 3e-4 | NEXT.md 6f; the A gates and the clean-slice CE read at every save, the kill rule on them |
@@ -236,12 +245,12 @@ the paired leak read), kill off. The control's exposure is open for the user: at
 - **Optimizer.** AdamW, lr 4e-4 (the 16B run at this width and batch, stable over 16B tokens,
   [16B]; the [6d] transfer sweep at reduced width is optional and can run on the local card),
   weight decay 0.1 (the micro and pilot value every leak read ran under; the 16B run used 0.02),
-  clip 1.0, warmup 1000 steps (0.52B tokens), cosine to 0.1 lr, router noise annealed over 1B
-  tokens, BF16; FP8 only after 6a's 2B-token A/B within about 1% ([6a]).
+  clip 1.0, warmup 1000 steps (0.52B tokens), cosine to 0.1 lr, router noise zero
+  (corrected 2026-10-28: `sft.py` sets router noise to zero and never reads `noise_anneal_tokens`, so every recorded arm and this run train without it; the earlier line "annealed over 1B tokens" was wrong), BF16; FP8 only after 6a's 2B-token A/B within about 1% ([6a]).
 - **Batch.** 524,288 tokens per update (the 16B run's, [16B]): batch 8 x 4096 per GPU, the
   accumulation set by the GPU count. `max_evidence_tokens` about 9k per row (1.5x the mean at
-  ratio 1.55, as the pilot's 4608 was against 0.72; estimate; the 1.55 came from 6b's 15% QA share, RUN2's own shares give about 1.49: 1.40 in the main body, 2.0 in the tail), set from the packing line in minute
-  one.
+  ratio 1.55, as the pilot's 4608 was against 0.72; estimate; the 1.55 came from 6b's 15% QA share, RUN2's own shares give about 1.49: 1.40 in the main body, 2.0 in the tail), set once from the day 1 `--probe-peak` read and the packing line in minute
+  one, before the warm-up (2026-10-28: a change after the first save is refused on resume).
 - **Cadence.** Save every 1B tokens (about 33 minutes on 8 GPUs at the estimated rate), keep every
   10B and the final; `[eval]` every 1B; `[eval fixed]` every 2B. The fixed pass is about 18% of a
   pilot arm's wall clock at its 25M cadence ([review]); at 2B, a 2 to 4 minute pass per 66
@@ -388,7 +397,8 @@ rate. The smoke at shape L on the 5090 (30 steps, batch 2, accumulation 1, `max_
   it is another size: 3.7 TB peak and 1.9 TB standing at the 3% chain share, the warm and main
   merges 853 GB each and the control 30 GB ([RUN2_corpus.md](RUN2_corpus.md) section 4).
   At 800B (2026-10-27): the corpus peaks at about 3.06 TB and stands at about 1.55 TB (the main
-  merge 1.37 TB, warm 144 GB, control 30 GB; RUN2_corpus.md section 3) in the 4 TB project quota;
+  merge 1.37 TB, warm 144 GB, control 30 GB; RUN2_corpus.md section 3) in the 4 TB project quota; with the tail split
+  (row 16, a 771 GB merge) the peak is about 3.15 TB and the standing size about 2.32 TB;
   about 80 kept saves of 4.6 GB, about 370 GB, the 10B saves hard linked into `$DATA_ROOT/pinned`;
   uploads off (no node has internet); weights leave as bf16 exports of about 0.67 GB
   (`scripts/export_weights.py`, `scripts/ops/pull_exports.sh`) against the 2 TB transfer allowance,
@@ -463,10 +473,10 @@ to a node, or move to the PC on exported bf16 weights; a question for support); 
    builder with the pretraining holdout honoured; evidence QA with gold, mixed, distractors and none 0.25; replay of the
    pretraining slices 0.35, the biographies with their filler windows and the plain chains; merged by
    `merge_evidence_splits.py`, with a check that every assistant turn ends in a supervised EOS), the configs
-   `config_run2_postsft.yaml` (lr 1e-4, one epoch, saves every 250M, batch 2 x 8) and `ckpts/inject/config_pilot_postsft.yaml`,
+   `config_run2_postsft.yaml` (lr 1e-4, one epoch, saves every 250M, batch 2 x 8, `conversation_loss_weighting: false` since 2026-10-28) and `ckpts/inject/config_pilot_postsft.yaml`,
    `scripts/launch_post_sft.sh`, the per save reads `scripts/reads/read_post_sft_save.sh` (A3 abstention read, clean slice CE
    per exit, the chat read `scripts/eval_chat.py` with 40 fixed prompts) with the kill verdict against the seed (clean CE
-   at the last exit up more than 0.15, or gold EM below the seed's), and the steps in
+   at the last exit up more than 0.15; revised 2026-10-28: 2000 examples, gold EM down with paired z at or under -3, and an abstention kill when the non-abstain rate under none or distractors is up with z at or over +3 and by 0.02 or more; a missing baseline exits 4; SQuAD from a local directory (`SQUAD_DIR`, `CHAINS_DIR`); the bridge retention read is reported only), and the steps in
    [RUN2_handover.md](RUN2_handover.md) "After the run: post-training on the PC". The 6f mix builder (item 10) stays open
    for the bridge rows.
 
@@ -633,3 +643,5 @@ chain_continuation_pilot.md, [lossfree], [muon], [infonce], [leak] leak_candidat
 [qhead] query_head_probe.md, [seedinstr] seed_instruments.md, [review] review_2026-10-24.md, [arch]
 architecture.md, [16B] CONCLUSION.md, [6a] to [6f] the NEXT.md Phase 6 sections. CLAUDE.md is cited
 by section name.
+
+**Review of 2026-10-28.** An 8 agent review of the launch path and its fixes are recorded in the State block of [NEXT.md](NEXT.md) and CLAUDE.md. Changes to this plan: the memory budget above (64 GB card, the day 1 probe, the frozen cap), router noise zero, the tail filler target 28.665B of text (was 28.119B; whole files counted, `TAIL_TEXT_MARGIN` 0.05), the QA replay excluding the ir phase's smoltalk2 hashes (the supply exactly covers 300M, zero slack), the hop4 note, the post-SFT verdict, and day 1 gaining the probe and a real `scancel --signal=TERM` test. Corpus checks added: the `tail_text` stage now fails only below what the merge needs and warns between that and its target, and the QA stage fails when the smoltalk2 replay arm realizes under 90% of its 300M target.
