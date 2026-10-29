@@ -1,0 +1,12 @@
+# systemd --user service: one relay poll. started by relay.timer. a oneshot unit is never started twice at once.
+# the repo checkout is ~/tiny-llm; change WorkingDirectory if it lives elsewhere.
+[Unit]
+Description=Run 2 relay poll (supervise, pull, upload, notify)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tiny-llm
+Environment=PATH=%h/relay-venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash scripts/ops/relay/relay_poll.sh
+TimeoutStartSec=6h

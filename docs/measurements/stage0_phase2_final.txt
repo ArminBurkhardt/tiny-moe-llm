@@ -1,0 +1,86 @@
+[93mINFO: Loading tokenizer from /mnt/d/AI/llm/dev/worth_a_try/new/tiny-llm/ckpts/pretrained/DeepSeek-V4-Pro-tokenizer-65536[0m
+[93mINFO: Loading checkpoint from ckpts/trained/checkpoint_phase2_final_phase0.pt[0m
+[93mINFO: params: total=332.3M active=173.1M (excl. emb=103.9M) | forward FLOP/token ~= 490M (body 264M + heads 100M + attn 126M @ seq_len=4096)[0m
+[93mINFO: Held-out slice starts at doc 0 (checkpoint global_offset=1,912,018)[0m
+[93mINFO: Dataset[phase1]: 45,652 documents, 0.10GB token stream[0m
+[93mINFO: [worker 0] starting at doc 0/45652 (global resume point 0)[0m
+[93mINFO: [eval_stage0] processed 10 batches (163,518 supervised tokens)[0m
+[93mINFO: [eval_stage0] processed 20 batches (327,050 supervised tokens)[0m
+[93mINFO: [eval_stage0] processed 30 batches (490,626 supervised tokens)[0m
+[93mINFO: [eval_stage0] processed 40 batches (654,128 supervised tokens)[0m
+[93mINFO: Evaluated 40 batches, 654,128 supervised tokens[0m
+
+=== 1. IR retrieval entropy (max = ln 8192 = 9.011 nats) ===
+  loop     entropy  frac of max   max weight   top-32 mass  read dispersion
+  1         8.9645       0.9948     0.000258      0.007914           0.1981
+  2         8.9640       0.9948     0.000246      0.007341           0.0230
+  3         8.9650       0.9949     0.000245      0.007300           0.0254
+  4         8.9656       0.9950     0.000244      0.007275           0.0276
+  5         8.9663       0.9950     0.000243      0.007243           0.0306
+  6         8.9671       0.9951     0.000242      0.007207           0.0341
+  uniform reference: max weight 0.000122, top-32 mass 0.003906
+  read dispersion = mean ||y_t - y_bar|| / ||y_bar||; ~0 means every token reads the same vector
+
+=== 2. IR ablation (Gate G1) ===
+  loop      CE full   CE read=0       dCE   CE read=mean       dCE
+  1          3.5152      3.5153    0.0002         3.5152    0.0000
+  2          3.3922      3.3924    0.0002         3.3922   -0.0000
+  3          3.3843      3.3845    0.0002         3.3842   -0.0000
+  GATE G1 (final-loop dCE with the read zeroed > 0.02): 0.0002 -> FAIL
+  content share: dCE(zero) - dCE(mean) = 0.0003 nats is what the read's per-token CONTENT is worth;
+  the remaining -0.0000 nats is worth a constant vector, i.e. a bias term.
+
+  loop     IR routed weight   IR selection rate
+  1                  0.0228              0.0652
+  2                  0.0368              0.0813
+  3                  0.0297              0.0609
+  4                  0.0241              0.0465
+  5                  0.0217              0.0416
+  6                  0.0239              0.0460
+
+=== 3. Query drift: cos(down_proj(h_i), down_proj(h_j)) ===
+              loop 1    loop 2    loop 3    loop 4    loop 5    loop 6
+  loop 1      1.0000   -0.6592   -0.6505   -0.6432   -0.6342   -0.6239
+  loop 2                1.0000    0.9894    0.9845    0.9779    0.9701
+  loop 3                          1.0000    0.9990    0.9964    0.9921
+  loop 4                                    1.0000    0.9990    0.9963
+  loop 5                                              1.0000    0.9990
+  loop 6                                                        1.0000
+
+=== 4. Loop-to-loop dynamics ===
+  transition          top-1 flip  mean |dlogp|  ||dh||/||h||   cos(d_k,d_k-1)
+  decoder -> loop 1          n/a           n/a        0.8691              n/a
+  loop 1 -> 2             0.1910        0.2315        0.3625           0.2994
+  loop 2 -> 3             0.0543        0.0672        0.1043           0.6340
+  loop 3 -> 4             0.0509        0.0641        0.0992           0.8459
+  loop 4 -> 5             0.0508        0.0638        0.0943           0.7767
+  loop 5 -> 6             0.0501        0.0641        0.0897           0.7343
+
+=== 5. Oracle minimum sufficient depth ===
+  loop    first correct  oracle cum.  top-1 acc  regressed
+  1              0.3834       0.3834     0.3834     0.0000
+  2              0.0348       0.4183     0.3957     0.0226
+  3              0.0061       0.4244     0.3963     0.0281
+  4              0.0052       0.4296     0.3957     0.0339
+  5              0.0045       0.4341     0.3939     0.0402
+  6              0.0040       0.4381     0.3919     0.0462
+  never correct at any depth: 0.5619
+  at the trained depth (loop 3): oracle 0.4244 vs. actual 0.3963 -- headroom 0.0281
+  'regressed' = right at some earlier loop, wrong at this one. measured on plain LM
+  continuation with no evidence pathway attached -- a floor on today's checkpoint, not a
+  recommended depth.
+
+=== 6. Per-loop CE, including past the trained depth (n_loops=3) ===
+  loop 1: CE=3.5152  ppl=33.622
+  loop 2: CE=3.3922  ppl=29.731
+  loop 3: CE=3.3843  ppl=29.496
+  loop 4: CE=3.3889  ppl=29.634   <- untrained depth
+  loop 5: CE=3.4026  ppl=30.042   <- untrained depth
+  loop 6: CE=3.4231  ppl=30.664   <- untrained depth
+
+=== summary line ===
+  tokens=654,128  entropy/max=0.9949  dCE(zero)=0.0002  dCE(mean)=-0.0000  cos(q1,q3)=-0.6505  oracle_headroom=0.0281
+
+real	2m27.140s
+user	0m56.830s
+sys	0m4.343s

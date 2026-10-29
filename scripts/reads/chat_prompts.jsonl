@@ -1,0 +1,40 @@
+{"id": 1, "category": "everyday", "messages": [{"role": "user", "content": "Hi! How are you today?"}]}
+{"id": 2, "category": "everyday", "messages": [{"role": "user", "content": "What should I cook for dinner tonight if I only have rice, eggs and spinach?"}]}
+{"id": 3, "category": "everyday", "messages": [{"role": "user", "content": "Can you give me three tips for sleeping better?"}]}
+{"id": 4, "category": "everyday", "messages": [{"role": "user", "content": "I feel stressed about an exam tomorrow. Any advice?"}]}
+{"id": 5, "category": "everyday", "messages": [{"role": "user", "content": "What is a good way to learn a new language quickly?"}]}
+{"id": 6, "category": "everyday", "messages": [{"role": "user", "content": "How do I make a cup of tea?"}]}
+{"id": 7, "category": "everyday", "messages": [{"role": "user", "content": "Suggest a name for a small bakery."}]}
+{"id": 8, "category": "everyday", "messages": [{"role": "user", "content": "Why is the sky blue?"}]}
+{"id": 9, "category": "everyday", "messages": [{"role": "user", "content": "What is the difference between a virus and a bacterium?"}]}
+{"id": 10, "category": "everyday", "messages": [{"role": "user", "content": "How do I politely decline an invitation to a party?"}]}
+{"id": 11, "category": "everyday", "messages": [{"role": "user", "content": "Give me a short packing list for a weekend hiking trip."}]}
+{"id": 12, "category": "everyday", "messages": [{"role": "user", "content": "What are some good habits for staying productive while working from home?"}]}
+{"id": 13, "category": "everyday", "messages": [{"role": "user", "content": "Thanks for your help earlier!"}]}
+{"id": 14, "category": "everyday", "messages": [{"role": "user", "content": "What can you help me with?"}]}
+{"id": 15, "category": "factual", "messages": [{"role": "user", "content": "What is the capital of France?"}]}
+{"id": 16, "category": "factual", "messages": [{"role": "user", "content": "Who wrote the play Romeo and Juliet?"}]}
+{"id": 17, "category": "factual", "messages": [{"role": "user", "content": "How many planets are there in the solar system?"}]}
+{"id": 18, "category": "factual", "messages": [{"role": "user", "content": "What is the boiling point of water at sea level in degrees Celsius?"}]}
+{"id": 19, "category": "factual", "messages": [{"role": "user", "content": "Who painted the Mona Lisa?"}]}
+{"id": 20, "category": "factual", "messages": [{"role": "user", "content": "What is the largest ocean on Earth?"}]}
+{"id": 21, "category": "factual", "messages": [{"role": "user", "content": "In what year did World War II end?"}]}
+{"id": 22, "category": "factual", "messages": [{"role": "user", "content": "What is the chemical symbol for gold?"}]}
+{"id": 23, "category": "factual", "messages": [{"role": "user", "content": "What does DNA stand for?"}]}
+{"id": 24, "category": "factual", "messages": [{"role": "user", "content": "Which country has the largest population in the world?"}]}
+{"id": 25, "category": "instruction", "messages": [{"role": "user", "content": "Write a two sentence summary of the water cycle."}]}
+{"id": 26, "category": "instruction", "messages": [{"role": "user", "content": "Rewrite this sentence to sound more formal: hey, can you send me that file asap?"}]}
+{"id": 27, "category": "instruction", "messages": [{"role": "user", "content": "List five fruits in alphabetical order."}]}
+{"id": 28, "category": "instruction", "messages": [{"role": "user", "content": "Translate 'good morning' into Spanish and French."}]}
+{"id": 29, "category": "instruction", "messages": [{"role": "user", "content": "Write a short poem about autumn."}]}
+{"id": 30, "category": "instruction", "messages": [{"role": "user", "content": "Explain what a for loop is in programming, in two sentences."}]}
+{"id": 31, "category": "instruction", "messages": [{"role": "user", "content": "Write a Python function that returns the square of a number."}]}
+{"id": 32, "category": "instruction", "messages": [{"role": "user", "content": "Give me a one paragraph description of a lighthouse."}]}
+{"id": 33, "category": "instruction", "messages": [{"role": "user", "content": "Convert 5 kilometers to miles and show the arithmetic."}]}
+{"id": 34, "category": "instruction", "messages": [{"role": "user", "content": "Write a polite email asking my manager for a day off on Friday."}]}
+{"id": 35, "category": "instruction", "messages": [{"role": "user", "content": "Explain recursion to a ten year old."}]}
+{"id": 36, "category": "instruction", "messages": [{"role": "user", "content": "What is 17 times 23?"}]}
+{"id": 37, "category": "multi_turn", "messages": [{"role": "user", "content": "My name is Sam and I am planning a trip to Japan."}, {"role": "assistant", "content": "That sounds exciting, Sam! Are you thinking of visiting Tokyo, Kyoto, or somewhere else?"}, {"role": "user", "content": "Kyoto. What is one thing I should not miss there?"}]}
+{"id": 38, "category": "multi_turn", "messages": [{"role": "user", "content": "Give me a number between 1 and 10."}, {"role": "assistant", "content": "Seven."}, {"role": "user", "content": "Now double it and tell me the result."}]}
+{"id": 39, "category": "system", "messages": [{"role": "system", "content": "You are a friendly assistant that answers in at most two sentences."}, {"role": "user", "content": "What is a good first step to start running?"}]}
+{"id": 40, "category": "system", "messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Tell me about the moon."}]}
